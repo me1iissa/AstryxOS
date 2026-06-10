@@ -109,6 +109,15 @@ impl Pipe {
         self.writers == 0
     }
 
+    /// Check if every read end has been closed.  Per `man 2 write` /
+    /// `man 7 pipe`: a write to a pipe with no reader yields `EPIPE`
+    /// (and `SIGPIPE`).  A writer that finds the buffer full must
+    /// distinguish "wait for the reader to drain" from "the reader is
+    /// gone, fail with EPIPE" — this predicate drives that decision.
+    pub fn reader_closed(&self) -> bool {
+        self.readers == 0
+    }
+
     /// Available bytes (count of unread data).
     pub fn available(&self) -> usize {
         self.count
@@ -169,6 +178,53 @@ pub fn pipe_write(pipe_id: u64, data: &[u8]) -> Option<usize> {
     let mut pipes = PIPE_TABLE.lock();
     let pipe = pipes.iter_mut().find(|p| p.id == pipe_id)?;
     Some(pipe.write(data))
+}
+
+/// Outcome of an atomic (`count <= PIPE_BUF`) deposit attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AtomicWrite {
+    /// Every byte of `data` was deposited in one contiguous piece.
+    Wrote,
+    /// Not enough room for the whole record — NOTHING was written.  The
+    /// caller must park (never publish a partial `<= PIPE_BUF` record).
+    NoSpace,
+    /// Pipe id no longer exists (both ends closed) — treat as `EBADF`.
+    Gone,
+}
+
+/// Atomically deposit `data` iff the pipe has room for ALL of it, under a
+/// SINGLE `PIPE_TABLE` critical section.
+///
+/// Per `man 7 pipe` (`PIPE_BUF`): a write of at most `PIPE_BUF` bytes is
+/// delivered in one contiguous piece — never interleaved with another
+/// writer's data and never split into a short write on a blocking fd.
+/// Performing the space-check and the deposit under one lock is what
+/// enforces that.  Two SEPARATE `PIPE_TABLE` acquisitions (a `pipe_space`
+/// probe followed by `pipe_write`) let two concurrent atomic writers both
+/// observe `space >= count`, after which the ring's self-cap
+/// (`Pipe::write` copies `min(data.len(), space)`) publishes two
+/// interleaved partial records.  This helper closes that window: the
+/// check and the deposit are indivisible.
+///
+/// Returns `Wrote` once the whole record is deposited, `NoSpace` when the
+/// buffer lacks room for all of `data` (nothing written — the caller
+/// parks via [`wait_writable`] with `need == data.len()`), or `Gone` when
+/// the pipe has vanished.
+pub fn pipe_write_atomic(pipe_id: u64, data: &[u8]) -> AtomicWrite {
+    let mut pipes = PIPE_TABLE.lock();
+    let pipe = match pipes.iter_mut().find(|p| p.id == pipe_id) {
+        Some(p) => p,
+        None => return AtomicWrite::Gone,
+    };
+    if pipe.space() < data.len() {
+        return AtomicWrite::NoSpace;
+    }
+    // Room for the whole record — deposit it in one shot.  `Pipe::write`
+    // copies `min(data.len(), space)`, which given the guard above is
+    // exactly `data.len()`, so the published record is whole and contiguous.
+    let n = pipe.write(data);
+    debug_assert_eq!(n, data.len(), "atomic pipe write must deposit the whole record");
+    AtomicWrite::Wrote
 }
 
 /// Increment the writer count (e.g. when a second fd aliases the write-end).
@@ -271,6 +327,36 @@ pub fn pipe_writer_closed(pipe_id: u64) -> bool {
         .unwrap_or(true)
 }
 
+/// Check if every read end of `pipe_id` has been closed.  Drives the
+/// `EPIPE` decision in the blocking-write path (per `man 2 write`: a
+/// write to a pipe with no reader fails with `EPIPE`).  A missing pipe
+/// id is treated as reader-closed so the writer fails fast rather than
+/// blocking on a vanished object.
+pub fn pipe_reader_closed(pipe_id: u64) -> bool {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.reader_closed())
+        .unwrap_or(true)
+}
+
+/// Free space currently available in `pipe_id`'s ring buffer (bytes).
+/// Used by the blocking-write loop to decide, under POSIX `write(2)`
+/// atomicity, whether a `count <= PIPE_BUF` write can land in one piece
+/// or must park until the reader drains enough room.  A missing pipe id
+/// reports zero space (the writer then re-checks reader-closed → EPIPE).
+pub fn pipe_space(pipe_id: u64) -> usize {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.space())
+        .unwrap_or(0)
+}
+
+/// The atomicity boundary for pipe writes, per `man 7 pipe`
+/// (`PIPE_BUF`): a write of at most this many bytes is delivered
+/// atomically (all-or-block), never interleaved with another writer's
+/// data and never split into a short write on a blocking fd.
+pub const PIPE_BUF: usize = PIPE_BUF_SIZE;
+
 // ── Wait / wake hooks ─────────────────────────────────────────────────────────
 
 /// Atomic check-then-park for a reader on `pipe_id`.
@@ -325,10 +411,26 @@ pub fn wait_readable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
     WaitOutcome::Enqueued
 }
 
-/// Atomic check-then-park for a writer on `pipe_id`.  Symmetric with
-/// `wait_readable`; a writer parks when the pipe is full unless the
-/// reader has gone away (in which case the caller will return EPIPE).
-pub fn wait_writable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
+/// Needs-aware check-then-park for a writer on `pipe_id`.  Symmetric with
+/// `wait_readable`; a writer parks unless it can make the progress it
+/// needs.  `need` is the number of CONTIGUOUS free bytes the writer
+/// requires before it should re-attempt:
+///   * atomic write (`count <= PIPE_BUF`): `need == count` — the writer
+///     must NOT wake until the whole record fits, or it would spin
+///     check -> Ready-on-any-space -> retry -> still-can't-write at 100%
+///     CPU (a write into `0 < space < count` makes no progress);
+///   * large write (`count > PIPE_BUF`): `need == 1` — any free byte is
+///     forward progress.
+///
+/// `Ready` is returned when `space() >= need` (enough room to advance) OR
+/// `readers == 0` (the writer must wake to observe `EPIPE`).  Otherwise the
+/// caller is parked.  The re-check runs under `PIPE_WRITE_WAITERS` while
+/// briefly holding `PIPE_TABLE`, closing the TOCTOU window against a reader
+/// drain that frees space between the caller's own space probe and the
+/// park: a drain that frees `>= need` wakes us (`wake_writers_all`) and we
+/// re-evaluate; a drain that frees `< need` leaves the predicate `Enqueued`
+/// here, so we genuinely park rather than spin (no spurious wake-consume).
+pub fn wait_writable(pipe_id: u64, need: usize, wake_tick: u64) -> WaitOutcome {
     let tid = crate::proc::current_tid();
     let mut waiters = PIPE_WRITE_WAITERS.lock();
 
@@ -336,7 +438,7 @@ pub fn wait_writable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
         let pipes = PIPE_TABLE.lock();
         match pipes.iter().find(|p| p.id == pipe_id) {
             None => WaitOutcome::Gone,
-            Some(p) if p.space() > 0 || p.readers == 0 => WaitOutcome::Ready,
+            Some(p) if p.space() >= need || p.readers == 0 => WaitOutcome::Ready,
             Some(_) => WaitOutcome::Enqueued,
         }
     };
