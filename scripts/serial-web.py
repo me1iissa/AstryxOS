@@ -85,11 +85,30 @@ SECTOR_BYTES = 512
 # whichever serial source is enabled. This is a tail-window substring scan (no
 # AND-anchoring), so the `[GATE]` markers carry the load on the fast profile.
 GATES = [
-    (8, "PNG",               ("[FF-OUT-PNG:path=/tmp/out.png size=",
+    # ff-exit-clean: the whole FF tree terminated with status 0.  The kernel
+    # now emits "[GATE] ff-exit-clean code=<c>" on the pid-1 group exit in
+    # firefox-test mode (vfs/main.rs, ff/runtime-url-gate-markers PR), so this
+    # is a reliable signal on the fast firefox-test-core profile — winning runs
+    # no longer mis-badge as "screenshot-actors".  The [PROC] fallback keys on
+    # the same event for full-trace boots.
+    (9, "ff-exit-clean",     ("[GATE] ff-exit-clean",
+                              "[PROC] PID 1 exit_group(0)")),
+    # "[GATE] png-write path=<p> bytes=<n>" = the kernel marker emitted on the
+    # close-after-write of the --screenshot output file (vfs/mod.rs, same PR) —
+    # a genuine "the PNG was written and closed" event, NOT a stat/resolve
+    # probe.  The legacy supervisor / host-extract markers are retained for
+    # full-trace boots and the post-exit PNG stream.
+    (8, "PNG",               ("[GATE] png-write",
+                              "[FF-OUT-PNG:path=/tmp/out.png size=",
                               "/tmp/out.png present", "89504e47", "out.png written",
                               "kdb-read-png")),
-    (7, "drawSnapshot",      ("[GATE] drawSnapshot", "drawSnapshot",
-                              "CrossProcessPaint", "libpng16")),
+    # NOTE: "libpng16" was removed as drawSnapshot evidence — it loads to
+    # DECODE page images during load and fired on boots that never
+    # snapshotted anything (false positive).  Bare "drawSnapshot" has no
+    # serial marker in current builds; the [GATE] form is kept for when one
+    # exists.
+    (7, "drawSnapshot",      ("[GATE] drawSnapshot",
+                              "CrossProcessPaint")),
     (6, "screenshot-actors", ("[GATE] screenshot-actors", "ScreenshotParent",
                               "getDimensions")),
     (5, "content-proc",      ("[GATE] content-procs", "isForBrowser")),
@@ -98,7 +117,7 @@ GATES = [
     (2, "x11",               ("X11 server ready", "Xastryx")),
     (1, "lib-load",          ("[GATE] libxul", "libxul")),
 ]
-GATE_MAX = 8
+GATE_MAX = 9
 _SC_RE = re.compile(r"pid=1[^\n]*?sc=(\d+)")
 _TICK_RE = re.compile(r"tick=(\d+)")
 _PANIC_RE = re.compile(r"PANIC|HEAP GUARD\] overflow|SCHEDULER_DEADLOCK|ke_bugcheck")
@@ -158,16 +177,22 @@ MILESTONES = [
                            ("[FF/write]", "getDimensions"),
                            ("[FF/write]", "ScreenshotParent"),
                            ("[FF/write]", "sendQuery"))),
-    ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
-    # PNG write. The FINAL screenshot PNG is NOT detected by a raw [GATE]/magic
+    # NOTE: libpng16.so removed as drawSnapshot evidence — it loads to DECODE
+    # page images during load (false positive on boots that never snapshot).
+    ("drawSnapshot",      ("[GATE] drawSnapshot",)),
+    # PNG write. The FINAL screenshot PNG is NOT detected by a raw magic
     # marker (Firefox writes many internal PNGs — favicons, theme assets — that
-    # would false-positive). The authoritative, single-per-run signal is the FF
-    # supervisor's functional `[FFTEST] /tmp/out.png present` /
-    # `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core); the
-    # `89504e47` magic / `out.png written` are kept for full-trace boots.
-    ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+    # would false-positive). The authoritative signal is the kernel's
+    # `[GATE] png-write path=<p> bytes=<n>` (close-after-write of the
+    # --screenshot output file; vfs/mod.rs, ff/runtime-url-gate-markers PR);
+    # the FF supervisor's functional lines are kept for full-trace runs.
+    ("PNG write",         ("[GATE] png-write",
+                           ("[FF-OUT-PNG:", "sig_ok=true"),
                            "/tmp/out.png present", "89504e47", "out.png written")),
+    # exit_group = ANY process exit (fires on crashes too); exit-clean = the
+    # whole-tree-success terminal state, so it is the DEEPEST rung.
     ("exit_group",        ("exit_group(",)),
+    ("exit-clean",        ("[GATE] ff-exit-clean", "[PROC] PID 1 exit_group(0)")),
 ]
 
 # OPTIONAL milestones: gates that can be absent OR arrive out-of-order on a
@@ -186,7 +211,15 @@ MILESTONES = [
 #     ladder advance to the gates the boot actually reached. (Pre-existing
 #     ordering quirk, surfaced once the deep [GATE] markers made the deeper
 #     gates reachable on the fast profile.)
-OPTIONAL_MILESTONES = {"TLS / network", "init / userspace"}
+#   * "drawSnapshot" — current builds emit NO drawSnapshot serial marker (the
+#     old libpng16 heuristic was a false positive and was removed); the gate
+#     must not stall the ladder until a kernel-side "[GATE] drawSnapshot"
+#     exists.
+#   * "PNG write" — all its markers come from the [FFTEST] supervisor /
+#     auto-PNG-emit, which are dead on hlt-park boots; a winning run advances
+#     to exit-clean without them ("[GATE] png-write" kernel marker in flight).
+OPTIONAL_MILESTONES = {"TLS / network", "init / userspace",
+                       "drawSnapshot", "PNG write"}
 
 # Only the kernel's own tick lines, not arbitrary "tick=" in FF/JS output.
 _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
