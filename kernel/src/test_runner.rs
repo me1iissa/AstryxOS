@@ -220,6 +220,16 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_wake_hook() { passed += 1; }
 
+    // ── Test 0a2: blocking pipe write semantics (write(2) / pipe(7)) ──────
+    // Regression guard for the POSIX blocking-write contract: a >PIPE_BUF
+    // blocking write completes fully when a reader drains on another
+    // thread; O_NONBLOCK on a full pipe returns -EAGAIN; a <=PIPE_BUF
+    // write is atomic; a parked writer wakes on reader-drain; EPIPE when
+    // the last reader is gone.  Pre-fix, a full pipe returned a no-progress
+    // 0 and musl stdio retried the same write forever.
+    total += 1;
+    if test_pipe_blocking_write_semantics() { passed += 1; }
+
     // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
@@ -35553,6 +35563,205 @@ fn test_pipe_wake_hook() -> bool {
     }
     test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
     test_pass!("pipe wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 0a2: blocking pipe write semantics (write(2) / pipe(7)) ─────────────
+//
+// POSIX write(2) on a pipe (man 7 pipe):
+//   * count <= PIPE_BUF: atomic — the write is delivered all in one piece or,
+//     on a blocking fd, blocks until it fits.  Never a short write.
+//   * count  > PIPE_BUF: may be split; a blocking fd blocks until every byte
+//     is written.
+//   * O_NONBLOCK + full pipe: -EAGAIN (no progress), never a no-op 0.
+//   * no reader (read end closed): -EPIPE.
+//
+// Pre-fix, `sys_write_linux`'s pipe arm called `pipe_write` once and returned
+// whatever fit — so a full pipe returned a no-progress 0 and musl stdio
+// retried the same write forever (a Firefox child wedged on its first stderr
+// line once the peer stopped draining its stdout).  This test pins the fixed
+// contract end-to-end through the syscall, with a draining reader on a second
+// kernel thread to prove the parked writer wakes on reader-drain.
+fn test_pipe_blocking_write_semantics() -> bool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    test_header!("pipe blocking write — atomic / blocks-until-drained / EAGAIN / EPIPE");
+
+    // ── Sub-test 1: O_NONBLOCK full pipe → -EAGAIN (atomicity preserved) ──
+    // pipe2(O_NONBLOCK) so both ends are non-blocking.
+    let mut fds = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds.as_mut_ptr() as u64, 0x0800 /*O_NONBLOCK*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(O_NONBLOCK) returned {}", r);
+        return false;
+    }
+    let (rfd_nb, wfd_nb) = (fds[0] as u64, fds[1] as u64);
+
+    // Fill the 4 KiB ring exactly (one PIPE_BUF write fits atomically).
+    let filler = [0xABu8; 4096];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, filler.as_ptr() as u64, filler.len() as u64, 0, 0, 0);
+    if n != 4096 {
+        test_fail!("pipe_blocking_write",
+            "nonblock fill write returned {} (expected 4096)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    // Pipe is now full.  A non-blocking write of even 1 byte must return EAGAIN
+    // (NOT a no-progress 0 — that was the bug that made musl spin).
+    let one = [0x55u8; 1];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, one.as_ptr() as u64, 1, 0, 0, 0);
+    if n != -11 {
+        test_fail!("pipe_blocking_write",
+            "O_NONBLOCK write to full pipe returned {} (expected -11 EAGAIN)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  O_NONBLOCK write to full pipe → -EAGAIN (no no-progress 0) ✓");
+    // Atomicity under O_NONBLOCK: drain 100 bytes, then a 200-byte write of a
+    // <=PIPE_BUF chunk must still EAGAIN (only 100 free < 200 → all-or-nothing).
+    let mut sink = [0u8; 100];
+    let dr = crate::syscall::dispatch_linux_kernel(
+        0 /*read*/, rfd_nb, sink.as_mut_ptr() as u64, 100, 0, 0, 0);
+    let chunk200 = [0x66u8; 200];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, chunk200.as_ptr() as u64, 200, 0, 0, 0);
+    if dr == 100 && n != -11 {
+        test_fail!("pipe_blocking_write",
+            "O_NONBLOCK 200B write with only 100B free returned {} (expected -11 EAGAIN — atomicity)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  O_NONBLOCK <=PIPE_BUF write with insufficient space → -EAGAIN (atomic) ✓");
+    crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+
+    // ── Sub-test 2: EPIPE when the reader is gone ─────────────────────────
+    let mut fds2 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds2.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for EPIPE returned {}", r);
+        return false;
+    }
+    let (rfd2, wfd2) = (fds2[0] as u64, fds2[1] as u64);
+    // Close the read end; the write end has no reader → EPIPE.
+    crate::syscall::dispatch_linux_kernel(3 /*close*/, rfd2, 0, 0, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd2, one.as_ptr() as u64, 1, 0, 0, 0);
+    if n != -32 {
+        test_fail!("pipe_blocking_write",
+            "write to pipe with no reader returned {} (expected -32 EPIPE)", n);
+        crate::syscall::dispatch_linux_kernel(3, wfd2, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  blocking write with no reader → -EPIPE ✓");
+    crate::syscall::dispatch_linux_kernel(3, wfd2, 0, 0, 0, 0, 0);
+
+    // ── Sub-test 3: blocking write of > PIPE_BUF completes when a reader
+    //               drains on another thread (the core fix) ───────────────
+    let mut fds3 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds3.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for drain test returned {}", r);
+        return false;
+    }
+    let (rfd3, wfd3) = (fds3[0] as u64, fds3[1] as u64);
+    let pid = crate::proc::current_pid_lockless();
+    let pipe_id = crate::syscall::get_pipe_id(pid, wfd3 as usize);
+
+    static DRAIN_STOP: AtomicU32 = AtomicU32::new(0);
+    static DRAINED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static DRAIN_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+    DRAIN_STOP.store(0, Ordering::SeqCst);
+    DRAINED_TOTAL.store(0, Ordering::SeqCst);
+    DRAIN_PIPE_ID.store(pipe_id, Ordering::SeqCst);
+
+    // Drainer thread: read the GLOBAL pipe object by id (pipe ops are keyed
+    // by id, not by a per-process fd, so a spawned kernel process can drain
+    // the same pipe the test thread is writing to).  Each non-zero drain
+    // makes room, so it MUST wake any parked writer.
+    fn drainer_entry() {
+        crate::hal::enable_interrupts();
+        let pid = DRAIN_PIPE_ID.load(Ordering::SeqCst);
+        let mut buf = [0u8; 512];
+        loop {
+            let n = crate::ipc::pipe::pipe_read(pid, &mut buf).unwrap_or(0);
+            if n > 0 {
+                DRAINED_TOTAL.fetch_add(n as u64, Ordering::SeqCst);
+                // Reader made space — wake a parked writer (this is what
+                // sys_read_linux does on the real path).
+                crate::ipc::pipe::wake_writers_all(pid);
+            } else {
+                if DRAIN_STOP.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                // Empty — yield and retry.
+                crate::sched::yield_cpu();
+                crate::hal::enable_interrupts();
+                for _ in 0..200u32 { core::hint::spin_loop(); }
+            }
+        }
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    let drainer_pid = crate::proc::create_kernel_process(
+        "pipe_drain_reader", drainer_entry as *const () as u64);
+    test_println!("  spawned drainer pid={} on pipe id={} ✓", drainer_pid, pipe_id);
+
+    // Issue a blocking write of 12 KiB (3 × PIPE_BUF).  With only a 4 KiB
+    // ring this CANNOT complete without the drainer making space — pre-fix it
+    // returned a partial/0 immediately; post-fix it blocks and completes fully.
+    const BIG: usize = 12288;
+    let big_buf = [0xCDu8; BIG];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd3, big_buf.as_ptr() as u64, BIG as u64, 0, 0, 0);
+
+    // Signal the drainer to stop once the pipe is empty.
+    DRAIN_STOP.store(1, Ordering::SeqCst);
+    // Let it drain any tail + observe the stop.
+    for _ in 0..256u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if DRAINED_TOTAL.load(Ordering::SeqCst) >= BIG as u64 { break; }
+    }
+
+    let leaked_writers = crate::ipc::pipe::debug_writer_waiter_count(pipe_id);
+    crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+    if !was_active { crate::sched::disable(); }
+
+    if n != BIG as i64 {
+        test_fail!("pipe_blocking_write",
+            "blocking write of {} bytes returned {} (expected {} — should block until drained, not short-return)",
+            BIG, n, BIG);
+        return false;
+    }
+    let drained = DRAINED_TOTAL.load(Ordering::SeqCst);
+    if drained < BIG as u64 {
+        test_fail!("pipe_blocking_write",
+            "drainer read {} bytes but write claimed {} written (data loss)", drained, n);
+        return false;
+    }
+    if leaked_writers != 0 {
+        test_fail!("pipe_blocking_write",
+            "{} stale writer(s) on PIPE_WRITE_WAITERS after completion (leaked entry)", leaked_writers);
+        return false;
+    }
+    test_println!("  blocking write {}B completed fully via reader-drain (drained={}, no leaked writers) ✓",
+        BIG, drained);
+
+    test_pass!("pipe blocking write — atomic / blocks-until-drained / EAGAIN / EPIPE");
     true
 }
 

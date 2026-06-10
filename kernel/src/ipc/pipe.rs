@@ -109,6 +109,15 @@ impl Pipe {
         self.writers == 0
     }
 
+    /// Check if every read end has been closed.  Per `man 2 write` /
+    /// `man 7 pipe`: a write to a pipe with no reader yields `EPIPE`
+    /// (and `SIGPIPE`).  A writer that finds the buffer full must
+    /// distinguish "wait for the reader to drain" from "the reader is
+    /// gone, fail with EPIPE" — this predicate drives that decision.
+    pub fn reader_closed(&self) -> bool {
+        self.readers == 0
+    }
+
     /// Available bytes (count of unread data).
     pub fn available(&self) -> usize {
         self.count
@@ -270,6 +279,36 @@ pub fn pipe_writer_closed(pipe_id: u64) -> bool {
         .map(|p| p.writer_closed())
         .unwrap_or(true)
 }
+
+/// Check if every read end of `pipe_id` has been closed.  Drives the
+/// `EPIPE` decision in the blocking-write path (per `man 2 write`: a
+/// write to a pipe with no reader fails with `EPIPE`).  A missing pipe
+/// id is treated as reader-closed so the writer fails fast rather than
+/// blocking on a vanished object.
+pub fn pipe_reader_closed(pipe_id: u64) -> bool {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.reader_closed())
+        .unwrap_or(true)
+}
+
+/// Free space currently available in `pipe_id`'s ring buffer (bytes).
+/// Used by the blocking-write loop to decide, under POSIX `write(2)`
+/// atomicity, whether a `count <= PIPE_BUF` write can land in one piece
+/// or must park until the reader drains enough room.  A missing pipe id
+/// reports zero space (the writer then re-checks reader-closed → EPIPE).
+pub fn pipe_space(pipe_id: u64) -> usize {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.space())
+        .unwrap_or(0)
+}
+
+/// The atomicity boundary for pipe writes, per `man 7 pipe`
+/// (`PIPE_BUF`): a write of at most this many bytes is delivered
+/// atomically (all-or-block), never interleaved with another writer's
+/// data and never split into a short write on a blocking fd.
+pub const PIPE_BUF: usize = PIPE_BUF_SIZE;
 
 // ── Wait / wake hooks ─────────────────────────────────────────────────────────
 
