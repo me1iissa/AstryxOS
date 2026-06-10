@@ -6808,6 +6808,44 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         }
     }
 
+    // CHILD-process stderr mirror ([FF/stderr-child]) — core-gated, cheap.
+    // Firefox CHILD processes (content/socket/rdd) write almost nothing to
+    // stderr (a handful of NSPR module-log lines per process), but when one
+    // aborts its init the reason is printed there.  pid 1 is the heavy
+    // stderr writer, so excluding it keeps this within a few KB per boot —
+    // affordable on the fast profile where the full *-trace mirror is off.
+    // Skipped on trace builds (the full mirror below already covers it).
+    #[cfg(all(feature = "firefox-test-core", not(feature = "firefox-test-trace")))]
+    {
+        // Per-boot line budget: a full stdout pipe makes musl stdio retry
+        // the same write(2) forever (see the Gate-1 pipe-blocking finding);
+        // without a cap that retry-spin floods serial with one mirrored
+        // line per attempt.
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static STDERR_CHILD_LINES: AtomicU32 = AtomicU32::new(0);
+        let cpid = crate::proc::current_pid_lockless();
+        if fd == 2 && cpid > 1 && count >= 4
+            && STDERR_CHILD_LINES.fetch_add(1, Ordering::Relaxed) < 192
+        {
+            let take = count.min(256);
+            let snap: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(buf_ptr, take).to_vec()
+            };
+            let mut buf = alloc::string::String::with_capacity(take + 16);
+            for &b in &snap {
+                match b {
+                    b'\n' => buf.push_str("\\n"),
+                    0x20..=0x7e => buf.push(b as char),
+                    _ => buf.push('.'),
+                }
+            }
+            if count > 256 { buf.push_str("..."); }
+            crate::serial_println!(
+                "[FF/stderr-child] pid={} bytes={} body=\"{}\"", cpid, count, buf);
+        }
+    }
+
     // Diagnostic stdout/stderr mirror ([FF/stderr] / [FF/write] / [FF/write-fd]).
     // This is the single largest serial source on a Firefox boot (~78% of a
     // ~45 MB log) and has no correctness role — it transcribes every tracked
@@ -9591,6 +9629,64 @@ pub fn sys_futex_linux(
                 }
             }
 
+            // Gate-1 child-init probe (core profile): the socket/content
+            // child's init-failure teardown is initiated by a synchronous
+            // dispatch — a 1-byte self-pipe kick followed by THIS futex
+            // wait.  A user backtrace at the wait names the posting call
+            // path.  Bounded: child pids 2..=12 only, first 96 waits per
+            // boot, so a steady-state boot emits nothing here.  GDB
+            // user-VA breakpoints cannot arm cross-CR3, hence kernel-side.
+            #[cfg(all(feature = "firefox-test-core",
+                      not(feature = "firefox-test-trace")))]
+            if (2..=12).contains(&pid) {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static GATE1_WALKS: AtomicU32 = AtomicU32::new(0);
+                if GATE1_WALKS.fetch_add(1, Ordering::Relaxed) < 96 {
+                    let user_rip = unsafe { crate::syscall::get_user_rip() };
+                    let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+                    crate::serial_println!(
+                        "[GATE1/FUTEX-WAIT] tid={} pid={} uaddr={:#x} val={} \
+                         op={:#x} rip={:#x} rsp={:#x} rbp={:#x}",
+                        tid, pid, uaddr, val, futex_op,
+                        user_rip, user_rsp, user_rbp
+                    );
+                    if user_rsp < astryx_shared::KERNEL_VIRT_BASE {
+                        let cr3 = crate::mm::vmm::get_cr3();
+                        crate::syscall::ring::dump_futex_wait_stack(
+                            tid, pid, uaddr, cr3, user_rip, user_rsp, user_rbp,
+                        );
+                        // Deep raw-stack window: 64 qwords above RSP so the
+                        // offline symboliser can recover return addresses
+                        // past the libc condwait frames (the 13-word scan in
+                        // dump_futex_wait_scan stops short of the caller).
+                        // Bounded by the same 96-walk cap as the line above.
+                        let mut line = alloc::string::String::with_capacity(64 * 8);
+                        let mut emitted = 0usize;
+                        for i in 0..64u64 {
+                            let va = user_rsp.wrapping_add(i * 8);
+                            let v = crate::mm::vmm::virt_to_phys_in(cr3, va)
+                                .map(|p| unsafe {
+                                    core::ptr::read_volatile(
+                                        (p + astryx_shared::KERNEL_VIRT_BASE) as *const u64)
+                                });
+                            if let Some(v) = v {
+                                // Only candidate code pointers: canonical user
+                                // VAs above 4 GiB (library text / heap range).
+                                if v >= 0x1_0000_0000 && v < astryx_shared::KERNEL_VIRT_BASE {
+                                    use core::fmt::Write as _;
+                                    let _ = write!(line, " +{:#x}={:#x}", i * 8, v);
+                                    emitted += 1;
+                                    if emitted >= 24 { break; }
+                                }
+                            }
+                        }
+                        crate::serial_println!(
+                            "[GATE1/STACKWIN] tid={} pid={} rsp={:#x}{}",
+                            tid, pid, user_rsp, line);
+                    }
+                }
+            }
+
             // Record this waiter in the per-CPU FUTEX_WAIT history ring so
             // the cluster-wake compensation (below) can use "this TGID
             // recently parked here" as a safety-harness signal when a
@@ -11194,6 +11290,14 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             let mut report = deliver_for(idx, subscribed, ready_ev);
             report |= efd_edge(idx, subscribed, ready_ev, report, true);
             if report != 0 {
+                // Per-fd delivery trace (firehose family — trace builds only).
+                // Records the EXACT event mask handed to userspace so a
+                // spurious EPOLLHUP/EPOLLRDHUP on an IPC channel fd is
+                // directly observable, not inferred from later behaviour.
+                #[cfg(feature = "firefox-test-trace")]
+                crate::serial_fast_println!(
+                    "[EPOLL_EV] pid={} fd={} report={:#x} ready={:#x} sub={:#x}",
+                    pid, fd, report, ready_ev, subscribed);
                 fired.push(EpollEvent { events: report, data });
             }
         }

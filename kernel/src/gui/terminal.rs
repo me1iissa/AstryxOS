@@ -981,6 +981,24 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // NSPR_LOG_FILE — we want output on the parent-visible fd, not
         // squirreled away in a file we'd have to tail separately.
         // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
+        // Gate-1 (socket-process init crash) discriminator: narrow MOZ_LOG to
+        // the PSM/NSS modules, add the `sync` flag (unbuffered writes — the
+        // previous buffered file stayed 0 bytes when the child aborted), and
+        // use the %PID token so every process gets its own log file
+        // (/tmp/moz-main.<pid>.log / /tmp/moz-child.<pid>.log) readable
+        // post-mortem via the kdb `read-file` op.
+        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
+        // Route NSPR/XPCOM module logging to stderr (fd 2) so the kernel
+        // write-trace picks it up.  Level 5 = debug.  Deliberately omit
+        // NSPR_LOG_FILE — we want output on the parent-visible fd, not
+        // squirreled away in a file we'd have to tail separately.
+        //
+        // Gate-1 caution (2026-06-10): do NOT raise the pid-1 stderr volume
+        // (e.g. by dropping MOZ_LOG_FILE below) until pipe(7) full-buffer
+        // blocking semantics land — with the stdout pipe full, write(2)
+        // currently returns no-progress and musl stdio retries forever,
+        // wedging every child on its first stderr line.
+        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
         "MOZ_LOG=all:5,nsresult:5,xpcom:5",
         "NSPR_LOG_MODULES=all:5",
         // Redirect MOZ_LOG output to a file so it survives past any pipe

@@ -606,6 +606,13 @@ pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
     // `SHUT_RDWR` was invisible to the parent's `epoll_pwait2` until
     // the 1 s rescan.
     drop(t);
+    // Lifecycle diagnostic (rare event — explicit shutdown(2) calls only).
+    // Gate-1 instrumentation: a spurious EPOLLHUP/EPOLLRDHUP on a live IPC
+    // channel implicates whoever flipped `shut_rd`; this names the caller.
+    crate::serial_println!(
+        "[UNIX/SHUT] id={} rd={} wr={} pid={} tid={}",
+        id, shut_rd_flag, shut_wr_flag,
+        crate::proc::current_pid_lockless(), crate::proc::current_tid());
     crate::ipc::waitlist::ring_poll_bell_for(
         crate::ipc::waitlist::PollBellSource::UnixShutdown);
     0
@@ -655,6 +662,11 @@ pub fn close(id: u64) {
     debug_assert!(s.ref_count > 0,
         "net::unix::close: id={} ref_count already 0 (double-close or \
          missing inc_ref on dup/fork)", id);
+    // Release-mode visibility for the same bookkeeping bug the
+    // debug_assert above catches: an underflow here means an extra
+    // decrement (or missing fork/dup increment) is tearing a live
+    // socket down early — the peer then observes a spurious hang-up.
+    let underflow = s.ref_count == 0;
     // Decrement the reference count.  Only proceed with teardown when
     // the last open reference is released (count reaches zero).
     if s.ref_count > 1 {
@@ -666,14 +678,24 @@ pub fn close(id: u64) {
     let peer_id = s.peer_id;
     s.reset();
     let mut ring = false;
+    let mut peer_was_connected = false;
     if (peer_id as usize) < MAX_UNIX_SOCKETS {
         let peer = &mut t.0[peer_id as usize];
         if peer.state == UnixState::Connected {
             peer.shut_rd = true;
             ring = true;
+            peer_was_connected = true;
         }
     }
     drop(t);
+    // Lifecycle diagnostic (rare event — final teardown only, never the
+    // common ref_count-decrement path).  Gate-1 instrumentation: when a
+    // live IPC channel collapses with a spurious hang-up, this line names
+    // the tearing process and whether the peer was still connected.
+    crate::serial_println!(
+        "[UNIX/TEARDOWN] id={} peer={} peer_connected={} underflow={} pid={} tid={}",
+        id, peer_id, peer_was_connected, underflow,
+        crate::proc::current_pid_lockless(), crate::proc::current_tid());
     // This socket is now fully torn down.  Any `SCM_RIGHTS` ancillary fds that
     // were queued for it but never `recvmsg`'d are about to be lost — release
     // the references that the sender took at enqueue time so the passed

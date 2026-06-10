@@ -3529,7 +3529,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // slow serial port.  The capture is gated to match the emit cfg
         // below — the `*-trace` features — so neither the per-mmap String
         // allocation nor the serial line is paid in the fast/perf builds.
-        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
         let so_trace_path: Option<alloc::string::String> = {
             let fd_num = fd as usize;
             proc.file_descriptors
@@ -3591,18 +3591,18 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
-        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base, so_trace_path)
         }
-        #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
+        #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode-trace")))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base)
         }
     };
-    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
     let (cr3, backing, name, base, so_trace_path_out) = mmap_setup;
-    #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
+    #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode-trace")))]
     let (cr3, backing, name, base) = mmap_setup;
 
     // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
@@ -3644,8 +3644,11 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // The previous `firefox-trace-verbose` gate was an oversight — without
     // mmap-so traces the harness symbolicator cannot resolve user RIPs to
     // `<lib>+offset`, which made `rip-trace`'s output uninterpretable for
-    // PIE binaries.
-    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+    // PIE binaries.  Extended to `firefox-test-core` (Gate-1, 2026-06-10):
+    // the fast profile needs per-pid library load bases for GDB breakpoint
+    // placement and fatal-fault symbolisation too — the cost is ~80 lines
+    // per boot, negligible next to the existing [PROC]/[CLONE] traffic.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
     if let Some(path) = so_trace_path_out {
         crate::serial_println!(
             "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
