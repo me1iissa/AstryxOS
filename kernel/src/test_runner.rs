@@ -569,6 +569,11 @@ pub fn run() -> ! {
     total += 1;
     if test_vfs_hardlink() { passed += 1; }
 
+    // ── Test 518: SIGKILL of a fully-blocked process = prompt group exit ─
+
+    total += 1;
+    if test_518_sigkill_blocked_process_group_teardown() { passed += 1; }
+
     // ── Test 35: VFS Symlinks ───────────────────────────────────────────
 
     total += 1;
@@ -38710,6 +38715,142 @@ fn test_exit_group_wakes_siblings() -> bool {
     test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
 
     test_pass!("exit_group wakes parked sibling threads (W59)");
+    true
+}
+
+/// Test 518 — SIGKILL of a fully-blocked process performs the FULL group
+/// teardown promptly, from the sender's context.
+///
+/// Regression guard for the blocked-SIGKILL divergence: `kill(2)` with
+/// SIGKILL on a process whose every thread is parked inside a blocking
+/// syscall (FUTEX_WAIT, poll) used to merely queue the signal.  Queued
+/// signals are only consumed when a target thread crosses the kernel/user
+/// boundary — which a fully-parked process never does — so the target
+/// survived SIGKILL indefinitely: threads stayed Blocked, the futex queue
+/// kept its TIDs, and (critically) every fd stayed open, so an AF_UNIX /
+/// pipe peer never observed EOF and a supervising parent hung with it.
+/// Per signal(7) SIGKILL cannot be caught, blocked, or ignored, and per
+/// kill(2)/POSIX the termination of the group must not depend on the
+/// victim cooperating.  The fix routes a foreign-pid SIGKILL through the
+/// same machinery as exit_group(2) (`exit_group_pid`).
+///
+/// Asserts, after `signal::kill(target, SIGKILL)` from the runner thread:
+///   (a) the target process is a Zombie with exit_code -9;
+///   (b) every thread of the group is Dead (incl. a futex-parked sibling);
+///   (c) the futex wait queue holds no entry owned by the group;
+///   (d) an AF_UNIX peer of a socket held by the target reads EOF (0),
+///       where before the kill it read -EAGAIN — the parent-observable
+///       death edge (unix(7): orderly shutdown → read returns 0).
+fn test_518_sigkill_blocked_process_group_teardown() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+    use crate::syscall::{FUTEX_WAITERS, FutexKey};
+    use crate::net::unix;
+
+    test_header!("SIGKILL of fully-blocked process = prompt group exit (518)");
+
+    // ── 1. Target process with a futex-parked sibling thread. ───────────
+    let target_pid = match crate::proc::usermode::create_user_process(
+        "sigkill_target", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("test518", "create_user_process: {:?}", e); return false; }
+    };
+    let sib_tid = match crate::proc::create_thread_blocked(target_pid, "sigkill-sib", 0) {
+        Some(t) => t,
+        None => { test_fail!("test518", "create sibling failed"); return false; }
+    };
+    const UADDR: u64 = 0x0000_7518_0000_1000;
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry(FutexKey::Private(target_pid, UADDR))
+            .or_insert_with(alloc::vec::Vec::new)
+            .push(sib_tid);
+    }
+
+    // ── 2. AF_UNIX socketpair: one end into the target's fd table, the
+    //       other held by the test as the "supervising parent" end. ──────
+    let (sock_target, sock_parent) = unix::socketpair(
+        unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == target_pid) {
+            Some(p) => p,
+            None => { test_fail!("test518", "target not in PROCESS_TABLE"); return false; }
+        };
+        proc.file_descriptors.push(Some(crate::vfs::FileDescriptor {
+            inode: sock_target, mount_idx: usize::MAX, offset: 0,
+            flags: crate::syscall::UNIX_SOCKET_FLAG,
+            file_type: crate::vfs::FileType::Socket,
+            is_console: false, cloexec: false,
+            open_path: alloc::string::String::from("[test518-sock]"),
+        }));
+    }
+
+    // Pre-condition: peer read = -EAGAIN (no data, peer alive).
+    let mut buf = [0u8; 8];
+    let pre_read = unix::read(sock_parent, &mut buf);
+    if pre_read != -11 {
+        test_fail!("test518", "pre-kill peer read = {} (want -EAGAIN/-11)", pre_read);
+        unix::close(sock_parent);
+        // exit_group_pid closes sock_target via the target's fd table.
+        crate::proc::exit_group_pid(target_pid, -1);
+        return false;
+    }
+
+    // ── 3. Exercise: foreign-pid SIGKILL from the runner thread. ────────
+    let ret = crate::signal::kill(target_pid, 9);
+    if ret != 0 {
+        test_fail!("test518", "kill(target, SIGKILL) = {} (want 0)", ret);
+        unix::close(sock_parent);
+        return false;
+    }
+
+    // ── 4. Post-conditions. ──────────────────────────────────────────────
+    // (a) Zombie + exit_code -9.
+    {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == target_pid) {
+            Some(p) if p.state == ProcessState::Zombie && p.exit_code == -9 => {}
+            Some(p) => {
+                test_fail!("test518", "target state={:?} exit_code={} (want Zombie/-9)",
+                    p.state, p.exit_code);
+                unix::close(sock_parent);
+                return false;
+            }
+            None => { /* already reaped — also acceptable */ }
+        }
+    }
+    // (b) Every group thread Dead.
+    {
+        let threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter().find(|t|
+            t.pid == target_pid && t.state != ThreadState::Dead)
+        {
+            test_fail!("test518", "tid={} still {:?} after SIGKILL", t.tid, t.state);
+            unix::close(sock_parent);
+            return false;
+        }
+    }
+    // (c) Futex queue drained of the group's entries.
+    {
+        let waiters = FUTEX_WAITERS.lock();
+        if waiters.contains_key(&FutexKey::Private(target_pid, UADDR)) {
+            test_fail!("test518", "futex bucket for dead group still present");
+            unix::close(sock_parent);
+            return false;
+        }
+    }
+    // (d) Peer observes EOF — the supervising-parent death edge.
+    let post_read = unix::read(sock_parent, &mut buf);
+    if post_read != 0 {
+        test_fail!("test518", "post-kill peer read = {} (want 0 = EOF)", post_read);
+        unix::close(sock_parent);
+        return false;
+    }
+    unix::close(sock_parent);
+
+    test_pass!("SIGKILL of fully-blocked process = prompt group exit (518)");
     true
 }
 
