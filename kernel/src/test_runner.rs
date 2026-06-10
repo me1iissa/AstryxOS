@@ -36951,6 +36951,7 @@ fn test_log_ring_cheaper_than_com1() -> bool {
 
     let line = b"[SC] pid=12 tid=34 nr=202 rip=0x7f00abcd1234 cr=0x7f00abcd5678 a1=0x1 a2=0x80 a3=0x0 a4=0x0 a5=0x0 a6=0x0 ksp=0xffff8000deadbeef kdepth=0x140\n";
     const ITERS: u64 = 50_000;
+    const BATCHES: usize = 9; // odd, so the median is a single sampled batch
 
     log_ring::_test_reset();
 
@@ -36960,19 +36961,70 @@ fn test_log_ring_cheaper_than_com1() -> bool {
     }
     log_ring::_test_reset();
 
-    let t0 = rdtsc();
-    for _ in 0..ITERS {
-        log_ring::record(line);
+    // ── In-boot RAM-memcpy baseline (self-calibrating reference) ─────────────
+    // The property under test is "record() writes to guest RAM, it does NOT
+    // take a VM-exit per byte" — a *relative* claim. The earlier absolute
+    // cyc/record ceiling proved brittle: this test body is inlined into the
+    // monolithic run(), so unrelated edits elsewhere in the file shift the hot
+    // loop's code placement and move the absolute cycle count by ~25% with no
+    // change to record() itself, drifting a fixed ceiling across the line on
+    // slower CI hosts. Instead we measure, in the SAME boot under the SAME
+    // rdtsc harness, the cost of a bare volatile byte-copy of the same length
+    // (the irreducible RAM-store work record() must do) and require record()
+    // to stay within a generous multiple of it. That reference scales with the
+    // host/emulator's per-instruction speed, so the bound is host-independent.
+    // A VM-exit-per-byte path (the failure we guard against) costs orders of
+    // magnitude more than a RAM copy (Intel SDM Vol. 3C §25.1.3), so even a
+    // loose multiple separates the two cleanly.
+    let mut scratch = [0u8; 160];
+    let baseline_per_call = {
+        let mut best = u64::MAX;
+        for _ in 0..BATCHES {
+            let b0 = rdtsc();
+            for _ in 0..ITERS {
+                let mut i = 0usize;
+                while i < line.len() {
+                    unsafe {
+                        core::ptr::write_volatile(
+                            scratch.as_mut_ptr().add(i),
+                            *line.get_unchecked(i),
+                        );
+                    }
+                    i += 1;
+                }
+            }
+            let b1 = rdtsc();
+            best = best.min(b1.wrapping_sub(b0) / ITERS);
+        }
+        // Floor at 1 to avoid a divide-by-zero / zero-ceiling on a host that
+        // measures the bare copy as ~0 cyc.
+        best.max(1)
+    };
+
+    // ── Measure record(): take the MEDIAN of several batches ─────────────────
+    // The median (not the mean) discards a single batch perturbed by an ISR,
+    // a TLB miss, or a host scheduler preemption landing in the window.
+    let mut samples = [0u64; BATCHES];
+    for s in samples.iter_mut() {
+        log_ring::_test_reset();
+        let t0 = rdtsc();
+        for _ in 0..ITERS {
+            log_ring::record(line);
+        }
+        let t1 = rdtsc();
+        *s = t1.wrapping_sub(t0) / ITERS;
     }
-    let t1 = rdtsc();
-
-    let total = t1.wrapping_sub(t0);
-    let per_call = total / ITERS;
+    samples.sort_unstable();
+    let per_call = samples[BATCHES / 2];
     let per_byte = per_call / (line.len() as u64);
-    test_println!("  {} records ({}B each) in {} cyc — {} cyc/record, {} cyc/byte",
-        ITERS, line.len(), total, per_call, per_byte);
+    test_println!(
+        "  {} records ({}B each) x {} batches — median {} cyc/record, {} cyc/byte \
+         (RAM-copy baseline {} cyc/record)",
+        ITERS, line.len(), BATCHES, per_call, per_byte, baseline_per_call);
 
-    // Sanity: every record must have been counted (no lost reservations).
+    // Sanity: every record in the final batch must have been counted (no lost
+    // reservations).  _test_reset() ran before the final batch, so stats()
+    // reflects exactly ITERS records.
     let st = log_ring::stats();
     if st.records != ITERS {
         test_fail!("log_ring write cost",
@@ -36980,21 +37032,27 @@ fn test_log_ring_cheaper_than_com1() -> bool {
         return false;
     }
 
-    // Ceiling. A relaxed fetch_add + ~150-byte memcpy is hundreds of cycles at
-    // most even on a cold cache. The COM1 path under KVM costs ~one VM-exit
-    // (thousands of cycles) PER BYTE — i.e. ~150 exits for this line — so any
-    // ceiling in the low thousands of cycles/record already demonstrates a
-    // multi-order-of-magnitude reduction. 5000 cyc/record is a generous bound
-    // that separates "wrote to RAM" from "took VM-exits".
-    const CEILING: u64 = 5_000;
-    if per_call >= CEILING {
+    // Self-calibrating ceiling: record() does the RAM copy plus a relaxed
+    // fetch_add cursor reservation and a header write, so a small multiple of
+    // the bare-copy baseline is expected and healthy (measured ~1.2–1.3× in
+    // practice). 8× is generous headroom that a RAM-path record() never
+    // approaches yet a per-byte VM-exit path — which costs tens of × the RAM
+    // baseline (Intel SDM Vol. 3C §25.1.3) — blows past.
+    const REL_MULT: u64 = 8;
+    let rel_ceiling = baseline_per_call.saturating_mul(REL_MULT);
+    // Belt-and-braces absolute backstop, far above any code-layout-induced
+    // drift (~6k cyc on a slow CI TCG host) but far below a VM-exit-per-byte
+    // path (record() of this 142-byte line would be ~150 exits ≈ 10^5+ cyc).
+    const ABS_BACKSTOP: u64 = 50_000;
+    if per_call >= rel_ceiling || per_call >= ABS_BACKSTOP {
         test_fail!("log_ring write cost",
-            "record() costs {} cyc/call (ceiling {}) — not the lock-free RAM path",
-            per_call, CEILING);
+            "record() costs {} cyc/call (rel ceiling {}×{}={}, abs {}) — not the \
+             lock-free RAM path",
+            per_call, REL_MULT, baseline_per_call, rel_ceiling, ABS_BACKSTOP);
         return false;
     }
 
-    // Clean up so the benchmark's 50k lines don't pollute a later drain.
+    // Clean up so the benchmark's lines don't pollute a later drain.
     log_ring::_test_reset();
 
     test_pass!("log_ring write cost (near-zero-overhead transport)");
