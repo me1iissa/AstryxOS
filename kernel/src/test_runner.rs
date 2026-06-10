@@ -2811,6 +2811,26 @@ pub fn run() -> ! {
     total += 1;
     if test_296_proc_fd_reopen_unlinked_memfd() { passed += 1; }
 
+    // ── Test 297: eventfd open-file-description refcount across fork/dup ───
+    // Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicate descriptors
+    // refer to the SAME open file description, and per close(2) the object
+    // is released only when the LAST reference is closed.  An eventfd
+    // inherited across fork is one shared counter with two references; the
+    // child's pre-execve close-on-exec scrub must NOT free the slot the
+    // parent still writes to.  Refs: close(2), fork(2), dup(2), eventfd(2).
+    total += 1;
+    if test_297_eventfd_ofd_refcount() { passed += 1; }
+
+    // ── Test 298: EPOLLET eventfd re-fires on EVERY write (wakeup-driven) ──
+    // Per eventfd(2) every successful write(2) is a readiness notification;
+    // per epoll(7) an edge-triggered watcher receives one event per
+    // notification — including a write that bumps an ALREADY-nonzero
+    // counter.  The reactor waker pattern (write-to-wake, never drain)
+    // depends on this; a pure level-delta model parks the waiter forever
+    // after the first delivery.  Refs: eventfd(2), epoll(7).
+    total += 1;
+    if test_298_epollet_eventfd_write_refire() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -49406,6 +49426,274 @@ fn test_294_epoll_edge_triggered_eventfd() -> bool {
 
     if ok {
         test_pass!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
+    }
+    ok
+}
+
+// ── Test 297: eventfd open-file-description refcount across fork/dup ─────────
+//
+// Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicated file descriptors
+// refer to the SAME open file description; per close(2), "If fildes is the
+// last file descriptor referring to the open file description, the resources
+// associated with the open file description shall be released" — i.e. only
+// the LAST close frees the object.  An eventfd inherited across fork(2) is
+// one shared counter with two references: the child's pre-execve(2)
+// close-on-exec scrub (a plain close(2) loop) must NOT free the slot the
+// parent still writes to.  Without the refcount, the child's scrub freed the
+// parent's waker slot, the parent's next write(2) returned EBADF, and a later
+// eventfd2(2) recycled the slot under the stale id.
+// Refs: close(2), fork(2), dup(2), eventfd(2).
+fn test_297_eventfd_ofd_refcount() -> bool {
+    test_header!("eventfd OFD refcount across fork/dup (Test 297)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    // Linux ABI for this process (eventfd/dup are Linux-personality calls).
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    // ── Part 1: module level — simulated fork inheritance ───────────────────
+    // create() takes the creating fd's reference; inc_ref() is exactly what
+    // `inc_eventfd_refs_for_fork` does for each inherited eventfd fd; the
+    // first close() models the child's CLOEXEC scrub.
+    {
+        use crate::ipc::eventfd;
+        let id = eventfd::create(0, 0);
+        if id == u64::MAX {
+            test_fail!("efd-refs", "create() returned no slot");
+            return false;
+        }
+        if eventfd::debug_ref_count(id) != 1 {
+            test_fail!("efd-refs", "refs after create = {} (want 1)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        eventfd::inc_ref(id); // fork: child inherits the fd
+        if eventfd::debug_ref_count(id) != 2 {
+            test_fail!("efd-refs", "refs after fork-inherit = {} (want 2)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        eventfd::close(id);   // child's CLOEXEC scrub close(2)
+        // THE regression: parent's write must still succeed (was Err(-9)
+        // EBADF — the child's close freed the shared slot).
+        match eventfd::write(id, 1) {
+            Ok(()) => test_println!("  parent write after child close → Ok ✓"),
+            Err(e) => {
+                test_fail!("efd-refs",
+                    "parent write after child close = {} (want Ok) — \
+                     child close freed the shared slot", e);
+                ok = false;
+            }
+        }
+        if !eventfd::is_readable(id) {
+            test_fail!("efd-refs", "slot not readable after parent write");
+            ok = false;
+        }
+        eventfd::close(id);   // parent's close — the LAST reference
+        if eventfd::write(id, 1) != Err(-9) {
+            test_fail!("efd-refs", "write after last close should be EBADF");
+            ok = false;
+        }
+        if eventfd::debug_ref_count(id) != 0 {
+            test_fail!("efd-refs", "refs after last close = {} (want 0)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        if ok {
+            test_println!("  simulated fork: 1→2→1→0 refs, free on last close ✓");
+        }
+    }
+
+    // ── Part 2: syscall level — dup(2) bumps, close(2) arm drops ────────────
+    {
+        const SYS_EVENTFD2: u64 = 290;
+        const SYS_DUP:      u64 = 32;
+        const SYS_CLOSE:    u64 = 3;
+        const SYS_WRITE:    u64 = 1;
+        const SYS_READ:     u64 = 0;
+
+        let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+        if efd < 0 {
+            test_fail!("efd-refs", "eventfd2 = {}", efd);
+            return false;
+        }
+        let id = crate::syscall::get_eventfd_id(pid, efd as usize);
+        let dupfd = dispatch(SYS_DUP, efd as u64, 0, 0, 0, 0, 0);
+        if dupfd < 0 {
+            test_fail!("efd-refs", "dup(eventfd) = {}", dupfd);
+            ok = false;
+        }
+        if crate::ipc::eventfd::debug_ref_count(id) != 2 {
+            test_fail!("efd-refs", "refs after dup = {} (want 2)",
+                crate::ipc::eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        // Close the ORIGINAL fd through the real close(2) dispatch arm —
+        // the duplicate must keep the slot alive.
+        let r = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+        if r != 0 {
+            test_fail!("efd-refs", "close(efd) = {}", r);
+            ok = false;
+        }
+        let v: u64 = 7;
+        let w = dispatch(SYS_WRITE, dupfd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+        if w == 8 {
+            test_println!("  write via dup'd fd after close(original) → 8 ✓");
+        } else {
+            test_fail!("efd-refs",
+                "write via dup'd fd after close(original) = {} (want 8)", w);
+            ok = false;
+        }
+        let mut rbuf = [0u8; 8];
+        let n = dispatch(SYS_READ, dupfd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if n != 8 || u64::from_le_bytes(rbuf) != 7 {
+            test_fail!("efd-refs", "read via dup'd fd = {} val={} (want 8/7)",
+                n, u64::from_le_bytes(rbuf));
+            ok = false;
+        }
+        let _ = dispatch(SYS_CLOSE, dupfd as u64, 0, 0, 0, 0, 0);
+        if crate::ipc::eventfd::debug_ref_count(id) != 0 {
+            test_fail!("efd-refs", "refs after closing both fds = {} (want 0)",
+                crate::ipc::eventfd::debug_ref_count(id));
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("eventfd OFD refcount across fork/dup (Test 297)");
+    }
+    ok
+}
+
+// ── Test 298: EPOLLET eventfd re-fires on EVERY write (wakeup-driven) ────────
+//
+// Per eventfd(2): "A write(2) call adds the 8-byte integer value supplied in
+// its buffer to the counter" — and each successful write constitutes a
+// readiness notification.  Per epoll(7), an edge-triggered watcher receives
+// an event for each such notification, including a write that bumps an
+// ALREADY-nonzero counter.  The canonical reactor waker pattern — one thread
+// write(2)s an eventfd to wake a sibling parked in epoll_wait(2), and the
+// reactor deliberately never read(2)s the counter — depends on this: under a
+// pure level-delta model the second write computes "still ready, no new
+// edge" and the parked waiter never returns (the AudioIPC-server reactor
+// park behind the Firefox render gate).  Refs: eventfd(2), epoll(7).
+fn test_298_epollet_eventfd_write_refire() -> bool {
+    test_header!("EPOLLET eventfd re-fires on every write (Test 298)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    fn make_ev(events: u32, data: u64) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&events.to_le_bytes());
+        b[4..12].copy_from_slice(&data.to_le_bytes());
+        b
+    }
+    fn ev_events(b: &[u8; 12]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLET: u32 = 1 << 31;
+    const CTL_ADD: u64 = 1;
+    const SYS_EPOLL_CTL:    u64 = 233;
+    const SYS_EPOLL_WAIT:   u64 = 232;
+    const SYS_EPOLL_CREATE: u64 = 291; // epoll_create1
+    const SYS_EVENTFD2:     u64 = 290;
+    const SYS_CLOSE:        u64 = 3;
+    const SYS_WRITE:        u64 = 1;
+
+    let mut ok = true;
+
+    let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+    let epfd = dispatch(SYS_EPOLL_CREATE, 0, 0, 0, 0, 0, 0);
+    if efd < 0 || epfd < 0 {
+        test_fail!("et-refire", "setup failed efd={} epfd={}", efd, epfd);
+        return false;
+    }
+    {
+        let ev = make_ev(EPOLLIN | EPOLLET, 0xE8);
+        let r = dispatch(SYS_EPOLL_CTL, epfd as u64, CTL_ADD, efd as u64,
+                         ev.as_ptr() as u64, 0, 0);
+        if r != 0 {
+            test_fail!("et-refire", "epoll_ctl(ADD, ET) = {}", r);
+            ok = false;
+        }
+    }
+    let write1 = |efd: i64| -> i64 {
+        let v: u64 = 1;
+        dispatch(SYS_WRITE, efd as u64, (&v as *const u64) as u64, 8, 0, 0, 0)
+    };
+    let wait0 = |epfd: i64| -> (i64, u32) {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64,
+                         buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        (r, ev_events(&buf[0]))
+    };
+
+    // write #1: counter 0→1 (a genuine rising edge) → one event.
+    if write1(efd) != 8 { test_fail!("et-refire", "write#1 failed"); ok = false; }
+    let (r, ev) = wait0(epfd);
+    if r == 1 && ev & EPOLLIN != 0 {
+        test_println!("  write#1 → wait → 1 event EPOLLIN ✓");
+    } else {
+        test_fail!("et-refire", "wait after write#1: r={} ev={:#x}", r, ev);
+        ok = false;
+    }
+
+    // No intervening write → no event (guards against a spurious refire:
+    // the pending edge must be consumed by the delivery above).
+    let (r, ev) = wait0(epfd);
+    if r == 0 {
+        test_println!("  no new write → wait → 0 events ✓");
+    } else {
+        test_fail!("et-refire",
+            "wait with no new write: r={} ev={:#x} (want 0 — edge not consumed?)",
+            r, ev);
+        ok = false;
+    }
+
+    // write #2 against the NEVER-DRAINED counter (1→2): per eventfd(2) +
+    // epoll(7) this is a fresh notification and MUST re-fire the ET watch.
+    // A level-delta kernel returns 0 here forever — the reactor park bug.
+    if write1(efd) != 8 { test_fail!("et-refire", "write#2 failed"); ok = false; }
+    let (r, ev) = wait0(epfd);
+    if r == 1 && ev & EPOLLIN != 0 {
+        test_println!("  write#2 (counter 1→2, never drained) → wait → 1 event EPOLLIN ✓");
+    } else {
+        test_fail!("et-refire",
+            "wait after write#2 on non-drained counter: r={} ev={:#x} \
+             (want 1/EPOLLIN — wakeup-driven ET re-fire missing)", r, ev);
+        ok = false;
+    }
+
+    // And the edge is again consumed exactly once.
+    let (r, ev) = wait0(epfd);
+    if r != 0 {
+        test_fail!("et-refire",
+            "wait after delivery: r={} ev={:#x} (want 0)", r, ev);
+        ok = false;
+    }
+
+    let _ = dispatch(SYS_CLOSE, epfd as u64, 0, 0, 0, 0, 0);
+    let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+
+    if ok {
+        test_pass!("EPOLLET eventfd re-fires on every write (Test 298)");
     }
     ok
 }

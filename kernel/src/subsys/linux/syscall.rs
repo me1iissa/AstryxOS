@@ -1280,7 +1280,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
                 crate::net::socket::socket_close(socket_id);
             }
-            // If it's an eventfd, free the counter slot.
+            // If it's an eventfd, drop one open-file-description reference.
+            // The counter slot is freed only when the LAST reference goes
+            // away (POSIX close(2)) — an eventfd inherited across fork(2)
+            // or duplicated via dup(2)/SCM_RIGHTS is one shared object, so
+            // a child's pre-execve close-on-exec scrub must not destroy
+            // the counter the parent still writes to.
             if crate::syscall::is_eventfd_fd(pid, fd) {
                 let efd_id = crate::syscall::get_eventfd_id(pid, fd);
                 crate::ipc::eventfd::close(efd_id);
@@ -2375,6 +2380,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                                 // on drain (scm_drop_fds path).
                                                 crate::vfs::pin_inode(
                                                     fdesc.mount_idx, fdesc.inode);
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::EventFd
+                                            {
+                                                // The in-flight copy is one more
+                                                // reference to the same open file
+                                                // description (unix(7) SCM_RIGHTS);
+                                                // balanced by the receiver's later
+                                                // close(2), or by scm_drop_fds if
+                                                // the batch is never received.
+                                                crate::ipc::eventfd::inc_ref(
+                                                    fdesc.inode);
                                             }
                                         }
                                         cloned
@@ -11010,7 +11026,7 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 
 /// epoll_wait — collect ready events into caller's buffer.
 fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i32) -> i64 {
-    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP, EPOLLET};
+    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP, EPOLLET, EPOLLIN};
     if maxevents == 0 { return -22; } // EINVAL
     let pid = crate::proc::current_pid_lockless();
 
@@ -11027,7 +11043,13 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // is retained so the (possibly updated) edge baselines can be written
     // back into the live `EpollInstance` after the poll completes.
     let epoll_id: u64;
-    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32)> = {
+    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32)>;
+    // Per-watch eventfd slot id (index-aligned with `watches_snap`);
+    // `u64::MAX` for non-eventfd watches.  Resolved once under the same
+    // lock hold so the EPOLLET write-edge re-fire below (see `efd_edge`)
+    // does not need a PROCESS_TABLE lookup per poll iteration.
+    let efd_for: alloc::vec::Vec<u64>;
+    {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -11041,8 +11063,16 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             Some(i) => i,
             None    => return -9,
         };
-        inst.watches.iter().map(|w| (w.fd, w.events, w.data, w.et_seen)).collect()
-    }; // lock released here
+        watches_snap = inst.watches.iter()
+            .map(|w| (w.fd, w.events, w.data, w.et_seen)).collect();
+        efd_for = inst.watches.iter().map(|w| {
+            proc.file_descriptors.get(w.fd)
+                .and_then(|f| f.as_ref())
+                .filter(|f| f.file_type == crate::vfs::FileType::EventFd)
+                .map(|f| f.inode)
+                .unwrap_or(u64::MAX)
+        }).collect();
+    } // lock released here
 
     // Live edge-trigger baselines, one per snapshot entry (index-aligned).
     // Seeded from the stored `et_seen` and mutated by `do_poll` / `probe_ready`
@@ -11116,12 +11146,45 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         report
     };
 
+    // Wakeup-driven EPOLLET re-fire for eventfds.  The `et_seen` baseline
+    // above models edge-triggering as a LEVEL DELTA ("became ready after
+    // not being ready"), but per eventfd(2) every successful write(2) is a
+    // fresh readiness notification, and per epoll(7) an edge-triggered
+    // watcher gets one event per notification — even when the counter was
+    // already nonzero.  A reactor that deliberately never drains its wakeup
+    // eventfd (the common waker pattern) would otherwise see exactly one
+    // event ever: write #2 against the still-nonzero counter computes
+    // `interest & !seen == 0` and the parked epoll_wait never returns.
+    //
+    // This helper reports EPOLLIN for an EPOLLET eventfd watch whose slot
+    // carries a pending write edge.  `consume == true` (delivery path)
+    // claims the edge via `take_write_edge`; the park predicate passes
+    // `consume == false` and only peeks.  When the level-delta machinery in
+    // `deliver_for` already reports EPOLLIN (`already & EPOLLIN != 0`), the
+    // pending edge is folded into that delivery — claimed but not
+    // re-reported — so one write never yields two events.  Scoped strictly
+    // to eventfd watches; all other fd types keep the level-delta model.
+    let efd_edge = |idx: usize, subscribed: u32, ready_ev: u32,
+                    already: u32, consume: bool| -> u32 {
+        if efd_for[idx] == u64::MAX        { return 0; } // not an eventfd
+        if subscribed & EPOLLET == 0       { return 0; } // level-triggered
+        if subscribed & EPOLLIN == 0       { return 0; } // not read-interested
+        if ready_ev   & EPOLLIN == 0       { return 0; } // counter is zero
+        let pending = if consume {
+            crate::ipc::eventfd::take_write_edge(efd_for[idx])
+        } else {
+            crate::ipc::eventfd::peek_write_edge(efd_for[idx])
+        };
+        if pending && already & EPOLLIN == 0 { EPOLLIN } else { 0 }
+    };
+
     // ── Step 2: poll without holding the lock ────────────────────────────────
     let do_poll = |fired: &mut alloc::vec::Vec<EpollEvent>| {
         for (idx, &(fd, subscribed, data, _)) in watches_snap.iter().enumerate() {
             if fired.len() >= maxevents { break; }
             let ready_ev = epoll_poll_events(pid, fd);
-            let report = deliver_for(idx, subscribed, ready_ev);
+            let mut report = deliver_for(idx, subscribed, ready_ev);
+            report |= efd_edge(idx, subscribed, ready_ev, report, true);
             if report != 0 {
                 fired.push(EpollEvent { events: report, data });
             }
@@ -11139,7 +11202,15 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     let probe_ready = || -> bool {
         for (idx, &(fd, subscribed, _data, _)) in watches_snap.iter().enumerate() {
             let ready_ev = epoll_poll_events(pid, fd);
-            if peek_for(idx, subscribed, ready_ev) != 0 { return true; }
+            let peeked = peek_for(idx, subscribed, ready_ev);
+            if peeked != 0 { return true; }
+            // A pending eventfd write edge is deliverable even when the
+            // level-delta peek reports nothing (counter stayed nonzero
+            // across the write) — without this the parked waiter wakes on
+            // the poll bell, computes 0, and re-parks forever.
+            if efd_edge(idx, subscribed, ready_ev, peeked, false) != 0 {
+                return true;
+            }
         }
         false
     };

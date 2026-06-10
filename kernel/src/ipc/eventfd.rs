@@ -56,11 +56,28 @@ struct EventFdEntry {
     counter: u64,
     flags:   u32,
     in_use:  bool,
+    /// Open-file-description reference count.  One reference per
+    /// `FileDescriptor` (in any process's fd table) that names this slot,
+    /// plus one per in-flight SCM_RIGHTS copy.  Per POSIX.1-2017 §2.14,
+    /// `fork(2)`, and `dup(2)`: duplicated descriptors refer to the SAME
+    /// open file description, and per `close(2)` the underlying object is
+    /// released only when the LAST descriptor referring to it is closed.
+    /// `create()` starts this at 1; `inc_ref()` bumps it on fork/dup/
+    /// SCM-enqueue; `close()` decrements and frees the slot only at zero.
+    refs:    u32,
+    /// Wakeup-edge marker for EPOLLET watchers.  Per `eventfd(2)`, every
+    /// successful `write(2)` adds to the counter AND constitutes a new
+    /// readiness notification; per `epoll(7)` an edge-triggered watcher
+    /// must receive one event per such notification even if the counter
+    /// was already nonzero (the consumer may deliberately never drain a
+    /// wakeup eventfd).  Set on every successful `write()`, consumed by
+    /// the epoll delivery path (`take_write_edge`).
+    write_edge: bool,
 }
 
 impl EventFdEntry {
     const fn empty() -> Self {
-        Self { counter: 0, flags: 0, in_use: false }
+        Self { counter: 0, flags: 0, in_use: false, refs: 0, write_edge: false }
     }
 }
 
@@ -92,10 +109,30 @@ pub fn create(initval: u64, flags: u32) -> u64 {
             slot.in_use  = true;
             slot.counter = initval;
             slot.flags   = flags;
+            slot.refs    = 1; // the creating fd's open-file-description ref
+            slot.write_edge = false;
             return i as u64;
         }
     }
     u64::MAX // No free slot
+}
+
+/// Add one open-file-description reference to a live slot.
+///
+/// Call sites mirror the unix-socket / pipe refcount discipline:
+/// `fork(2)`/`clone(2)`-without-CLONE_FILES fd-table duplication,
+/// `dup(2)`/`dup2(2)`/`fcntl(F_DUPFD)`, and SCM_RIGHTS enqueue.  Per
+/// POSIX.1-2017 §2.14 the duplicate descriptor refers to the same open
+/// file description; without this bump the FIRST `close(2)` from either
+/// holder would free the shared counter slot, leaving the survivor with
+/// a dangling id that fails EBADF — or worse, lands on a recycled slot.
+pub fn inc_ref(id: u64) {
+    let mut table = TABLE.lock();
+    if let Some(slot) = table.get_mut(id as usize) {
+        if slot.in_use {
+            slot.refs = slot.refs.saturating_add(1);
+        }
+    }
 }
 
 /// Non-blocking read from eventfd.  Returns the current counter as a u64
@@ -164,20 +201,75 @@ pub fn write(id: u64, val: u64) -> Result<(), i64> {
         return Err(-27); // EFBIG
     }
     slot.counter += val;
+    // Every successful write is a fresh readiness notification for
+    // edge-triggered pollers, independent of prior counter history —
+    // see the `write_edge` field doc (eventfd(2) + epoll(7)).
+    slot.write_edge = true;
     Ok(())
 }
 
-/// Free an eventfd slot.  Wakes every reader parked on the slot so they
+/// Consume the pending write-edge marker: returns `true` exactly once per
+/// `write()` (or per coalesced burst of writes) since the last call.  Used
+/// by the `epoll_wait(2)` delivery path so an EPOLLET watcher receives one
+/// event per wakeup notification even when the counter stays nonzero
+/// (never-drained wakeup-eventfd reactor pattern; epoll(7)).  When several
+/// edge-triggered watchers share one eventfd, the edge is delivered to the
+/// first poller that reaches delivery — consistent with epoll(7)'s
+/// guidance that ET consumers must tolerate wakeup races.
+pub fn take_write_edge(id: u64) -> bool {
+    let mut table = TABLE.lock();
+    match table.get_mut(id as usize) {
+        Some(slot) if slot.in_use && slot.write_edge => {
+            slot.write_edge = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Non-consuming probe of the pending write-edge marker.  Used by the
+/// epoll park predicate (prepare-to-wait recheck), which must never
+/// consume an edge — only the call path that actually returns events to
+/// userspace does (see `take_write_edge`).
+pub fn peek_write_edge(id: u64) -> bool {
+    let table = TABLE.lock();
+    table.get(id as usize)
+        .map(|s| s.in_use && s.write_edge)
+        .unwrap_or(false)
+}
+
+/// Drop one open-file-description reference; free the slot only when the
+/// LAST reference is released.  Per POSIX `close(2)`: "If fildes is the
+/// last file descriptor referring to the open file description, the
+/// resources associated with the open file description shall be
+/// released."  An eventfd inherited across `fork(2)` (or duplicated via
+/// `dup(2)`/SCM_RIGHTS) is one shared object with multiple references —
+/// a child's close (e.g. a pre-`execve(2)` close-on-exec scrub) must NOT
+/// destroy the counter the parent is still writing to.
+///
+/// On the final free, wakes every reader parked on the slot so they
 /// observe EBADF on the next try_read call rather than blocking
 /// indefinitely against a counter that nobody can ever post to.
 pub fn close(id: u64) {
-    {
+    let freed = {
         let mut table = TABLE.lock();
-        if let Some(slot) = table.get_mut(id as usize) {
-            *slot = EventFdEntry::empty();
+        match table.get_mut(id as usize) {
+            Some(slot) if slot.in_use => {
+                if slot.refs > 1 {
+                    slot.refs -= 1;
+                    false
+                } else {
+                    *slot = EventFdEntry::empty();
+                    true
+                }
+            }
+            // Not in use: double-close or stale id — nothing to drop.
+            _ => false,
         }
+    };
+    if freed {
+        wake_readers_all(id);
     }
-    wake_readers_all(id);
 }
 
 /// Check if counter > 0 (used by `poll` / `select`).
@@ -266,4 +358,13 @@ pub fn waiter_cleanup(efd_id: u64, tid: u64) {
 pub fn debug_reader_waiter_count(efd_id: u64) -> usize {
     let waiters = EVENTFD_READ_WAITERS.lock();
     waiters.get(&efd_id).map(|l| l.len()).unwrap_or(0)
+}
+
+/// Test-only diagnostic: returns the open-file-description reference
+/// count for `efd_id` (0 when the slot is free).
+pub fn debug_ref_count(efd_id: u64) -> u32 {
+    let table = TABLE.lock();
+    table.get(efd_id as usize)
+        .map(|s| if s.in_use { s.refs } else { 0 })
+        .unwrap_or(0)
 }
