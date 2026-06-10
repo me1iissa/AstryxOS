@@ -2507,6 +2507,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         Err(e) => e,
                     }
                 };
+                // Attribute data bytes to the caller.  The `bytes_read > 0`
+                // guard matches the POSIX recv(2) contract: a 0-byte return
+                // is an orderly EOF or a control-only SCM frame, neither of
+                // which transfers payload bytes.  Called here — after the
+                // SMAP guard around read_msg has been released and before the
+                // SCM delivery block — so the bump is issued once per syscall
+                // regardless of how many SCM fds are attached.
+                if bytes_read > 0 {
+                    crate::proc::proc_metrics::bump_net_read(
+                        crate::proc::current_pid_lockless(), bytes_read as u64);
+                }
                 // Deliver pending SCM_RIGHTS fds into receiver's fd table.
                 // Bound the batch to the reader's now-current stream position
                 // (recv_consumed) so an earlier data-only frame's reader does

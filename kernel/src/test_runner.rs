@@ -706,6 +706,13 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_socketpair() { passed += 1; }
 
+    // ── Test 294: proc_metrics net_r_bytes via recvmsg(2) ─────────────────
+    // Regression for the omission where nr-47 on AF_UNIX called read_msg()
+    // directly and skipped bump_net_read(); the counter appeared to freeze
+    // under heavy recvmsg traffic (only write/read syscall paths bumped it).
+    total += 1;
+    if test_proc_metrics_net_recvmsg() { passed += 1; }
+
     // ── AF_UNIX POLLOUT writable-gate + recv-drain write-space wake ────────
     total += 1;
     if test_unix_pollout_writable_gate() { passed += 1; }
@@ -36944,6 +36951,7 @@ fn test_log_ring_cheaper_than_com1() -> bool {
 
     let line = b"[SC] pid=12 tid=34 nr=202 rip=0x7f00abcd1234 cr=0x7f00abcd5678 a1=0x1 a2=0x80 a3=0x0 a4=0x0 a5=0x0 a6=0x0 ksp=0xffff8000deadbeef kdepth=0x140\n";
     const ITERS: u64 = 50_000;
+    const BATCHES: usize = 9; // odd, so the median is a single sampled batch
 
     log_ring::_test_reset();
 
@@ -36953,19 +36961,70 @@ fn test_log_ring_cheaper_than_com1() -> bool {
     }
     log_ring::_test_reset();
 
-    let t0 = rdtsc();
-    for _ in 0..ITERS {
-        log_ring::record(line);
+    // ── In-boot RAM-memcpy baseline (self-calibrating reference) ─────────────
+    // The property under test is "record() writes to guest RAM, it does NOT
+    // take a VM-exit per byte" — a *relative* claim. The earlier absolute
+    // cyc/record ceiling proved brittle: this test body is inlined into the
+    // monolithic run(), so unrelated edits elsewhere in the file shift the hot
+    // loop's code placement and move the absolute cycle count by ~25% with no
+    // change to record() itself, drifting a fixed ceiling across the line on
+    // slower CI hosts. Instead we measure, in the SAME boot under the SAME
+    // rdtsc harness, the cost of a bare volatile byte-copy of the same length
+    // (the irreducible RAM-store work record() must do) and require record()
+    // to stay within a generous multiple of it. That reference scales with the
+    // host/emulator's per-instruction speed, so the bound is host-independent.
+    // A VM-exit-per-byte path (the failure we guard against) costs orders of
+    // magnitude more than a RAM copy (Intel SDM Vol. 3C §25.1.3), so even a
+    // loose multiple separates the two cleanly.
+    let mut scratch = [0u8; 160];
+    let baseline_per_call = {
+        let mut best = u64::MAX;
+        for _ in 0..BATCHES {
+            let b0 = rdtsc();
+            for _ in 0..ITERS {
+                let mut i = 0usize;
+                while i < line.len() {
+                    unsafe {
+                        core::ptr::write_volatile(
+                            scratch.as_mut_ptr().add(i),
+                            *line.get_unchecked(i),
+                        );
+                    }
+                    i += 1;
+                }
+            }
+            let b1 = rdtsc();
+            best = best.min(b1.wrapping_sub(b0) / ITERS);
+        }
+        // Floor at 1 to avoid a divide-by-zero / zero-ceiling on a host that
+        // measures the bare copy as ~0 cyc.
+        best.max(1)
+    };
+
+    // ── Measure record(): take the MEDIAN of several batches ─────────────────
+    // The median (not the mean) discards a single batch perturbed by an ISR,
+    // a TLB miss, or a host scheduler preemption landing in the window.
+    let mut samples = [0u64; BATCHES];
+    for s in samples.iter_mut() {
+        log_ring::_test_reset();
+        let t0 = rdtsc();
+        for _ in 0..ITERS {
+            log_ring::record(line);
+        }
+        let t1 = rdtsc();
+        *s = t1.wrapping_sub(t0) / ITERS;
     }
-    let t1 = rdtsc();
-
-    let total = t1.wrapping_sub(t0);
-    let per_call = total / ITERS;
+    samples.sort_unstable();
+    let per_call = samples[BATCHES / 2];
     let per_byte = per_call / (line.len() as u64);
-    test_println!("  {} records ({}B each) in {} cyc — {} cyc/record, {} cyc/byte",
-        ITERS, line.len(), total, per_call, per_byte);
+    test_println!(
+        "  {} records ({}B each) x {} batches — median {} cyc/record, {} cyc/byte \
+         (RAM-copy baseline {} cyc/record)",
+        ITERS, line.len(), BATCHES, per_call, per_byte, baseline_per_call);
 
-    // Sanity: every record must have been counted (no lost reservations).
+    // Sanity: every record in the final batch must have been counted (no lost
+    // reservations).  _test_reset() ran before the final batch, so stats()
+    // reflects exactly ITERS records.
     let st = log_ring::stats();
     if st.records != ITERS {
         test_fail!("log_ring write cost",
@@ -36973,21 +37032,27 @@ fn test_log_ring_cheaper_than_com1() -> bool {
         return false;
     }
 
-    // Ceiling. A relaxed fetch_add + ~150-byte memcpy is hundreds of cycles at
-    // most even on a cold cache. The COM1 path under KVM costs ~one VM-exit
-    // (thousands of cycles) PER BYTE — i.e. ~150 exits for this line — so any
-    // ceiling in the low thousands of cycles/record already demonstrates a
-    // multi-order-of-magnitude reduction. 5000 cyc/record is a generous bound
-    // that separates "wrote to RAM" from "took VM-exits".
-    const CEILING: u64 = 5_000;
-    if per_call >= CEILING {
+    // Self-calibrating ceiling: record() does the RAM copy plus a relaxed
+    // fetch_add cursor reservation and a header write, so a small multiple of
+    // the bare-copy baseline is expected and healthy (measured ~1.2–1.3× in
+    // practice). 8× is generous headroom that a RAM-path record() never
+    // approaches yet a per-byte VM-exit path — which costs tens of × the RAM
+    // baseline (Intel SDM Vol. 3C §25.1.3) — blows past.
+    const REL_MULT: u64 = 8;
+    let rel_ceiling = baseline_per_call.saturating_mul(REL_MULT);
+    // Belt-and-braces absolute backstop, far above any code-layout-induced
+    // drift (~6k cyc on a slow CI TCG host) but far below a VM-exit-per-byte
+    // path (record() of this 142-byte line would be ~150 exits ≈ 10^5+ cyc).
+    const ABS_BACKSTOP: u64 = 50_000;
+    if per_call >= rel_ceiling || per_call >= ABS_BACKSTOP {
         test_fail!("log_ring write cost",
-            "record() costs {} cyc/call (ceiling {}) — not the lock-free RAM path",
-            per_call, CEILING);
+            "record() costs {} cyc/call (rel ceiling {}×{}={}, abs {}) — not the \
+             lock-free RAM path",
+            per_call, REL_MULT, baseline_per_call, rel_ceiling, ABS_BACKSTOP);
         return false;
     }
 
-    // Clean up so the benchmark's 50k lines don't pollute a later drain.
+    // Clean up so the benchmark's lines don't pollute a later drain.
     log_ring::_test_reset();
 
     test_pass!("log_ring write cost (near-zero-overhead transport)");
@@ -47910,4 +47975,126 @@ fn test_293_epoll_listening_unix_has_pending() -> bool {
         test_pass!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
     }
     ok
+}
+
+// ── Test 294: proc_metrics net=R counter via recvmsg(2) ─────────────────────────
+//
+// Regression test for the omission where `recvmsg` (syscall nr 47) on an
+// AF_UNIX SOCK_STREAM socket called `unix::read_msg()` directly and never
+// invoked `bump_net_read()`.  Every `recvmsg` drain on an AF_UNIX fd was
+// invisible to the `net=R/W` counters; the fix adds the `bump_net_read` call
+// immediately after `bytes_read` is established in the nr-47 arm.
+//
+// The test writes N bytes on one half of a SOCK_STREAM socketpair and
+// receives them via `recvmsg(2)`, then asserts that `net_r_bytes` advanced
+// by exactly N.  Per recv(2) / recvmsg(2) / POSIX.1-2017 §2.10.6: a
+// successful receive must account for every byte returned to the caller.
+fn test_proc_metrics_net_recvmsg() -> bool {
+    test_header!("proc_metrics net_r_bytes via recvmsg(2) — omission fix");
+
+    // Re-use the current process's already-registered PID so we can snapshot
+    // its metrics without registering a scratch PID.
+    let pid = crate::proc::current_pid_lockless();
+
+    // Baseline: read the current net_r_bytes for this PID before the test.
+    let snap0 = crate::proc::proc_metrics::snapshot(pid);
+    let baseline = snap0.map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Build a STREAM socketpair via dispatch_linux(53, AF_UNIX, SOCK_STREAM).
+    let mut fds = [0i32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        53, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
+        fds.as_mut_ptr() as u64, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "socketpair(AF_UNIX, SOCK_STREAM) returned {}", r);
+        return false;
+    }
+    let (fd_w, fd_r) = (fds[0] as u64, fds[1] as u64);
+    test_println!("  socketpair() fds=[{},{}] ✓", fd_w, fd_r);
+
+    // Write 64 bytes on fd_w → lands in fd_r's recv ring.
+    let payload = [0x5Au8; 64];
+    let w = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, fd_w, payload.as_ptr() as u64, payload.len() as u64,
+        0, 0, 0,
+    );
+    if w != payload.len() as i64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "write returned {} (expected {})", w, payload.len());
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_w, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_r, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  write({}) ✓", w);
+
+    // Build a minimal msghdr pointing at a 64-byte receive buffer.
+    // Linux x86_64 struct msghdr (sys/socket.h):
+    //   off  0: msg_name     (ptr,  8 B)
+    //   off  8: msg_namelen  (u32,  4 B) + pad (4 B)
+    //   off 16: msg_iov      (ptr,  8 B)
+    //   off 24: msg_iovlen   (u64,  8 B)
+    //   off 32: msg_control  (ptr,  8 B)
+    //   off 40: msg_controllen (u64, 8 B)
+    //   off 48: msg_flags    (i32,  4 B)
+    let mut rxbuf = [0u8; 64];
+    let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, rxbuf.len() as u64];
+    let mut hdr = [0u64; 7];
+    hdr[2] = iov.as_mut_ptr() as u64; // msg_iov
+    hdr[3] = 1u64;                    // msg_iovlen = 1
+
+    // Capture the baseline immediately before the recvmsg call so that any
+    // concurrent counter activity (e.g. from timer ISR paths on the same PID)
+    // is excluded from the delta.
+    let before = crate::proc::proc_metrics::snapshot(pid)
+        .map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Issue recvmsg(2) (nr 47) on fd_r — this is the path that was broken.
+    let n = crate::syscall::dispatch_linux_kernel(
+        47 /*recvmsg*/, fd_r, hdr.as_mut_ptr() as u64,
+        0 /*flags*/, 0, 0, 0,
+    );
+
+    let after = crate::proc::proc_metrics::snapshot(pid)
+        .map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Cleanup before assertions so a failed test doesn't leak fds.
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_w, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_r, 0, 0, 0, 0, 0);
+
+    if n != payload.len() as i64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "recvmsg returned {} (expected {})", n, payload.len());
+        return false;
+    }
+    test_println!("  recvmsg returned {} bytes ✓", n);
+
+    // The counter must have advanced by exactly the number of bytes received.
+    // (before..after may include other reads on this PID from concurrent ISR
+    // paths, but in a single-threaded test context with no other AF_UNIX
+    // activity that delta is exactly `n`.)
+    let delta = after.wrapping_sub(before);
+    if delta != n as u64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "net_r_bytes delta={} (expected {}): counter did NOT advance via recvmsg — \
+             bump_net_read missing from nr-47 AF_UNIX arm",
+            delta, n);
+        return false;
+    }
+    test_println!("  net_r_bytes: before={} after={} delta={} (== recvmsg bytes) ✓",
+        before, after, delta);
+
+    // Secondary check: the total baseline (before - initial) only grows; it
+    // never decreases across the whole test body.
+    let total_delta = after.wrapping_sub(baseline);
+    if total_delta < n as u64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "net_r_bytes total delta={} < n={} (counter rolled back — corrupted?)",
+            total_delta, n);
+        return false;
+    }
+
+    test_pass!("proc_metrics net_r_bytes via recvmsg(2) — counter advances correctly");
+    true
 }
