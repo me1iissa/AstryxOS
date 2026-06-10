@@ -2047,9 +2047,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // promptly.  Iterate a snapshot to avoid holding PROCESS_TABLE while calling
     // into PIPE_TABLE / unix socket TABLE (lock ordering: resource table before
     // PROCESS_TABLE).
-    let (pipe_ends, socket_ids): (alloc::vec::Vec<(u64, bool)>, alloc::vec::Vec<u64>) = {
+    let (pipe_ends, socket_ids, eventfd_ids): (
+        alloc::vec::Vec<(u64, bool)>,
+        alloc::vec::Vec<u64>,
+        alloc::vec::Vec<u64>,
+    ) = {
         let procs = PROCESS_TABLE.lock();
-        let (mut pipes, mut sockets) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        let (mut pipes, mut sockets, mut eventfds) =
+            (alloc::vec::Vec::new(), alloc::vec::Vec::new(), alloc::vec::Vec::new());
         if let Some(p) = procs.iter().find(|p| p.pid == pid) {
             for f in p.file_descriptors.iter().filter_map(|f| f.as_ref()) {
                 if f.file_type == crate::vfs::FileType::Pipe
@@ -2061,10 +2066,12 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                     && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                 {
                     sockets.push(f.inode);
+                } else if f.file_type == crate::vfs::FileType::EventFd {
+                    eventfds.push(f.inode);
                 }
             }
         }
-        (pipes, sockets)
+        (pipes, sockets, eventfds)
     };
     for (pipe_id, is_write) in pipe_ends {
         if is_write {
@@ -2077,6 +2084,13 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // close tears the slot down and notifies the peer.
     for socket_id in socket_ids {
         crate::net::unix::close(socket_id);
+    }
+    // Drop the exiting process's eventfd open-file-description refs; the
+    // slot is freed only when the last reference (parent's fd, in the
+    // inherited case) goes away — per POSIX close(2) last-reference
+    // semantics, mirroring the socket/pipe handling above.
+    for efd_id in eventfd_ids {
+        crate::ipc::eventfd::close(efd_id);
     }
 
     // Release POSIX file locks held by this process (C1).
@@ -2739,6 +2753,24 @@ fn inc_pipe_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
     }
 }
 
+/// Bump the eventfd open-file-description refcount for every eventfd fd
+/// the child inherits via fork/vfork/clone-without-`CLONE_FILES`.  Same
+/// rationale as `inc_socket_refs_for_fork` / `inc_pipe_refs_for_fork`:
+/// per POSIX.1-2017 §2.14 and `fork(2)`, the duplicated descriptors refer
+/// to the same open file description, so each inherited eventfd fd must
+/// count as one more reference.  Without this bump, the child's
+/// close-on-exec scrub (a plain `close(2)` loop before `execve(2)`) frees
+/// the parent's live counter slot — the parent's next `write(2)` to its
+/// own fd then fails EBADF, and a later `eventfd2(2)` recycles the slot
+/// out from under the stale id (CWE-416 class via slot reuse).
+fn inc_eventfd_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
+    for fd in fds.iter().filter_map(|f| f.as_ref()) {
+        if fd.file_type == crate::vfs::FileType::EventFd {
+            crate::ipc::eventfd::inc_ref(fd.inode);
+        }
+    }
+}
+
 /// Drop the pipe-end refcount associated with a single `FileDescriptor`
 /// that is about to be cleared (e.g. by `close(2)`, by `execve(2)`'s
 /// `FD_CLOEXEC` purge, or by `dup2(2)` overwriting an existing slot).
@@ -2825,6 +2857,9 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     // purges its CLOEXEC fd, so parent's `read` would see premature EOF
     // (or worse, refcount underflow on the second close).
     inc_pipe_refs_for_fork(&fds);
+    // And eventfd slots — the child's pre-exec close-on-exec scrub must
+    // not free a counter the parent still posts to (AudioIPC waker case).
+    inc_eventfd_refs_for_fork(&fds);
 
     // Enforce RLIMIT_NPROC: count non-zombie processes.
     {
@@ -3091,6 +3126,8 @@ pub fn fork_process_share_vm(
     // (and any other inherited pipe end) survives until BOTH the parent's
     // copy AND the child's copy are closed.  See `inc_pipe_refs_for_fork`.
     inc_pipe_refs_for_fork(&fds);
+    // And eventfd open-file-description refs (see `inc_eventfd_refs_for_fork`).
+    inc_eventfd_refs_for_fork(&fds);
 
     // RLIMIT_NPROC.
     {
@@ -3797,6 +3834,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     inc_socket_refs_for_fork(&fds);
     // And pipe fd refcounts.
     inc_pipe_refs_for_fork(&fds);
+    // And eventfd open-file-description refs (see `inc_eventfd_refs_for_fork`).
+    inc_eventfd_refs_for_fork(&fds);
 
     // Get parent's TLS base from thread struct.
     let parent_tls = {
