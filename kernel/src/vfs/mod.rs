@@ -17,6 +17,7 @@
 pub mod ext2;
 pub mod fat32;
 pub mod ntfs;
+pub mod path_cache;
 pub mod ramfs;
 pub mod tmpfs;
 pub mod procfs;
@@ -316,6 +317,27 @@ pub trait FileSystemOps: Send + Sync {
     /// update `i_uid` / `i_gid` and write the inode back).
     fn chown(&self, _inode: u64, _uid: u32, _gid: u32) -> VfsResult<()> {
         Err(VfsError::Unsupported)
+    }
+
+    /// May the VFS-level path cache ([`path_cache`]) memoize `lookup`
+    /// outcomes (positive **and negative** dentries) for this filesystem?
+    ///
+    /// Opt-in, default `false`.  `true` is only safe when ALL hold:
+    ///
+    /// 1. Every directory mutation (create / unlink / rmdir / rename /
+    ///    symlink / link) flows through the VFS helpers in this module,
+    ///    which invalidate the affected cache keys.  A filesystem whose
+    ///    namespace changes through any other channel must stay `false`.
+    /// 2. Name lookup is case-sensitive byte-string comparison.  On a
+    ///    case-insensitive filesystem (FAT32, NTFS) differently-cased
+    ///    queries alias one directory entry, and exact-string invalidation
+    ///    cannot cover the aliases — stale entries would survive.
+    /// 3. The namespace is not synthesized from live kernel state.
+    ///    Pseudo-filesystems (procfs, sysfs) materialize and retire entries
+    ///    (e.g. `/proc/<pid>`) with no VFS-visible mutation event, so any
+    ///    cached entry — especially a negative one — goes stale silently.
+    fn lookup_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -762,6 +784,9 @@ pub fn mount(path: &str, fs: Box<dyn FileSystemOps>, root_inode: u64) {
         fs: Arc::from(fs),
         root_inode,
     });
+    // Mount-table change: the new mount may shadow cached lookups under its
+    // path — flush the path cache (see path_cache invalidation contract).
+    path_cache::flush();
 }
 
 /// Initialize disks: mount in-memory test image at /mnt, then probe for
@@ -1494,27 +1519,88 @@ fn resolve_path_opts(
             return Err(VfsError::TimedOut);
         }
 
-        // Snapshot the current FS handle before each dispatch.  Holding
-        // `MOUNTS` across `lookup` / `stat` / `readlink` would deadlock if
-        // the FS implementation faults on a user-supplied or file-backed
-        // buffer — the page-fault handler also needs `MOUNTS` to demand-page
-        // the missing frame, but this thread already holds it (#82).
-        let fs = fs_at(cur_mount).ok_or(VfsError::NotFound)?.0;
+        // ── Path-cache fast path ────────────────────────────────────────
+        // `path_cache` memoizes per-component lookup outcomes — positive
+        // (child inode + file type, so the symlink-check `stat` dispatch is
+        // skipped too) and negative (memoized ENOENT, the sqlite
+        // journal-probe pattern).  A hit replaces ONLY the `lookup`+`stat`
+        // dispatches below; the deadline, trace, symlink-follow and
+        // mount-crossing logic are identical on both paths.  `".."` is
+        // never cached: rename(2) of a directory rewires its parent linkage
+        // without touching any key invalidation could name.  Entries are
+        // only ever inserted for filesystems that opt in via
+        // `lookup_cacheable` (see the trait doc), so a hit implies the FS
+        // already consented — the hit path needs no FS handle at all.
+        let cache_this = *component != "..";
+        let cached = if cache_this {
+            path_cache::lookup(cur_mount, cur_inode, component)
+        } else {
+            None
+        };
 
-        // Lookup this component in the current directory.
-        let child_inode = fs.lookup(cur_inode, component)?;
+        let (child_inode, child_file_type) = match cached {
+            Some(path_cache::Cached::Negative) => return Err(VfsError::NotFound),
+            Some(path_cache::Cached::Positive { child, ftype }) => (child, ftype),
+            None => {
+                // Generation snapshot BEFORE the FS dispatch: if any
+                // directory mutation invalidates concurrently, the insert
+                // below is dropped instead of caching a stale outcome
+                // (see path_cache module docs, "the insert/mutate race").
+                let gen = path_cache::generation();
 
-        // Check if the child is a symlink.
-        let child_stat = fs.stat(child_inode)?;
+                // Snapshot the current FS handle before each dispatch.  Holding
+                // `MOUNTS` across `lookup` / `stat` / `readlink` would deadlock if
+                // the FS implementation faults on a user-supplied or file-backed
+                // buffer — the page-fault handler also needs `MOUNTS` to demand-page
+                // the missing frame, but this thread already holds it (#82).
+                let fs = fs_at(cur_mount).ok_or(VfsError::NotFound)?.0;
+                let cacheable = cache_this && fs.lookup_cacheable();
 
-        if child_stat.file_type == FileType::SymLink {
+                // Lookup this component in the current directory.
+                let child_inode = match fs.lookup(cur_inode, component) {
+                    Ok(c) => c,
+                    Err(VfsError::NotFound) => {
+                        // Memoize the ENOENT so repeat probes of the same
+                        // missing name (sqlite -journal/-wal hot-journal
+                        // checks) skip the directory scan entirely.
+                        if cacheable {
+                            path_cache::insert(
+                                gen, cur_mount, cur_inode, component,
+                                path_cache::Cached::Negative,
+                            );
+                        }
+                        return Err(VfsError::NotFound);
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                // Check if the child is a symlink.
+                let child_stat = fs.stat(child_inode)?;
+                if cacheable {
+                    path_cache::insert(
+                        gen, cur_mount, cur_inode, component,
+                        path_cache::Cached::Positive {
+                            child: child_inode,
+                            ftype: child_stat.file_type,
+                        },
+                    );
+                }
+                (child_inode, child_stat.file_type)
+            }
+        };
+
+        if child_file_type == FileType::SymLink {
             // If this is the final component and we were asked not to follow,
             // return the symlink inode directly.
             if is_final && !follow_final {
                 return Ok((cur_mount, child_inode));
             }
 
-            // Read the symlink target.
+            // Read the symlink target.  Re-fetch the FS handle here: on the
+            // path-cache hit path no handle was fetched (the hit replaces
+            // the lookup/stat dispatches), and `readlink` must observe the
+            // live target — symlink targets are intentionally NOT cached.
+            let fs = fs_at(cur_mount).ok_or(VfsError::NotFound)?.0;
             let target = fs.readlink(child_inode)?;
 
             // Build the new path: target + remaining components after this one.
@@ -1610,6 +1696,9 @@ pub fn create_file(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
     fs.create_file(parent_inode, &name)?;
+    // The name now exists: drop any cached (negative) lookup outcome so the
+    // next resolve observes the new file (path_cache invalidation contract).
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_CREATE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
     crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_CREATE, 0);
@@ -1623,6 +1712,8 @@ pub fn mkdir(path: &str) -> VfsResult<()> {
         let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
         fs.create_dir(parent_inode, &name)?;
     }
+    // The name now exists: drop any cached (negative) lookup outcome.
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_CREATE|IN_ISDIR on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
     crate::ipc::inotify::notify_event(
@@ -1661,6 +1752,10 @@ pub fn remove(path: &str) -> VfsResult<()> {
     } else {
         fs.remove(parent_inode, &name)?;
     }
+    // The name is gone (immediately in both branches — deferred deletion
+    // only keeps the *inode* alive, the directory entry is already
+    // unlinked): drop any cached positive lookup outcome.
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_DELETE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
     crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_DELETE, 0);
@@ -1810,6 +1905,11 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
         let fs = fs_at(old_mount).ok_or(VfsError::NotFound)?.0;
         fs.rename(old_parent, &old_name, new_parent, &new_name)?;
     }
+    // Per rename(2) BOTH names changed binding: the old name no longer
+    // exists (drop its positive entry) and the new name now exists,
+    // possibly replacing an earlier ENOENT probe (drop its negative entry).
+    path_cache::invalidate(old_mount, old_parent, &old_name);
+    path_cache::invalidate(new_mount, new_parent, &new_name);
     // Fire IN_MOVED_FROM / IN_MOVED_TO with a shared non-zero cookie.
     // Use a simple increment from the tick counter as the cookie.
     let cookie = (crate::arch::x86_64::irq::TICK_COUNT
@@ -1826,6 +1926,8 @@ pub fn symlink(link_path: &str, target: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(link_path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
     fs.symlink(parent_inode, &name, target)?;
+    // The link name now exists: drop any cached (negative) lookup outcome.
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     Ok(())
 }
 
@@ -1846,6 +1948,8 @@ pub fn link(old_path: &str, new_path: &str) -> VfsResult<()> {
         let fs = fs_at(new_mount).ok_or(VfsError::NotFound)?.0;
         fs.link(target_inode, new_parent, &new_name)?;
     }
+    // The new name now exists: drop any cached (negative) lookup outcome.
+    path_cache::invalidate(new_mount, new_parent, &new_name);
     // A new name appeared in the target directory — fire IN_CREATE so inotify
     // watchers (and any dentry-cache invalidation riding on it) observe it.
     let (new_dir, new_fn) = split_parent_name(new_path);
@@ -2145,6 +2249,11 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
             let (m, parent, name) = resolve_parent(lookup_path)?;
             let fs = fs_at(m).ok_or(VfsError::NotFound)?.0;
             let ino = fs.create_file(parent, &name)?;
+            // The failed resolve above may have cached a negative entry for
+            // this name; the create materialized it — invalidate so the
+            // next resolve (including the sqlite journal-probe pattern:
+            // stat ENOENT → open(O_CREAT) → stat) sees the file.
+            path_cache::invalidate(m, parent, &name);
             (m, ino, true)
         }
         Err(e) => return Err(e),
@@ -3070,6 +3179,9 @@ pub fn sys_mount(
                     root_inode: ri,
                 });
             }
+            // Mount-table change: flush the path cache (the new mount
+            // shadows cached lookups under its path).
+            path_cache::flush();
             crate::serial_println!("[VFS] mount: {} mounted at '{}' (rdonly={})", fstype, target, rdonly);
             0
         }
@@ -3083,6 +3195,8 @@ pub fn sys_mount(
                 fs: Arc::new(proc_fs),
                 root_inode: proc_root,
             });
+            // Mount-table change: flush the path cache.
+            path_cache::flush();
             crate::serial_println!("[VFS] mount: procfs mounted at '{}'", target);
             0
         }
@@ -3161,6 +3275,10 @@ pub fn sys_umount(target: &str, _flags: u64) -> i64 {
         }
         mounts.remove(mount_idx);
     }
+    // Mount-table change: `Vec::remove` SHIFTED every mount index above
+    // `mount_idx`, and the path cache keys entries by mount index — a flush
+    // is mandatory, not just hygienic (stale keys would alias other mounts).
+    path_cache::flush();
 
     // Any remaining open-fd mount_idx values that were above `mount_idx` are
     // now off-by-one.  Fix them up so existing fds stay valid.
