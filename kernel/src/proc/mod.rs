@@ -2008,10 +2008,25 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // exit_group (which is still executing on its own stack) gets
     // `ctx_rsp_valid=false`, and only on the yield_self path below where
     // switch_context_asm will re-set it after saving RSP.
+    //
+    // SMP free-deferral snapshot: capture, BEFORE overwriting each victim's
+    // state with Dead, whether any victim thread was actually `Running` on
+    // another logical processor.  The later free guard MUST read this
+    // pre-overwrite snapshot, not the post-Dead state — once the loop runs,
+    // every victim reads back as Dead, so a post-loop `any Running` test is
+    // unconditionally false and would free the address space while a victim is
+    // still executing with that CR3 loaded (Intel SDM Vol. 3A §4.10 — a
+    // CR3-referenced PML4 must stay valid while any CPU holds the CR3).  This
+    // is the only correct snapshot point for the foreign (`calling_tid == 0`)
+    // group-exit that kill(2)/SIGKILL (signal(7)) routes here.
+    let mut any_victim_was_running = false;
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
             if t.pid == pid && t.tid != calling_tid && t.state != ThreadState::Dead {
+                if t.state == ThreadState::Running {
+                    any_victim_was_running = true;
+                }
                 t.state = ThreadState::Dead;
                 t.exit_code = exit_code;
             }
@@ -2192,31 +2207,23 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // user VA.  Per Intel SDM Vol. 3A §4.10, CR3-referenced PML4 entries
     // must remain valid while any logical processor has the CR3 loaded.
     //
-    // Guard: if any sibling is still Running, defer the PMM teardown.
-    // The sibling's own syscall dispatch tail (dispatch() in
-    // subsys/linux/syscall.rs) checks for Dead state on return and calls
-    // exit_thread(), which checks all_dead and performs the PMM teardown
-    // as the final owner.  This keeps the common single-thread path fast
-    // (no sibling → free immediately) while making the multi-thread path
-    // safe (CLONE_THREAD: wait for Running siblings to drain off-CPU).
+    // Guard: if any victim thread was still Running, defer the PMM teardown.
+    // A victim that finishes its in-flight syscall hits the Dead-thread drain
+    // at the syscall-return tail (dispatch() in subsys/linux/syscall.rs) and
+    // calls exit_thread(), which performs the PMM teardown as the final owner;
+    // a victim preempted mid-syscall before reaching that drain converges via
+    // the reaper (reap_dead_threads_sched frees a fully-dead Zombie's vm_space).
+    // This keeps the common single-thread path fast (no Running victim → free
+    // immediately) while making the multi-thread path safe.
     //
-    // Contention note: THREAD_TABLE is a spin::Mutex.  This lock
-    // acquisition is on the exit path — interrupts are enabled and the
-    // calling CPU is about to schedule away, so contention with a
-    // concurrent timer ISR or AP scheduler is bounded to a short
-    // critical section (one iter + state compare).  If SMP thread counts
-    // grow large enough that the linear scan becomes a latency concern,
-    // consider an atomic per-process Running-thread counter as a fast
-    // pre-check before taking the lock.
-    let any_sibling_running = {
-        let threads = THREAD_TABLE.lock();
-        threads.iter().any(|t| {
-            t.pid == pid
-            && (calling_tid == 0 || t.tid != calling_tid)
-            && t.state == ThreadState::Running
-        })
-    };
-    if !any_sibling_running {
+    // CRITICAL: read the PRE-OVERWRITE snapshot taken in the Dead-marking loop,
+    // NOT the post-loop thread state.  By the time we get here every victim has
+    // been written to Dead, so a fresh `any Running` scan is unconditionally
+    // false — on the foreign group-exit (`calling_tid == 0`, kill(2)/SIGKILL)
+    // that would free the address space out from under a victim still executing
+    // on another CPU (UAF: SYSRETQ to an unmapped VA / speculative walk of the
+    // freed PML4 — Intel SDM Vol. 3A §4.10).
+    if !any_victim_was_running {
         free_process_memory(pid);
     }
 

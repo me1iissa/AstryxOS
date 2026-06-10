@@ -517,7 +517,10 @@ fn reap_dead_threads_sched() {
     let current_tid = crate::proc::current_tid();
 
     // Collect (stack_base, stack_pages) for each reapable thread, removing
-    // them from THREAD_TABLE in the same pass.
+    // them from THREAD_TABLE in the same pass.  `reaped_pids` records the owning
+    // PID of every thread removed so we can converge the deferred user-memory
+    // free below (see the post-reap Zombie sweep).
+    let mut reaped_pids: alloc::vec::Vec<crate::proc::Pid> = alloc::vec::Vec::new();
     let stacks: alloc::vec::Vec<(u64, usize)> = {
         let mut threads = THREAD_TABLE.lock();
         // A Dead thread is safe to reap only when ctx_rsp_valid == true, which
@@ -543,7 +546,11 @@ fn reap_dead_threads_sched() {
             let pages = if t.kernel_stack_size > 0 {
                 (t.kernel_stack_size as usize + 4095) / 4096
             } else { 0 };
+            let owner = t.pid;
             threads.swap_remove(idx);
+            if !reaped_pids.contains(&owner) {
+                reaped_pids.push(owner);
+            }
             if base > 0 && pages > 0 {
                 out.push((base, pages));
             }
@@ -592,6 +599,59 @@ fn reap_dead_threads_sched() {
         };
         for p in 0..stack_pages {
             crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
+        }
+    }
+
+    // ── Deferred user-memory convergence ─────────────────────────────────────
+    //
+    // exit_group(2) defers `free_process_memory` when a victim thread was still
+    // Running on another CPU (the SMP free guard — proc::exit_group_inner): the
+    // address space must stay valid while any logical processor still has that
+    // CR3 loaded (Intel SDM Vol. 3A §4.10).  The deferred free is normally
+    // completed by the victim's own dispatch-tail `exit_thread` once it leaves
+    // Running.  But a victim killed purely in userspace — parked in a blocking
+    // syscall (FUTEX_WAIT/poll) when a FOREIGN kill(2)/SIGKILL (signal(7)) marks
+    // it Dead, or preempted mid-syscall before reaching the drain — never runs
+    // `exit_thread`, so without a convergence point its backing frames AND
+    // page-table structures would leak for the kernel's lifetime.
+    //
+    // The reaper is the natural convergence point: it is the single place that
+    // removes the LAST Dead thread of such a process.  Once every thread of a
+    // Zombie is gone, no CPU can hold its CR3, so the deferred free is safe to
+    // complete here.  For any PID we just reaped from, if the process is a
+    // Zombie whose `vm_space` is still `Some` and has no surviving thread in
+    // THREAD_TABLE, free it now.  `free_process_memory` is idempotent
+    // (`vm_space.take()` → second call is a no-op), so a process whose own
+    // `exit_thread` already freed it is a cheap early return — memory is freed
+    // exactly once.
+    //
+    // Safety under IF=0: this runs in the same interrupts-disabled window as the
+    // stack frees above, so no timer ISR can fire on this CPU to re-enter
+    // PMM_LOCK / PROCESS_TABLE (the timer ISR deliberately takes neither — see
+    // `timer_tick_schedule`).  The cross-CPU shootdown inside
+    // `free_process_memory` is ACK-bounded and quarantine-degraded.
+    for pid in reaped_pids {
+        let needs_free = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == pid) {
+                Some(p) => {
+                    p.state == crate::proc::ProcessState::Zombie
+                        && p.vm_space.is_some()
+                }
+                None => false, // process slot already recycled
+            }
+        };
+        if !needs_free {
+            continue;
+        }
+        // Confirm no thread of this PID survives in THREAD_TABLE — only then is
+        // the CR3 guaranteed off every CPU.
+        let any_thread_left = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().any(|t| t.pid == pid)
+        };
+        if !any_thread_left {
+            crate::proc::free_process_memory(pid);
         }
     }
 }

@@ -574,6 +574,10 @@ pub fn run() -> ! {
     total += 1;
     if test_518_sigkill_blocked_process_group_teardown() { passed += 1; }
 
+    // ── Test 518b: foreign SIGKILL with a Running victim defers the free ─
+    total += 1;
+    if test_518b_sigkill_running_sibling_deferred_free() { passed += 1; }
+
     // ── Test 35: VFS Symlinks ───────────────────────────────────────────
 
     total += 1;
@@ -38741,6 +38745,13 @@ fn test_exit_group_wakes_siblings() -> bool {
 ///   (d) an AF_UNIX peer of a socket held by the target reads EOF (0),
 ///       where before the kill it read -EAGAIN — the parent-observable
 ///       death edge (unix(7): orderly shutdown → read returns 0).
+///
+/// Variant B (`test_518b_sigkill_running_sibling_deferred_free`) covers the
+/// SMP deferred-free path: a victim thread that is `Running` on another CPU at
+/// kill time must NOT have its address space freed inline — that would be a
+/// use-after-free when the victim SYSRETs to a now-unmapped VA (Intel SDM
+/// Vol. 3A §4.10) — and the deferred free must converge exactly once after the
+/// victim drains off-CPU.
 fn test_518_sigkill_blocked_process_group_teardown() -> bool {
     use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
     use crate::syscall::{FUTEX_WAITERS, FutexKey};
@@ -38749,11 +38760,15 @@ fn test_518_sigkill_blocked_process_group_teardown() -> bool {
     test_header!("SIGKILL of fully-blocked process = prompt group exit (518)");
 
     // ── 1. Target process with a futex-parked sibling thread. ───────────
-    let target_pid = match crate::proc::usermode::create_user_process(
-        "sigkill_target", &crate::proc::hello_elf::HELLO_ELF
+    // Create the target BLOCKED so it stays parked until we kill it.  Started
+    // Ready, its initial thread would race the scheduler to self-exit, leaving
+    // the test asserting against an already-reaped process.
+    let target_pid = match crate::proc::usermode::create_user_process_with_args_blocked(
+        "sigkill_target", &crate::proc::hello_elf::HELLO_ELF,
+        &["sigkill_target"], &["HOME=/", "PATH=/bin:/disk/bin"],
     ) {
         Ok(p) => p,
-        Err(e) => { test_fail!("test518", "create_user_process: {:?}", e); return false; }
+        Err(e) => { test_fail!("test518", "create_user_process_with_args_blocked: {:?}", e); return false; }
     };
     let sib_tid = match crate::proc::create_thread_blocked(target_pid, "sigkill-sib", 0) {
         Some(t) => t,
@@ -38851,6 +38866,166 @@ fn test_518_sigkill_blocked_process_group_teardown() -> bool {
     unix::close(sock_parent);
 
     test_pass!("SIGKILL of fully-blocked process = prompt group exit (518)");
+    true
+}
+
+/// Test 518b — foreign SIGKILL with a victim thread still `Running` defers the
+/// address-space free (SMP UAF guard) and converges exactly once.
+///
+/// A foreign `kill(2)`/SIGKILL (signal(7)) routes through `exit_group_pid` →
+/// `exit_group_inner(pid, calling_tid=0)`, which marks every victim thread Dead
+/// up front.  If a victim was executing on ANOTHER logical processor at that
+/// instant, freeing its page tables inline is a use-after-free: that CPU still
+/// has the victim's CR3 loaded and will SYSRET to a now-unmapped VA, or
+/// speculatively walk the freed PML4 (Intel SDM Vol. 3A §4.10 — a
+/// CR3-referenced PML4 must remain valid while any CPU holds the CR3).
+///
+/// The guard must therefore DEFER the free when any victim was `Running`,
+/// snapshotting that fact BEFORE the Dead-marking loop overwrites the state
+/// (post-loop every victim reads back Dead, so the snapshot is the only correct
+/// source).  The deferred free converges when the last thread drains off-CPU —
+/// either via the victim's own dispatch-tail `exit_thread`, or, for a victim
+/// killed purely in userspace that never reaches that drain, via the scheduler
+/// reaper (`reap_dead_threads_sched`), which frees a fully-dead Zombie whose
+/// `vm_space` is still `Some`.  Either way the free runs exactly once
+/// (`free_process_memory` is idempotent via `vm_space.take()`).
+///
+/// Asserts:
+///   (a) immediately after the kill, the target's `vm_space` is still `Some`
+///       and `cr3 != 0` — the free was DEFERRED, not run inline (UAF guard);
+///   (b) the target is a Zombie with exit_code -9 and every thread Dead;
+///   (c) no KERNEL_GPF / bugcheck fired (implicit: the test continues to run);
+///   (d) after one reaper pass (driven via `schedule()`), all the group's TIDs
+///       are swept AND the target's `vm_space` is now `None` / `cr3 == 0` —
+///       the deferred free converged exactly once.
+fn test_518b_sigkill_running_sibling_deferred_free() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+
+    test_header!("SIGKILL with Running victim defers free, converges once (518b)");
+
+    // ── 1. Blocked target + a sibling we will pin to `Running`. ─────────
+    let target_pid = match crate::proc::usermode::create_user_process_with_args_blocked(
+        "sigkill_run_target", &crate::proc::hello_elf::HELLO_ELF,
+        &["sigkill_run_target"], &["HOME=/", "PATH=/bin:/disk/bin"],
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("test518b", "create blocked target: {:?}", e); return false; }
+    };
+    let run_sib = match crate::proc::create_thread_blocked(target_pid, "sigkill-run-sib", 0) {
+        Some(t) => t,
+        None => { test_fail!("test518b", "create running sibling failed"); return false; }
+    };
+
+    // Pin the sibling to `Running` to model a thread executing on another CPU
+    // at the moment of the foreign kill.  `ctx_rsp_valid` stays true (set at
+    // creation) so the reaper can sweep it once it goes Dead.  This is the
+    // exact THREAD_TABLE state the foreign killer's Dead-marking loop observes.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == run_sib) {
+            t.state = ThreadState::Running;
+        }
+    }
+
+    // Snapshot the address space identity before the kill.
+    let cr3_before = {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == target_pid) {
+            Some(p) if p.vm_space.is_some() && p.cr3 != 0 => p.cr3,
+            Some(p) => {
+                test_fail!("test518b", "pre-kill vm_space/cr3 invalid (cr3={:#x}, some={})",
+                    p.cr3, p.vm_space.is_some());
+                crate::proc::exit_group_pid(target_pid, -1);
+                return false;
+            }
+            None => { test_fail!("test518b", "target missing pre-kill"); return false; }
+        }
+    };
+
+    // ── 2. Exercise: foreign-pid SIGKILL from the runner thread. ────────
+    let ret = crate::signal::kill(target_pid, 9);
+    if ret != 0 {
+        test_fail!("test518b", "kill(target, SIGKILL) = {} (want 0)", ret);
+        return false;
+    }
+
+    // ── 3. Post-conditions BEFORE convergence. ──────────────────────────
+    // (a) The free was DEFERRED: vm_space still Some, cr3 unchanged.  An
+    //     inline free would have run `vm_space.take()` + set cr3=0 — the UAF.
+    {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == target_pid) {
+            Some(p) if p.vm_space.is_some() && p.cr3 == cr3_before => {}
+            Some(p) => {
+                test_fail!("test518b",
+                    "free NOT deferred for Running victim: cr3={:#x} (was {:#x}), vm_space_some={} \
+                     — SMP UAF guard failed",
+                    p.cr3, cr3_before, p.vm_space.is_some());
+                return false;
+            }
+            None => { test_fail!("test518b", "target reaped before convergence"); return false; }
+        }
+    }
+    // (b) Zombie -9, every thread Dead (the "Running" sibling included — it was
+    //     marked Dead by the group-exit; only its state-at-mark drove deferral).
+    {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == target_pid) {
+            Some(p) if p.state == ProcessState::Zombie && p.exit_code == -9 => {}
+            Some(p) => {
+                test_fail!("test518b", "target state={:?} exit_code={} (want Zombie/-9)",
+                    p.state, p.exit_code);
+                return false;
+            }
+            None => { test_fail!("test518b", "target missing post-kill"); return false; }
+        }
+    }
+    {
+        let threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter().find(|t|
+            t.pid == target_pid && t.state != ThreadState::Dead)
+        {
+            test_fail!("test518b", "tid={} still {:?} after SIGKILL", t.tid, t.state);
+            return false;
+        }
+    }
+    test_println!("  free deferred while victim Running; Zombie -9, all Dead ✓");
+
+    // ── 4. Drive convergence: one reaper pass via schedule(). ───────────
+    //     The victim was killed in "userspace" (never reaches the syscall-tail
+    //     drain), so the reaper is the convergence point — it sweeps the last
+    //     Dead thread and frees the Zombie's still-`Some` vm_space (fix #3).
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+
+    // (d) All TIDs swept AND vm_space freed exactly once (cr3==0, vm_space None).
+    {
+        let threads = THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.pid == target_pid) {
+            test_fail!("test518b", "THREAD_TABLE still has a target tid after reaper pass");
+            return false;
+        }
+    }
+    {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == target_pid) {
+            // Freed: vm_space taken (None) and cr3 cleared.
+            Some(p) if p.vm_space.is_none() && p.cr3 == 0 => {}
+            Some(p) => {
+                test_fail!("test518b",
+                    "deferred free did NOT converge: vm_space_some={} cr3={:#x} (leak)",
+                    p.vm_space.is_some(), p.cr3);
+                return false;
+            }
+            // Slot already recycled — also acceptable (freed + reaped).
+            None => {}
+        }
+    }
+    test_println!("  reaper swept all tids and converged the deferred free (cr3=0) ✓");
+
+    test_pass!("SIGKILL with Running victim defers free, converges once (518b)");
     true
 }
 
