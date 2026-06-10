@@ -411,6 +411,29 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
             return if procs.iter().any(|p| p.pgid == pgid) { 0 } else { -3 };
         }
         if sig >= MAX_SIGNAL { return -22; }
+        // SIGKILL: see the single-pid branch below — terminate each group
+        // member directly rather than queueing an undeliverable signal.
+        if sig == SIGKILL {
+            let targets: alloc::vec::Vec<u64> = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter()
+                    .filter(|p| p.pgid == pgid
+                            && p.state != crate::proc::ProcessState::Zombie)
+                    .map(|p| p.pid)
+                    .collect()
+            };
+            if targets.is_empty() { return -3; } // ESRCH
+            let self_pid = crate::proc::current_pid_lockless();
+            for pid in targets.iter().copied().filter(|&p| p != self_pid) {
+                crate::proc::exit_group_pid(pid, -(SIGKILL as i64));
+            }
+            ring_signal_bell();
+            if targets.contains(&self_pid) {
+                // Suicide last: exit_group never returns.
+                crate::proc::exit_group(-(SIGKILL as i64));
+            }
+            return 0;
+        }
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let mut found = false;
         for proc in procs.iter_mut() {
@@ -443,6 +466,36 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
 
     if sig >= MAX_SIGNAL {
         return -22; // EINVAL
+    }
+
+    // SIGKILL cannot be caught, blocked, or ignored (signal(7)); its outcome
+    // is the unconditional, immediate termination of the entire thread group
+    // (kill(2), "the signal ... will be delivered" — for SIGKILL delivery IS
+    // group death).  The queue-and-deliver path below only takes effect when
+    // a target thread next crosses the kernel/user boundary; a process whose
+    // threads are ALL parked inside blocking syscalls (FUTEX_WAIT,
+    // poll/epoll, blocking recv) never dequeues the signal and survives
+    // SIGKILL indefinitely — keeping every fd open, so AF_UNIX/pipe peers
+    // never observe EOF/HUP, the parent's waitpid(2) never completes, and a
+    // supervisor (e.g. a browser parent force-killing a hung child) hangs
+    // with it.  POSIX requires lethal-signal termination to be prompt even
+    // for blocked tasks (the kernel-side equivalent of an uninterruptible
+    // wait being made killable).  Terminate the group directly from the
+    // sender's context via the same machinery exit_group(2) uses — CLEARTID
+    // for every thread, futex-queue drain, pipe/socket close (peer EOF),
+    // Zombie + parent wake.
+    if sig == SIGKILL && target_pid != crate::proc::current_pid_lockless() {
+        {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == target_pid) {
+                Some(p) if p.state != crate::proc::ProcessState::Zombie => {}
+                Some(_) => return 0,  // already a zombie — nothing to do
+                None => return -3,    // ESRCH
+            }
+        } // drop PROCESS_TABLE before the teardown takes its own locks
+        crate::proc::exit_group_pid(target_pid, -(SIGKILL as i64));
+        ring_signal_bell();
+        return 0;
     }
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -512,22 +565,19 @@ pub fn check_signals() -> bool {
 
     // SIGKILL and SIGSTOP cannot be caught or ignored
     if sig == SIGKILL {
-        proc.state = crate::proc::ProcessState::Zombie;
-        proc.exit_code = -(sig as i32);
         crate::serial_println!("[SIGNAL] Process {} killed by SIGKILL", pid);
         drop(procs);
         // Per `signal(7)` ("Standard signals"): a lethal signal terminates
         // every thread in the target process, not just the thread that
-        // observes it.  Conceptually equivalent to `exit_group(2)`, so
-        // every sibling owes a CLEARTID write + FUTEX_WAKE per `clone(2)`
-        // ("C library/kernel ABI differences", CLONE_CHILD_CLEARTID) and
-        // `futex(2)` (NOTES on task-exit semantics) — otherwise a cross-
-        // thread joiner parked in `FUTEX_WAIT` on a sibling's joinstate
-        // never wakes (CWE-833 Deadlock).  Helper from PR #375 already
-        // covers `exit_group(2)`; this is the K1 audit's lethal-signal
-        // companion (F1b).
-        crate::proc::fire_cleartid_for_group(pid);
-        crate::proc::exit_thread(-(sig as i64));
+        // observes it — equivalent to `exit_group(2)`.  Route through the
+        // group-exit machinery so siblings are marked Dead, CLEARTID fires
+        // for every thread (`clone(2)` CLONE_CHILD_CLEARTID; `futex(2)`
+        // NOTES on task-exit), the futex queues are drained, and — the part
+        // the old hand-rolled body missed — every pipe/socket fd is CLOSED
+        // so peers observe EOF/HUP promptly (CWE-833 Deadlock otherwise:
+        // a parent supervising this process over an AF_UNIX channel never
+        // learns it died).
+        crate::proc::exit_group(-(sig as i64));
         return true;
     }
 
@@ -704,18 +754,15 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
 
     // SIGKILL — terminate immediately.
     if sig == SIGKILL {
-        proc_entry.state = crate::proc::ProcessState::Zombie;
-        proc_entry.exit_code = -(sig as i32);
         crate::serial_println!("[SIGNAL] Process {} killed by SIGKILL (syscall return)", pid);
         drop(procs);
-        // Mirror of the `check_signals()` SIGKILL branch.  Per `signal(7)`
-        // a lethal signal kills the whole thread group; CLEARTID must
-        // fire for every sibling before any of them is reaped, otherwise
-        // `pthread_join(3)` waiters on this group block indefinitely
-        // (CWE-833).  See `clone(2)` CLONE_CHILD_CLEARTID and `futex(2)`
-        // NOTES on task-exit semantics.
-        crate::proc::fire_cleartid_for_group(pid);
-        crate::proc::exit_thread(-(sig as i64));
+        // Mirror of the `check_signals()` SIGKILL branch: route through the
+        // group-exit machinery (sibling Dead transitions, group CLEARTID per
+        // `clone(2)` CLONE_CHILD_CLEARTID / `futex(2)` task-exit NOTES,
+        // futex-queue drain, pipe/socket close so peers see EOF/HUP, Zombie
+        // + parent wake).  The old hand-rolled body exited only the
+        // observing thread and left every sibling and fd alive (CWE-833).
+        crate::proc::exit_group(-(sig as i64));
         return 0; // unreachable
     }
 

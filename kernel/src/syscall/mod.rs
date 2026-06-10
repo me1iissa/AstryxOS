@@ -2584,9 +2584,31 @@ fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
     unsafe {
         core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
     }
-    crate::mm::refcount::page_ref_set(phys, 1);
-    map_page_in(cr3, page_addr, phys, install_flags);
-    crate::mm::vmm::invlpg(page_addr);
+    // Anti-aliasing install (Intel SDM Vol. 3A §4.10.4.3 "Optional Invalidation";
+    // POSIX mmap(2) demand paging).  This arm is now reachable from a FOREIGN
+    // killer CPU (a group-exit driven by kill(2)/SIGKILL — signal(7)) while the
+    // victim's own threads still Run on another logical processor and can
+    // demand-fault the SAME not-present `clear_child_tid` page concurrently.  An
+    // unconditional `map_page_in` here would overwrite a sibling's just-published
+    // PTE with a second frame, and a local-only `invlpg` would leave that sibling
+    // (and any later faulting CPU) caching one frame while the page table points
+    // at another — one VA backed by two frames, a silent cross-CPU
+    // store-visibility failure.  Mirror Arm A and the anonymous `#PF` arm: install
+    // atomically-with-present-check under the page-table lock, and on losing the
+    // race drop our redundant frame and re-walk to the winner's authoritative PTE.
+    if crate::mm::vmm::map_page_in_if_absent(cr3, page_addr, phys, install_flags) {
+        // We won — record the single PTE reference AFTER a successful install so
+        // a lost race leaves the frame at refcount 0 and frees cleanly.
+        crate::mm::refcount::page_ref_set(phys, 1);
+    } else {
+        // Lost the race: a sibling CPU already mapped this VA.  Our frame was
+        // never installed (refcount still 0), so it frees cleanly; the caller
+        // re-reads the PTE and writes through the winner's frame.
+        crate::mm::pmm::free_page(phys);
+    }
+    // Publish the install cross-CPU so the still-Running victim sibling re-walks
+    // to the authoritative PTE rather than caching a not-present translation.
+    crate::mm::tlb::shootdown_page(cr3, page_addr);
     true
 }
 

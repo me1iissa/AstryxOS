@@ -6096,6 +6096,16 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                     "(expected on|off|reset or none)"
                 )
         return req
+    if op == "proc-kill":
+        # Deliver a signal to a guest process (default SIGKILL) — the
+        # induced-verdict primitive for live debugging.
+        #   kdb <sid> proc-kill <pid> [<sig>]
+        if len(rest) < 1:
+            raise ValueError("proc-kill requires <pid> [<sig>]")
+        out = {"op": "proc-kill", "pid": int(rest[0], 0)}
+        if len(rest) >= 2:
+            out["sig"] = int(rest[1], 0)
+        return out
     if op == "cond-autopsy":
         # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report.
         #   kdb <sid> cond-autopsy <pid> <cond_va> [<half>]   (half default 128)
@@ -11733,6 +11743,8 @@ def main():
         # struct dump + parked waiters + recent wakes + holder + verdict.
         # See subsys/linux/futex_cluster.rs::recent_wakes_near + op_cond_autopsy.
         "cond-autopsy",
+        # proc-kill: deliver a signal (default SIGKILL) to a guest process.
+        "proc-kill",
         # epoll-watch: live epoll interest-set + per-fd readiness/delivered dump
         # for one (pid, epfd).  Tests "fd POLLIN-ready but epoll_wait never
         # delivers it" (reactor-starvation vs kernel readiness-drop).  Request

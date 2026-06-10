@@ -390,6 +390,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         // wait-addr report.  Composes the live struct dump + parked waiters +
         // recent wake targets + inferred lock holder into a single verdict.
         "cond-autopsy"   => op_cond_autopsy(req, out),
+        // Deliver a signal to a guest process (default SIGKILL) — the
+        // induced-verdict primitive: terminate a parked process and observe
+        // what its supervisor/peer reports.
+        "proc-kill"      => op_proc_kill(req, out),
         // INFRA-3 record/replay introspection.  Off-path when the
         // `record-replay` feature is OFF — the ops return a fixed
         // "feature off" JSON object so the KDB protocol surface is
@@ -3453,6 +3457,21 @@ const COND_STRUCT_WORDS: u64 = 12;
 /// and the robust/owner-dead markers.
 #[inline]
 fn musl_mutex_owner_tid(m_lock_word: u32) -> u32 { m_lock_word & 0x3FFF_FFFF }
+
+// Deliver a signal to a process — controlled fault-injection for live
+// debugging (e.g. SIGKILL a parked content process and observe which awaited
+// link its supervisor reports in the rejection).  POSIX kill(2) semantics via
+// signal::kill.  Request: {"op":"proc-kill","pid":N,"sig":M} (sig default 9).
+fn op_proc_kill(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let sig = extract_field(req, "sig").and_then(|s| parse_u64(&s)).unwrap_or(9).min(64) as u8;
+    let ret = crate::signal::kill(pid, sig);
+    let _ = write!(out, r#"{{"op":"proc-kill","pid":{},"sig":{},"ret":{}}}"#, pid, sig, ret);
+}
 
 fn op_cond_autopsy(req: &str, out: &mut String) {
     use core::fmt::Write;
