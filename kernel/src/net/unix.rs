@@ -99,6 +99,21 @@ struct UnixSocket {
     /// the in-memory pipe.
     shut_rd:     bool,
     shut_wr:     bool,
+    /// "No more bytes will ever arrive" — set on this socket when its peer
+    /// performs `shutdown(SHUT_WR)` or fully closes.  Distinct from the local
+    /// `shut_rd` (SHUT_RD discards queued data and EOFs immediately per
+    /// IEEE 1003.1 §shutdown): with `rx_eof` the reader first DRAINS any
+    /// bytes already queued in `recv_buf` and only then observes the orderly
+    /// EOF — the recv(2) contract for a peer that performed an orderly
+    /// shutdown ("return 0 once all queued data is consumed").  Feeds the
+    /// `POLLIN`/`POLLRDHUP` readiness edges via [`read_shutdown`].
+    rx_eof:      bool,
+    /// The peer endpoint has FULLY closed (last open file description gone).
+    /// Set together with severing our `peer_id` back-pointer in [`close`], so
+    /// no code path can ever dereference the freed — and possibly RECYCLED —
+    /// peer slot through us.  Drives `POLLHUP` ([`fully_hung_up`]), the
+    /// always-writable EPIPE fast-path ([`writable`]), and write(2) → -EPIPE.
+    peer_closed: bool,
     /// Count of open file-description references to this socket slot.
     ///
     /// `socket(2)` / `socketpair(2)` initialise this to 1.  Every call that
@@ -148,6 +163,8 @@ impl UnixSocket {
             backlog_len: 0,
             shut_rd:     false,
             shut_wr:     false,
+            rx_eof:      false,
+            peer_closed: false,
             ref_count:   0,
             creator_pid: 0,
             creator_uid: 0,
@@ -169,6 +186,8 @@ impl UnixSocket {
         self.backlog_len = 0;
         self.shut_rd     = false;
         self.shut_wr     = false;
+        self.rx_eof      = false;
+        self.peer_closed = false;
         self.ref_count   = 0;
         self.creator_pid = 0;
         self.creator_uid = 0;
@@ -445,9 +464,28 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         if s.state != UnixState::Connected { return -32; }
         // SHUT_WR locally → -EPIPE per IEEE 1003.1 §shutdown.
         if s.shut_wr { return -32; }
+        // Peer fully closed → -EPIPE per POSIX write(2)/send(2) on a
+        // stream socket whose peer is gone.  (`peer_id` is severed to
+        // u64::MAX at peer teardown, so the bounds check below also
+        // catches this; the explicit flag keeps the intent readable.)
+        if s.peer_closed { return -32; }
         (s.peer_id, s.kind)
     };
     if peer_id as usize >= MAX_UNIX_SOCKETS { return -32; }
+    // Mutual-pairing gate: only deliver if the resolved peer slot still
+    // points back at US.  The socket table recycles slot indices the moment
+    // a slot's last reference is closed; a stale `peer_id` held across that
+    // recycling would otherwise inject this stream's bytes into an UNRELATED
+    // connection's receive ring (cross-channel corruption).  A connected
+    // pair is mutual by construction (socketpair(2)/connect(2)), so a
+    // mismatch can only mean "freed and possibly recycled" → the write must
+    // observe -EPIPE, exactly as if the peer had closed (POSIX send(2)).
+    {
+        let peer = &t.0[peer_id as usize];
+        if peer.state != UnixState::Connected || peer.peer_id != id {
+            return -32;
+        }
+    }
 
     if kind == SockKind::SeqPacket {
         // SEQPACKET: an entire message must fit in the receiver's ring AND
@@ -535,7 +573,14 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     if s.kind == SockKind::SeqPacket {
         // SEQPACKET: dequeue exactly one message, truncating any tail that
         // does not fit per `man 7 unix` §SOCK_SEQPACKET.
-        if s.seq_head == s.seq_tail { return Err(-11); } // EAGAIN — no message
+        if s.seq_head == s.seq_tail {
+            // No queued message.  If the peer's write side is gone
+            // (orderly shutdown or full close), report EOF — but only
+            // AFTER the queue is empty: recv(2) requires queued data to
+            // be returned before the 0-byte orderly-shutdown indication.
+            if s.rx_eof { return Ok((0, 0)); }
+            return Err(-11); // EAGAIN — no message
+        }
         let msg_len = s.seq_lens[s.seq_head] as usize;
         s.seq_head = (s.seq_head + 1) % SEQ_QUEUE_CAP;
 
@@ -555,7 +600,13 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
         result  = Ok((copied, discard));
     } else {
         // STREAM: byte-stream — copy as many bytes as fit, no boundaries.
-        if s.recv_available() == 0 { return Err(-11); }
+        if s.recv_available() == 0 {
+            // Drain-then-EOF (recv(2)): once the ring is empty AND the peer
+            // can never push more bytes (peer SHUT_WR or peer fully closed),
+            // the read observes the orderly EOF.  Queued bytes always win.
+            if s.rx_eof { return Ok((0, 0)); }
+            return Err(-11);
+        }
         let copied = s.pop(buf);
         drained = copied;
         result  = Ok((copied, 0));
@@ -594,7 +645,16 @@ pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
     if shut_rd_flag { s.shut_rd = true; }
     if shut_wr_flag { s.shut_wr = true; }
     if shut_wr_flag && (peer_id as usize) < MAX_UNIX_SOCKETS {
-        t.0[peer_id as usize].shut_rd = true;
+        let p = &mut t.0[peer_id as usize];
+        // Mutual-pairing gate (see `write`): never flip half-close state on
+        // a slot that no longer points back at us — after slot recycling it
+        // belongs to an UNRELATED connection, and a stale SHUT_WR here would
+        // EOF-kill that innocent stream.  Also: the peer's read direction is
+        // marked `rx_eof` (drain-then-EOF per recv(2)), NOT `shut_rd` —
+        // bytes we pushed before half-closing must remain readable.
+        if p.state == UnixState::Connected && p.peer_id == id {
+            p.rx_eof = true;
+        }
     }
     // Drop the table lock before ringing — per `man 2 shutdown` and
     // `man 7 unix`, a half-close surfaces on the peer as an orderly
@@ -668,8 +728,24 @@ pub fn close(id: u64) {
     let mut ring = false;
     if (peer_id as usize) < MAX_UNIX_SOCKETS {
         let peer = &mut t.0[peer_id as usize];
-        if peer.state == UnixState::Connected {
-            peer.shut_rd = true;
+        // Mutual-pairing gate: only notify the peer if it still points back
+        // at the slot we just freed.  Slot indices are recycled the moment a
+        // slot's last reference drops; without this check, closing a STALE
+        // survivor (one whose own peer died earlier) would flip half-close
+        // state on whatever UNRELATED connection re-allocated the index.
+        if peer.state == UnixState::Connected && peer.peer_id == id {
+            // The peer survives us:
+            //  * `rx_eof` — its reads drain any queued bytes, then observe
+            //    the orderly EOF (recv(2): data first, then 0).
+            //  * `peer_closed` — its writes fail -EPIPE, poll reports
+            //    POLLHUP (full hang-up; POSIX poll(2)).
+            //  * SEVER its back-pointer: our slot index is about to become
+            //    recyclable, and any later dereference of it through the
+            //    survivor (write/shutdown/close/SCM enqueue) would reach an
+            //    unrelated connection.  u64::MAX fails every bounds check.
+            peer.rx_eof      = true;
+            peer.peer_closed = true;
+            peer.peer_id     = u64::MAX;
             ring = true;
         }
     }
@@ -721,7 +797,11 @@ pub fn read_shutdown(id: u64) -> bool {
     let t = TABLE.lock();
     let s = &t.0[id as usize];
     if s.state == UnixState::Free { return true; }
-    s.shut_rd
+    // `rx_eof` (peer SHUT_WR or peer close) raises the same POLLIN/POLLRDHUP
+    // readiness edges as a local SHUT_RD: the read side can no longer block
+    // (queued bytes are returned, then 0).  Edge TIMING is identical to the
+    // pre-`rx_eof` behaviour, which flipped `shut_rd` directly.
+    s.shut_rd || s.rx_eof
 }
 
 /// Returns true on a *full* hang-up — the SHUTDOWN_MASK / TCP_CLOSE
@@ -746,6 +826,10 @@ pub fn fully_hung_up(id: u64) -> bool {
     let s = &t.0[id as usize];
     if s.state == UnixState::Free { return true; }
     if s.shut_rd && s.shut_wr { return true; }
+    // Peer fully closed — recorded as a flag at teardown time (the peer's
+    // slot index is severed/recyclable, so probing `t.0[peer].state` would
+    // race with re-allocation and is no longer meaningful).
+    if s.peer_closed { return true; }
     let peer = s.peer_id;
     if peer == u64::MAX { return false; }
     if (peer as usize) >= MAX_UNIX_SOCKETS { return false; }
@@ -780,6 +864,7 @@ pub fn writable(id: u64) -> bool {
     if s.state == UnixState::Free { return true; }     // closed: write → EPIPE, no block
     if s.state != UnixState::Connected { return true; } // not connected: never blocks
     if s.shut_wr { return true; }                       // SHUT_WR: write → EPIPE, no block
+    if s.peer_closed { return true; }                   // peer gone: write → EPIPE, no block
     let peer = s.peer_id;
     if peer == u64::MAX || (peer as usize) >= MAX_UNIX_SOCKETS { return true; }
     let peer = &t.0[peer as usize];
@@ -930,6 +1015,8 @@ pub fn diag_for(id: u64) -> Option<UnixDiag> {
         recv_popped: s.recv_popped,
         read_shutdown: s.shut_rd,
         write_shutdown: s.shut_wr,
+        rx_eof: s.rx_eof,
+        peer_closed: s.peer_closed,
     })
 }
 
@@ -944,6 +1031,10 @@ pub struct UnixDiag {
     pub recv_popped: u64,
     pub read_shutdown: bool,
     pub write_shutdown: bool,
+    /// Peer write side gone (SHUT_WR or full close) — reads drain then EOF.
+    pub rx_eof: bool,
+    /// Peer endpoint fully closed; `peer_id` has been severed to u64::MAX.
+    pub peer_closed: bool,
 }
 
 pub fn state(id: u64) -> UnixState {

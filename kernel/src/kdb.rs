@@ -2042,6 +2042,8 @@ fn op_unix_diag(req: &str, out: &mut String) {
                 let _ = write!(out, r#""recv_popped":{},"#, d.recv_popped);
                 let _ = write!(out, r#""read_shutdown":{},"#, d.read_shutdown);
                 let _ = write!(out, r#""write_shutdown":{},"#, d.write_shutdown);
+                let _ = write!(out, r#""rx_eof":{},"#, d.rx_eof);
+                let _ = write!(out, r#""peer_closed":{},"#, d.peer_closed);
                 let _ = write!(out, r#""has_data":{},"#, d.recv_avail > 0);
                 let _ = write!(out, r#""scm_deliverable":{},"#, has_scm_deliv);
                 out.push_str(r#""scm_batches":["#);
