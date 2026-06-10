@@ -2904,6 +2904,24 @@ def cmd_start(args):
     features_str = (args.features or "")
     feats = [f.strip() for f in features_str.split(",")]
 
+    # ── --ff-url: validate EARLY (before the expensive build) ────────────────
+    # A bad URL must fail fast, not after a multi-minute kernel rebuild.  The
+    # fw_cfg argv token is appended later (where extra_qemu_args is composed);
+    # here we only reject malformed input.  Validation mirrors the kernel-side
+    # boot_config::url_is_valid gate (defence in depth): scheme http/https/file
+    # (RFC 3986 §3.1), printable ASCII only, ≤2048 chars, and no comma (the
+    # `-fw_cfg ...,string=...` argument is comma-delimited).
+    ff_url = getattr(args, "ff_url", None)
+    if ff_url:
+        if not ff_url.startswith(("http://", "https://", "file://")):
+            _err(f"--ff-url: scheme must be http/https/file (got {ff_url!r})")
+        if not all(0x21 <= ord(c) <= 0x7e for c in ff_url) or len(ff_url) > 2048:
+            _err(f"--ff-url: must be printable ASCII, no whitespace, <=2048 "
+                 f"chars (got {ff_url!r})")
+        if "," in ff_url:
+            _err("--ff-url: a comma in the URL is not supported (it delimits "
+                 "the -fw_cfg argument); percent-encode it as %2C")
+
     # ── Firefox serial profile (perf vs trace) ───────────────────────────────
     # Two profiles share the same functional kernel:
     #
@@ -3497,6 +3515,19 @@ def cmd_start(args):
     )
 
     extra_qemu_args = list(getattr(args, "extra_qemu_args", None) or [])
+
+    # ── --ff-url: append the fw_cfg argv token (validated early above) ───────
+    # Delivers the URL through the QEMU `opt/astryx/cmdline` fw_cfg blob the
+    # kernel reads at boot (boot_config.rs reads `astryx.ff_url=<url>`), so a
+    # site change needs no rebuild.  `ff_url` was already validated (scheme /
+    # length / printable / no-comma) near the top of cmd_start.
+    if ff_url:
+        extra_qemu_args += [
+            "-fw_cfg",
+            f"name=opt/astryx/cmdline,string=astryx.ff_url={ff_url}",
+        ]
+        print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
+
     # When `xeyes-test` is in the feature set, the kernel boots an Alpine
     # X11 binary that needs a real framebuffer for any visible window to
     # show up.  `_launch_qemu_harness` is hard-wired to mode="test", which
@@ -3601,6 +3632,9 @@ def cmd_start(args):
         "pcap_path":    pcap_path,
         "pcap_enabled": pcap_enabled,
         "pcap_reason":  pcap_reason,
+        # Runtime firefox-test target URL (--ff-url), delivered via fw_cfg.
+        # "" / absent when the compiled CMDLINE_* default is used.  Additive.
+        "ff_url":       ff_url or "",
         # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
         # If oracle_stub_pid is 0 the stub wasn't launched (default).
         "oracle_stub_port": oracle_stub_port,
@@ -4088,10 +4122,14 @@ def _classify_exit_cause(serial_log: str, running: bool) -> str:
       1. `BUGCHECK 0xNNNN` → `bugcheck:0xNNNN`
       2. `SCHEDULER_DEADLOCK` → `scheduler_deadlock`
       3. `PANIC:` / `panicked at` → `panic`
-      4. `[FFTEST] DONE` → `firefox_exited_clean`
-      5. `[FFTEST] Firefox exited after N ticks` → `firefox_exited:ticks=N`
-      6. Still running (process alive) → `running`
-      7. Nothing of the above → `unknown_exit`
+      4. `[GATE] ff-exit-clean code=C` → `firefox_exited_clean:code=C`
+         (authoritative kernel marker on the pid-1 group exit; fires on the
+         fast `firefox-test-core` profile, where the prose lines below may be
+         compiled out)
+      5. `[FFTEST] DONE` → `firefox_exited_clean`
+      6. `[FFTEST] Firefox exited after N ticks` → `firefox_exited:ticks=N`
+      7. Still running (process alive) → `running`
+      8. Nothing of the above → `unknown_exit`
 
     We read only the last ~256 KiB of the log; the causal marker is always
     near the end. Reading from the tail keeps latency O(1) regardless of
@@ -4115,6 +4153,9 @@ def _classify_exit_cause(serial_log: str, running: bool) -> str:
         return "scheduler_deadlock"
     if re.search(r"PANIC:|panicked at", tail):
         return "panic"
+    m = re.search(r"\[GATE\]\s+ff-exit-clean\s+code=(-?\d+)", tail)
+    if m:
+        return f"firefox_exited_clean:code={m.group(1)}"
     if re.search(r"\[FFTEST\]\s+DONE", tail):
         return "firefox_exited_clean"
     m = re.search(r"\[FFTEST\]\s+Firefox exited after\s+(\d+)\s+ticks", tail)
@@ -4150,7 +4191,8 @@ def _load_ff_gates() -> list[dict]:
         {"id": "content-proc",      "marker_regex": rb"\[FF/write\]\s+pid=2\b", "kind": "line"},
         {"id": "screenshot-actors", "marker_regex": rb"ScreenshotParent|getDimensions|sendQuery", "kind": "ipc-body"},
         {"id": "draw-snapshot",     "marker_regex": rb"drawSnapshot", "kind": "ipc-body"},
-        {"id": "png-write",         "marker_regex": rb"Screenshot saved|out\.png|\[SCREENSHOT-B64:", "kind": "line"},
+        {"id": "png-write",         "marker_regex": rb"\[GATE\]\s+png-write\b|\[FF-OUT-PNG:path=|/tmp/out\.png present|Screenshot saved", "kind": "line"},
+        {"id": "ff-exit-clean",     "marker_regex": rb"\[GATE\]\s+ff-exit-clean\b", "kind": "line"},
     ]
     raw = None
     if _FF_GATES_PATH.exists():
@@ -4257,6 +4299,9 @@ def cmd_ff_progress(args):
     alive = _pid_alive(pid) if pid else False
     terminal_cause = _classify_exit_cause(serial_log, alive)
     reached_png = "png-write" in seen
+    # `[GATE] ff-exit-clean` — the kernel's authoritative clean-exit marker
+    # on the pid-1 group exit (fires on the fast firefox-test-core profile).
+    reached_exit_clean = "ff-exit-clean" in seen
 
     _out({
         "sid":            args.sid,
@@ -4265,6 +4310,7 @@ def cmd_ff_progress(args):
         "deepest_index":  deepest_index,
         "max_sc":         max_sc,
         "reached_png":    reached_png,
+        "reached_exit_clean": reached_exit_clean,
         "terminal_cause": terminal_cause,
         "total_lines":    line_no,
         "gates":          gate_rows,
@@ -4535,7 +4581,7 @@ def _ff_gate_label(sid: str) -> dict:
                 info["max_sc"] = max(scs)
             # Cheap gate hints (matches ff-progress vocabulary, additive).
             for label, pat in (
-                ("png-write",      r"Screenshot saved|out\.png"),
+                ("png-write",      r"\[GATE\]\s+png-write\b|\[FF-OUT-PNG:path=|/tmp/out\.png present|Screenshot saved"),
                 ("draw-snapshot",  r"drawSnapshot|DrawSnapshot"),
                 ("content-proc",   r"content process|contentproc|HeadlessShell"),
                 ("compositor",     r"Compositor"),
@@ -11498,6 +11544,21 @@ def main():
                                "Suppress the auto-restage with "
                                "--no-regen-data-img — the mismatch is still "
                                "warned about on stderr.")
+    p_start.add_argument("--ff-url", dest="ff_url", default=None, metavar="URL",
+                          help="firefox-test target URL delivered to the kernel "
+                               "at boot WITHOUT a rebuild.  The harness appends "
+                               "`-fw_cfg name=opt/astryx/cmdline,"
+                               "string=astryx.ff_url=<URL>` so the kernel's "
+                               "firefox-test launch path (boot_config.rs) reads "
+                               "and substitutes it into the Firefox command "
+                               "line, falling back to the compiled default when "
+                               "absent.  The scheme must be http/https/file "
+                               "(RFC 3986 3.1) and the value is validated "
+                               "kernel-side; an invalid value is ignored.  "
+                               "Example: --ff-url file:///tmp/hello.html for a "
+                               "fast local-render win, or --ff-url "
+                               "https://bbc.com/news.  Additive: omit to keep "
+                               "the compiled CMDLINE_* default.")
     p_start.add_argument("--pcap", action="store_true", dest="pcap",
                           help="FORCE host-side packet capture ON for this "
                                "boot, even a non-FF one.  Captures ALL guest "

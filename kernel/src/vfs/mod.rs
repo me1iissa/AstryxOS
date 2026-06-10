@@ -232,6 +232,60 @@ fn inode_is_pinned(mount_idx: usize, inode: u64) -> bool {
     PINNED_INODES.lock().iter().any(|(m, n, c)| *m == mount_idx && *n == inode && *c > 0)
 }
 
+// ───── firefox-test screenshot-write gate ───────────────────────────────────
+//
+// The firefox-test workload renders to a `--screenshot <PATH>` file.  There is
+// no genuine "PNG written" serial marker in the fast (core) build, so winning
+// boots are mis-classified as stalled at the screenshot-IPC stage.  The launch
+// path registers the screenshot PATH here; [`close`] then emits exactly one
+// `[GATE] png-write path=<p> bytes=<n>` line the first time that file is closed
+// after a write (the file is complete the moment the renderer closes it).  The
+// marker is keyed on a write-mode close of a non-empty file, NOT on opens or
+// path resolves, so a probe/stat of the path never false-fires.
+
+/// Registered screenshot output path (full open path, e.g. `/tmp/out.png`), or
+/// empty when unset.  Set once by the launch path via
+/// [`set_screenshot_gate_path`]; read on every regular-file close.
+static SCREENSHOT_GATE_PATH: Mutex<String> = Mutex::new(String::new());
+
+/// True once the `[GATE] png-write` line has been emitted this boot, so a later
+/// re-write/close of the same path (e.g. a relaunch overwriting the file) does
+/// not double-fire.  The first complete write is the demo-success signal.
+static SCREENSHOT_GATE_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Register the firefox-test `--screenshot` output path so [`close`] can emit
+/// the `[GATE] png-write` marker for exactly that file.  Idempotent; the last
+/// caller wins (the launch path calls it once before launching Firefox).
+pub fn set_screenshot_gate_path(path: &str) {
+    *SCREENSHOT_GATE_PATH.lock() = String::from(path);
+    SCREENSHOT_GATE_FIRED.store(false, Ordering::Relaxed);
+}
+
+/// On a write-mode close of the registered screenshot path with `bytes > 0`,
+/// emit one `[GATE] png-write path=<p> bytes=<n>` line (first arrival only).
+/// `bytes` is the file's write offset at close — a non-zero offset proves the
+/// renderer wrote content before closing.  Cheap: a single atomic load short-
+/// circuits once fired or when no path is registered.
+fn maybe_emit_png_write_gate(open_path: &str, writable: bool, bytes: u64) {
+    if !writable || bytes == 0 {
+        return;
+    }
+    if SCREENSHOT_GATE_FIRED.load(Ordering::Relaxed) {
+        return;
+    }
+    {
+        let p = SCREENSHOT_GATE_PATH.lock();
+        if p.is_empty() || p.as_str() != open_path {
+            return;
+        }
+    }
+    // First arrival claims the flag; only that caller emits the line.
+    if !SCREENSHOT_GATE_FIRED.swap(true, Ordering::Relaxed) {
+        crate::serial_println!("[GATE] png-write path={} bytes={}", open_path, bytes);
+    }
+}
+
 /// A held POSIX byte-range lock.
 #[derive(Clone)]
 pub struct FileLockEntry {
@@ -2225,11 +2279,11 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
         let fd_opt = &mut proc.file_descriptors[fd_num];
         if fd_opt.is_none() { return Err(VfsError::BadFd); }
         fd_opt.take().map(|fd| {
-            (fd.mount_idx, fd.inode, fd.is_console, fd.file_type, fd.flags, fd.open_path.clone())
+            (fd.mount_idx, fd.inode, fd.is_console, fd.file_type, fd.flags, fd.open_path.clone(), fd.offset)
         })
     };
 
-    if let Some((mount_idx, inode, is_console, file_type, open_flags, open_path)) = closed {
+    if let Some((mount_idx, inode, is_console, file_type, open_flags, open_path, write_off)) = closed {
         // Release POSIX locks held by this pid on the closed inode (C1).
         if !is_console && mount_idx != usize::MAX {
             FILE_LOCKS.lock().retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
@@ -2296,6 +2350,14 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
             };
             let (parent_dir, filename) = split_parent_name(&open_path);
             crate::ipc::inotify::notify_event(parent_dir, filename, close_mask, 0);
+
+            // firefox-test screenshot-write gate: the renderer just closed a
+            // file it wrote to.  If it is the registered `--screenshot` path
+            // and carries bytes, emit `[GATE] png-write` exactly once — the
+            // genuine "the PNG was written and closed" signal (vs the stat/
+            // resolve probes that previously stood in for it).  `write_off`
+            // is the fd's offset at close: non-zero ⇒ content was written.
+            maybe_emit_png_write_gate(&open_path, writable, write_off);
         }
     }
 
