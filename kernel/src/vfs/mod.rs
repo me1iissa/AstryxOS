@@ -3274,11 +3274,16 @@ pub fn sys_umount(target: &str, _flags: u64) -> i64 {
             return -2; // ENOENT — raced with another umount
         }
         mounts.remove(mount_idx);
+        // Mount-table change: `Vec::remove` SHIFTED every mount index above
+        // `mount_idx`, and the path cache keys entries by mount index — a
+        // flush is mandatory, not just hygienic (stale keys would alias
+        // other mounts).  The flush must complete before the MOUNTS lock is
+        // released: a resolver that can observe the shifted table must never
+        // be able to read a pre-shift cache entry, or a cross-mount
+        // inode-number collision could serve a child from the wrong
+        // filesystem.
+        path_cache::flush();
     }
-    // Mount-table change: `Vec::remove` SHIFTED every mount index above
-    // `mount_idx`, and the path cache keys entries by mount index — a flush
-    // is mandatory, not just hygienic (stale keys would alias other mounts).
-    path_cache::flush();
 
     // Any remaining open-fd mount_idx values that were above `mount_idx` are
     // now off-by-one.  Fix them up so existing fds stay valid.
