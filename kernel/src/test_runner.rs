@@ -706,6 +706,13 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_socketpair() { passed += 1; }
 
+    // ── Test 294: proc_metrics net_r_bytes via recvmsg(2) ─────────────────
+    // Regression for the omission where nr-47 on AF_UNIX called read_msg()
+    // directly and skipped bump_net_read(); the counter appeared to freeze
+    // under heavy recvmsg traffic (only write/read syscall paths bumped it).
+    total += 1;
+    if test_proc_metrics_net_recvmsg() { passed += 1; }
+
     // ── AF_UNIX POLLOUT writable-gate + recv-drain write-space wake ────────
     total += 1;
     if test_unix_pollout_writable_gate() { passed += 1; }
@@ -47910,4 +47917,126 @@ fn test_293_epoll_listening_unix_has_pending() -> bool {
         test_pass!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
     }
     ok
+}
+
+// ── Test 294: proc_metrics net=R counter via recvmsg(2) ─────────────────────────
+//
+// Regression test for the omission where `recvmsg` (syscall nr 47) on an
+// AF_UNIX SOCK_STREAM socket called `unix::read_msg()` directly and never
+// invoked `bump_net_read()`.  Every `recvmsg` drain on an AF_UNIX fd was
+// invisible to the `net=R/W` counters; the fix adds the `bump_net_read` call
+// immediately after `bytes_read` is established in the nr-47 arm.
+//
+// The test writes N bytes on one half of a SOCK_STREAM socketpair and
+// receives them via `recvmsg(2)`, then asserts that `net_r_bytes` advanced
+// by exactly N.  Per recv(2) / recvmsg(2) / POSIX.1-2017 §2.10.6: a
+// successful receive must account for every byte returned to the caller.
+fn test_proc_metrics_net_recvmsg() -> bool {
+    test_header!("proc_metrics net_r_bytes via recvmsg(2) — omission fix");
+
+    // Re-use the current process's already-registered PID so we can snapshot
+    // its metrics without registering a scratch PID.
+    let pid = crate::proc::current_pid_lockless();
+
+    // Baseline: read the current net_r_bytes for this PID before the test.
+    let snap0 = crate::proc::proc_metrics::snapshot(pid);
+    let baseline = snap0.map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Build a STREAM socketpair via dispatch_linux(53, AF_UNIX, SOCK_STREAM).
+    let mut fds = [0i32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        53, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
+        fds.as_mut_ptr() as u64, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "socketpair(AF_UNIX, SOCK_STREAM) returned {}", r);
+        return false;
+    }
+    let (fd_w, fd_r) = (fds[0] as u64, fds[1] as u64);
+    test_println!("  socketpair() fds=[{},{}] ✓", fd_w, fd_r);
+
+    // Write 64 bytes on fd_w → lands in fd_r's recv ring.
+    let payload = [0x5Au8; 64];
+    let w = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, fd_w, payload.as_ptr() as u64, payload.len() as u64,
+        0, 0, 0,
+    );
+    if w != payload.len() as i64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "write returned {} (expected {})", w, payload.len());
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_w, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_r, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  write({}) ✓", w);
+
+    // Build a minimal msghdr pointing at a 64-byte receive buffer.
+    // Linux x86_64 struct msghdr (sys/socket.h):
+    //   off  0: msg_name     (ptr,  8 B)
+    //   off  8: msg_namelen  (u32,  4 B) + pad (4 B)
+    //   off 16: msg_iov      (ptr,  8 B)
+    //   off 24: msg_iovlen   (u64,  8 B)
+    //   off 32: msg_control  (ptr,  8 B)
+    //   off 40: msg_controllen (u64, 8 B)
+    //   off 48: msg_flags    (i32,  4 B)
+    let mut rxbuf = [0u8; 64];
+    let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, rxbuf.len() as u64];
+    let mut hdr = [0u64; 7];
+    hdr[2] = iov.as_mut_ptr() as u64; // msg_iov
+    hdr[3] = 1u64;                    // msg_iovlen = 1
+
+    // Capture the baseline immediately before the recvmsg call so that any
+    // concurrent counter activity (e.g. from timer ISR paths on the same PID)
+    // is excluded from the delta.
+    let before = crate::proc::proc_metrics::snapshot(pid)
+        .map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Issue recvmsg(2) (nr 47) on fd_r — this is the path that was broken.
+    let n = crate::syscall::dispatch_linux_kernel(
+        47 /*recvmsg*/, fd_r, hdr.as_mut_ptr() as u64,
+        0 /*flags*/, 0, 0, 0,
+    );
+
+    let after = crate::proc::proc_metrics::snapshot(pid)
+        .map(|s| s.net_r_bytes).unwrap_or(0);
+
+    // Cleanup before assertions so a failed test doesn't leak fds.
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_w, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_r, 0, 0, 0, 0, 0);
+
+    if n != payload.len() as i64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "recvmsg returned {} (expected {})", n, payload.len());
+        return false;
+    }
+    test_println!("  recvmsg returned {} bytes ✓", n);
+
+    // The counter must have advanced by exactly the number of bytes received.
+    // (before..after may include other reads on this PID from concurrent ISR
+    // paths, but in a single-threaded test context with no other AF_UNIX
+    // activity that delta is exactly `n`.)
+    let delta = after.wrapping_sub(before);
+    if delta != n as u64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "net_r_bytes delta={} (expected {}): counter did NOT advance via recvmsg — \
+             bump_net_read missing from nr-47 AF_UNIX arm",
+            delta, n);
+        return false;
+    }
+    test_println!("  net_r_bytes: before={} after={} delta={} (== recvmsg bytes) ✓",
+        before, after, delta);
+
+    // Secondary check: the total baseline (before - initial) only grows; it
+    // never decreases across the whole test body.
+    let total_delta = after.wrapping_sub(baseline);
+    if total_delta < n as u64 {
+        test_fail!("proc_metrics_net_recvmsg",
+            "net_r_bytes total delta={} < n={} (counter rolled back — corrupted?)",
+            total_delta, n);
+        return false;
+    }
+
+    test_pass!("proc_metrics net_r_bytes via recvmsg(2) — counter advances correctly");
+    true
 }
