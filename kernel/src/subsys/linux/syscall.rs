@@ -6813,8 +6813,11 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // ~45 MB log) and has no correctness role — it transcribes every tracked
     // write(2) to COM1, one PIO VM-exit per byte under KVM.  Gated on the
     // *-trace features so the functional `firefox-test-core` / plain `test-mode`
-    // builds run identically without the spew.
-    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+    // builds run identically without the spew.  `ff-stderr-mirror` enables
+    // JUST this mirror (no other firehose) for near-perf-timing capture of a
+    // child's abort/assertion text — see kernel/Cargo.toml.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace",
+              feature = "ff-stderr-mirror"))]
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {

@@ -49,6 +49,14 @@ firefox-test-core = ["heap-canary"]
 # `dump_futex_wait_stack` rbp-chain walker) — trace is a strict superset of the
 # functional core, never a standalone.
 firefox-test-trace = ["firefox-test-core"]
+# `ff-stderr-mirror` — JUST the [FF/stderr] / [FF/write] stdout/stderr mirror,
+# without the rest of the `firefox-test-trace` firehose ([POLL_RET],
+# [VFS/resolve], futex traces).  Lets a perf-profile boot capture a child
+# process's crash/abort text (e.g. an assertion-failure reason printed to
+# fd 2 immediately before exit) while keeping near-perf timing — the full
+# trace profile perturbs scheduling enough to mask timing-dependent failures.
+# Pure diagnostic — no correctness role.
+ff-stderr-mirror = ["firefox-test-core"]
 # Backward-compatible super-feature: `--features firefox-test` enables both the
 # functional core and the full diagnostic trace, so existing debugging
 # invocations are byte-identical to before this split.  Perf/render/CI boots
