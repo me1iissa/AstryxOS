@@ -36137,17 +36137,30 @@ fn test_pipe_blocking_write_semantics() -> bool {
     let leaked5 = crate::ipc::pipe::debug_writer_waiter_count(pipe_id5);
     crate::syscall::dispatch_linux_kernel(3, rfd5, 0, 0, 0, 0, 0);
     crate::syscall::dispatch_linux_kernel(3, wfd5, 0, 0, 0, 0, 0);
-    if !was_active { crate::sched::disable(); }
+    // NOTE: do NOT disable the scheduler here on the success path — sub-test 6
+    // follows in the same function and spawns a kernel-context watchdog process
+    // (`pipe_kdrain_watchdog`) that must be picked by the scheduler to drain the
+    // pipe and wake the parked writer.  Disabling the scheduler between the two
+    // sub-tests strands that watchdog forever (`SCHEDULER_ACTIVE == false` keeps
+    // every AP in its pre-scheduler `hlt` idle loop and makes the BSP's
+    // `schedule()` a no-op), so the sub-test-6 blocking write parks and
+    // livelocks with no drainer — a wedge that only manifests under true SMP
+    // (`smp=2`), where the watchdog needs a peer CPU to run it.  The scheduler
+    // stays enabled across sub-tests 3-6 and is disabled once, at the end of
+    // sub-test 6.  Each `return false` below restores the scheduler state it
+    // promised the caller (off iff it was off on entry).
 
     // Both writers must have deposited their full 2500-byte record.
     if a_ret != REC as i64 || b_ret != REC as i64 {
         test_fail!("pipe_blocking_write",
             "concurrent writers returned a={} b={} (expected {} each — a short return means a partial atomic record)", a_ret, b_ret, REC);
+        if !was_active { crate::sched::disable(); }
         return false;
     }
     if stream.len() != 2 * REC {
         test_fail!("pipe_blocking_write",
             "drained {} bytes from concurrent writers (expected {})", stream.len(), 2 * REC);
+        if !was_active { crate::sched::disable(); }
         return false;
     }
     // Atomicity check: scan the stream for contiguous same-byte runs.  Each
@@ -36166,11 +36179,13 @@ fn test_pipe_blocking_write_semantics() -> bool {
         test_fail!("pipe_blocking_write",
             "concurrent atomicity VIOLATED: expected 2 contiguous runs of {} (0xA1, 0xB2); got {} runs {:?} (a split/interleaved <=PIPE_BUF record — BLOCKER #3)",
             REC, runs.len(), runs);
+        if !was_active { crate::sched::disable(); }
         return false;
     }
     if leaked5 != 0 {
         test_fail!("pipe_blocking_write",
             "{} stale writer(s) on PIPE_WRITE_WAITERS after concurrent completion", leaked5);
+        if !was_active { crate::sched::disable(); }
         return false;
     }
     test_println!("  concurrent two-writer atomicity: 2 contiguous {}B records, no interleave ✓", REC);
@@ -36294,6 +36309,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
     }
     test_println!("  kernel-context supervisor drain (pipe_read_wake) woke parked writer ✓");
 
+    // All sub-tests passed — restore the scheduler state we found on entry
+    // (the single `sched::enable()` before sub-test 3 stays in effect across
+    // sub-tests 3-6; disable once here on the success path).
+    if !was_active { crate::sched::disable(); }
     test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / kernel-drain-wake / EAGAIN / EPIPE");
     true
 }
