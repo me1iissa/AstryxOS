@@ -1425,22 +1425,60 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // Re-check generation right before install — Acquire pairs
                 // with the Release fetch_add in `bump_generation_for_cr3`
                 // and `VmSpace::*` mutators (Intel SDM Vol. 3A §8.2.3).
+                //
+                // `generation` is address-space-WIDE, so a bump here can come
+                // from an unrelated VA's mutation.  This arm's install is an
+                // atomic compare-and-swap: `map_page_in_cow_if_unchanged` (below)
+                // writes the leaf PTE only if it STILL maps `old_phys` under
+                // `VMM_LOCK`, and the loser frees `new_phys` cleanly and returns
+                // true.  That CAS is the true protection against a concurrent
+                // unmap/CoW of THIS VA — if a sibling cleared or replaced the
+                // PTE, the CAS fails and we back out without aliasing.  A
+                // `return false` on a bare generation bump would instead deliver
+                // SIGSEGV to a thread doing a legitimate CoW write of a present,
+                // valid page (this kernel has no silent re-fault), so we no
+                // longer abort on a bump alone.  We only abandon the fault if the
+                // faulting VA's own VMA is gone or no longer writable — the case
+                // where the user genuinely lost write access (POSIX SIGSEGV).
                 let gen_now = vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                 if gen_now != gen_at_start {
+                    let still_writable_here = vm_space
+                        .find_vma(faulting_addr)
+                        .map(|v| v.prot & crate::mm::vma::PROT_WRITE != 0)
+                        .unwrap_or(false);
+                    if !still_writable_here {
+                        #[cfg(feature = "firefox-test-core")]
+                        {
+                            static CNT: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 5 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/gen-abort] COW-COPY #{} addr={:#x} \
+                                     gen_at_start={} gen_now={} — faulting VMA \
+                                     gone/RO, dropping new frame",
+                                    n, page_addr, gen_at_start, gen_now);
+                            }
+                        }
+                        crate::mm::pmm::free_page(new_phys);
+                        return false;
+                    }
+                    // Unrelated mutation — the faulting VA is still a writable
+                    // mapping.  Fall through to the atomic CAS install, which
+                    // re-validates `old_phys` under the page-table lock.
                     #[cfg(feature = "firefox-test-core")]
                     {
-                        static CNT: core::sync::atomic::AtomicU64 =
+                        static REVAL: core::sync::atomic::AtomicU64 =
                             core::sync::atomic::AtomicU64::new(0);
-                        let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if n < 5 || n % 500 == 0 {
+                        let n = REVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 5 || n % 5000 == 0 {
                             crate::serial_println!(
-                                "[PF/gen-abort] COW-COPY #{} addr={:#x} \
-                                 gen_at_start={} gen_now={} — dropping new frame",
+                                "[PF/gen-reval] COW-COPY #{} addr={:#x} \
+                                 gen_at_start={} gen_now={} — VMA still writable, \
+                                 proceeding with CAS install",
                                 n, page_addr, gen_at_start, gen_now);
                         }
                     }
-                    crate::mm::pmm::free_page(new_phys);
-                    return false;
                 }
                 // W215 measurement (Phase-1 witness, behaviourally inert):
                 // re-read the leaf PTE immediately before the install.  If a
@@ -1754,16 +1792,43 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     return false;
                 }
 
-                // Closure: per-arm generation re-check.  Returns true if the
-                // caller should abort (and the caller must release `cached_phys`
-                // appropriately before returning false).  The CoW-copy sub-arm
-                // additionally frees its freshly-allocated `private_phys` via
-                // its own check immediately before installing.
-                let gen_unchanged = || -> bool {
+                // Closure: per-arm "safe to install" re-check.  Returns true if
+                // the caller may proceed with the install, false if it must
+                // abandon the fault.
+                //
+                // `generation` is an address-space-WIDE counter: a bump can be
+                // caused by a mutation on a virtual address unrelated to the one
+                // we are faulting on.  Aborting (→ `return false` → SIGSEGV, with
+                // no silent re-fault in this kernel) on a bare bump killed
+                // processes whose faulting page was a live, unchanged cache-hit
+                // mapping — a fatal use-after-fault that any concurrent sibling
+                // mmap could trigger.  The cache-hit install below is atomic
+                // (`map_page_in_if_absent`, mm_sem + VMM_LOCK, present-recheck),
+                // so the install/unmap race on THIS VA is already closed.  We
+                // therefore treat a bump as "safe to proceed" UNLESS the faulting
+                // VA's own VMA has been removed or re-backed away from this
+                // (mount,inode) — the only case where the cached frame would be
+                // stale for the VA (a brief PROCESS_TABLE re-acquire; that lock
+                // is top of the order here, MOUNTS/cache/PMM are not held).
+                let gen_safe_to_install = || -> bool {
                     match ch_vm_generation.as_ref() {
                         Some(g) => {
                             let now = g.load(core::sync::atomic::Ordering::Acquire);
-                            now == ch_gen_at_revalidate
+                            if now == ch_gen_at_revalidate {
+                                return true;
+                            }
+                            // Generation moved — re-validate the SPECIFIC
+                            // faulting VA against the same file backing.
+                            let procs = crate::proc::PROCESS_TABLE.lock();
+                            procs.iter()
+                                .find(|p| p.pid == target_pid)
+                                .and_then(|p| p.vm_space.as_ref())
+                                .and_then(|vs| vs.find_vma(faulting_addr))
+                                .map(|v| matches!(&v.backing,
+                                    crate::mm::vma::VmBacking::File {
+                                        mount_idx: m, inode: ino, ..
+                                    } if *m == mount_idx && *ino == inode))
+                                .unwrap_or(false)
                         }
                         None => true,
                     }
@@ -1799,9 +1864,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 crate::mm::pmm::PAGE_SIZE,
                             );
                         }
-                        // W216 H_5j-B (unified concurrency): re-check generation
-                        // immediately before install — see arm-level closure.
-                        if !gen_unchanged() {
+                        // W216 H_5j-B (unified concurrency): re-validate the
+                        // faulting VA before install — see arm-level closure.
+                        // Only abandon if the faulting VA's own VMA was
+                        // removed/re-backed (an unrelated address-space mutation
+                        // is no longer treated as a reason to SIGSEGV).
+                        if !gen_safe_to_install() {
                             #[cfg(feature = "firefox-test-core")]
                             {
                                 static CNT: core::sync::atomic::AtomicU64 =
@@ -1810,7 +1878,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 if n < 5 || n % 500 == 0 {
                                     crate::serial_println!(
                                         "[PF/gen-abort] CACHE-PRIVATE #{} addr={:#x} \
-                                         gen_at_rev={} — releasing private+cache refs",
+                                         gen_at_rev={} — faulting VMA replaced, \
+                                         releasing private+cache refs",
                                         n, page_addr, ch_gen_at_revalidate);
                                 }
                             }
@@ -1908,11 +1977,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // Steady state after install: cache holds one ref,
                     // this PTE holds one ref (the promoted guard ref) = rc ≥ 2.
                     //
-                    // W216 H_5j-B (unified concurrency): re-check generation
-                    // immediately before install.  On abort we release the
-                    // guard ref so the cache's own reference remains the sole
-                    // holder of `cached_phys`.
-                    if !gen_unchanged() {
+                    // W216 H_5j-B (unified concurrency): re-validate the faulting
+                    // VA before install — see arm-level closure.  Only abandon if
+                    // the faulting VA's own VMA was removed/re-backed; on abort
+                    // we release the guard ref so the cache's own reference
+                    // remains the sole holder of `cached_phys`.
+                    if !gen_safe_to_install() {
                         #[cfg(feature = "firefox-test-core")]
                         {
                             static CNT: core::sync::atomic::AtomicU64 =
@@ -1921,7 +1991,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             if n < 5 || n % 500 == 0 {
                                 crate::serial_println!(
                                     "[PF/gen-abort] CACHE-ALIAS #{} addr={:#x} \
-                                     gen_at_rev={} — releasing guard ref",
+                                     gen_at_rev={} — faulting VMA replaced, \
+                                     releasing guard ref",
                                     n, page_addr, ch_gen_at_revalidate);
                             }
                         }
@@ -2365,32 +2436,106 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // Phase 2b, MADV_DONTNEED, mprotect, sysv_shm push/remove,
                 // brk grow/shrink, clone_for_fork CoW write-protect) since
                 // the post-revalidate sample bumps `vm_space.generation`.
-                // A mismatch means the snapshot we computed before this
-                // iteration is no longer authoritative — abort the install
-                // loop, free remaining frames, return false so the user
-                // re-faults against the new VMA.  Per Intel SDM Vol. 3A
-                // §8.2.3, this Acquire load pairs with the Release fetch_add
-                // in `bump_generation_for_cr3` and `VmSpace::*` mutators.
+                //
+                // `generation` is an address-space-WIDE counter, so a bump can
+                // be caused by a mutation on a virtual address that has nothing
+                // to do with the one we are faulting on.  The original abort
+                // here did `free_page` on every remaining frame and `return
+                // false`; but `false` from `handle_page_fault` delivers SIGSEGV
+                // to the faulting thread immediately (exception_handler →
+                // `deliver_sigsegv_from_isr`) — this kernel has no silent
+                // re-fault, so the "user re-faults against the new VMA" rationale
+                // was incorrect.  When the abort fired on iteration 0 — the
+                // FAULTING page (pages_to_map[0]) — it freed that page WITHOUT
+                // installing any PTE for it and then SIGSEGV'd the live
+                // mapping: a fatal use-after-fault that an unrelated concurrent
+                // mmap on a sibling CPU could trigger at will.
+                //
+                // The only real hazard — installing a PTE over a frame a
+                // concurrent `unmap_and_free_range_in` is freeing — is closed by
+                // the per-page atomic installs below (`map_page_in_if_absent`,
+                // which holds `mm_sem` + `VMM_LOCK` and only writes an absent
+                // leaf PTE; Intel SDM Vol. 3A §4.10.4.3).  So on a bump we
+                // re-validate the SPECIFIC faulting VA's VMA: if it still names
+                // the same file backing and span, the mutation was elsewhere and
+                // we continue the install loop (resyncing the generation
+                // baseline).  Only if the faulting VA's own VMA was replaced do
+                // we drop the not-yet-installed frames; even then we only
+                // SIGSEGV when the faulting page (index 0) itself was never
+                // installed — if an earlier iteration already mapped it, the
+                // fault is resolved and we break to `return true`.
                 if let Some(g) = vm_generation.as_ref() {
                     let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != gen_at_revalidate {
-                        #[cfg(feature = "firefox-test-core")]
-                        crate::serial_println!(
-                            "[PF/gen-abort] READAHEAD addr={:#x} mount={} inode={} \
-                             foff={:#x} gen_at_rev={} gen_now={} — releasing {} \
-                             unmapped frames",
-                            faulting_addr, mount_idx, inode, file_base_offset,
-                            gen_at_revalidate, gen_now, n_pages.saturating_sub(i));
-                        // Release every frame we have not yet installed.
-                        // Frames already installed in earlier iterations (i'
-                        // < i) are reachable via PTE refs and the cache, so
-                        // they remain valid; the user keeps observing them
-                        // through the existing PTEs.
-                        for j in i..n_pages {
-                            let (_v, p, _f) = pages_to_map[j];
-                            crate::mm::pmm::free_page(p);
+                        // Re-validate the faulting VA's VMA (brief PROCESS_TABLE
+                        // re-acquire; PROCESS_TABLE is top of the lock order here
+                        // — MOUNTS / cache / PMM are NOT held).  Mirrors the
+                        // post-I/O revalidate above.
+                        let faulting_vma_ok = {
+                            let procs = crate::proc::PROCESS_TABLE.lock();
+                            procs.iter()
+                                .find(|p| p.pid == target_pid)
+                                .and_then(|p| p.vm_space.as_ref())
+                                .and_then(|vs| vs.find_vma(faulting_addr))
+                                .map(|v| {
+                                    matches!(&v.backing,
+                                        crate::mm::vma::VmBacking::File {
+                                            mount_idx: m, inode: ino, offset: o, ..
+                                        } if *m == mount_idx && *ino == inode
+                                            && *o == file_base_offset)
+                                    && v.base == vma_base
+                                    && v.base + v.length == vma_end
+                                })
+                                .unwrap_or(false)
+                        };
+                        if faulting_vma_ok {
+                            // Unrelated mutation — the faulting VMA is intact.
+                            // Resync the baseline and keep installing.  The
+                            // per-page atomic install protects against any
+                            // residual install/unmap race on each individual VA.
+                            gen_at_revalidate = gen_now;
+                            #[cfg(feature = "firefox-test-core")]
+                            {
+                                static REVAL: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                let n = REVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n < 5 || n % 5000 == 0 {
+                                    crate::serial_println!(
+                                        "[PF/gen-reval] READAHEAD addr={:#x} mount={} \
+                                         inode={} foff={:#x} gen_now={} — faulting VMA \
+                                         intact, continuing install (i={}/{})",
+                                        faulting_addr, mount_idx, inode,
+                                        file_base_offset, gen_now, i, n_pages);
+                                }
+                            }
+                        } else {
+                            // The faulting VA's own VMA was replaced/removed.
+                            // Drop every frame we have not yet installed; frames
+                            // installed in earlier iterations (i' < i) stay valid
+                            // via their PTE + cache refs.
+                            #[cfg(feature = "firefox-test-core")]
+                            crate::serial_println!(
+                                "[PF/gen-abort] READAHEAD addr={:#x} mount={} inode={} \
+                                 foff={:#x} gen_at_rev={} gen_now={} — faulting VMA \
+                                 replaced, releasing {} unmapped frames (i={})",
+                                faulting_addr, mount_idx, inode, file_base_offset,
+                                gen_at_revalidate, gen_now,
+                                n_pages.saturating_sub(i), i);
+                            for j in i..n_pages {
+                                let (_v, p, _f) = pages_to_map[j];
+                                crate::mm::pmm::free_page(p);
+                            }
+                            // The faulting page is pages_to_map[0].  If we already
+                            // passed iteration 0 it is installed and the fault is
+                            // resolved → break to the `mapped_faulting` return.
+                            // If we are still at iteration 0 the faulting page was
+                            // never mapped against a VMA that no longer describes
+                            // it → SIGSEGV (POSIX: access to an unmapped VA).
+                            if i == 0 {
+                                return false;
+                            }
+                            break;
                         }
-                        return false;
                     }
                 }
 
@@ -2794,17 +2939,58 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     }
                 }
                 // W216 H_5j-B: re-check generation immediately before install.
+                //
+                // `generation` is address-space-WIDE, so a bump can come from a
+                // mutation on an unrelated VA.  A `return false` here delivers
+                // SIGSEGV to the faulting thread immediately (this kernel has no
+                // silent re-fault), so the original abort killed a process whose
+                // faulting page was still a live, unchanged file mapping.  The
+                // recycle hazard is already closed by the `map_page_in_if_absent`
+                // install below (mm_sem + VMM_LOCK, present-recheck).  On a bump
+                // we therefore re-validate the SPECIFIC faulting VA; if its VMA
+                // still names the same backing we proceed, and only abandon the
+                // fault (legitimate SIGSEGV) if the faulting VA's own VMA was
+                // replaced/removed.  Per Intel SDM Vol. 3A §4.10.4.3.
                 if let Some(g) = sp_vm_generation.as_ref() {
                     let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != sp_gen_at_revalidate {
+                        let faulting_vma_ok = {
+                            let procs = crate::proc::PROCESS_TABLE.lock();
+                            procs.iter()
+                                .find(|p| p.pid == target_pid)
+                                .and_then(|p| p.vm_space.as_ref())
+                                .and_then(|vs| vs.find_vma(faulting_addr))
+                                .map(|v| matches!(&v.backing,
+                                    crate::mm::vma::VmBacking::File {
+                                        mount_idx: m, inode: ino, ..
+                                    } if *m == mount_idx && *ino == inode))
+                                .unwrap_or(false)
+                        };
+                        if !faulting_vma_ok {
+                            #[cfg(feature = "firefox-test-core")]
+                            crate::serial_println!(
+                                "[PF/gen-abort] SINGLE-PAGE addr={:#x} mount={} inode={} \
+                                 foff={:#x} gen_at_rev={} gen_now={} — faulting VMA \
+                                 replaced, dropping frame",
+                                faulting_addr, mount_idx, inode, file_page_offset,
+                                sp_gen_at_revalidate, gen_now);
+                            crate::mm::pmm::free_page(phys);
+                            return false;
+                        }
                         #[cfg(feature = "firefox-test-core")]
-                        crate::serial_println!(
-                            "[PF/gen-abort] SINGLE-PAGE addr={:#x} mount={} inode={} \
-                             foff={:#x} gen_at_rev={} gen_now={} — dropping frame",
-                            faulting_addr, mount_idx, inode, file_page_offset,
-                            sp_gen_at_revalidate, gen_now);
-                        crate::mm::pmm::free_page(phys);
-                        return false;
+                        {
+                            static REVAL: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = REVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 5 || n % 5000 == 0 {
+                                crate::serial_println!(
+                                    "[PF/gen-reval] SINGLE-PAGE addr={:#x} mount={} \
+                                     inode={} foff={:#x} gen_now={} — faulting VMA \
+                                     intact, proceeding with atomic install",
+                                    faulting_addr, mount_idx, inode,
+                                    file_page_offset, gen_now);
+                            }
+                        }
                     }
                 }
                 // Bug-B fix (single-page fallback): hold a guard reference
@@ -3052,23 +3238,81 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
                     }
                     // Re-check generation immediately before install.
+                    //
+                    // A generation bump means SOME VMA-list mutation happened on
+                    // a sibling CPU since `gen_at_start` (sys_mmap/munmap,
+                    // MAP_FIXED Phase 2b, MADV_DONTNEED, brk grow/shrink, a CoW
+                    // write-protect pass) — but `generation` is an
+                    // address-space-WIDE counter: it is bumped for mutations on
+                    // UNRELATED virtual addresses, not just the faulting one.
+                    // The original abort here did `free_page(phys); return
+                    // false`, and a `false` return from `handle_page_fault`
+                    // delivers SIGSEGV to the faulting thread IMMEDIATELY
+                    // (exception_handler → `deliver_sigsegv_from_isr`) — this
+                    // kernel has NO silent re-fault/retry of the instruction, so
+                    // `false` is a hard kill, not a "re-fault against the new
+                    // VMA".  A bump caused by an unrelated mmap on another VA
+                    // therefore SIGSEGV'd a process whose faulting page was
+                    // perfectly valid.  Under a genuinely-concurrent SMP
+                    // scheduler (per-CPU runqueues) sibling mutations land
+                    // constantly during process startup, making this a fatal
+                    // use-after-fault on a LIVE anonymous VMA.
+                    //
+                    // The real hazard the gen-check was meant to guard —
+                    // installing a PTE over a frame a concurrent
+                    // `unmap_and_free_range_in` is freeing — is already closed by
+                    // the atomic `map_page_in_if_absent` install below: it holds
+                    // `mm_sem` + `VMM_LOCK` and writes the leaf PTE only if it is
+                    // still absent, so the loser of any install/unmap race on
+                    // THIS VA backs out and frees its own fresh frame (`phys`),
+                    // never aliasing or resurrecting a recycled one (Intel SDM
+                    // Vol. 3A §4.10.4.3).
+                    //
+                    // Correct response to a bump: re-validate the SPECIFIC
+                    // faulting VA.  If its VMA is still anonymous and still
+                    // covers `page_addr`, the mutation was elsewhere — proceed
+                    // with the atomic install.  Only if the faulting VA's own
+                    // VMA was removed or re-backed do we abandon the fault — a
+                    // legitimate SIGSEGV: the user really lost this mapping
+                    // (POSIX: access to an unmapped address raises SIGSEGV).
                     let gen_now =
                         vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != gen_at_start {
+                        let still_anon_here = matches!(
+                            vm_space.find_vma(faulting_addr).map(|v| &v.backing),
+                            Some(crate::mm::vma::VmBacking::Anonymous));
+                        if !still_anon_here {
+                            #[cfg(feature = "firefox-test-core")]
+                            {
+                                static CNT: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n < 5 || n % 500 == 0 {
+                                    crate::serial_println!(
+                                        "[PF/gen-abort] ANON #{} addr={:#x} \
+                                         gen_at_start={} gen_now={} — faulting VMA \
+                                         removed/re-backed, releasing frame",
+                                        n, page_addr, gen_at_start, gen_now);
+                                }
+                            }
+                            crate::mm::pmm::free_page(phys);
+                            return false;
+                        }
+                        // Unrelated mutation — the faulting VA is still a live
+                        // anonymous mapping.  Fall through to the atomic install.
                         #[cfg(feature = "firefox-test-core")]
                         {
-                            static CNT: core::sync::atomic::AtomicU64 =
+                            static REVAL: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
-                            let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            if n < 5 || n % 500 == 0 {
+                            let n = REVAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 5 || n % 5000 == 0 {
                                 crate::serial_println!(
-                                    "[PF/gen-abort] ANON #{} addr={:#x} \
-                                     gen_at_start={} gen_now={} — releasing frame",
+                                    "[PF/gen-reval] ANON #{} addr={:#x} \
+                                     gen_at_start={} gen_now={} — VMA still live, \
+                                     proceeding with atomic install",
                                     n, page_addr, gen_at_start, gen_now);
                             }
                         }
-                        crate::mm::pmm::free_page(phys);
-                        return false;
                     }
                     // Anti-aliasing re-check (POSIX mmap(2) demand paging;
                     // Intel SDM Vol. 3A §4.10.4.3 "Optional Invalidation").
