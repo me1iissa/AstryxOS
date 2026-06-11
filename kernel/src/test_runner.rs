@@ -233,6 +233,19 @@ pub fn run() -> ! {
     total += 1;
     if test_exit_group_running_sibling_stack_guard() { passed += 1; }
 
+    // ── Test 245: kstack context-switch-generation quiescence barrier ────
+    // The SMP teardown grace period: a reclaimed kstack is unreusable until
+    // every online CPU has passed through schedule() since reclaim, and is
+    // never stranded once they have.  Companion to the live-kstack reap
+    // guard above — registered equally early (and before the blocking-pipe
+    // suite, which is known to wedge on this branch under dual-core) so the
+    // barrier regression signal always lands.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_245_kstack_gen_quiesce_barrier() { passed += 1; }
+    }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
@@ -2349,6 +2362,11 @@ pub fn run() -> ! {
         total += 1;
         if test_236_dead_stack_zeroing() { passed += 1; }
     }
+
+    // (Test 245 — kstack generation-barrier quiescence — is registered in
+    // the early block right after the exit_group SMP teardown guard, before
+    // the blocking-pipe suite, so its signal lands even if a later test
+    // wedges.  See the top of this function.)
 
     // ── Test 237: IPv4 total_length clamp (H6) ───────────────────────────
     // RFC 791 §3.1 — verifies `clamp_payload_to_total_length` produces
@@ -45464,32 +45482,38 @@ fn test_236_dead_stack_zeroing() -> bool {
     // Push through the public shim — same code path the reaper uses.
     let pushed = crate::sched::push_dead_stack_pub(base_virt);
     if !pushed {
-        // The cache may already be full from prior tests.  Drop the stack
-        // back to PMM and report a soft pass (the zeroing has happened
-        // before the cache-full check returned false, so the stack is
-        // still zeroed — we can verify that).
-        test_println!("  cache full — verifying zeroing happened anyway");
-        let mut nonzero = 0u32;
+        // The cache may already be full from prior tests.  The push must
+        // not have WRITTEN anything: zeroing is deferred to re-issue
+        // (`pop_dead_stack`), because a push-time write is exactly the
+        // corrupting store the context-switch-generation quiescence gate
+        // exists to prevent (a sibling CPU may still be
+        // mid-`switch_context_asm` on the stack at push time).  Verify the
+        // sentinel survived untouched, then drop the pages back to PMM.
+        test_println!("  cache full — verifying push wrote NOTHING (zero deferred to pop)");
+        let mut clobbered = 0u32;
         for off in 0..STACK_BYTES {
             let b = unsafe { core::ptr::read_volatile((base_virt + off as u64) as *const u8) };
-            if b != 0 { nonzero += 1; if nonzero <= 4 { test_println!("    nonzero at off={:#x} = {:#x}", off, b); } }
+            if b != SENTINEL { clobbered += 1; if clobbered <= 4 { test_println!("    clobbered at off={:#x} = {:#x}", off, b); } }
         }
         for p in 0..STACK_PAGES {
             crate::mm::pmm::free_page(phys + (p as u64) * 0x1000);
         }
-        if nonzero != 0 {
-            test_fail!("test236", "{} nonzero bytes after push (cache-full path)", nonzero);
+        if clobbered != 0 {
+            test_fail!("test236", "{} bytes written by push (cache-full path) — push must not write", clobbered);
             return false;
         }
-        test_pass!("kstack zeroed even when dead-stack cache was full");
+        test_pass!("push_dead_stack wrote nothing (zero correctly deferred to re-issue)");
         return true;
     }
 
     // Pop it back to recover the same base.  Use the test-only force shim
-    // that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate added in PR #348 —
-    // a same-frame push/pop pair would otherwise be withheld for ~20 ms
-    // (TICK_HZ=100 × 2 ticks) and the test would deterministically fail.
-    // Production callers continue to use the quiesced `pop_dead_stack`.
+    // that bypasses the context-switch-generation quiescence gate — a
+    // same-frame push/pop pair would otherwise be withheld until every
+    // online CPU has scheduled at least once and the test would
+    // deterministically fail.  The force shim still performs the re-issue
+    // zero-fill, so the CWE-244 contract checked below is the production
+    // contract.  Production callers continue to use the gated
+    // `pop_dead_stack`.
     //
     // The pop returns `(base, size)`; size is verified below to match
     // the honest extent we pushed, closing the
@@ -45576,6 +45600,159 @@ fn test_236_dead_stack_zeroing() -> bool {
 //   (d) total_length == frame_len, total_length > frame_len, and the
 //       degenerate frame_len == payload_start case.
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+/// ── Test 245: kstack context-switch-generation quiescence barrier ────────
+///
+/// Regression guard for the SMP kstack reuse/free race: a reclaimed kernel
+/// stack must not be re-issued (nor zero-filled, nor PMM-freed) until every
+/// online CPU has passed through `schedule()` at least once after the
+/// reclaim-time generation snapshot.  This is the causal grace period the
+/// previous wall-clock gate (`TICK_COUNT` advance) could not provide: a live
+/// sibling CPU keeps the wall clock ticking even while the other CPU is
+/// stalled mid-`switch_context_asm` on the very stack being recycled, so a
+/// time-based gate can (and did) declare a still-in-use stack "quiesced".
+///
+/// Deterministic assertions:
+///   (a) HOLD — with IF=0 on this CPU, a generation snapshot taken now can
+///       never report quiesced (this CPU's generation is provably frozen
+///       while it cannot pass through `schedule()`), and a stack pushed in
+///       the same IF=0 window is withheld by `pop_dead_stack`.
+///   (b) RELEASE — after yielding, the same snapshot quiesces (every online
+///       CPU scheduled at least once) and the pushed stack becomes
+///       recyclable: the barrier releases, stacks are NOT stranded forever.
+fn test_245_kstack_gen_quiesce_barrier() -> bool {
+    test_header!("sched: kstack gen barrier holds under IF=0, releases after grace period");
+
+    const STACK_PAGES: usize = crate::proc::KERNEL_STACK_PAGES_PUB;
+
+    // The grace clock only advances while CPUs schedule: `schedule()` bumps
+    // only when the scheduler is active, and the BSP's release-phase yields
+    // are no-ops while it is disabled.  The suite runs most tests with the
+    // scheduler disabled, so enable it for the duration (same pattern as
+    // the other scheduling tests) and restore on every exit path.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Fresh page run standing in for a reaped kstack (same pattern as 236).
+    let phys = match crate::mm::pmm::alloc_pages(STACK_PAGES) {
+        Some(p) => p,
+        None => {
+            test_fail!("test245", "pmm::alloc_pages({}) failed", STACK_PAGES);
+            if !was_active { crate::sched::disable(); }
+            return false;
+        }
+    };
+    let base_virt = crate::proc::KERNEL_VIRT_OFFSET + phys;
+
+    // Drain pre-existing quiesced entries so the pop assertions below run
+    // against a deterministic cache.  Drained bases are re-parked at the end.
+    crate::sched::wait_dead_stacks_quiesced();
+    let mut parked: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    while let Some(e) = crate::sched::pop_dead_stack() {
+        parked.push(e);
+    }
+
+    // ── (a) HOLD ──────────────────────────────────────────────────────────
+    crate::hal::disable_interrupts();
+    let snap = crate::sched::ctx_gen_snapshot_now();
+    let held_gen = !crate::sched::ctx_gen_quiesced(&snap);
+    let pushed = crate::sched::push_dead_stack_pub(base_virt);
+    // A stack pushed in this same IF=0 window carries a snapshot that
+    // includes THIS CPU's frozen generation — pop must withhold it.
+    let held_cache = if pushed {
+        crate::sched::pop_dead_stack().is_none()
+    } else {
+        true // cache full — nothing to assert on the cache half
+    };
+    crate::hal::enable_interrupts();
+
+    if !held_gen {
+        test_fail!("test245", "snapshot reported quiesced while IF=0 froze this CPU's generation");
+    }
+    if !held_cache {
+        test_fail!("test245", "pop_dead_stack re-issued a stack in the same IF=0 window as its push");
+    }
+
+    // ── (b) RELEASE ───────────────────────────────────────────────────────
+    // Tick-bounded wait: an idle sibling CPU reports quiescence from its
+    // 100 Hz timer wake (`check_reschedule`), so the release can take a few
+    // timer periods — an iteration-counted spin of fast yields can elapse
+    // in under one tick and miss it.
+    let release_deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(200);
+    let mut released_gen = false;
+    while crate::arch::x86_64::irq::get_ticks() < release_deadline {
+        if crate::sched::ctx_gen_quiesced(&snap) { released_gen = true; break; }
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    if !released_gen {
+        test_fail!("test245", "generation snapshot never quiesced within 200 ticks — barrier strands");
+    }
+
+    // The pushed stack must become recyclable.  Pop scans oldest-first and
+    // the cache was drained above, so our entry is at the front; a foreign
+    // entry (a reaper push that landed between the drain and our push) is
+    // re-parked and the loop continues.  If the cache empties without us
+    // seeing our base, a concurrent thread-spawn legitimately consumed it —
+    // recycling demonstrably works; the pages have become a live kstack and
+    // MUST NOT be freed here.
+    let mut released_cache = !pushed;
+    let mut pages_ownership_transferred = false;
+    if pushed {
+        let pop_deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(200);
+        while crate::arch::x86_64::irq::get_ticks() < pop_deadline {
+            match crate::sched::pop_dead_stack() {
+                Some((b, _sz)) if b == base_virt => {
+                    released_cache = true;
+                    break;
+                }
+                Some((b, _sz)) => {
+                    // Foreign quiesced entry — return it to the cache.
+                    let _ = crate::sched::push_dead_stack_pub(b);
+                }
+                None => {}
+            }
+            if crate::sched::dead_stack_cache_len() == 0 {
+                released_cache = true;
+                pages_ownership_transferred = true;
+                break;
+            }
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+    }
+    if !released_cache {
+        test_fail!("test245", "pushed stack never became recyclable after the grace period");
+    }
+
+    // Re-park the entries drained at the start (restores the pre-test cache).
+    for (b, _s) in parked {
+        let _ = crate::sched::push_dead_stack_pub(b);
+    }
+
+    // Return our pages to the PMM unless a concurrent spawn took ownership,
+    // or the entry is still gated inside the cache (failure path — freeing
+    // under a parked entry would recreate the very UAF this barrier closes).
+    if released_cache && !pages_ownership_transferred {
+        for p in 0..STACK_PAGES {
+            crate::mm::pmm::free_page(phys + (p as u64) * 0x1000);
+        }
+    }
+
+    let quarantine_len = crate::sched::dead_stack_quarantine_len();
+    test_println!("  quarantine_len={} (drains via reaper as CPUs schedule)", quarantine_len);
+
+    if !was_active { crate::sched::disable(); }
+
+    if held_gen && held_cache && released_gen && released_cache {
+        test_pass!("gen barrier: held under IF=0, released after every-CPU grace, no strand");
+        true
+    } else {
+        false
+    }
+}
+
 fn test_237_ipv4_total_length_clamp() -> bool {
     test_header!("security: IPv4 total_length payload clamp (audit H6, RFC 791 §3.1)");
 
