@@ -36148,7 +36148,126 @@ fn test_pipe_blocking_write_semantics() -> bool {
     }
     test_println!("  concurrent two-writer atomicity: 2 contiguous {}B records, no interleave ✓", REC);
 
-    test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / EAGAIN / EPIPE");
+    // ── Sub-test 6: KERNEL-context supervisor drain wakes parked writers ──
+    //
+    // The exec supervisors (gui::terminal::poll_output and the demo
+    // supervisor loops) drain the child's stdout/stderr pipe from KERNEL
+    // context via the pipe-id helpers, not via read(2).  Per POSIX
+    // write(2)/pipe(7), a writer blocked on a full pipe must resume when
+    // the reader frees room — so the kernel-context drain must wake parked
+    // writers exactly like the read(2) arm does.  Pre-fix, `poll_output`
+    // called raw `pipe_read` (state advance only, no wake): a writer that
+    // filled the 4 KiB launcher pipe parked forever even though the
+    // supervisor drained the pipe to empty on the very next poll.  This
+    // sub-test parks a writer (watchdog-proven, same pattern as sub-test
+    // 4), then drains ONCE via `pipe_read_wake` — the call the supervisors
+    // now use — and asserts the blocked write completes.
+    static W6_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+    static W6_PARK_OBSERVED: AtomicU32 = AtomicU32::new(0);
+    static W6_DRAINED: AtomicU64 = AtomicU64::new(0);
+
+    let mut fds6 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds6.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for kernel-drain test returned {}", r);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let (rfd6, wfd6) = (fds6[0] as u64, fds6[1] as u64);
+    let pipe_id6 = crate::syscall::get_pipe_id(pid, wfd6 as usize);
+    W6_PIPE_ID.store(pipe_id6, Ordering::SeqCst);
+    W6_PARK_OBSERVED.store(0, Ordering::SeqCst);
+    W6_DRAINED.store(0, Ordering::SeqCst);
+
+    // Fill the ring exactly: the next atomic write MUST park.
+    let fill6 = [0x33u8; crate::ipc::pipe::PIPE_BUF];
+    let fn6 = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd6, fill6.as_ptr() as u64, fill6.len() as u64, 0, 0, 0);
+    if fn6 != fill6.len() as i64 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain prefill write returned {} (expected {})", fn6, fill6.len());
+        crate::syscall::dispatch_linux_kernel(3, rfd6, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd6, 0, 0, 0, 0, 0);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+
+    // Watchdog: wait until the writer is provably parked, then drain ONCE
+    // from kernel context via pipe_read_wake — the supervisor-drain call
+    // under test.  No read(2), no fd: this is exactly what poll_output does.
+    fn w6_watchdog_entry() {
+        crate::hal::enable_interrupts();
+        let pipe_id = W6_PIPE_ID.load(Ordering::SeqCst);
+        loop {
+            if crate::ipc::pipe::debug_writer_waiter_count(pipe_id) >= 1 {
+                W6_PARK_OBSERVED.store(1, Ordering::SeqCst);
+                break;
+            }
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+        let mut sink = [0u8; 4096];
+        loop {
+            let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut sink).unwrap_or(0);
+            if n == 0 {
+                // Empty — if the writer hasn't deposited yet, keep polling
+                // until the parked write completes and is drained too.
+                if W6_DRAINED.load(Ordering::SeqCst) >= (crate::ipc::pipe::PIPE_BUF + 512) as u64 {
+                    break;
+                }
+                crate::sched::yield_cpu();
+                crate::hal::enable_interrupts();
+                for _ in 0..200u32 { core::hint::spin_loop(); }
+                continue;
+            }
+            W6_DRAINED.fetch_add(n as u64, Ordering::SeqCst);
+        }
+        crate::proc::exit_thread(0);
+    }
+    let _w6_pid = crate::proc::create_kernel_process(
+        "pipe_kdrain_watchdog", w6_watchdog_entry as *const () as u64);
+
+    // Blocking atomic write of 512 bytes into 0 free — must park, then be
+    // woken by the watchdog's pipe_read_wake drain and complete in full.
+    let rec6 = [0x44u8; 512];
+    let wn6 = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd6, rec6.as_ptr() as u64, rec6.len() as u64, 0, 0, 0);
+
+    // Allow the watchdog to drain the deposited record before teardown.
+    for _ in 0..256u32 {
+        if W6_DRAINED.load(Ordering::SeqCst) >= (crate::ipc::pipe::PIPE_BUF + 512) as u64 { break; }
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    let leaked6 = crate::ipc::pipe::debug_writer_waiter_count(pipe_id6);
+    crate::syscall::dispatch_linux_kernel(3, rfd6, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd6, 0, 0, 0, 0, 0);
+
+    if W6_PARK_OBSERVED.load(Ordering::SeqCst) != 1 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain sub-test: writer never parked on the full pipe");
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if wn6 != rec6.len() as i64 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain sub-test: blocked write returned {} (expected {} after pipe_read_wake drain — a raw pipe_read drain leaves the writer parked forever)",
+            wn6, rec6.len());
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if leaked6 != 0 {
+        test_fail!("pipe_blocking_write",
+            "{} stale writer(s) on PIPE_WRITE_WAITERS after kernel-context drain", leaked6);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    test_println!("  kernel-context supervisor drain (pipe_read_wake) woke parked writer ✓");
+
+    test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / kernel-drain-wake / EAGAIN / EPIPE");
     true
 }
 

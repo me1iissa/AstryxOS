@@ -259,6 +259,25 @@ pub fn get_ticks() -> u64 {
 /// fired.
 pub static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Per-CPU TSC timestamp of the most recent LAPIC-timer ISR on that CPU,
+/// recorded by the timer ISR itself.  Lets `idle_tick` decide whether
+/// THIS CPU's timer fired RECENTLY (safe to `hlt` — the next periodic
+/// fire will wake us) or has gone silent while a sibling keeps the global
+/// clock alive (must spin — a halted core with a dead local timer never
+/// wakes; Intel SDM Vol. 2A, HLT).  A timestamp, not a fire COUNT: a
+/// count delta only proves "fired since the previous check", which on the
+/// first check after a long gap (e.g. the supervisor loop's very first
+/// iteration, long after an early-boot LAPIC death) wrongly blesses a
+/// terminal hlt.  Each slot is written only by its own CPU's ISR.
+static LAST_TIMER_FIRE_TSC: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
+/// Per-CPU TSC of the last LAPIC rearm attempt from `idle_tick`'s
+/// timer-silent path — rate-limits revival writes to one per slack window
+/// so the spin path doesn't hammer LAPIC MMIO.
+static LAST_REARM_TSC: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
 /// Last TSC-floor tick at which the BSP idle path drove a software scheduler
 /// tick. Used to rate-limit the software tick to ~`TICK_HZ`.
 static LAST_SOFT_TICK: AtomicU64 = AtomicU64::new(0);
@@ -302,14 +321,60 @@ pub fn idle_tick(slack: u64) -> bool {
     if tsc_per_tick == 0 {
         return true; // pre-calibration: nothing to drive yet, hlt is fine
     }
+    let now_tsc = rdtsc();
     let published = TICK_COUNT.load(Ordering::Relaxed);
     let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
-    let elapsed = rdtsc().wrapping_sub(tsc_at_boot);
+    let elapsed = now_tsc.wrapping_sub(tsc_at_boot);
     let tsc_floor = elapsed / tsc_per_tick;
 
     // Timer healthy: the ISR is keeping TICK_COUNT within `slack` of the TSC.
     if tsc_floor <= published.wrapping_add(slack) {
-        return true;
+        // The GLOBAL clock is healthy — but on SMP that only proves SOME
+        // CPU's LAPIC is firing.  `hlt` parks THIS CPU until an interrupt
+        // arrives HERE, so the caller may only sleep if THIS CPU's own
+        // timer has fired recently.  Otherwise a CPU whose LAPIC delivery
+        // is suppressed (KVM occasionally silences one vCPU's periodic
+        // timer while a sibling keeps the global tick alive) passes the
+        // global check, executes `hlt`, and — receiving no interrupts at
+        // all — never runs again.  Observed live: the BSP supervisor loop
+        // slept forever at its `hlt` while CPU 1 carried the whole boot,
+        // so the launcher-pipe drain stopped and every Firefox process
+        // wedged in a blocking stdout/stderr write.  Per Intel SDM Vol. 2A
+        // (HLT): the processor remains halted until an enabled interrupt,
+        // NMI, or reset — a silent LAPIC provides none.
+        let cpu = super::apic::cpu_index();
+        if cpu >= super::apic::MAX_CPUS {
+            return true;
+        }
+        // Bless the hlt ONLY if this CPU's own timer ISR fired within the
+        // slack window (TSC timestamp recorded by the ISR itself).  A
+        // recent fire is the only evidence that the NEXT periodic fire —
+        // the thing that wakes a hlt — is actually coming.  A fire COUNT
+        // delta is not sufficient: it proves "fired at some point since
+        // the previous check", which on the first check after a long gap
+        // wrongly blesses a terminal hlt (observed live: the BSP's LAPIC
+        // delivered its last fire ~1.2 s into boot, the supervisor loop
+        // started later, saw a nonzero count on its first iteration,
+        // hlt'ed, and slept forever — no device IRQ ever woke it, the
+        // launcher-pipe drain stopped, and every Firefox process wedged
+        // in a blocking stdout/stderr write).
+        let last_fire = LAST_TIMER_FIRE_TSC[cpu].load(Ordering::Relaxed);
+        let stale_tsc = slack.saturating_mul(tsc_per_tick);
+        if last_fire != 0 && now_tsc.wrapping_sub(last_fire) <= stale_tsc {
+            return true;
+        }
+        // THIS CPU's timer is silent beyond the slack window (or has never
+        // fired) while the global clock advances on a sibling.  Tell the
+        // caller to SPIN — its outer loop stays alive and re-polls — and
+        // try to revive our LAPIC, rate-limited to one attempt per window
+        // so the spin path doesn't hammer LAPIC MMIO.
+        let last_rearm = LAST_REARM_TSC[cpu].load(Ordering::Relaxed);
+        if now_tsc.wrapping_sub(last_rearm) > stale_tsc {
+            LAST_REARM_TSC[cpu].store(now_tsc, Ordering::Relaxed);
+            super::apic::rearm_timer();
+            TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        return false;
     }
 
     // Timer starved. Try to revive it (harmless if it's just masked), then
@@ -513,6 +578,10 @@ extern "C" fn timer_tick() {
     let is_bsp = cpu == 0;
     if cpu < super::apic::MAX_CPUS {
         TIMER_ISR_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+        // Freshness timestamp for `idle_tick`'s hlt-safety check: a CPU may
+        // only hlt if ITS OWN timer fired recently enough that the next
+        // periodic fire (the wakeup) is credibly imminent.
+        LAST_TIMER_FIRE_TSC[cpu].store(rdtsc(), Ordering::Relaxed);
     }
 
     // Compute the wall-clock-correct TICK_COUNT from the TSC delta.  Any

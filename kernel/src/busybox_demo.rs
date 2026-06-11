@@ -182,7 +182,7 @@ pub(crate) fn run_applet_with_env_and_cwd(
 
         // Drain whatever the child wrote since last poll.  pipe_read is
         // non-blocking; n==0 means "no bytes ready", not EOF.
-        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+        if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {
             if n > 0 && captured.len() < 4096 {
                 let take = core::cmp::min(n, 4096 - captured.len());
                 captured.extend_from_slice(&buf[..take]);
@@ -217,7 +217,7 @@ pub(crate) fn run_applet_with_env_and_cwd(
     // Drain any tail bytes the child wrote after we noticed it exited.
     {
         let mut tail = [0u8; 4096];
-        while let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut tail) {
+        while let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail) {
             if n == 0 {
                 break;
             }

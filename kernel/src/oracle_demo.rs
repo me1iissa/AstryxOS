@@ -201,7 +201,7 @@ pub fn run_oracle_demo() {
     loop {
         crate::sched::yield_cpu();
 
-        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+        if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {
             if n > 0 && captured.len() < cap {
                 let take = core::cmp::min(n, cap - captured.len());
                 captured.extend_from_slice(&buf[..take]);
@@ -250,7 +250,7 @@ pub fn run_oracle_demo() {
     // Drain any tail bytes the child wrote after we noticed it exited.
     {
         let mut tail = [0u8; 4096];
-        while let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut tail) {
+        while let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail) {
             if n == 0 {
                 break;
             }
@@ -548,7 +548,7 @@ pub fn run_oracle_daemon() {
         // tcp_timer_tick() has no caller to drain the send_buffer.
         crate::net::poll();
 
-        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+        if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {
             if n > 0 && captured.len() < cap {
                 let take = core::cmp::min(n, cap - captured.len());
                 captured.extend_from_slice(&buf[..take]);
@@ -642,7 +642,7 @@ pub fn run_oracle_daemon() {
     // Drain any tail bytes the child wrote after the soak deadline.
     {
         let mut tail = [0u8; 4096];
-        while let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut tail) {
+        while let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail) {
             if n == 0 {
                 break;
             }

@@ -180,7 +180,7 @@ pub fn run_sshd_demo() {
         crate::sched::yield_cpu();
 
         // Drain stdout — dropbear writes init banner + per-event lines.
-        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+        if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {
             if n > 0 && captured.len() < 16_384 {
                 let take = core::cmp::min(n, 16_384 - captured.len());
                 captured.extend_from_slice(&buf[..take]);

@@ -1625,7 +1625,31 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 if crate::arch::x86_64::irq::idle_tick(5) {
                     unsafe { core::arch::asm!("hlt"); }
                 } else {
-                    core::hint::spin_loop();
+                    // THIS CPU's LAPIC timer is silent (idle_tick refused
+                    // the hlt — a halted core with a dead local timer never
+                    // wakes; Intel SDM Vol. 2A, HLT).  Busy-wait until the
+                    // GLOBAL tick advances (the sibling CPU's ISR keeps it
+                    // alive) so this loop still iterates at ~TICK_HZ — the
+                    // same cadence as the healthy-timer hlt path — instead
+                    // of re-entering yield_cpu()/schedule() millions of
+                    // times per second.  Bounded by a TSC guard so a
+                    // fully-dead clock (no sibling either) cannot trap us
+                    // here: idle_tick has then already driven a software
+                    // tick and we fall through to the next iteration.
+                    let entry_tick = crate::arch::x86_64::irq::get_ticks();
+                    let mut spin_guard: u64 = 0;
+                    while crate::arch::x86_64::irq::get_ticks() == entry_tick {
+                        core::hint::spin_loop();
+                        // Iteration-bounded guard (~one tick of PAUSE):
+                        // if the GLOBAL clock is dead too (no sibling),
+                        // idle_tick has already driven a software tick —
+                        // fall through to the next loop iteration rather
+                        // than trapping here.
+                        spin_guard += 1;
+                        if spin_guard > 50_000_000 {
+                            break;
+                        }
+                    }
                 }
             }
 

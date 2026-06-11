@@ -344,6 +344,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
         "unix-diag"      => op_unix_diag(req, out),
+        "pipe-diag"      => op_pipe_diag(req, out),
         "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
@@ -2004,6 +2005,39 @@ fn op_fd_map(req: &str, out: &mut String) {
 //
 // Decisive recv-side readiness probe for one AF_UNIX socket inode.  Answers, at
 // a live wedge, the gate-4 question: does the content proc's IPDL channel have
+// ── pipe-diag ─────────────────────────────────────────────────────────────────
+//
+// One-pipe diagnostic for blocking-write triage: ring occupancy, free space,
+// endpoint refcounts, and how many threads are parked on each waitlist.
+// Discriminates "pipe full + writers parked" (reader not draining) from
+// "pipe empty + writers parked" (drain ran but the wake was lost) from
+// "no waiters" (writer blocked elsewhere).
+//
+// Request: {"op":"pipe-diag","id":N}.
+// Reply:   {"id":N,"buffered":B,"space":S,"readers":R,"writers":W,
+//           "read_waiters":RW,"write_waiters":WW}
+fn op_pipe_diag(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let id: u64 = match extract_field(req, "id").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing 'id' field"}"#); return; }
+    };
+    match crate::ipc::pipe::pipe_diag_for(id) {
+        Some((buffered, space, readers, writers)) => {
+            let rw = crate::ipc::pipe::debug_reader_waiter_count(id);
+            let ww = crate::ipc::pipe::debug_writer_waiter_count(id);
+            let _ = write!(
+                out,
+                r#"{{"id":{},"buffered":{},"space":{},"readers":{},"writers":{},"read_waiters":{},"write_waiters":{}}}"#,
+                id, buffered, space, readers, writers, rw, ww
+            );
+        }
+        None => {
+            let _ = write!(out, r#"{{"id":{},"error":"no such pipe"}}"#, id);
+        }
+    }
+}
+
 // UNREAD data in its recv ring (recv_avail>0) that epoll fails to report (=> P1
 // epoll readiness drop), an undelivered SCM batch sitting ahead of the reader
 // (=> P2 recvmsg SCM drop), or an EMPTY ring with no pending SCM (=> the parent

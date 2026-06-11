@@ -976,35 +976,25 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Without this, Firefox forks a child that execs dbus-launch, fails
         // (not on disk), and both parent and child exit with code 1.
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus.sock",
-        // Route NSPR/XPCOM module logging to stderr (fd 2) so the kernel
-        // write-trace picks it up.  Level 5 = debug.  Deliberately omit
-        // NSPR_LOG_FILE — we want output on the parent-visible fd, not
-        // squirreled away in a file we'd have to tail separately.
-        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
-        // Gate-1 (socket-process init crash) discriminator: narrow MOZ_LOG to
-        // the PSM/NSS modules, add the `sync` flag (unbuffered writes — the
-        // previous buffered file stayed 0 bytes when the child aborted), and
-        // use the %PID token so every process gets its own log file
-        // (/tmp/moz-main.<pid>.log / /tmp/moz-child.<pid>.log) readable
-        // post-mortem via the kdb `read-file` op.
-        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
-        // Route NSPR/XPCOM module logging to stderr (fd 2) so the kernel
-        // write-trace picks it up.  Level 5 = debug.  Deliberately omit
-        // NSPR_LOG_FILE — we want output on the parent-visible fd, not
-        // squirreled away in a file we'd have to tail separately.
-        //
-        // Gate-1 caution (2026-06-10): do NOT raise the pid-1 stderr volume
-        // (e.g. by dropping MOZ_LOG_FILE below) until pipe(7) full-buffer
-        // blocking semantics land — with the stdout pipe full, write(2)
-        // currently returns no-progress and musl stdio retries forever,
-        // wedging every child on its first stderr line.
-        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
-        "MOZ_LOG=all:5,nsresult:5,xpcom:5",
-        "NSPR_LOG_MODULES=all:5",
-        // Redirect MOZ_LOG output to a file so it survives past any pipe
-        // read-deadline.  Extractable post-run via QGA guest-file-read.
-        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
-        "MOZ_LOG_FILE=/tmp/mozlog",
+        // Gecko module logging, scoped + routed to stderr (fd 2) so the
+        // kernel stderr mirrors pick every line up live.  Module choice is
+        // the Gate-1 (socket-process init crash) discriminator set: the
+        // socket process dies inside its own NSS/PSM init with a
+        // release-silent `return false`, and these modules are the only
+        // voice that names the failing sub-step:
+        //   * socketprocess — SocketProcessChild init/teardown lifecycle
+        //   * pipnss        — PSM/NSS init (CommonInit / cipher-suite /
+        //                     TLS-version-range failures log here)
+        //   * nsHostResolver — DNS service init (an earlier Init() step)
+        // `sync` = flush each message immediately (no buffering), so the
+        // last line before an abort is never lost.  Level 5 = verbose.
+        // Deliberately NO MOZ_LOG_FILE: a file buffer is empty on abort
+        // (observed: /tmp/mozlog stayed 0 bytes when the child died) and
+        // stderr is now safe to use — pipe(7) full-buffer writes block
+        // properly per POSIX.1-2017 write(2) since the blocking-write fix,
+        // instead of wedging stdio in a retry spin.
+        // Modules + flags: https://firefox-source-docs.mozilla.org/xpcom/logging.html
+        "MOZ_LOG=sync,socketprocess:5,pipnss:5,nsHostResolver:5",
         // Ask ld-linux to narrate every library load (one line per DSO open,
         // ~30 lines for a Firefox process — negligible serial budget).
         // "bindings" omitted since PR #212 (W197): one line per PLT/GOT entry
@@ -1261,10 +1251,16 @@ pub fn poll_output() {
     let mut raw = [0u8; 4096];
     let mut any_data = false;
 
-    // First pass: read all available data before locking TERMINAL
+    // First pass: read all available data before locking TERMINAL.
+    // `pipe_read_wake` (NOT raw `pipe_read`): this drain is the ONLY
+    // consumer of the launcher pipe, and the child-side writers block on a
+    // full pipe per POSIX write(2)/pipe(7).  A drain that frees room
+    // without waking the parked writers strands every child stdout/stderr
+    // writer forever (observed live as all Firefox processes wedged in
+    // writev(fd=2) once the 4 KiB pipe filled).
     let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     loop {
-        let n = crate::ipc::pipe::pipe_read(pipe_id, &mut raw).unwrap_or(0);
+        let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut raw).unwrap_or(0);
         if n == 0 { break; }
         chunks.push(raw[..n].to_vec());
         any_data = true;
@@ -1293,7 +1289,7 @@ pub fn poll_output() {
         // Drain any final bytes the child wrote before exiting.
         drop(guard); // release TERMINAL before pipe_read
         let mut tail = [0u8; 4096];
-        let tn = crate::ipc::pipe::pipe_read(pipe_id, &mut tail).unwrap_or(0);
+        let tn = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail).unwrap_or(0);
         crate::ipc::pipe::pipe_close_reader(pipe_id);
 
         let mut guard2 = TERMINAL.lock();
