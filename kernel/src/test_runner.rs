@@ -227,6 +227,12 @@ pub fn run() -> ! {
     // write is atomic; a parked writer wakes on reader-drain; EPIPE when
     // the last reader is gone.  Pre-fix, a full pipe returned a no-progress
     // 0 and musl stdio retried the same write forever.
+    // ── exit_group of a RUNNING-on-another-CPU sibling must not let the reaper
+    //    free its live kernel stack (SMP teardown-race guard for PR #552).
+    //    Registered early so it runs regardless of any later slow/wedged test.
+    total += 1;
+    if test_exit_group_running_sibling_stack_guard() { passed += 1; }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
@@ -40113,6 +40119,210 @@ fn test_exit_group_wakes_siblings() -> bool {
     test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
 
     test_pass!("exit_group wakes parked sibling threads (W59)");
+    true
+}
+
+/// Regression guard: a group-exit that marks a sibling Dead while that sibling
+/// is **Running on another logical processor** must not allow the scheduler
+/// reaper to free the sibling's still-live kernel stack.
+///
+/// Background.  `sched::reap_dead_threads_sched` frees a Dead thread's kernel
+/// stack as soon as it observes `is_reapable() && ctx_rsp_valid == true`.  For
+/// a Blocked / Ready / Sleeping sibling that flag is legitimately `true` (the
+/// context was saved at switch-out), so the reaper may free it.  But a sibling
+/// that is `Running` is executing right now on a different CPU — its RSP has
+/// NOT been saved, yet `ctx_rsp_valid` still reads `true` from its last
+/// switch-in.  If `exit_group` marks such a sibling Dead without clearing the
+/// flag, the reaper on either CPU will free (and `push_dead_stack` zero-fills)
+/// the kernel stack the victim is still running on: a use-after-free that
+/// surfaces as a KERNEL_GPF with RIP on a kernel stack or a jump-to-NULL when
+/// the zero-filled return slot is popped.  This race became reachable once both
+/// CPUs genuinely schedule (a sibling can be Running on CPU B while CPU A tears
+/// the group down); #544 guarded the address-space free against a Running
+/// victim but left the kernel-stack reap unguarded.
+///
+/// The fix (`proc::exit_group_inner` Dead-marking loop) clears
+/// `ctx_rsp_valid=false` for the Running victims only — leaving Blocked/Ready/
+/// Sleeping siblings reapable so their stacks are not leaked.  This test drives
+/// the same Dead-marking loop via `exit_group_pid` and asserts both halves of
+/// the invariant.  Cite: Intel SDM Vol. 3A §4.10 (CR3/translation validity);
+/// POSIX exit_group(2) (whole-group termination).
+fn test_exit_group_running_sibling_stack_guard() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+    use core::sync::atomic::Ordering;
+
+    test_header!("exit_group: Running sibling's live kstack is not reaped (SMP teardown race)");
+
+    // 1. Synthetic target process.
+    let target_pid = match crate::proc::usermode::create_user_process(
+        "exitgrp_run_target", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("exit_group_running_sibling",
+            "create_user_process: {:?}", e); return false; }
+    };
+    let main_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == target_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if main_tid == 0 {
+        test_fail!("exit_group_running_sibling", "no main thread for target");
+        return false;
+    }
+
+    // 2. One "running on another CPU" sibling and one Blocked sibling, both
+    //    with a REAL allocated kernel stack and ctx_rsp_valid=true (the state a
+    //    just-switched-in thread has).
+    let run_tid = match crate::proc::create_thread_blocked(target_pid, "sib-running", 0) {
+        Some(t) => t,
+        None => { test_fail!("exit_group_running_sibling", "create running sibling failed"); return false; }
+    };
+    let blk_tid = match crate::proc::create_thread_blocked(target_pid, "sib-blocked", 0) {
+        Some(t) => t,
+        None => { test_fail!("exit_group_running_sibling", "create blocked sibling failed"); return false; }
+    };
+
+    // Force the "running" sibling into Running state (simulating it executing a
+    // syscall on a peer CPU) while keeping ctx_rsp_valid=true; leave the other
+    // sibling Blocked.  Record the running sibling's kernel-stack base so we can
+    // confirm the reaper never touched it.
+    let run_kstack_base = {
+        let mut threads = THREAD_TABLE.lock();
+        let mut base = 0u64;
+        for t in threads.iter_mut() {
+            if t.tid == run_tid {
+                t.state = ThreadState::Running;
+                t.ctx_rsp_valid.store(true, Ordering::Release);
+                base = t.kernel_stack_base;
+            }
+        }
+        base
+    };
+    if run_kstack_base == 0 {
+        test_fail!("exit_group_running_sibling", "running sibling has no kernel stack");
+        return false;
+    }
+    test_println!("  target PID {}: main {}, running-sib {} (kstack={:#x}), blocked-sib {}",
+        target_pid, main_tid, run_tid, run_kstack_base, blk_tid);
+
+    // 3. Tear the group down out-of-band (mirrors a concurrent exit_group on a
+    //    peer CPU).  calling_tid=0 means every member, including the Running
+    //    one, traverses the Dead-marking loop under test.
+    const EXIT_CODE: i64 = -11; // SIGSEGV-style, matches the FF teardown signature
+    crate::proc::exit_group_pid(target_pid, EXIT_CODE);
+
+    // 4a. INVARIANT — Running victim: marked Dead AND ctx_rsp_valid cleared, so
+    //     the reaper cannot free its live stack.
+    let (run_state, run_valid, blk_state, blk_valid) = {
+        let threads = THREAD_TABLE.lock();
+        let r = threads.iter().find(|t| t.tid == run_tid);
+        let b = threads.iter().find(|t| t.tid == blk_tid);
+        (
+            r.map(|t| t.state),
+            r.map(|t| t.ctx_rsp_valid.load(Ordering::Acquire)),
+            b.map(|t| t.state),
+            b.map(|t| t.ctx_rsp_valid.load(Ordering::Acquire)),
+        )
+    };
+    if run_state != Some(ThreadState::Dead) {
+        test_fail!("exit_group_running_sibling",
+            "running sibling state {:?} != Dead", run_state);
+        return false;
+    }
+    if run_valid != Some(false) {
+        test_fail!("exit_group_running_sibling",
+            "running sibling ctx_rsp_valid={:?} (expected false — live stack must not be reapable)",
+            run_valid);
+        return false;
+    }
+    test_println!("  running sibling: Dead + ctx_rsp_valid=false (live kstack protected) ✓");
+
+    // 4b. INVARIANT — Blocked victim: marked Dead but ctx_rsp_valid LEFT TRUE so
+    //     it remains reapable (no kernel-stack leak regression, W58/W59).
+    if blk_state != Some(ThreadState::Dead) {
+        test_fail!("exit_group_running_sibling",
+            "blocked sibling state {:?} != Dead", blk_state);
+        return false;
+    }
+    if blk_valid != Some(true) {
+        test_fail!("exit_group_running_sibling",
+            "blocked sibling ctx_rsp_valid={:?} (expected true — must stay reapable, no kstack leak)",
+            blk_valid);
+        return false;
+    }
+    test_println!("  blocked sibling: Dead + ctx_rsp_valid=true (reapable, no leak) ✓");
+
+    // 5. Drive one reaper pass.  The Running victim is NOT reapable (flag false),
+    //    so its TID and live kernel stack must survive; the Blocked victim and
+    //    the (now-Dead) main thread ARE reapable and must be swept.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+
+    {
+        let threads = THREAD_TABLE.lock();
+        let run_present = threads.iter().any(|t| t.tid == run_tid);
+        if !run_present {
+            test_fail!("exit_group_running_sibling",
+                "running sibling tid {} was REAPED despite ctx_rsp_valid=false — \
+                 its live kernel stack {:#x} would have been freed (UAF)",
+                run_tid, run_kstack_base);
+            return false;
+        }
+        // The running victim's stack base must be unchanged (not handed back to
+        // the dead-stack cache / PMM).
+        if let Some(t) = threads.iter().find(|t| t.tid == run_tid) {
+            if t.kernel_stack_base != run_kstack_base {
+                test_fail!("exit_group_running_sibling",
+                    "running sibling kstack base changed {:#x} -> {:#x}",
+                    run_kstack_base, t.kernel_stack_base);
+                return false;
+            }
+        }
+    }
+    test_println!("  reaper pass: running sibling's live kstack preserved ✓");
+
+    // 6. Converge: a real thread would reach the Dead-thread drain on syscall
+    //    return, set ctx_rsp_valid=false, schedule(), and have switch_context_asm
+    //    re-set it true after saving RSP — at which point it is safely reapable.
+    //    Emulate that final transition and reap so the synthetic state does not
+    //    leak across the test suite.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == run_tid) {
+            t.ctx_rsp_valid.store(true, Ordering::Release);
+        }
+    }
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+    {
+        let threads = THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.tid == run_tid) {
+            test_fail!("exit_group_running_sibling",
+                "running sibling tid {} not reaped after convergence", run_tid);
+            return false;
+        }
+    }
+    // Process should be a Zombie with the supplied code; drop the slot so PID
+    // numbering and metrics stay bounded across the suite.
+    {
+        let procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter().find(|p| p.pid == target_pid) {
+            if p.state != ProcessState::Zombie {
+                drop(procs);
+                test_fail!("exit_group_running_sibling", "target not Zombie at end");
+                return false;
+            }
+        }
+    }
+    // Synthetic processes are created with parent_pid=0; reap the Zombie via
+    // that parent so the PROCESS_TABLE slot and metrics do not linger.
+    let _ = crate::proc::waitpid(0, target_pid as i64);
+    test_println!("  convergence: running sibling safely reaped after RSP saved ✓");
+
+    test_pass!("exit_group: Running sibling's live kstack is not reaped (SMP teardown race)");
     true
 }
 

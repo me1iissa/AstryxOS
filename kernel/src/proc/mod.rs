@@ -1996,18 +1996,38 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // if preempted it will be rescheduled and finish the Zombie/parent-wake steps.
     // We mark the caller Dead last, just before calling schedule().
     //
-    // INVARIANT: do NOT touch `ctx_rsp_valid` on siblings.  Sibling threads are
-    // Blocked / Ready / Sleeping when we reach here, meaning their context was
-    // saved long ago by switch_context_asm and `ctx_rsp_valid` is true.  The
-    // reaper at `sched::reap_dead_threads_sched` filters Dead threads by
-    // `ctx_rsp_valid == true` precisely so it can safely free a kernel stack
-    // whose context-save has completed.  Forcing the flag false here would
-    // strand every sibling as Dead-but-unreapable, leaking its 16 KiB kernel
-    // stack until the process slot itself is recycled.  Mozilla's 51-thread
-    // worker pool would lose ~800 KiB per teardown.  Only the caller of
-    // exit_group (which is still executing on its own stack) gets
-    // `ctx_rsp_valid=false`, and only on the yield_self path below where
-    // switch_context_asm will re-set it after saving RSP.
+    // INVARIANT: `ctx_rsp_valid` on a sibling we mark Dead must reflect whether
+    // that sibling's CPU context has actually been saved — because the reaper
+    // (`sched::reap_dead_threads_sched`) frees a Dead thread's kernel stack the
+    // moment it observes `is_reapable() && ctx_rsp_valid == true`.
+    //
+    //   * Blocked / Ready / Sleeping siblings: their context was saved long ago
+    //     by switch_context_asm, so `ctx_rsp_valid` is legitimately true and we
+    //     leave it alone.  Forcing it false here would strand them as
+    //     Dead-but-unreapable and leak their 16 KiB kernel stack until the
+    //     process slot is recycled (Mozilla's worker pool would lose ~800 KiB
+    //     per teardown).
+    //
+    //   * Running siblings: a sibling that is `Running` is executing RIGHT NOW
+    //     on another logical processor (SMP) — its kernel stack is live and its
+    //     RSP has NOT been saved, yet `ctx_rsp_valid` still reads `true` from
+    //     its last switch-in.  Marking it Dead without clearing the flag makes
+    //     it instantly reapable, so a reaper pass on EITHER CPU can free (and
+    //     zero-fill, per `push_dead_stack`) the very kernel stack the victim is
+    //     still running on — a use-after-free that surfaces as a KERNEL_GPF with
+    //     RIP on a kernel stack, or a jump-to-NULL when the zero-filled return
+    //     slot is popped.  We therefore clear `ctx_rsp_valid=false` for the
+    //     Running victims ONLY.  This is self-healing: when the victim's
+    //     in-flight syscall returns it hits the Dead-thread drain
+    //     (`subsys/linux/syscall.rs`) → `exit_thread` → `schedule()`, and
+    //     switch_context_asm re-sets `ctx_rsp_valid=true` only after it has
+    //     genuinely saved the RSP — at which point the stack is safe to reap.
+    //     A victim preempted mid-syscall converges the same way: its
+    //     context-switch-out saves the RSP and re-sets the flag.  This is the
+    //     kernel-stack companion to the address-space free-deferral below; #544
+    //     guarded the CR3/vm_space free against a Running victim but left the
+    //     stack reap unguarded, which only became reachable once both CPUs
+    //     genuinely schedule.
     //
     // SMP free-deferral snapshot: capture, BEFORE overwriting each victim's
     // state with Dead, whether any victim thread was actually `Running` on
@@ -2026,6 +2046,10 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
             if t.pid == pid && t.tid != calling_tid && t.state != ThreadState::Dead {
                 if t.state == ThreadState::Running {
                     any_victim_was_running = true;
+                    // The victim's live kernel stack must not be reaped until it
+                    // genuinely leaves Running (switch_context_asm re-sets the
+                    // flag after saving RSP).  See the INVARIANT above.
+                    t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                 }
                 t.state = ThreadState::Dead;
                 t.exit_code = exit_code;
