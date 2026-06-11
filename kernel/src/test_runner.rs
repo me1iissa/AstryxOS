@@ -1174,6 +1174,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pfh_cow_arm_anti_alias_refcount() { passed += 1; }
 
+    // ── Test 98j: gen-abort re-validates the faulting VA (no spurious SIGSEGV)
+    total += 1;
+    if test_pfh_gen_abort_revalidate_faulting_va() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -31326,6 +31330,190 @@ fn test_pfh_install_arm_anti_alias_backout() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("PFH install-arm anti-aliasing back-out");
+    true
+}
+
+/// Regression test for the PFH generation-abort over-release use-after-fault.
+///
+/// The page-fault handler's install arms sample an address-space-wide
+/// `generation` counter and re-check it immediately before installing a PTE.
+/// The original arms returned `false` on ANY generation change; a `false`
+/// return from `handle_page_fault` delivers SIGSEGV to the faulting thread
+/// immediately (this kernel has no silent re-fault), so an unrelated
+/// concurrent mmap/munmap/brk on a SIBLING virtual address killed processes
+/// whose faulting page was a live, unchanged mapping — a fatal
+/// use-after-fault exposed once SMP became genuinely concurrent.
+///
+/// The fix narrows the abort: on a generation change the handler re-validates
+/// the SPECIFIC faulting VA and only abandons the fault (SIGSEGV) if that VA's
+/// OWN VMA was removed or re-backed; an unrelated mutation lets the install
+/// proceed.  This test models the exact re-validation predicates the fixed
+/// arms use (anonymous VMA still covers the addr; file VMA still names the
+/// same (mount,inode); writable VMA still grants PROT_WRITE) and confirms:
+///   (1) an unrelated generation bump leaves every predicate TRUE → proceed;
+///   (2) removing/re-backing the faulting VMA flips its predicate FALSE →
+///       legitimate SIGSEGV.
+fn test_pfh_gen_abort_revalidate_faulting_va() -> bool {
+    test_header!("PFH gen-abort re-validates faulting VA (no spurious SIGSEGV)");
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                         PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+    use core::sync::atomic::Ordering;
+    // Drive the SAME full-tuple FILE predicate the CACHE/READAHEAD/SINGLE-PAGE
+    // install arms call (`pfh_file_vma_match`), so any regression in the install
+    // arms' re-validation — in particular weakening the (mount, inode, offset,
+    // base, end) tuple back to a (mount, inode)-only check — fails this test.
+    use crate::arch::x86_64::idt::pfh_file_vma_match;
+
+    let mut vm = match VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("gen-reval", "VmSpace::new_user() OOM"); return false; }
+    };
+
+    // Faulting anonymous VA, a faulting FILE-backed VA, and an UNRELATED VA.
+    let anon_va: u64 = 0x5556_0001_0000;
+    let anon_base = crate::mm::vma::page_align_down(anon_va);
+    let file_va: u64 = 0x5556_0020_0000;
+    let file_base = crate::mm::vma::page_align_down(file_va);
+    let file_len: u64 = 0x4000;
+    let file_end = file_base + file_len;
+    const F_MOUNT: usize = 0;
+    const F_INODE: u64 = 42;
+    const F_OFFSET: u64 = 0x8000;       // page-aligned file offset of this VMA
+    let unrelated_base: u64 = 0x5556_0100_0000;
+
+    macro_rules! bail { ($($arg:tt)*) => {{
+        crate::proc::free_vm_space(vm);
+        test_fail!("gen-reval", $($arg)*);
+        return false;
+    }}; }
+
+    if vm.insert_vma(VmArea {
+        base: anon_base, length: 0x4000,
+        prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE | MAP_ANONYMOUS,
+        backing: VmBacking::Anonymous, name: "[anon]",
+    }).is_err() { bail!("insert anon VMA failed"); }
+    if vm.insert_vma(VmArea {
+        base: file_base, length: file_len,
+        prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE,
+        backing: VmBacking::File {
+            mount_idx: F_MOUNT, inode: F_INODE, offset: F_OFFSET, elf_load_delta: 0 },
+        name: "[mmap-file]",
+    }).is_err() { bail!("insert file VMA failed"); }
+
+    // Snapshot the generation BEFORE an unrelated mutation.
+    let gen_before = vm.generation.load(Ordering::Acquire);
+
+    // (1) Unrelated mutation: insert an UNRELATED file VMA elsewhere.
+    //     insert_vma bumps the address-space-wide generation (the trigger that
+    //     used to SIGSEGV).
+    if vm.insert_vma(VmArea {
+        base: unrelated_base, length: 0x2000,
+        prot: PROT_READ, flags: MAP_PRIVATE,
+        backing: VmBacking::File { mount_idx: 0, inode: 7, offset: 0, elf_load_delta: 0 },
+        name: "[mmap-file2]",
+    }).is_err() { bail!("insert unrelated file VMA failed"); }
+
+    let gen_after = vm.generation.load(Ordering::Acquire);
+    if gen_after == gen_before {
+        bail!("unrelated insert did not bump generation (before={} after={})",
+            gen_before, gen_after);
+    }
+
+    // The fixed ANON arm's predicate: faulting VA is still anonymous → proceed.
+    let still_anon = matches!(
+        vm.find_vma(anon_va).map(|v| &v.backing),
+        Some(VmBacking::Anonymous));
+    if !still_anon {
+        bail!("anon re-validation FALSE after unrelated bump — would spuriously SIGSEGV");
+    }
+    // The fixed COW-COPY arm's predicate: faulting VA still writable → proceed.
+    let still_writable = vm.find_vma(anon_va)
+        .map(|v| v.prot & PROT_WRITE != 0).unwrap_or(false);
+    if !still_writable {
+        bail!("writable re-validation FALSE after unrelated bump — would spuriously SIGSEGV");
+    }
+    // The fixed FILE arms' shared predicate: faulting file VA, full tuple
+    // unchanged → Some (proceed), and the install would use the LIVE flags.
+    match pfh_file_vma_match(
+        vm.find_vma(file_va), F_MOUNT, F_INODE, F_OFFSET, file_base, file_end) {
+        Some((flags, is_shared)) => {
+            if flags & crate::mm::vmm::PAGE_WRITABLE == 0 {
+                bail!("file predicate returned RO flags for a PROT_WRITE VMA");
+            }
+            if is_shared {
+                bail!("file predicate reported MAP_SHARED for a MAP_PRIVATE VMA");
+            }
+        }
+        None => bail!("file re-validation FALSE after unrelated bump — would spuriously SIGSEGV"),
+    }
+    test_println!("  (1) unrelated bump (gen {}→{}); faulting anon+file VMAs intact → install proceeds ✓",
+        gen_before, gen_after);
+
+    // (2) NON-TAUTOLOGY GUARD: same inode, DIFFERENT offset at the SAME VA.
+    //     Re-back the faulting file VA with a VMA that keeps (mount, inode) but
+    //     names a different file offset — the ld.so reserve-then-overwrite /
+    //     hole-punch class.  A (mount, inode)-only check (the pre-fix predicate)
+    //     would wrongly return Some and install OLD-offset bytes at this VA;
+    //     the full-tuple predicate MUST return None.  This is the assertion that
+    //     fails if the install arms regress to (mount, inode)-only.
+    if vm.remove_range(file_base, file_len).is_err() {
+        bail!("remove_range(file) failed");
+    }
+    if vm.insert_vma(VmArea {
+        base: file_base, length: file_len,
+        prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE,
+        backing: VmBacking::File {
+            mount_idx: F_MOUNT, inode: F_INODE,
+            offset: F_OFFSET + file_len,   // SAME inode, DIFFERENT offset
+            elf_load_delta: 0 },
+        name: "[mmap-file-remap]",
+    }).is_err() { bail!("re-insert different-offset file VMA failed"); }
+    // Sanity: a (mount, inode)-only check WOULD match here (proves the case is
+    // real and the test is not vacuously passing on a missing VMA).
+    let mount_inode_only_would_match = matches!(
+        vm.find_vma(file_va).map(|v| &v.backing),
+        Some(VmBacking::File { mount_idx: m, inode: ino, .. })
+            if *m == F_MOUNT && *ino == F_INODE);
+    if !mount_inode_only_would_match {
+        bail!("remap VMA not found / wrong inode — test setup broken");
+    }
+    // The full-tuple predicate (asked for the ORIGINAL offset) must reject it.
+    if pfh_file_vma_match(
+        vm.find_vma(file_va), F_MOUNT, F_INODE, F_OFFSET, file_base, file_end).is_some() {
+        bail!("FULL-TUPLE FILE predicate returned Some for a same-inode-DIFFERENT-offset \
+               remap — wrong-offset .text/GOT corruption (predicate weakened to (mount,inode))");
+    }
+    test_println!("  (2) same-inode-different-offset remap → full-tuple predicate FALSE \
+                   (would install OLD-offset bytes under a (mount,inode)-only check) ✓");
+
+    // (3) Genuine removal of the faulting anon VA's own VMA → predicate FALSE →
+    //     legitimate SIGSEGV (the user really lost this mapping).
+    if vm.remove_range(anon_base, 0x4000).is_err() {
+        bail!("remove_range(anon) failed");
+    }
+    let gone = vm.find_vma(anon_va).is_none();
+    if !gone {
+        bail!("faulting VMA still present after remove_range — predicate would not SIGSEGV");
+    }
+    // The FILE predicate on a fully-removed VA must also be None.
+    if pfh_file_vma_match(
+        vm.find_vma(file_va), F_MOUNT, F_INODE, F_OFFSET + file_len, file_base, file_end).is_some() {
+        // (file VA still mapped by the remap; remove it too, then re-check)
+        let _ = vm.remove_range(file_base, file_len);
+        if pfh_file_vma_match(
+            vm.find_vma(file_va), F_MOUNT, F_INODE, F_OFFSET + file_len, file_base, file_end).is_some() {
+            bail!("FILE predicate returned Some after the VMA was removed");
+        }
+    }
+    test_println!("  (3) faulting VMA removed → re-validation FALSE → legitimate SIGSEGV ✓");
+
+    // NOTE (future work): this models the predicates the install arms call; a
+    // full two-CPU concurrency test (sibling munmap/MAP_FIXED racing the FILE
+    // install while PROCESS_TABLE is held across both re-validation and install)
+    // is not exercised here and is left for a dedicated SMP harness test.
+
+    crate::proc::free_vm_space(vm);
+    test_pass!("PFH gen-abort re-validates faulting VA");
     true
 }
 
