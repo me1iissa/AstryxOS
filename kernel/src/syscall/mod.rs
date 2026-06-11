@@ -3424,6 +3424,53 @@ pub(crate) fn sys_dsp_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
 ///
 /// Supports both anonymous (MAP_ANONYMOUS) and file-backed mappings.
 /// Actual physical pages are allocated on demand via the page-fault handler.
+/// Test-mode state for the mmap placement-race re-pick test (see
+/// `mmap_test_inject_placement_squatter` and `test_runner.rs`).
+#[cfg(feature = "test-mode")]
+pub mod mmap_race_test {
+    use core::sync::atomic::AtomicU64;
+    /// Pid armed to deterministically lose the Phase-1→Phase-3 placement
+    /// race on its next kernel-placed mmap (0 = disarmed).
+    pub static ARMED_PID: AtomicU64 = AtomicU64::new(0);
+    /// Base address where the squatter VMA was injected (for the test to
+    /// read back and clean up; 0 = hook has not fired).
+    pub static SQUATTER_BASE: AtomicU64 = AtomicU64::new(0);
+}
+
+/// When armed for `pid`, insert a 1-page anonymous VMA at `base` — the
+/// address Phase 1 just chose — mimicking a sibling thread's concurrent
+/// kernel-placed mmap winning the Phase-1→Phase-3 window.  One-shot.
+#[cfg(feature = "test-mode")]
+fn mmap_test_inject_placement_squatter(pid: u64, base: u64, is_fixed: bool) {
+    use core::sync::atomic::Ordering;
+    use crate::mm::vma::*;
+    if is_fixed {
+        return;
+    }
+    if mmap_race_test::ARMED_PID
+        .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+        if let Some(space) = p.vm_space.as_mut() {
+            let squatter = VmArea {
+                base,
+                length: 0x1000,
+                prot: PROT_READ | PROT_WRITE,
+                flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                backing: VmBacking::Anonymous,
+                name: "[test-squatter]",
+            };
+            if space.insert_vma(squatter).is_ok() {
+                mmap_race_test::SQUATTER_BASE.store(base, Ordering::Release);
+            }
+        }
+    }
+}
+
 pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u64, offset: u64) -> i64 {
     use crate::mm::vma::*;
 
@@ -3631,6 +3678,15 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode-trace")))]
     let (cr3, backing, name, base) = mmap_setup;
 
+    // ── Test-mode hook: deterministically lose the Phase-1→Phase-3 placement
+    // race.  When armed for this pid, a 1-page squatter VMA is inserted at the
+    // just-chosen base — exactly what a sibling thread's concurrent mmap
+    // Phase 3 would do in the window between our two PROCESS_TABLE
+    // acquisitions — so the Phase-3 re-pick path is exercised without relying
+    // on real cross-CPU timing.  Compiled out of production kernels.
+    #[cfg(feature = "test-mode")]
+    mmap_test_inject_placement_squatter(pid, base, is_fixed);
+
     // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
     //
     // The check is after argument decode and backing resolution (above), but
@@ -3787,6 +3843,51 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         None => return -3,
     };
 
+    // Re-validate the Phase-1 placement under the lock we now hold.  The
+    // address pick (find_free_range / find_free_stack_range, Phase 1) and
+    // this insert run under SEPARATE PROCESS_TABLE acquisitions, so a sibling
+    // thread's mmap / brk / stack allocation can claim an overlapping range in
+    // the window between them.  For kernel-placed (non-MAP_FIXED) requests
+    // POSIX mmap(2) leaves the placement entirely to the implementation, so
+    // the correct response to losing that race is to RE-PICK here — atomically
+    // with the insert — never to fail the call.  Returning ENOMEM for the
+    // transient collision was a real-workload killer: the loser of two
+    // concurrent kernel-placed mmaps on SMP got a spurious ENOMEM, which a
+    // release-assert in the caller then escalated to a fatal abort.
+    //
+    // MAP_FIXED keeps its address contract and is NOT re-picked: its Phase 2a
+    // remove_range cleared the requested range, and a squatter VMA appearing
+    // in the 2a→3 window still fails the insert below (residual divergence —
+    // mmap(2) MAP_FIXED would atomically replace; tracked as a follow-up
+    // because handling it requires re-running the 2a/2b teardown loop).
+    let mut vma = vma;
+    let mut base = base;
+    if !is_fixed && space.areas.iter().any(|v| v.overlaps(base, length)) {
+        let repick = if is_stack_alloc {
+            space.find_free_stack_range(length)
+        } else {
+            space.find_free_range(length)
+        };
+        match repick {
+            Some(b) => {
+                #[cfg(feature = "firefox-test-core")]
+                crate::serial_println!(
+                    "[MMAP-REPICK] pid={} lost placement race: base={:#x} len={:#x} re-placed at {:#x}",
+                    pid, base, length, b
+                );
+                base = b;
+                vma.base = b;
+            }
+            None => {
+                crate::serial_println!(
+                    "[MMAP-ERR] pid={} address space exhausted on re-pick: len={:#x} flags={:#x} fd={}",
+                    pid, length, flags, fd as i64
+                );
+                return -12; // ENOMEM — genuinely out of address space
+            }
+        }
+    }
+
     match space.insert_vma(vma) {
         Ok(()) => {
             // Lower `mmap_hint` only when this allocation participates in the
@@ -3813,7 +3914,14 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
                 pid, base, length, flags, fd as i64
             );
-            -12 // ENOMEM
+            if is_noreplace {
+                // A mapping appeared in the requested range between the
+                // Phase-1 conflict check and this insert.  Per mmap(2),
+                // MAP_FIXED_NOREPLACE reports a collision as EEXIST.
+                -17 // EEXIST
+            } else {
+                -12 // ENOMEM
+            }
         }
     }
 }
