@@ -165,6 +165,33 @@ pub fn pipe_read(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
     Some(pipe.read(buf))
 }
 
+/// Drain-and-wake helper for KERNEL-context pipe consumers (the exec
+/// supervisors' stdout/stderr drain loops in `gui::terminal::poll_output`
+/// and the demo supervisors).
+///
+/// `pipe_read` deliberately only advances pipe state; the SYSCALL-layer
+/// read path issues `wake_writers_all` itself after the drain (the
+/// `read(2)` pipe arm), keeping `PIPE_TABLE` disjoint from the waiter
+/// maps.  A kernel-context drain that calls raw `pipe_read` and forgets
+/// the wake strands blocking writers forever: per POSIX.1-2017 write(2) /
+/// pipe(7), a writer blocked on a full pipe must resume when the reader
+/// frees room, and the parked thread has no timeout.  (Observed live:
+/// every Firefox process wedged in `writev(2, …)` once the 4 KiB launcher
+/// pipe filled, because `poll_output` drained it to empty without ever
+/// waking the parked writers.)  This wrapper makes drain-then-wake the
+/// one-call default for such consumers.
+///
+/// The wake fires only on a nonzero drain and strictly after `pipe_read`
+/// has released `PIPE_TABLE`, so the `PIPE_*_WAITERS` → `PIPE_TABLE` lock
+/// order is never violated (we hold neither lock when waking).
+pub fn pipe_read_wake(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
+    let n = pipe_read(pipe_id, buf);
+    if matches!(n, Some(cnt) if cnt > 0) {
+        wake_writers_all(pipe_id);
+    }
+    n
+}
+
 /// Write to a pipe by ID.
 ///
 /// On a successful write of one or more bytes the caller should invoke
@@ -519,6 +546,15 @@ pub fn waiter_cleanup_writer(pipe_id: u64, tid: u64) {
             waiters.remove(&pipe_id);
         }
     }
+}
+
+/// Diagnostic snapshot of one pipe's ring + endpoint state for the kdb
+/// `pipe-diag` op: `(buffered_bytes, free_space, readers, writers)`.
+/// `None` when the pipe id does not exist (both ends fully closed).
+pub fn pipe_diag_for(pipe_id: u64) -> Option<(usize, usize, u32, u32)> {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| (p.count, p.space(), p.readers, p.writers))
 }
 
 /// Test-only diagnostic: returns the number of reader TIDs currently

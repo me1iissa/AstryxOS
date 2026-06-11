@@ -259,9 +259,141 @@ pub fn get_ticks() -> u64 {
 /// fired.
 pub static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Per-CPU TSC timestamp of the most recent LAPIC-timer ISR on that CPU,
+/// recorded by the timer ISR itself.  Lets `idle_tick` decide whether
+/// THIS CPU's timer fired RECENTLY (safe to `hlt` — the next periodic
+/// fire will wake us) or has gone silent while a sibling keeps the global
+/// clock alive (must spin — a halted core with a dead local timer never
+/// wakes; Intel SDM Vol. 2A, HLT).  A timestamp, not a fire COUNT: a
+/// count delta only proves "fired since the previous check", which on the
+/// first check after a long gap (e.g. the supervisor loop's very first
+/// iteration, long after an early-boot LAPIC death) wrongly blesses a
+/// terminal hlt.  Each slot is written only by its own CPU's ISR.
+static LAST_TIMER_FIRE_TSC: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
+/// Per-CPU TSC of the last LAPIC rearm attempt from `idle_tick`'s
+/// timer-silent path — rate-limits revival writes to one per slack window
+/// so the spin path doesn't hammer LAPIC MMIO.
+static LAST_REARM_TSC: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
 /// Last TSC-floor tick at which the BSP idle path drove a software scheduler
 /// tick. Used to rate-limit the software tick to ~`TICK_HZ`.
 static LAST_SOFT_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// LAPIC periodic-timer interrupt vector (IRQ0).  Kept in sync with the LVT
+/// programming in `apic::init`/`apic::rearm_timer` (`0x20000 | 32`).  Used as
+/// the IPI vector when a healthy CPU pokes a sibling whose own timer has gone
+/// silent, so the sibling re-enters the SAME `timer_tick` path it would have
+/// run from its own LAPIC.
+const TIMER_VECTOR: u8 = 32;
+
+/// Staleness threshold (in ticks) past which a sibling CPU's LAPIC timer is
+/// judged silent and is poked with a wake IPI from the publishing CPU.  At
+/// TICK_HZ=100 this is ~30 ms — comfortably longer than the one-tick ISR
+/// publish lag of a healthy timer (so a merely-busy CPU is never poked) and
+/// far shorter than any user-perceptible scheduling stall.
+const SIBLING_STALE_TICKS: u64 = 3;
+
+/// Per-CPU TSC of the last wake-IPI a sibling sent to THIS slot's CPU.  Read
+/// and written only by the poking (publishing) CPU under its tick-crossing
+/// guard, so a single relaxed slot per target suffices: it rate-limits the
+/// cross-CPU poke to at most one per published tick crossing, preventing an
+/// IPI storm when a sibling stays silent for many ticks.
+static LAST_SIBLING_POKE_TSC: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
+/// Cumulative count of wake-IPIs sent to a silent-timer sibling.  A non-zero
+/// value means at least one CPU's LAPIC timer went silent and was kept alive
+/// by a sibling's poke — the dual-core liveness backstop fired.  Monotone
+/// since boot; the watchdog regression test snapshots it.
+pub static SIBLING_WAKE_IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`SIBLING_WAKE_IPIS`] for test/diagnostic assertions.
+pub fn sibling_wake_ipi_count() -> u64 {
+    SIBLING_WAKE_IPIS.load(Ordering::Relaxed)
+}
+
+/// Pure helper: should a sibling whose timer last fired at `last_fire` (TSC) be
+/// woken with a poke IPI, given the current TSC `now_tsc` and the per-tick TSC
+/// span `tsc_per_tick`?
+///
+/// Returns `false` for a sibling that has never fired yet (`last_fire == 0`,
+/// still in bringup) or fired within `SIBLING_STALE_TICKS`; `true` once it has
+/// been silent past the staleness window.  Extracted so the scheduler-liveness
+/// regression test can assert the staleness curve without a real dead-timer
+/// vCPU (which only manifests under KVM and cannot be synthesised in-kernel).
+#[inline]
+pub fn sibling_timer_is_stale(now_tsc: u64, last_fire: u64, tsc_per_tick: u64) -> bool {
+    if tsc_per_tick == 0 || last_fire == 0 {
+        return false;
+    }
+    let stale_tsc = SIBLING_STALE_TICKS.saturating_mul(tsc_per_tick);
+    now_tsc.wrapping_sub(last_fire) > stale_tsc
+}
+
+/// Poke any sibling CPU whose LAPIC periodic timer has gone silent.
+///
+/// Called only by the CPU that just published a `TICK_COUNT` crossing — i.e.
+/// the CPU whose own timer is demonstrably live and carrying the global clock.
+/// For each OTHER online CPU it compares that CPU's `LAST_TIMER_FIRE_TSC`
+/// (stamped by its own ISR on every fire) against `now_tsc`; if the sibling has
+/// not fired within `SIBLING_STALE_TICKS`, it sends a fire-and-forget
+/// vector-32 IPI to wake it.
+///
+/// Why this is necessary (the dead-LAPIC dual-core liveness bug): under KVM a
+/// single vCPU's LAPIC periodic timer can go permanently silent ~1.2 s into
+/// boot (observed: `TIMER_ISR_PER_CPU[0]` frozen at ~120 fires while the
+/// sibling accumulates tens of thousands).  A halted CPU is woken only by an
+/// interrupt delivered TO IT (Intel SDM Vol. 2A, HLT); with its own timer dead
+/// and no other IRQ routed there, it never wakes.  `idle_tick`'s per-CPU
+/// freshness check cannot rescue it because that check runs only while the CPU
+/// is AWAKE — once it has `hlt`ed on the last tick its timer still looked
+/// fresh, it can never run the check again.  The live-clock sibling is the only
+/// context guaranteed to keep running, so it must lend the silent CPU a tick.
+///
+/// Deadlock-freedom: the poke uses [`apic::send_ipi_noblock`] (no
+/// delivery-status spin), so it cannot wedge against a peer that is itself in
+/// an ISR — the failure mode that retired the earlier IPI-based debug-register
+/// cross-CPU sync.  A halted target accepts the fixed-vector IPI immediately
+/// and re-runs `timer_tick`; a momentarily-not-ready target simply gets re-poked
+/// on the next tick crossing.  The poke is rate-limited to once per published
+/// tick crossing per target via `LAST_SIBLING_POKE_TSC`.
+#[inline]
+fn poke_stale_siblings(now_tsc: u64, tsc_per_tick: u64) {
+    if tsc_per_tick == 0 {
+        return;
+    }
+    let ncpus = super::apic::cpu_count() as usize;
+    if ncpus <= 1 {
+        return; // single core: no sibling to lend a tick (idle_tick covers it)
+    }
+    let self_cpu = super::apic::cpu_index();
+    let limit = core::cmp::min(ncpus, super::apic::MAX_CPUS);
+    for cpu in 0..limit {
+        if cpu == self_cpu {
+            continue;
+        }
+        let last_fire = LAST_TIMER_FIRE_TSC[cpu].load(Ordering::Relaxed);
+        // Never fired yet (still spinning up) OR fired recently → not stale.
+        // `last_fire == 0` is the pre-first-fire sentinel; an AP that has not
+        // yet taken its first timer ISR is mid-bringup, not wedged, so skip it.
+        if !sibling_timer_is_stale(now_tsc, last_fire, tsc_per_tick) {
+            continue;
+        }
+        // Rate-limit: at most one poke per published tick crossing per target.
+        let last_poke = LAST_SIBLING_POKE_TSC[cpu].load(Ordering::Relaxed);
+        if now_tsc.wrapping_sub(last_poke) < tsc_per_tick {
+            continue;
+        }
+        LAST_SIBLING_POKE_TSC[cpu].store(now_tsc, Ordering::Relaxed);
+        SIBLING_WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+        // QEMU assigns contiguous APIC IDs from 0, so the logical CPU index is
+        // its APIC ID (the same identity `cpu_index()` reads from IA32_TSC_AUX).
+        super::apic::send_ipi_noblock(cpu as u8, TIMER_VECTOR);
+    }
+}
 
 /// Cooperative idle step for the BSP polling/soak loop.
 ///
@@ -302,14 +434,60 @@ pub fn idle_tick(slack: u64) -> bool {
     if tsc_per_tick == 0 {
         return true; // pre-calibration: nothing to drive yet, hlt is fine
     }
+    let now_tsc = rdtsc();
     let published = TICK_COUNT.load(Ordering::Relaxed);
     let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
-    let elapsed = rdtsc().wrapping_sub(tsc_at_boot);
+    let elapsed = now_tsc.wrapping_sub(tsc_at_boot);
     let tsc_floor = elapsed / tsc_per_tick;
 
     // Timer healthy: the ISR is keeping TICK_COUNT within `slack` of the TSC.
     if tsc_floor <= published.wrapping_add(slack) {
-        return true;
+        // The GLOBAL clock is healthy — but on SMP that only proves SOME
+        // CPU's LAPIC is firing.  `hlt` parks THIS CPU until an interrupt
+        // arrives HERE, so the caller may only sleep if THIS CPU's own
+        // timer has fired recently.  Otherwise a CPU whose LAPIC delivery
+        // is suppressed (KVM occasionally silences one vCPU's periodic
+        // timer while a sibling keeps the global tick alive) passes the
+        // global check, executes `hlt`, and — receiving no interrupts at
+        // all — never runs again.  Observed live: the BSP supervisor loop
+        // slept forever at its `hlt` while CPU 1 carried the whole boot,
+        // so the launcher-pipe drain stopped and every Firefox process
+        // wedged in a blocking stdout/stderr write.  Per Intel SDM Vol. 2A
+        // (HLT): the processor remains halted until an enabled interrupt,
+        // NMI, or reset — a silent LAPIC provides none.
+        let cpu = super::apic::cpu_index();
+        if cpu >= super::apic::MAX_CPUS {
+            return true;
+        }
+        // Bless the hlt ONLY if this CPU's own timer ISR fired within the
+        // slack window (TSC timestamp recorded by the ISR itself).  A
+        // recent fire is the only evidence that the NEXT periodic fire —
+        // the thing that wakes a hlt — is actually coming.  A fire COUNT
+        // delta is not sufficient: it proves "fired at some point since
+        // the previous check", which on the first check after a long gap
+        // wrongly blesses a terminal hlt (observed live: the BSP's LAPIC
+        // delivered its last fire ~1.2 s into boot, the supervisor loop
+        // started later, saw a nonzero count on its first iteration,
+        // hlt'ed, and slept forever — no device IRQ ever woke it, the
+        // launcher-pipe drain stopped, and every Firefox process wedged
+        // in a blocking stdout/stderr write).
+        let last_fire = LAST_TIMER_FIRE_TSC[cpu].load(Ordering::Relaxed);
+        let stale_tsc = slack.saturating_mul(tsc_per_tick);
+        if last_fire != 0 && now_tsc.wrapping_sub(last_fire) <= stale_tsc {
+            return true;
+        }
+        // THIS CPU's timer is silent beyond the slack window (or has never
+        // fired) while the global clock advances on a sibling.  Tell the
+        // caller to SPIN — its outer loop stays alive and re-polls — and
+        // try to revive our LAPIC, rate-limited to one attempt per window
+        // so the spin path doesn't hammer LAPIC MMIO.
+        let last_rearm = LAST_REARM_TSC[cpu].load(Ordering::Relaxed);
+        if now_tsc.wrapping_sub(last_rearm) > stale_tsc {
+            LAST_REARM_TSC[cpu].store(now_tsc, Ordering::Relaxed);
+            super::apic::rearm_timer();
+            TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        return false;
     }
 
     // Timer starved. Try to revive it (harmless if it's just masked), then
@@ -513,6 +691,10 @@ extern "C" fn timer_tick() {
     let is_bsp = cpu == 0;
     if cpu < super::apic::MAX_CPUS {
         TIMER_ISR_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+        // Freshness timestamp for `idle_tick`'s hlt-safety check: a CPU may
+        // only hlt if ITS OWN timer fired recently enough that the next
+        // periodic fire (the wakeup) is credibly imminent.
+        LAST_TIMER_FIRE_TSC[cpu].store(rdtsc(), Ordering::Relaxed);
     }
 
     // Compute the wall-clock-correct TICK_COUNT from the TSC delta.  Any
@@ -569,6 +751,20 @@ extern "C" fn timer_tick() {
         }
     };
     crate::perf::record_interrupt(32); // IRQ0 = vector 32
+
+    // ── Dual-core liveness: lend a tick to a silent-timer sibling ───
+    // The CPU that just published a TICK_COUNT crossing has, by definition, a
+    // live LAPIC timer carrying the global clock.  It is the only context
+    // guaranteed to keep running, so it is responsible for waking any sibling
+    // whose own LAPIC timer has gone silent (a KVM failure mode that otherwise
+    // leaves a halted CPU asleep forever — see `poke_stale_siblings`).  Gated
+    // on `we_published` so exactly one CPU per tick crossing does the scan, and
+    // only after the scheduler is active (before that, all work is on the BSP
+    // and there is no sibling runqueue to keep alive).  `tsc_per_tick == 0`
+    // (pre-calibration) makes this a no-op via the guard inside the callee.
+    if we_published && crate::sched::is_active() {
+        poke_stale_siblings(rdtsc(), tsc_per_tick);
+    }
 
     // ── Record/replay: virtual tick advance on the publishing CPU ───
     // Only the CPU that actually CAS'd a new TICK_COUNT advances the

@@ -501,6 +501,24 @@ where
                     }
                 }
             } else {
+                // INVARIANT: Release-store ctx_rsp_valid=false BEFORE
+                // transitioning to Blocked (same protocol as ke/wait.rs,
+                // ipc/waitlist.rs and proc::sleep_ticks).  `context.rsp` is
+                // STALE here — it still holds the RSP saved by this thread's
+                // PREVIOUS switch-out; the fresh value is only written by
+                // `switch_context_asm` inside the upcoming `schedule()`.
+                // Without clearing the flag, a FUTEX_WAKE on a sibling CPU
+                // in the park→switch window flips us Blocked→Ready and the
+                // sibling's picker — whose only mid-switch guard is this
+                // flag — resumes us from the stale RSP while THIS CPU is
+                // still saving the live frame onto the same kernel stack:
+                // two CPUs interleave on one kstack and the resumed side
+                // pops a torn `switch_context_asm` frame (observed as
+                // KERNEL_PAGE_FAULT CR2=0 with partially-zeroed callee-saved
+                // GPRs under genuine dual-core scheduling).  futex(2) wakes
+                // may fire at any instant after the waiter is enqueued, so
+                // this park site is the hottest instance of the race.
+                t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                 t.state = crate::proc::ThreadState::Blocked;
                 t.wake_tick = wake_tick;
             }
@@ -2867,6 +2885,14 @@ pub(crate) fn sys_waitpid_ex(
         {
             let mut threads = crate::proc::THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                // INVARIANT: Release-store ctx_rsp_valid=false BEFORE Blocked
+                // (see futex_wait_check_and_enqueue for the full rationale).
+                // A child's exit can wake this waiter from a sibling CPU at
+                // any instant after the state store; without clearing the
+                // flag the sibling's picker would resume us from the STALE
+                // `context.rsp` of our previous switch-out while this CPU is
+                // still mid-`switch_context_asm` on the same kernel stack.
+                t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                 t.state = crate::proc::ThreadState::Blocked;
                 t.wake_tick = u64::MAX - 1; // sentinel: blocked in waitpid
             }

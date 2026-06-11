@@ -227,8 +227,30 @@ pub fn run() -> ! {
     // write is atomic; a parked writer wakes on reader-drain; EPIPE when
     // the last reader is gone.  Pre-fix, a full pipe returned a no-progress
     // 0 and musl stdio retried the same write forever.
+    // ── exit_group of a RUNNING-on-another-CPU sibling must not let the reaper
+    //    free its live kernel stack (SMP teardown-race guard for PR #552).
+    //    Registered early so it runs regardless of any later slow/wedged test.
+    total += 1;
+    if test_exit_group_running_sibling_stack_guard() { passed += 1; }
+
+    // ── Test 245: kstack context-switch-generation quiescence barrier ────
+    // The SMP teardown grace period: a reclaimed kstack is unreusable until
+    // every online CPU has passed through schedule() since reclaim, and is
+    // never stranded once they have.  Companion to the live-kstack reap
+    // guard above — registered equally early (and before the blocking-pipe
+    // suite, which is known to wedge on this branch under dual-core) so the
+    // barrier regression signal always lands.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_245_kstack_gen_quiesce_barrier() { passed += 1; }
+    }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
+
+    total += 1;
+    if test_sibling_timer_stale_poke_curve() { passed += 1; }
 
     // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
     total += 1;
@@ -2340,6 +2362,11 @@ pub fn run() -> ! {
         total += 1;
         if test_236_dead_stack_zeroing() { passed += 1; }
     }
+
+    // (Test 245 — kstack generation-barrier quiescence — is registered in
+    // the early block right after the exit_group SMP teardown guard, before
+    // the blocking-pipe suite, so its signal lands even if a later test
+    // wedges.  See the top of this function.)
 
     // ── Test 237: IPv4 total_length clamp (H6) ───────────────────────────
     // RFC 791 §3.1 — verifies `clamp_payload_to_total_length` produces
@@ -36148,7 +36175,208 @@ fn test_pipe_blocking_write_semantics() -> bool {
     }
     test_println!("  concurrent two-writer atomicity: 2 contiguous {}B records, no interleave ✓", REC);
 
-    test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / EAGAIN / EPIPE");
+    // ── Sub-test 6: KERNEL-context supervisor drain wakes parked writers ──
+    //
+    // The exec supervisors (gui::terminal::poll_output and the demo
+    // supervisor loops) drain the child's stdout/stderr pipe from KERNEL
+    // context via the pipe-id helpers, not via read(2).  Per POSIX
+    // write(2)/pipe(7), a writer blocked on a full pipe must resume when
+    // the reader frees room — so the kernel-context drain must wake parked
+    // writers exactly like the read(2) arm does.  Pre-fix, `poll_output`
+    // called raw `pipe_read` (state advance only, no wake): a writer that
+    // filled the 4 KiB launcher pipe parked forever even though the
+    // supervisor drained the pipe to empty on the very next poll.  This
+    // sub-test parks a writer (watchdog-proven, same pattern as sub-test
+    // 4), then drains ONCE via `pipe_read_wake` — the call the supervisors
+    // now use — and asserts the blocked write completes.
+    static W6_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+    static W6_PARK_OBSERVED: AtomicU32 = AtomicU32::new(0);
+    static W6_DRAINED: AtomicU64 = AtomicU64::new(0);
+
+    let mut fds6 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds6.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for kernel-drain test returned {}", r);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let (rfd6, wfd6) = (fds6[0] as u64, fds6[1] as u64);
+    let pipe_id6 = crate::syscall::get_pipe_id(pid, wfd6 as usize);
+    W6_PIPE_ID.store(pipe_id6, Ordering::SeqCst);
+    W6_PARK_OBSERVED.store(0, Ordering::SeqCst);
+    W6_DRAINED.store(0, Ordering::SeqCst);
+
+    // Fill the ring exactly: the next atomic write MUST park.
+    let fill6 = [0x33u8; crate::ipc::pipe::PIPE_BUF];
+    let fn6 = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd6, fill6.as_ptr() as u64, fill6.len() as u64, 0, 0, 0);
+    if fn6 != fill6.len() as i64 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain prefill write returned {} (expected {})", fn6, fill6.len());
+        crate::syscall::dispatch_linux_kernel(3, rfd6, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd6, 0, 0, 0, 0, 0);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+
+    // Watchdog: wait until the writer is provably parked, then drain ONCE
+    // from kernel context via pipe_read_wake — the supervisor-drain call
+    // under test.  No read(2), no fd: this is exactly what poll_output does.
+    fn w6_watchdog_entry() {
+        crate::hal::enable_interrupts();
+        let pipe_id = W6_PIPE_ID.load(Ordering::SeqCst);
+        loop {
+            if crate::ipc::pipe::debug_writer_waiter_count(pipe_id) >= 1 {
+                W6_PARK_OBSERVED.store(1, Ordering::SeqCst);
+                break;
+            }
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+        let mut sink = [0u8; 4096];
+        loop {
+            let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut sink).unwrap_or(0);
+            if n == 0 {
+                // Empty — if the writer hasn't deposited yet, keep polling
+                // until the parked write completes and is drained too.
+                if W6_DRAINED.load(Ordering::SeqCst) >= (crate::ipc::pipe::PIPE_BUF + 512) as u64 {
+                    break;
+                }
+                crate::sched::yield_cpu();
+                crate::hal::enable_interrupts();
+                for _ in 0..200u32 { core::hint::spin_loop(); }
+                continue;
+            }
+            W6_DRAINED.fetch_add(n as u64, Ordering::SeqCst);
+        }
+        crate::proc::exit_thread(0);
+    }
+    let _w6_pid = crate::proc::create_kernel_process(
+        "pipe_kdrain_watchdog", w6_watchdog_entry as *const () as u64);
+
+    // Blocking atomic write of 512 bytes into 0 free — must park, then be
+    // woken by the watchdog's pipe_read_wake drain and complete in full.
+    let rec6 = [0x44u8; 512];
+    let wn6 = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd6, rec6.as_ptr() as u64, rec6.len() as u64, 0, 0, 0);
+
+    // Allow the watchdog to drain the deposited record before teardown.
+    for _ in 0..256u32 {
+        if W6_DRAINED.load(Ordering::SeqCst) >= (crate::ipc::pipe::PIPE_BUF + 512) as u64 { break; }
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    let leaked6 = crate::ipc::pipe::debug_writer_waiter_count(pipe_id6);
+    crate::syscall::dispatch_linux_kernel(3, rfd6, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd6, 0, 0, 0, 0, 0);
+
+    if W6_PARK_OBSERVED.load(Ordering::SeqCst) != 1 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain sub-test: writer never parked on the full pipe");
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if wn6 != rec6.len() as i64 {
+        test_fail!("pipe_blocking_write",
+            "kernel-drain sub-test: blocked write returned {} (expected {} after pipe_read_wake drain — a raw pipe_read drain leaves the writer parked forever)",
+            wn6, rec6.len());
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if leaked6 != 0 {
+        test_fail!("pipe_blocking_write",
+            "{} stale writer(s) on PIPE_WRITE_WAITERS after kernel-context drain", leaked6);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    test_println!("  kernel-context supervisor drain (pipe_read_wake) woke parked writer ✓");
+
+    test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / kernel-drain-wake / EAGAIN / EPIPE");
+    true
+}
+
+/// Regression test for the dual-core liveness backstop: the timer ISR's
+/// stale-sibling poke decision (`arch::x86_64::irq::sibling_timer_is_stale`).
+///
+/// Under KVM one vCPU's LAPIC periodic timer can go permanently silent mid-boot
+/// while a sibling keeps the global clock alive.  A halted CPU is woken only by
+/// an interrupt delivered to it (Intel SDM Vol. 2A, HLT); with its own timer
+/// dead and no IRQ routed there it never wakes, stranding its runqueue.  The
+/// fix has the live-clock CPU poke any sibling whose timer has gone stale with a
+/// vector-32 wake IPI.  The real dead-timer condition only manifests under KVM
+/// and cannot be synthesised in-kernel, so this test exercises the pure
+/// staleness predicate that gates the poke, covering the three regimes:
+///   * never-fired sentinel (last_fire == 0)  → not stale (sibling mid-bringup)
+///   * fired within SIBLING_STALE_TICKS        → not stale (healthy/busy)
+///   * silent beyond the staleness window      → stale (poke it)
+/// plus the pre-calibration (tsc_per_tick == 0) no-op guard, and confirms the
+/// monotone wake-IPI counter API is wired.
+fn test_sibling_timer_stale_poke_curve() -> bool {
+    use crate::arch::x86_64::irq::sibling_timer_is_stale as stale;
+
+    // A representative calibrated per-tick TSC span (≈1.0 GHz × 10 ms).  The
+    // predicate is span-relative, so the exact value is immaterial.
+    let per_tick: u64 = 10_000_000;
+    // SIBLING_STALE_TICKS is 3; pick a `now` comfortably past 3 ticks of span.
+    let now: u64 = 1_000_000_000;
+
+    // 1. Pre-calibration guard: tsc_per_tick == 0 → never stale (no division /
+    //    no poke before the timer is even calibrated).
+    if stale(now, now.saturating_sub(per_tick * 100), 0) {
+        test_fail!("sibling_timer_stale_poke",
+            "tsc_per_tick==0 must be treated as not-stale (pre-calibration no-op)");
+        return false;
+    }
+
+    // 2. Never-fired sentinel: last_fire == 0 → not stale (AP still in bringup,
+    //    not a wedged timer).
+    if stale(now, 0, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "last_fire==0 sentinel must be treated as not-stale (sibling mid-bringup)");
+        return false;
+    }
+
+    // 3. Fired within the staleness window → not stale.  At SIBLING_STALE_TICKS
+    //    == 3, a fire 2 ticks ago is fresh.
+    let fired_2_ticks_ago = now.saturating_sub(2 * per_tick);
+    if stale(now, fired_2_ticks_ago, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "a timer that fired 2 ticks ago (< 3-tick window) must NOT be judged stale");
+        return false;
+    }
+
+    // 4. Silent beyond the staleness window → stale (poke it).  A fire 10 ticks
+    //    ago is well past the 3-tick window.
+    let fired_10_ticks_ago = now.saturating_sub(10 * per_tick);
+    if !stale(now, fired_10_ticks_ago, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "a timer silent for 10 ticks (> 3-tick window) MUST be judged stale");
+        return false;
+    }
+
+    // 5. Boundary: exactly at the window edge is NOT stale (strict `>`), one
+    //    span past it IS — confirms the comparison is a clean threshold.
+    let at_edge = now.saturating_sub(3 * per_tick); // == window: now - 3*span
+    if stale(now, at_edge, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "fire exactly at the 3-tick window edge must NOT be stale (strict >)");
+        return false;
+    }
+    let just_past_edge = now.saturating_sub(3 * per_tick + 1);
+    if !stale(now, just_past_edge, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "fire one TSC past the 3-tick window edge MUST be stale");
+        return false;
+    }
+
+    // 6. The monotone wake-IPI counter API is wired and readable (the harness /
+    //    soak asserts a non-zero delta on a real dead-timer KVM boot).
+    let _ = crate::arch::x86_64::irq::sibling_wake_ipi_count();
+
+    test_pass!("sibling-timer stale-poke curve — sentinel / within-window / beyond-window / boundary / counter-wired");
     true
 }
 
@@ -39994,6 +40222,210 @@ fn test_exit_group_wakes_siblings() -> bool {
     test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
 
     test_pass!("exit_group wakes parked sibling threads (W59)");
+    true
+}
+
+/// Regression guard: a group-exit that marks a sibling Dead while that sibling
+/// is **Running on another logical processor** must not allow the scheduler
+/// reaper to free the sibling's still-live kernel stack.
+///
+/// Background.  `sched::reap_dead_threads_sched` frees a Dead thread's kernel
+/// stack as soon as it observes `is_reapable() && ctx_rsp_valid == true`.  For
+/// a Blocked / Ready / Sleeping sibling that flag is legitimately `true` (the
+/// context was saved at switch-out), so the reaper may free it.  But a sibling
+/// that is `Running` is executing right now on a different CPU — its RSP has
+/// NOT been saved, yet `ctx_rsp_valid` still reads `true` from its last
+/// switch-in.  If `exit_group` marks such a sibling Dead without clearing the
+/// flag, the reaper on either CPU will free (and `push_dead_stack` zero-fills)
+/// the kernel stack the victim is still running on: a use-after-free that
+/// surfaces as a KERNEL_GPF with RIP on a kernel stack or a jump-to-NULL when
+/// the zero-filled return slot is popped.  This race became reachable once both
+/// CPUs genuinely schedule (a sibling can be Running on CPU B while CPU A tears
+/// the group down); #544 guarded the address-space free against a Running
+/// victim but left the kernel-stack reap unguarded.
+///
+/// The fix (`proc::exit_group_inner` Dead-marking loop) clears
+/// `ctx_rsp_valid=false` for the Running victims only — leaving Blocked/Ready/
+/// Sleeping siblings reapable so their stacks are not leaked.  This test drives
+/// the same Dead-marking loop via `exit_group_pid` and asserts both halves of
+/// the invariant.  Cite: Intel SDM Vol. 3A §4.10 (CR3/translation validity);
+/// POSIX exit_group(2) (whole-group termination).
+fn test_exit_group_running_sibling_stack_guard() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+    use core::sync::atomic::Ordering;
+
+    test_header!("exit_group: Running sibling's live kstack is not reaped (SMP teardown race)");
+
+    // 1. Synthetic target process.
+    let target_pid = match crate::proc::usermode::create_user_process(
+        "exitgrp_run_target", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("exit_group_running_sibling",
+            "create_user_process: {:?}", e); return false; }
+    };
+    let main_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == target_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if main_tid == 0 {
+        test_fail!("exit_group_running_sibling", "no main thread for target");
+        return false;
+    }
+
+    // 2. One "running on another CPU" sibling and one Blocked sibling, both
+    //    with a REAL allocated kernel stack and ctx_rsp_valid=true (the state a
+    //    just-switched-in thread has).
+    let run_tid = match crate::proc::create_thread_blocked(target_pid, "sib-running", 0) {
+        Some(t) => t,
+        None => { test_fail!("exit_group_running_sibling", "create running sibling failed"); return false; }
+    };
+    let blk_tid = match crate::proc::create_thread_blocked(target_pid, "sib-blocked", 0) {
+        Some(t) => t,
+        None => { test_fail!("exit_group_running_sibling", "create blocked sibling failed"); return false; }
+    };
+
+    // Force the "running" sibling into Running state (simulating it executing a
+    // syscall on a peer CPU) while keeping ctx_rsp_valid=true; leave the other
+    // sibling Blocked.  Record the running sibling's kernel-stack base so we can
+    // confirm the reaper never touched it.
+    let run_kstack_base = {
+        let mut threads = THREAD_TABLE.lock();
+        let mut base = 0u64;
+        for t in threads.iter_mut() {
+            if t.tid == run_tid {
+                t.state = ThreadState::Running;
+                t.ctx_rsp_valid.store(true, Ordering::Release);
+                base = t.kernel_stack_base;
+            }
+        }
+        base
+    };
+    if run_kstack_base == 0 {
+        test_fail!("exit_group_running_sibling", "running sibling has no kernel stack");
+        return false;
+    }
+    test_println!("  target PID {}: main {}, running-sib {} (kstack={:#x}), blocked-sib {}",
+        target_pid, main_tid, run_tid, run_kstack_base, blk_tid);
+
+    // 3. Tear the group down out-of-band (mirrors a concurrent exit_group on a
+    //    peer CPU).  calling_tid=0 means every member, including the Running
+    //    one, traverses the Dead-marking loop under test.
+    const EXIT_CODE: i64 = -11; // SIGSEGV-style, matches the FF teardown signature
+    crate::proc::exit_group_pid(target_pid, EXIT_CODE);
+
+    // 4a. INVARIANT — Running victim: marked Dead AND ctx_rsp_valid cleared, so
+    //     the reaper cannot free its live stack.
+    let (run_state, run_valid, blk_state, blk_valid) = {
+        let threads = THREAD_TABLE.lock();
+        let r = threads.iter().find(|t| t.tid == run_tid);
+        let b = threads.iter().find(|t| t.tid == blk_tid);
+        (
+            r.map(|t| t.state),
+            r.map(|t| t.ctx_rsp_valid.load(Ordering::Acquire)),
+            b.map(|t| t.state),
+            b.map(|t| t.ctx_rsp_valid.load(Ordering::Acquire)),
+        )
+    };
+    if run_state != Some(ThreadState::Dead) {
+        test_fail!("exit_group_running_sibling",
+            "running sibling state {:?} != Dead", run_state);
+        return false;
+    }
+    if run_valid != Some(false) {
+        test_fail!("exit_group_running_sibling",
+            "running sibling ctx_rsp_valid={:?} (expected false — live stack must not be reapable)",
+            run_valid);
+        return false;
+    }
+    test_println!("  running sibling: Dead + ctx_rsp_valid=false (live kstack protected) ✓");
+
+    // 4b. INVARIANT — Blocked victim: marked Dead but ctx_rsp_valid LEFT TRUE so
+    //     it remains reapable (no kernel-stack leak regression, W58/W59).
+    if blk_state != Some(ThreadState::Dead) {
+        test_fail!("exit_group_running_sibling",
+            "blocked sibling state {:?} != Dead", blk_state);
+        return false;
+    }
+    if blk_valid != Some(true) {
+        test_fail!("exit_group_running_sibling",
+            "blocked sibling ctx_rsp_valid={:?} (expected true — must stay reapable, no kstack leak)",
+            blk_valid);
+        return false;
+    }
+    test_println!("  blocked sibling: Dead + ctx_rsp_valid=true (reapable, no leak) ✓");
+
+    // 5. Drive one reaper pass.  The Running victim is NOT reapable (flag false),
+    //    so its TID and live kernel stack must survive; the Blocked victim and
+    //    the (now-Dead) main thread ARE reapable and must be swept.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+
+    {
+        let threads = THREAD_TABLE.lock();
+        let run_present = threads.iter().any(|t| t.tid == run_tid);
+        if !run_present {
+            test_fail!("exit_group_running_sibling",
+                "running sibling tid {} was REAPED despite ctx_rsp_valid=false — \
+                 its live kernel stack {:#x} would have been freed (UAF)",
+                run_tid, run_kstack_base);
+            return false;
+        }
+        // The running victim's stack base must be unchanged (not handed back to
+        // the dead-stack cache / PMM).
+        if let Some(t) = threads.iter().find(|t| t.tid == run_tid) {
+            if t.kernel_stack_base != run_kstack_base {
+                test_fail!("exit_group_running_sibling",
+                    "running sibling kstack base changed {:#x} -> {:#x}",
+                    run_kstack_base, t.kernel_stack_base);
+                return false;
+            }
+        }
+    }
+    test_println!("  reaper pass: running sibling's live kstack preserved ✓");
+
+    // 6. Converge: a real thread would reach the Dead-thread drain on syscall
+    //    return, set ctx_rsp_valid=false, schedule(), and have switch_context_asm
+    //    re-set it true after saving RSP — at which point it is safely reapable.
+    //    Emulate that final transition and reap so the synthetic state does not
+    //    leak across the test suite.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == run_tid) {
+            t.ctx_rsp_valid.store(true, Ordering::Release);
+        }
+    }
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+    {
+        let threads = THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.tid == run_tid) {
+            test_fail!("exit_group_running_sibling",
+                "running sibling tid {} not reaped after convergence", run_tid);
+            return false;
+        }
+    }
+    // Process should be a Zombie with the supplied code; drop the slot so PID
+    // numbering and metrics stay bounded across the suite.
+    {
+        let procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter().find(|p| p.pid == target_pid) {
+            if p.state != ProcessState::Zombie {
+                drop(procs);
+                test_fail!("exit_group_running_sibling", "target not Zombie at end");
+                return false;
+            }
+        }
+    }
+    // Synthetic processes are created with parent_pid=0; reap the Zombie via
+    // that parent so the PROCESS_TABLE slot and metrics do not linger.
+    let _ = crate::proc::waitpid(0, target_pid as i64);
+    test_println!("  convergence: running sibling safely reaped after RSP saved ✓");
+
+    test_pass!("exit_group: Running sibling's live kstack is not reaped (SMP teardown race)");
     true
 }
 
@@ -45050,32 +45482,38 @@ fn test_236_dead_stack_zeroing() -> bool {
     // Push through the public shim — same code path the reaper uses.
     let pushed = crate::sched::push_dead_stack_pub(base_virt);
     if !pushed {
-        // The cache may already be full from prior tests.  Drop the stack
-        // back to PMM and report a soft pass (the zeroing has happened
-        // before the cache-full check returned false, so the stack is
-        // still zeroed — we can verify that).
-        test_println!("  cache full — verifying zeroing happened anyway");
-        let mut nonzero = 0u32;
+        // The cache may already be full from prior tests.  The push must
+        // not have WRITTEN anything: zeroing is deferred to re-issue
+        // (`pop_dead_stack`), because a push-time write is exactly the
+        // corrupting store the context-switch-generation quiescence gate
+        // exists to prevent (a sibling CPU may still be
+        // mid-`switch_context_asm` on the stack at push time).  Verify the
+        // sentinel survived untouched, then drop the pages back to PMM.
+        test_println!("  cache full — verifying push wrote NOTHING (zero deferred to pop)");
+        let mut clobbered = 0u32;
         for off in 0..STACK_BYTES {
             let b = unsafe { core::ptr::read_volatile((base_virt + off as u64) as *const u8) };
-            if b != 0 { nonzero += 1; if nonzero <= 4 { test_println!("    nonzero at off={:#x} = {:#x}", off, b); } }
+            if b != SENTINEL { clobbered += 1; if clobbered <= 4 { test_println!("    clobbered at off={:#x} = {:#x}", off, b); } }
         }
         for p in 0..STACK_PAGES {
             crate::mm::pmm::free_page(phys + (p as u64) * 0x1000);
         }
-        if nonzero != 0 {
-            test_fail!("test236", "{} nonzero bytes after push (cache-full path)", nonzero);
+        if clobbered != 0 {
+            test_fail!("test236", "{} bytes written by push (cache-full path) — push must not write", clobbered);
             return false;
         }
-        test_pass!("kstack zeroed even when dead-stack cache was full");
+        test_pass!("push_dead_stack wrote nothing (zero correctly deferred to re-issue)");
         return true;
     }
 
     // Pop it back to recover the same base.  Use the test-only force shim
-    // that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate added in PR #348 —
-    // a same-frame push/pop pair would otherwise be withheld for ~20 ms
-    // (TICK_HZ=100 × 2 ticks) and the test would deterministically fail.
-    // Production callers continue to use the quiesced `pop_dead_stack`.
+    // that bypasses the context-switch-generation quiescence gate — a
+    // same-frame push/pop pair would otherwise be withheld until every
+    // online CPU has scheduled at least once and the test would
+    // deterministically fail.  The force shim still performs the re-issue
+    // zero-fill, so the CWE-244 contract checked below is the production
+    // contract.  Production callers continue to use the gated
+    // `pop_dead_stack`.
     //
     // The pop returns `(base, size)`; size is verified below to match
     // the honest extent we pushed, closing the
@@ -45162,6 +45600,159 @@ fn test_236_dead_stack_zeroing() -> bool {
 //   (d) total_length == frame_len, total_length > frame_len, and the
 //       degenerate frame_len == payload_start case.
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+/// ── Test 245: kstack context-switch-generation quiescence barrier ────────
+///
+/// Regression guard for the SMP kstack reuse/free race: a reclaimed kernel
+/// stack must not be re-issued (nor zero-filled, nor PMM-freed) until every
+/// online CPU has passed through `schedule()` at least once after the
+/// reclaim-time generation snapshot.  This is the causal grace period the
+/// previous wall-clock gate (`TICK_COUNT` advance) could not provide: a live
+/// sibling CPU keeps the wall clock ticking even while the other CPU is
+/// stalled mid-`switch_context_asm` on the very stack being recycled, so a
+/// time-based gate can (and did) declare a still-in-use stack "quiesced".
+///
+/// Deterministic assertions:
+///   (a) HOLD — with IF=0 on this CPU, a generation snapshot taken now can
+///       never report quiesced (this CPU's generation is provably frozen
+///       while it cannot pass through `schedule()`), and a stack pushed in
+///       the same IF=0 window is withheld by `pop_dead_stack`.
+///   (b) RELEASE — after yielding, the same snapshot quiesces (every online
+///       CPU scheduled at least once) and the pushed stack becomes
+///       recyclable: the barrier releases, stacks are NOT stranded forever.
+fn test_245_kstack_gen_quiesce_barrier() -> bool {
+    test_header!("sched: kstack gen barrier holds under IF=0, releases after grace period");
+
+    const STACK_PAGES: usize = crate::proc::KERNEL_STACK_PAGES_PUB;
+
+    // The grace clock only advances while CPUs schedule: `schedule()` bumps
+    // only when the scheduler is active, and the BSP's release-phase yields
+    // are no-ops while it is disabled.  The suite runs most tests with the
+    // scheduler disabled, so enable it for the duration (same pattern as
+    // the other scheduling tests) and restore on every exit path.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Fresh page run standing in for a reaped kstack (same pattern as 236).
+    let phys = match crate::mm::pmm::alloc_pages(STACK_PAGES) {
+        Some(p) => p,
+        None => {
+            test_fail!("test245", "pmm::alloc_pages({}) failed", STACK_PAGES);
+            if !was_active { crate::sched::disable(); }
+            return false;
+        }
+    };
+    let base_virt = crate::proc::KERNEL_VIRT_OFFSET + phys;
+
+    // Drain pre-existing quiesced entries so the pop assertions below run
+    // against a deterministic cache.  Drained bases are re-parked at the end.
+    crate::sched::wait_dead_stacks_quiesced();
+    let mut parked: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    while let Some(e) = crate::sched::pop_dead_stack() {
+        parked.push(e);
+    }
+
+    // ── (a) HOLD ──────────────────────────────────────────────────────────
+    crate::hal::disable_interrupts();
+    let snap = crate::sched::ctx_gen_snapshot_now();
+    let held_gen = !crate::sched::ctx_gen_quiesced(&snap);
+    let pushed = crate::sched::push_dead_stack_pub(base_virt);
+    // A stack pushed in this same IF=0 window carries a snapshot that
+    // includes THIS CPU's frozen generation — pop must withhold it.
+    let held_cache = if pushed {
+        crate::sched::pop_dead_stack().is_none()
+    } else {
+        true // cache full — nothing to assert on the cache half
+    };
+    crate::hal::enable_interrupts();
+
+    if !held_gen {
+        test_fail!("test245", "snapshot reported quiesced while IF=0 froze this CPU's generation");
+    }
+    if !held_cache {
+        test_fail!("test245", "pop_dead_stack re-issued a stack in the same IF=0 window as its push");
+    }
+
+    // ── (b) RELEASE ───────────────────────────────────────────────────────
+    // Tick-bounded wait: an idle sibling CPU reports quiescence from its
+    // 100 Hz timer wake (`check_reschedule`), so the release can take a few
+    // timer periods — an iteration-counted spin of fast yields can elapse
+    // in under one tick and miss it.
+    let release_deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(200);
+    let mut released_gen = false;
+    while crate::arch::x86_64::irq::get_ticks() < release_deadline {
+        if crate::sched::ctx_gen_quiesced(&snap) { released_gen = true; break; }
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    if !released_gen {
+        test_fail!("test245", "generation snapshot never quiesced within 200 ticks — barrier strands");
+    }
+
+    // The pushed stack must become recyclable.  Pop scans oldest-first and
+    // the cache was drained above, so our entry is at the front; a foreign
+    // entry (a reaper push that landed between the drain and our push) is
+    // re-parked and the loop continues.  If the cache empties without us
+    // seeing our base, a concurrent thread-spawn legitimately consumed it —
+    // recycling demonstrably works; the pages have become a live kstack and
+    // MUST NOT be freed here.
+    let mut released_cache = !pushed;
+    let mut pages_ownership_transferred = false;
+    if pushed {
+        let pop_deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(200);
+        while crate::arch::x86_64::irq::get_ticks() < pop_deadline {
+            match crate::sched::pop_dead_stack() {
+                Some((b, _sz)) if b == base_virt => {
+                    released_cache = true;
+                    break;
+                }
+                Some((b, _sz)) => {
+                    // Foreign quiesced entry — return it to the cache.
+                    let _ = crate::sched::push_dead_stack_pub(b);
+                }
+                None => {}
+            }
+            if crate::sched::dead_stack_cache_len() == 0 {
+                released_cache = true;
+                pages_ownership_transferred = true;
+                break;
+            }
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+    }
+    if !released_cache {
+        test_fail!("test245", "pushed stack never became recyclable after the grace period");
+    }
+
+    // Re-park the entries drained at the start (restores the pre-test cache).
+    for (b, _s) in parked {
+        let _ = crate::sched::push_dead_stack_pub(b);
+    }
+
+    // Return our pages to the PMM unless a concurrent spawn took ownership,
+    // or the entry is still gated inside the cache (failure path — freeing
+    // under a parked entry would recreate the very UAF this barrier closes).
+    if released_cache && !pages_ownership_transferred {
+        for p in 0..STACK_PAGES {
+            crate::mm::pmm::free_page(phys + (p as u64) * 0x1000);
+        }
+    }
+
+    let quarantine_len = crate::sched::dead_stack_quarantine_len();
+    test_println!("  quarantine_len={} (drains via reaper as CPUs schedule)", quarantine_len);
+
+    if !was_active { crate::sched::disable(); }
+
+    if held_gen && held_cache && released_gen && released_cache {
+        test_pass!("gen barrier: held under IF=0, released after every-CPU grace, no strand");
+        true
+    } else {
+        false
+    }
+}
+
 fn test_237_ipv4_total_length_clamp() -> bool {
     test_header!("security: IPv4 total_length payload clamp (audit H6, RFC 791 §3.1)");
 

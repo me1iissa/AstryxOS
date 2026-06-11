@@ -25,6 +25,102 @@ static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Per-CPU context-switch generation counter (quiescent-state grace-period clock for the
+/// kernel-stack lifecycle).
+///
+/// `CTX_SWITCH_GEN[cpu]` is bumped once at the TOP of every `schedule()` call
+/// on that CPU (see `bump_ctx_switch_gen`).  Reaching the top of `schedule()`
+/// is a *quiescent state* for the kernel-stack lifecycle: a CPU that is
+/// executing the body of `schedule()` has fully returned from any prior
+/// `switch_context_asm` and is running on a well-defined current kernel stack
+/// — it cannot be mid-switch on, or about to `ret` off, any *other* thread's
+/// stack.
+///
+/// Why this is the right grace-period observation point: a reaped kernel stack
+/// `S` belongs to a thread that is `!is_tid_current_on_any_cpu` AND has
+/// `ctx_rsp_valid == true` at reclaim time.  The ONLY way any CPU can still be
+/// touching `S` after those two guards pass is if that CPU is *inside*
+/// `switch_context_asm` — between loading `S` as RSP and completing the `ret`,
+/// or between saving its outgoing RSP onto `S` and updating its per-CPU
+/// `current` slot.  In every such state the CPU has NOT yet reached the top of
+/// its *next* `schedule()`.  Therefore, once a CPU's generation has advanced
+/// past a snapshot taken at reclaim time, that CPU has passed through the top
+/// of `schedule()` at least once since the reclaim → it completed any in-flight
+/// switch → it is provably off `S`.
+///
+/// When EVERY online CPU's generation has advanced past the reclaim-time
+/// snapshot, no CPU can be on `S`, so `S` is safe to zero-fill and recycle.
+/// This replaces the previous wall-clock `DEAD_STACK_QUIESCE_TICKS` gate, which
+/// was unsound under genuine SMP: the live sibling CPU keeps `TICK_COUNT`
+/// advancing even while another CPU is stalled mid-`switch_context_asm` on the
+/// very stack the wall-clock gate then deems "quiesced" and recycles.
+///
+/// The counter is monotone and wraps only after 2^64 context switches
+/// (unreachable in any real uptime).  A single relaxed bump per `schedule()`
+/// is the entire hot-path cost — see Intel SDM Vol. 3A §8.2 (memory ordering)
+/// for why a plain atomic store/load pair suffices: we need ordering between
+/// the bump and the *prior* switch's stack writes, which x86-TSO program order
+/// already provides on the bumping CPU, and the reader (the reaper) takes
+/// `THREAD_TABLE` which fences against the reclaim decision.
+static CTX_SWITCH_GEN: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Bump this CPU's context-switch generation.  Called once at the top of
+/// every `schedule()` invocation — the quiescent-state observation point for
+/// the kernel-stack reclamation grace period (see `CTX_SWITCH_GEN`).
+///
+/// `Release` ordering publishes all of this CPU's prior memory effects
+/// (including any stack writes performed by the switch that just completed)
+/// to any CPU that subsequently observes the new generation value with an
+/// `Acquire` load in `stack_gen_snapshot_quiesced`.
+#[inline]
+fn bump_ctx_switch_gen() {
+    let cpu = cpu_index();
+    // fetch_add with Release: the increment is the publish edge.  We don't
+    // read the result on the hot path.
+    CTX_SWITCH_GEN[cpu].fetch_add(1, Ordering::Release);
+}
+
+/// Snapshot the generation vector of all CPUs at kstack-reclaim time.
+///
+/// Captures `CTX_SWITCH_GEN[cpu]` for every CPU slot.  A reclaimed stack
+/// records this vector; it is eligible for reuse/zero-fill only once every
+/// online CPU's generation has advanced strictly past its snapshot value
+/// (`stack_gen_snapshot_quiesced`).
+#[inline]
+fn snapshot_ctx_switch_gen() -> [u64; MAX_CPUS] {
+    let mut snap = [0u64; MAX_CPUS];
+    for (i, slot) in CTX_SWITCH_GEN.iter().enumerate() {
+        snap[i] = slot.load(Ordering::Acquire);
+    }
+    snap
+}
+
+/// True iff every online CPU has performed at least one full context switch
+/// (passed through the top of `schedule()`) since the snapshot was taken —
+/// i.e. `CTX_SWITCH_GEN[cpu] > snapshot[cpu]` for every online CPU.
+///
+/// Only the first `cpu_count()` slots are consulted: an offline CPU never
+/// bumps its generation, but it also can never be mid-switch on a stack
+/// (it is not executing), so requiring its (frozen) counter to advance would
+/// strand every cached stack forever.  `cpu_count()` is monotone-nondecreasing
+/// over a boot (APs only ever come online), so a CPU that comes online AFTER a
+/// snapshot started from generation 0 and its first `schedule()` bump moves it
+/// to 1 > 0 — never a false "not quiesced" for a freshly-onlined CPU against an
+/// older snapshot, and never a false "quiesced" for a CPU that was already
+/// online at snapshot time (its snapshot captured its real generation).
+#[inline]
+fn stack_gen_snapshot_quiesced(snapshot: &[u64; MAX_CPUS]) -> bool {
+    let n = crate::arch::x86_64::apic::cpu_count() as usize;
+    let n = if n > MAX_CPUS { MAX_CPUS } else { n };
+    for cpu in 0..n {
+        if CTX_SWITCH_GEN[cpu].load(Ordering::Acquire) <= snapshot[cpu] {
+            return false;
+        }
+    }
+    true
+}
+
 /// Global "a timer due-wake scan was deferred" flag.
 ///
 /// The 100 Hz timer ISR (`wake_sleeping_threads`) is the driver that re-Readies
@@ -493,6 +589,23 @@ fn drain_due_wakes_if_pending(threads: &mut alloc::vec::Vec<proc::Thread>) {
 /// calling `cpu_index()` (which reads `IA32_TSC_AUX` via `rdmsr`) before
 /// `syscall::init()` has initialised that MSR on the BSP.
 pub fn check_reschedule() {
+    // Quiescent-state report for the kstack grace period (see
+    // `CTX_SWITCH_GEN`).  Every call site of `check_reschedule` executes on
+    // the CURRENT thread's own kernel stack with no in-flight
+    // `switch_context_asm` (AP idle loop post-HLT; syscall dispatcher tail
+    // with all locks released; #PF exit returning to user mode) — the same
+    // quiescent property as the top-of-`schedule()` bump.  This is what
+    // keeps an IDLE CPU advancing the grace clock: an AP with no runnable
+    // threads never has `NEED_RESCHEDULE` set, so it never enters
+    // `schedule()` at all — without this bump its generation freezes and
+    // every cached/quarantined dead stack strands until work happens to
+    // land on that CPU.  Deliberately ABOVE the `is_active()` early return:
+    // while the scheduler is administratively disabled (test-harness
+    // windows, early boot) `schedule()`'s own bump never runs, so this is
+    // the only report keeping the grace clock advancing through such
+    // windows.  Callers added in the future must preserve the call-site
+    // contract above (own current stack, not mid-switch).
+    bump_ctx_switch_gen();
     if !is_active() {
         return;
     }
@@ -508,7 +621,13 @@ pub fn check_reschedule() {
 /// cannot deadlock with a concurrent timer ISR that also acquires PMM_LOCK.
 /// Called at the start of schedule() which guarantees IF=0 via disable_interrupts().
 fn reap_dead_threads_sched() {
-    use crate::proc::KERNEL_VIRT_OFFSET;
+    // Drain any quarantined stacks whose reclaim-time generation snapshot has
+    // quiesced (every online CPU has context-switched since reclaim).  This
+    // runs BEFORE the early `dead_indices.is_empty()` return below so the
+    // quarantine keeps draining even on passes that reap nothing — otherwise
+    // a quiet stretch after a teardown burst would strand parked stacks until
+    // the next thread death.  Caller guarantees IF=0 (PMM_LOCK safety).
+    drain_quiesced_quarantine();
 
     // IMPORTANT: Never reap the CURRENT thread. The caller is still running on
     // its kernel stack — freeing the stack while executing on it is a UAF.
@@ -533,6 +652,25 @@ fn reap_dead_threads_sched() {
                 t.is_reapable()
                     && t.tid != current_tid
                     && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+                    // SMP live-stack guard: never reap a thread that is the
+                    // `current` thread on ANY logical processor.  `ctx_rsp_valid`
+                    // alone is insufficient under genuine dual-core scheduling:
+                    // `switch_context_asm` sets it true on switch-OUT and never
+                    // re-clears it on switch-IN, so a thread that was switched in
+                    // and is executing RIGHT NOW on a sibling CPU still reads
+                    // `ctx_rsp_valid == true`.  If such a thread is then marked
+                    // Dead by a concurrent group exit on this CPU, the bare
+                    // `is_reapable() && ctx_rsp_valid` test would free — and
+                    // `push_dead_stack` zero-fills — the kernel stack the sibling
+                    // is still running on, so its next `ret` pops a zeroed return
+                    // slot and the CPU jumps to a corrupted RIP (observed:
+                    // KERNEL_PAGE_FAULT, CR2=0, RIP mid-instruction in an
+                    // unrelated routine).  The per-CPU `current` table is the
+                    // authoritative "executing on a CPU now" signal — see
+                    // `proc::is_tid_current_on_any_cpu`.  Per Intel SDM Vol. 3A
+                    // §4.10 a thread's working set (its kernel stack) must remain
+                    // valid while any CPU executes on it.
+                    && !crate::proc::is_tid_current_on_any_cpu(t.tid)
             })
             .map(|(i, _)| i)
             .collect();
@@ -566,13 +704,19 @@ fn reap_dead_threads_sched() {
     // unrelated higher-half mappings.
     //
     // The push carries the honest byte-extent of the dead Thread's
-    // kernel stack (`stack_pages * 0x1000`) so that
-    // `push_dead_stack`'s bulk zero-fill is strictly bounded to the
-    // entry's allocation — see `CachedDeadStack` and
-    // `push_dead_stack`'s doc-comments for the PR #399
-    // STACK_CANARY_CORRUPT closure rationale.  Overflow (cache full,
-    // or push rejected by the defensive size check) falls through to
-    // per-page PMM free as before.
+    // kernel stack (`stack_pages * 0x1000`) so that the deferred
+    // zero-fill at re-issue is strictly bounded to the entry's
+    // allocation — see `CachedDeadStack` and `pop_dead_stack`'s
+    // doc-comments for the PR #399 STACK_CANARY_CORRUPT closure
+    // rationale.  Overflow (cache full, or push rejected by the
+    // defensive size check) is parked in the quiescence QUARANTINE, not
+    // freed straight to PMM: a freed frame can be re-`alloc`ed and
+    // written by an unrelated allocation while a sibling CPU is still
+    // mid-`switch_context_asm` on the stack — the residual corruption
+    // writer that survived even with the reuse cache disabled.  The
+    // quarantine applies the same context-switch-generation gate as the
+    // cache and `drain_quiesced_quarantine` (top of this function)
+    // performs the actual PMM free once every online CPU has switched.
     for (stack_base, stack_pages) in stacks {
         if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
             let stack_size_bytes = (stack_pages as u64) * 0x1000;
@@ -587,19 +731,12 @@ fn reap_dead_threads_sched() {
                 continue; // cached for reuse
             }
         }
-        // Cache full or non-standard size — free to PMM.
+        // Cache full or non-standard size — park for quiesced PMM free.
         #[cfg(feature = "test-mode")]
         crate::serial_println!(
-            "[KSTACK/REAP] cache full or non-std size={} — freed to PMM base={:#x}",
+            "[KSTACK/REAP] cache full or non-std size={} — quarantined base={:#x}",
             stack_pages, stack_base);
-        let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
-            stack_base - KERNEL_VIRT_OFFSET
-        } else {
-            stack_base
-        };
-        for p in 0..stack_pages {
-            crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
-        }
+        quarantine_dead_stack(stack_base, stack_pages);
     }
 
     // ── Deferred user-memory convergence ─────────────────────────────────────
@@ -665,74 +802,67 @@ fn reap_dead_threads_sched() {
 /// Maximum cached dead stacks. Increased for Firefox (many threads + PMM fragmentation).
 const MAX_DEAD_STACKS: usize = 64;
 
-/// Quiescence margin: a cached kstack is eligible for re-issue only after
-/// the global `TICK_COUNT` has advanced by at least this many ticks since
-/// the push.  N=2 gives a 20 ms wall-clock window at TICK_HZ=100 — longer
-/// than any in-flight `switch_context_asm` call (x86-64 context switches
-/// take microseconds, not milliseconds) but negligible against thread-
-/// creation cost.
+/// Maximum quarantined (pending-PMM-free) stacks held while they quiesce.
 ///
-/// `TICK_COUNT` is TSC-derived and advances at wall-clock rate regardless
-/// of which CPU fires the timer ISR (any CPU that wins the CAS publishes
-/// the new value).  This replaces a previous per-CPU
-/// `TIMER_ISR_PER_CPU[i]` scheme that could deadlock if a single CPU's
-/// LAPIC timer stopped delivering interrupts — causing its per-CPU counter
-/// to freeze and all cache entries to remain permanently unquiesced.
-const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
+/// When the dead-stack cache is full (or a stack is a non-standard size), the
+/// stack cannot go straight to `pmm::free_page`: another CPU may still be
+/// mid-`switch_context_asm` on it, and a freed frame can be re-`alloc`ed and
+/// zeroed by an unrelated allocation, corrupting the in-flight switch frame
+/// (the residual writer that survived even with the cache disabled).  Such
+/// stacks are parked here with a context-switch-generation snapshot and freed
+/// to PMM only once `stack_gen_snapshot_quiesced` holds.  Bounded so a path0
+/// burst of teardowns cannot grow it without limit; on overflow we fall back
+/// to the previous behaviour (immediate PMM free) for the oldest entry, which
+/// is acceptable because by the time the quarantine is this deep the oldest
+/// entries have almost certainly quiesced (every CPU schedules at 100 Hz).
+const MAX_QUARANTINE_STACKS: usize = 128;
 
 /// One cached dead stack: the higher-half kernel-stack base, the honest
 /// byte-extent of the underlying kernel-stack allocation, plus the per-CPU
-/// timer-ISR tick counter snapshot taken at push time.
+/// context-switch-generation vector snapshot taken at reclaim time.
 ///
 /// `size` is the honest byte-extent reported by the reaper from
 /// `Thread::kernel_stack_size` (see `proc::alloc_kernel_stack` for why
 /// callers stamp the real span, not the compile-time
-/// `KERNEL_STACK_SIZE`).  It is load-bearing: `push_dead_stack`
-/// zero-fills exactly `size` bytes starting at `base`, never more.
+/// `KERNEL_STACK_SIZE`).  It is load-bearing: the zero-fill at re-issue
+/// time covers exactly `size` bytes starting at `base`, never more.
 /// Without this, a buggy or future loosened call site that admits a
 /// shorter stack to the cache would scribble through the cached
 /// entry's true extent and into whichever physical pages happen to lie
 /// at the higher-half VAs immediately above it — corrupting an
 /// unrelated thread's kernel stack and tripping the STACK_CANARY_CORRUPT
 /// bugcheck (PR #399 D20 DR-watchpoint dispositive evidence).  See the
-/// `push_dead_stack` doc-comment for the closure narrative.
+/// `pop_dead_stack` doc-comment for the closure narrative.
 ///
-/// Generation snapshot: `push_tick` is the value of the global
-/// `TICK_COUNT` (TSC-derived wall-clock, see `arch::x86_64::irq`) at
-/// push time.  At pop time we require `TICK_COUNT >= push_tick +
-/// DEAD_STACK_QUIESCE_TICKS`.
+/// Generation snapshot: `gen_snapshot[cpu]` is the value of
+/// `CTX_SWITCH_GEN[cpu]` for every CPU, captured at the moment the reaper
+/// reclaimed this stack from THREAD_TABLE.  The entry is eligible for
+/// re-issue (and only THEN zero-filled) once `stack_gen_snapshot_quiesced`
+/// holds — i.e. every online CPU has bumped its generation past the
+/// snapshot, having passed through the top of `schedule()` at least once
+/// and therefore left any in-flight `switch_context_asm` on this stack.
 ///
-/// Why this works: `TICK_COUNT` is monotone and advances at the real
-/// wall-clock rate regardless of which CPU fires the timer ISR (any CPU
-/// that wins the CAS publishes the new value).  Waiting two ticks (20 ms
-/// at TICK_HZ=100) is sufficient for any in-flight `switch_context_asm`
-/// to complete — x86-64 context switches take microseconds, never
-/// tens of milliseconds.
+/// Why a generation barrier and not wall-clock: under genuine dual-core
+/// scheduling the live sibling CPU keeps `TICK_COUNT` advancing even while
+/// the other CPU is stalled mid-`switch_context_asm` on the stack we are
+/// caching.  A wall-clock "2 ticks elapsed → quiesced" gate therefore
+/// declares the stack safe and zero-fills it while a CPU is still executing
+/// on it — its next `ret` from `switch_context_asm` pops a zeroed return
+/// slot and the CPU jumps to a near-zero RIP (observed: KERNEL_PAGE_FAULT,
+/// CR2≈0, RIP mid-instruction in an unrelated routine, partial-zeroed
+/// callee-saved GPRs).  The generation barrier waits for a *causal* event
+/// (every CPU completing a switch), not for wall-clock time, so it cannot
+/// be fooled by a sibling that keeps ticking while one CPU is stalled.
 ///
-/// Previous design used per-CPU `TIMER_ISR_PER_CPU[i]` counters.  That
-/// scheme fails when a CPU's LAPIC timer delivers interrupts to a
-/// different MSR slot (e.g. if `IA32_TSC_AUX` is transiently wrong),
-/// causing one CPU's counter to freeze while the others advance.
-/// `TICK_COUNT` sidesteps this: it is a single global value advanced by
-/// the first CPU to win the CAS each tick period — immune to per-CPU
-/// timer delivery skew.
-///
-/// Why this matters: when a thread exits, its saved context (the
-/// `switch_context_asm` frame stored in `Thread::context.rsp`) still
-/// points into the kstack VA range we're caching.  Another CPU mid-way
-/// through `schedule()` may have already loaded that thread's `rsp` into
-/// a register and be about to execute the post-`ret` epilogue.  If we
-/// re-issue the kstack to a new thread before the other CPU completes
-/// at least one full quiescent state (Intel SDM Vol. 3A §11.10 cache-
-/// coherence implies the CPU has retired the in-flight stack reads/writes
-/// only after it has serialised against the timer ISR returning), the
-/// new thread's first `ret` from `switch_context_asm` pops zero bytes
-/// (we bulk-zeroed at push) and lands at RIP=0 — the deterministic
-/// low-RIP kernel #GP cluster.
+/// Why the zero-fill is deferred to re-issue (pop) and not done at push:
+/// a stack that is still being switched-through must not be written at all
+/// until quiescence; zeroing at push is exactly the corrupting write.  We
+/// zero only at the instant we hand the stack to a new thread, which by
+/// construction is after `stack_gen_snapshot_quiesced` — so no CPU is on it.
 ///
 /// POSIX clone(2) thread lifecycle: a thread is reaped only after the
 /// scheduler has fully removed it from THREAD_TABLE and no CPU
-/// references it.  This gen-tick gate is the kernel-side mechanism that
+/// references it.  This generation gate is the kernel-side mechanism that
 /// guarantees the "no CPU references it" half of that contract under SMP.
 #[derive(Clone, Copy)]
 struct CachedDeadStack {
@@ -741,39 +871,133 @@ struct CachedDeadStack {
     /// Honest byte-extent of this cached stack — exactly the same value
     /// the reaper read from `Thread::kernel_stack_size` (which itself is
     /// `stack_top - stack_base`, set at allocation time in
-    /// `proc::alloc_kernel_stack`).  Used to bound the bulk zero-fill in
-    /// `push_dead_stack` and to compute `stack_top` at
-    /// `pop_dead_stack` time.
+    /// `proc::alloc_kernel_stack`).  Used to bound the zero-fill at
+    /// re-issue and to compute `stack_top` at `pop_dead_stack` time.
     size: u64,
-    /// Global `TICK_COUNT` snapshot at push time.  `entry_is_quiesced`
-    /// requires `TICK_COUNT >= push_tick + DEAD_STACK_QUIESCE_TICKS`
-    /// before re-issuing this entry.  Replaces the previous per-CPU
-    /// `TIMER_ISR_PER_CPU` snapshot — see the struct-level doc comment
-    /// for the rationale.
-    push_tick: u64,
+    /// `CTX_SWITCH_GEN` vector snapshot taken at reclaim time.  The entry
+    /// is withheld from re-issue (and from its zero-fill) until
+    /// `stack_gen_snapshot_quiesced(&gen_snapshot)` holds.  See the
+    /// struct-level doc comment for the full rationale.
+    gen_snapshot: [u64; MAX_CPUS],
 }
 
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<CachedDeadStack>> =
     spin::Mutex::new(alloc::vec::Vec::new());
 
-/// Read the current global tick count for use as a quiescence snapshot.
-///
-/// Uses `TICK_COUNT` rather than per-CPU `TIMER_ISR_PER_CPU` — see the
-/// `CachedDeadStack` struct doc for the rationale.
-#[inline]
-fn current_tick_for_quiesce() -> u64 {
-    crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed)
+/// A kernel stack parked for deferred PMM free: it could not be admitted to
+/// the reuse cache (cache full, or non-standard emergency-tier size), but it
+/// MUST still wait for context-switch quiescence before its frames return to
+/// the page allocator — a freed frame can be re-`alloc`ed and zeroed by an
+/// unrelated allocation while a sibling CPU is still mid-switch on it.  This
+/// is the residual-writer fix: even with the reuse cache fully disabled, the
+/// direct-to-PMM path was corrupting in-flight switch frames.
+#[derive(Clone, Copy)]
+struct QuarantinedStack {
+    /// Higher-half kernel-stack base virtual address.
+    base: u64,
+    /// Number of 4 KiB pages backing this stack.
+    pages: usize,
+    /// `CTX_SWITCH_GEN` vector snapshot at reclaim time — same gate as the
+    /// reuse cache.
+    gen_snapshot: [u64; MAX_CPUS],
 }
 
-/// Decide whether a cached entry has quiesced — the global `TICK_COUNT`
-/// must have advanced by at least `DEAD_STACK_QUIESCE_TICKS` since push.
+static DEAD_STACK_QUARANTINE: spin::Mutex<alloc::vec::Vec<QuarantinedStack>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Park a kernel stack for deferred PMM free once it quiesces.
 ///
-/// This replaces the previous per-CPU `TIMER_ISR_PER_CPU` check.  See
-/// `CachedDeadStack` struct doc for the full rationale.
+/// Used by the reaper's fallback path (cache full / non-standard size) so a
+/// freed frame can never be re-`alloc`ed and zeroed while a sibling CPU is
+/// still mid-`switch_context_asm` on it (the residual writer that survived
+/// disabling the reuse cache).  Records the reclaim-time generation snapshot;
+/// `drain_quiesced_quarantine` performs the actual `pmm::free_page` once every
+/// online CPU has switched.
+///
+/// Caller MUST hold IF=0 (it does — invoked only from `reap_dead_threads_sched`
+/// under `schedule()`'s `disable_interrupts()`).
+fn quarantine_dead_stack(stack_base: u64, stack_pages: usize) {
+    use crate::proc::KERNEL_VIRT_OFFSET;
+    let gen_snapshot = snapshot_ctx_switch_gen();
+    let mut q = DEAD_STACK_QUARANTINE.lock();
+    if q.len() >= MAX_QUARANTINE_STACKS {
+        // Quarantine saturated by a teardown burst.  Evict the oldest
+        // QUIESCED entry to make room — quiesced means provably safe to
+        // free (every online CPU has switched since its reclaim).  We
+        // never free an un-quiesced entry here: freeing on a depth
+        // heuristic alone would reintroduce the exact use-while-freed
+        // race this quarantine closes, just behind a deeper queue.  If
+        // nothing has quiesced yet (a pathological machine-wide stall),
+        // exceed the soft cap instead — the Vec grows past
+        // MAX_QUARANTINE_STACKS transiently and the reaper's
+        // `drain_quiesced_quarantine` shrinks it on the next pass once
+        // the grace period elapses (generations advance at >= tick rate
+        // on every live CPU, so the excess is short-lived and bounded by
+        // the teardown rate times the grace latency).
+        if let Some(i) = q.iter().position(|e| stack_gen_snapshot_quiesced(&e.gen_snapshot)) {
+            let victim = q.remove(i);
+            let phys_base = if victim.base >= KERNEL_VIRT_OFFSET {
+                victim.base - KERNEL_VIRT_OFFSET
+            } else { victim.base };
+            for p in 0..victim.pages {
+                crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
+            }
+        }
+        #[cfg(feature = "test-mode")]
+        crate::serial_println!(
+            "[KSTACK/QUARANTINE] soft cap reached (len={}) — evicted-quiesced-or-grew",
+            q.len());
+    }
+    q.push(QuarantinedStack { base: stack_base, pages: stack_pages, gen_snapshot });
+}
+
+/// Free every quarantined stack whose reclaim-time generation snapshot has
+/// quiesced (every online CPU has switched since reclaim).  Returns the number
+/// of stacks freed this pass.
+///
+/// Called at the top of every reaper pass (`reap_dead_threads_sched`) so the
+/// quarantine drains continuously as the machine schedules — bounded latency,
+/// no permanent leak.  Caller MUST hold IF=0 (PMM_LOCK safety vs the timer ISR).
+fn drain_quiesced_quarantine() -> usize {
+    use crate::proc::KERNEL_VIRT_OFFSET;
+    // Collect the freeable entries under the quarantine lock, then free to PMM
+    // after releasing it — keeps the quarantine lock window tight and avoids
+    // holding two resource locks at once.
+    let to_free: alloc::vec::Vec<(u64, usize)> = {
+        let mut q = DEAD_STACK_QUARANTINE.lock();
+        if q.is_empty() { return 0; }
+        let mut freed = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if stack_gen_snapshot_quiesced(&q[i].gen_snapshot) {
+                let e = q.remove(i);
+                freed.push((e.base, e.pages));
+            } else {
+                i += 1;
+            }
+        }
+        freed
+    };
+    let n = to_free.len();
+    for (base, pages) in to_free {
+        let phys_base = if base >= KERNEL_VIRT_OFFSET {
+            base - KERNEL_VIRT_OFFSET
+        } else { base };
+        for p in 0..pages {
+            crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
+        }
+    }
+    n
+}
+
+/// Decide whether a cached entry has quiesced — every online CPU must have
+/// bumped its context-switch generation past the snapshot taken at reclaim.
+///
+/// Replaces the previous wall-clock `TICK_COUNT` check.  See `CachedDeadStack`
+/// struct doc and `CTX_SWITCH_GEN` for the full rationale.
 #[inline]
 fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
-    let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
-    now >= entry.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS)
+    stack_gen_snapshot_quiesced(&entry.gen_snapshot)
 }
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
@@ -812,62 +1036,45 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
 /// the broader "improper resource shutdown" class — recycled-resource
 /// leak of residual data).
 ///
-/// Cost: one `write_bytes(.., 0, stack_size_bytes)` per reaped thread.
-/// At 64 pages = 256 KiB this is ~12 µs on a modern core, paid once
-/// per thread death — comparable to the page-zeroing cost paid on the
-/// non-cached path (`pmm::free_page` → `pmm::alloc_page` zero on the
-/// allocation side).  The cache exists to skip TLB shootdowns and the
-/// PMM round-trip, not to skip zeroing.
+/// Where the zero-fill happens: NOT here.  Zeroing the stack while a
+/// sibling CPU may still be mid-`switch_context_asm` on it IS the
+/// corrupting write this whole subsystem exists to prevent.  The
+/// zero-fill is therefore deferred to `pop_dead_stack`, which only
+/// hands a stack to a new thread after `entry_is_quiesced` (every CPU
+/// has switched since reclaim → no CPU is on the stack).  `push_dead_stack`
+/// merely records the entry and the reclaim-time generation snapshot.
 ///
-/// Quiescence gate: the global `TICK_COUNT` is recorded alongside the
-/// kstack base so `pop_dead_stack` can withhold the entry from re-issue
-/// until `TICK_COUNT` has advanced by at least `DEAD_STACK_QUIESCE_TICKS`
-/// (wall-clock: 20 ms at TICK_HZ=100).  See `CachedDeadStack` for the
-/// rationale.
+/// Cost: one `write_bytes(.., 0, stack_size_bytes)` per *reused* stack,
+/// paid at pop time.  At 64 pages = 256 KiB this is ~12 µs on a modern
+/// core — comparable to the page-zeroing cost paid on the non-cached path
+/// (`pmm::free_page` → `pmm::alloc_page` zero on the allocation side).
+/// The cache exists to skip TLB shootdowns and the PMM round-trip, not to
+/// skip zeroing.
+///
+/// Quiescence gate: the `CTX_SWITCH_GEN` vector is snapshotted alongside
+/// the kstack base so `pop_dead_stack` can withhold the entry from
+/// re-issue until every online CPU has performed a full context switch
+/// since reclaim.  See `CachedDeadStack` for the rationale.
 fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
     // Defensive: refuse zero-sized or absurdly-large entries.  Both shapes
     // are programmer errors at the call site — the cache must never
     // hand back a base whose true extent we cannot honour.  Treat as
-    // "cache full" so the caller falls through to `pmm::free_page` for
-    // each of the kstack's pages (see `reap_dead_threads_sched`).
+    // "cache full" so the caller falls through to the quarantine /
+    // `pmm::free_page` path for each of the kstack's pages (see
+    // `reap_dead_threads_sched`).
     if stack_size_bytes == 0
         || stack_size_bytes > (crate::proc::KERNEL_STACK_PAGES_PUB as u64) * 0x1000
     {
         return false;
     }
 
-    // Bulk-zero the kernel stack via the higher-half virtual base BEFORE
-    // taking the cache lock — keeps the lock window tight (a few CPU
-    // cycles to push the entry; the ~12 µs zero runs outside the lock).
-    // The cached entry is not observable to any reader until we acquire
-    // the lock below, so the zero is guaranteed to be visible to the
-    // first `pop_dead_stack` caller that recycles this base.
-    //
-    // The zero length is `stack_size_bytes`, which is the honest extent
-    // of this entry's underlying allocation (see doc-comment).  Writing
-    // past that would step into another allocation's higher-half
-    // mapping and corrupt unrelated kernel state.
-    // SAFETY: `stack_base_virt` is a kernel higher-half virtual address
-    // that was previously allocated as a kernel stack for a thread that
-    // is now Dead and removed from THREAD_TABLE (see
-    // `reap_dead_threads_sched`).  The caller runs with interrupts
-    // disabled; no other CPU can be executing on this stack — Dead
-    // state is set by the thread's last `schedule()` call, after which
-    // the per-CPU `current_tid` moves away from this thread.  The
-    // mapping is in the kernel half (above KERNEL_VIRT_BASE) so a
-    // user-mode access cannot reach it.  The length `stack_size_bytes`
-    // is bounded above by `KERNEL_STACK_PAGES_PUB * 0x1000` (checked
-    // immediately above), so the write stays within the kstack
-    // allocation's physical extent.
-    unsafe {
-        core::ptr::write_bytes(
-            stack_base_virt as *mut u8,
-            0u8,
-            stack_size_bytes as usize,
-        );
-    }
-
-    let push_tick = current_tick_for_quiesce();
+    // Capture the generation vector BEFORE taking the cache lock.  This is
+    // the reclaim-time snapshot; the entry is ineligible for re-issue (and
+    // its zero-fill) until every online CPU's generation has advanced past
+    // it (see `entry_is_quiesced` / `stack_gen_snapshot_quiesced`).  No
+    // memory is written to the stack here — the dangerous write is deferred
+    // to pop time, after quiescence.
+    let gen_snapshot = snapshot_ctx_switch_gen();
 
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.len() >= MAX_DEAD_STACKS {
@@ -876,7 +1083,7 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
     cache.push(CachedDeadStack {
         base: stack_base_virt,
         size: stack_size_bytes,
-        push_tick,
+        gen_snapshot,
     });
     true
 }
@@ -884,9 +1091,17 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
 /// Try to pop a cached stack for reuse.
 ///
 /// Returns `(stack_base_virt, stack_size_bytes)` of the oldest cached
-/// entry that has quiesced — i.e. the global `TICK_COUNT` has advanced
-/// by at least `DEAD_STACK_QUIESCE_TICKS` since push.  Non-quiesced
-/// entries are left in place; the next pop attempt re-checks them.
+/// entry that has quiesced — i.e. every online CPU has performed a full
+/// context switch since the entry was reclaimed (`entry_is_quiesced`).
+/// Non-quiesced entries are left in place; the next pop attempt re-checks
+/// them.
+///
+/// The returned stack is zero-filled HERE, at re-issue time, immediately
+/// before being handed to the new thread.  This is the only safe moment to
+/// zero it: quiescence guarantees no CPU is mid-`switch_context_asm` on the
+/// stack, so the write cannot corrupt an in-flight switch frame.  Zeroing
+/// was previously done at push time — which, under genuine SMP, is exactly
+/// the corrupting write a stalled sibling resumes onto.
 ///
 /// `stack_size_bytes` is the honest extent stamped at push time (the
 /// reaper's view of `Thread::kernel_stack_size`).  Callers use it to
@@ -907,32 +1122,40 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
 /// (Intel SDM Vol. 3A §6.14 "Interrupt and Exception Handling").  See
 /// `CachedDeadStack` for the full quiescence rationale.
 pub fn pop_dead_stack() -> Option<(u64, u64)> {
-    let mut cache = DEAD_STACK_CACHE.lock();
-    // Scan from the oldest end (index 0) — older entries have had more
-    // time to quiesce, so this preserves rough-FIFO recycle order even
-    // though pushes append to the end.
-    let mut idx_found: Option<usize> = None;
-    for (i, entry) in cache.iter().enumerate() {
-        if entry_is_quiesced(entry) {
-            idx_found = Some(i);
-            break;
+    let (base, size) = {
+        let mut cache = DEAD_STACK_CACHE.lock();
+        // Scan from the oldest end (index 0) — older entries have had more
+        // generations to quiesce, so this preserves rough-FIFO recycle order
+        // even though pushes append to the end.
+        let mut idx_found: Option<usize> = None;
+        for (i, entry) in cache.iter().enumerate() {
+            if entry_is_quiesced(entry) {
+                idx_found = Some(i);
+                break;
+            }
         }
+        let i = idx_found?;
+        // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
+        // (alloc_kernel_stack) is off the hot scheduler path — already
+        // amortised against PMM allocation cost.
+        let entry = cache.remove(i);
+        (entry.base, entry.size)
+    }; // cache lock released before the ~12 µs zero-fill below
+
+    // Zero-fill the recycled stack now — post-quiescence, so no CPU is on it.
+    // SAFETY: `base` is a kernel higher-half virtual address previously
+    // allocated as a kernel stack for a now-Dead, fully-reaped thread.  The
+    // entry was admitted to the cache with `size <= KERNEL_STACK_PAGES_PUB *
+    // 0x1000` (checked in `push_dead_stack`), so the write stays within the
+    // kstack allocation's physical extent.  `entry_is_quiesced` held above,
+    // so every online CPU has switched away since reclaim — no CPU is
+    // executing on this stack, hence the write cannot corrupt an in-flight
+    // `switch_context_asm` frame.  The mapping is in the kernel half (above
+    // KERNEL_VIRT_BASE) so a user-mode access cannot reach it.
+    unsafe {
+        core::ptr::write_bytes(base as *mut u8, 0u8, size as usize);
     }
-    #[cfg(feature = "test-mode")]
-    if idx_found.is_none() && !cache.is_empty() {
-        let e = &cache[0];
-        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
-        crate::serial_println!(
-            "[KSTACK/QUIESCE] push_tick={} now={} need={} quiesced={}",
-            e.push_tick, now, e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS),
-            now >= e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS));
-    }
-    let i = idx_found?;
-    // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
-    // (alloc_kernel_stack) is off the hot scheduler path — already
-    // amortised against PMM allocation cost.
-    let entry = cache.remove(i);
-    Some((entry.base, entry.size))
+    Some((base, size))
 }
 
 /// Public interface to pre-populate the dead stack cache (called from main.rs).
@@ -947,15 +1170,6 @@ pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
     push_dead_stack(stack_base_virt, stack_size)
 }
 
-/// Test-only pop that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate so a
-/// freshly-pushed entry can be popped in the same tick.  Behaves like
-/// `pop_dead_stack` but disregards `entry_is_quiesced`.
-///
-/// This exists for `test_runner::test_236_dead_stack_zeroing`, which pushes
-/// and pops in the same call frame to verify the zeroing contract — the
-/// quiescence gate would otherwise withhold the entry for ~20 ms and the
-/// test would deterministically fail under `--features test-mode`.
-///
 /// Return the number of entries currently in the dead-stack cache.
 ///
 /// Diagnostic helper: only compiled for test-mode to avoid polluting the
@@ -965,36 +1179,90 @@ pub fn dead_stack_cache_len() -> usize {
     DEAD_STACK_CACHE.lock().len()
 }
 
-/// Wait (yield-based) until the global `TICK_COUNT` has advanced by
-/// `DEAD_STACK_QUIESCE_TICKS + 1` ticks from the current instant.
+/// Wait (yield-based) until every dead-stack cache entry that exists right
+/// now has quiesced — i.e. every online CPU has bumped its context-switch
+/// generation past every cached entry's reclaim-time snapshot.
 ///
 /// After this returns, any dead-stack cache entry pushed BEFORE the call
-/// will satisfy `entry_is_quiesced` — `TICK_COUNT` is the same counter
-/// that `entry_is_quiesced` now reads (see `CachedDeadStack.push_tick`).
+/// will satisfy `entry_is_quiesced`, so the next `pop_dead_stack` can
+/// recycle it.  Yielding repeatedly drives this CPU (and, via the timer,
+/// the sibling) through `schedule()`, advancing the generation counters.
 ///
 /// Test-mode only: used by the PMM-leak test to ensure the child's kstack
 /// is recycled on the next iteration rather than forcing a fresh PMM alloc.
 #[cfg(feature = "test-mode")]
 pub fn wait_dead_stacks_quiesced() {
-    const NEEDED: u64 = DEAD_STACK_QUIESCE_TICKS + 1;
-    let baseline = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    // Loop-yield until every cached entry has quiesced.  The budget is
+    // TICK-based, not iteration-based: an idle sibling CPU only reports
+    // quiescence from its 100 Hz timer wake (`check_reschedule`), so the
+    // wait must span at least a few timer periods — a fixed iteration count
+    // of fast yields can elapse in well under one tick and time out before
+    // the sibling ever gets a chance to bump.  ~100 ticks (1 s) is a
+    // generous bound; a pathological never-scheduling sibling past that
+    // simply leaves a non-recycled stack, which callers tolerate.
+    let deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(100);
     loop {
+        let all_quiesced = {
+            let cache = DEAD_STACK_CACHE.lock();
+            cache.iter().all(entry_is_quiesced)
+        };
+        if all_quiesced { break; }
+        if crate::arch::x86_64::irq::get_ticks() >= deadline { break; }
         crate::hal::enable_interrupts();
         yield_cpu();
-        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
-        if now >= baseline.saturating_add(NEEDED) { break; }
         for _ in 0..200 { core::hint::spin_loop(); }
     }
 }
 
+/// Test-mode hook: snapshot the per-CPU context-switch generation vector.
+///
+/// Pairs with [`ctx_gen_quiesced`] so the gen-barrier regression test can
+/// assert the gate's two halves deterministically: (a) a snapshot taken with
+/// interrupts disabled on the calling CPU can NEVER report quiesced (this
+/// CPU's generation is frozen while IF=0 — it cannot pass through
+/// `schedule()`), and (b) the gate RELEASES once every online CPU schedules.
+#[cfg(feature = "test-mode")]
+pub fn ctx_gen_snapshot_now() -> [u64; MAX_CPUS] {
+    snapshot_ctx_switch_gen()
+}
+
+/// Test-mode hook: evaluate the generation barrier against a snapshot.
+/// See [`ctx_gen_snapshot_now`].
+#[cfg(feature = "test-mode")]
+pub fn ctx_gen_quiesced(snap: &[u64; MAX_CPUS]) -> bool {
+    stack_gen_snapshot_quiesced(snap)
+}
+
+/// Test-mode hook: number of stacks parked in the pending-PMM-free
+/// quarantine.  Used by leak tests to assert the quarantine drains (no
+/// permanent kstack strand) once the machine schedules.
+#[cfg(feature = "test-mode")]
+pub fn dead_stack_quarantine_len() -> usize {
+    DEAD_STACK_QUARANTINE.lock().len()
+}
+
 /// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
 /// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
+///
+/// This forced variant bypasses the quiescence gate (for tests that push and
+/// pop in the same call frame) but STILL zero-fills the recycled stack, so
+/// the recycled-data-leak contract that `test_236_dead_stack_zeroing` checks
+/// is preserved.  Bypassing the gate is sound here only because the test
+/// drives both push and pop on a single CPU with no sibling mid-switch.
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
-    let mut cache = DEAD_STACK_CACHE.lock();
-    if cache.is_empty() { return None; }
-    let entry = cache.remove(0);
-    Some((entry.base, entry.size))
+    let (base, size) = {
+        let mut cache = DEAD_STACK_CACHE.lock();
+        if cache.is_empty() { return None; }
+        let entry = cache.remove(0);
+        (entry.base, entry.size)
+    };
+    // Zero-fill at re-issue, matching the production `pop_dead_stack` contract.
+    // SAFETY: same as `pop_dead_stack`; `size <= KERNEL_STACK_PAGES_PUB * 0x1000`.
+    unsafe {
+        core::ptr::write_bytes(base as *mut u8, 0u8, size as usize);
+    }
+    Some((base, size))
 }
 
 /// Schedule the next thread to run.
@@ -1019,6 +1287,20 @@ pub fn schedule() {
     // Interrupts are re-enabled at each early-return and after the context
     // switch completes.
     crate::hal::disable_interrupts();
+
+    // ── Quiescent-state observation for the kstack grace period ──────────────
+    // Bump this CPU's context-switch generation NOW, before reaping.  Reaching
+    // this point means the CPU has fully returned from any prior
+    // `switch_context_asm` and is executing the body of `schedule()` on a
+    // well-defined current stack — it is provably not mid-switch on, nor about
+    // to `ret` off, any *other* thread's kernel stack.  Bumping before the
+    // reaper's snapshot guarantees the snapshot a reaper takes THIS pass
+    // includes this CPU's current generation, so any stack reclaimed this pass
+    // (whose snapshot therefore records `CTX_SWITCH_GEN[this_cpu] == g`) cannot
+    // be re-issued until THIS CPU bumps again (a later `schedule()`), forcing
+    // the one-more-grace-step that the wall-clock gate never enforced under SMP.
+    // See `CTX_SWITCH_GEN` for the full grace-period rationale.
+    bump_ctx_switch_gen();
 
     // Reap dead threads here (interrupts disabled → PMM_LOCK safe, no ISR deadlock).
     reap_dead_threads_sched();
@@ -1106,6 +1388,18 @@ was_emergency_4k={}",
         // against a future edit that switches to a wait primitive that
         // does not re-disable interrupts.
         crate::hal::disable_interrupts();
+        // Quiescent-state report for the kstack grace period (see
+        // `CTX_SWITCH_GEN`): every `'pick` iteration executes on the current
+        // thread's own kernel stack with any prior `switch_context_asm` fully
+        // retired — the same quiescent property as the top-of-`schedule()`
+        // bump.  Without this, a CPU parked in the `sti; hlt; cli` wait paths
+        // below (idle AP, or a Sleeping/Blocked sole thread) would freeze its
+        // generation for the whole wait and stall dead-stack recycling and
+        // quarantine drain machine-wide, even though the parked CPU is
+        // trivially quiescent.  One `LOCK XADD` per iteration; iterations
+        // beyond the first only occur on the wait paths, so the hot path
+        // (single pass) pays exactly one extra bump per schedule().
+        bump_ctx_switch_gen();
         let mut threads = THREAD_TABLE.lock();
         // Deferred timer due-wake drain (lock-held window).
         //

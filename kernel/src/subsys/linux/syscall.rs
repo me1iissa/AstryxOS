@@ -3495,6 +3495,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     t.state = crate::proc::ThreadState::Ready;
                                     t.wake_tick = u64::MAX;
                                 } else {
+                                    // INVARIANT: Release-store ctx_rsp_valid=false
+                                    // BEFORE Blocked (see futex_wait_check_and_enqueue
+                                    // in syscall/mod.rs).  The vfork child's completion
+                                    // wake can fire from the sibling CPU at any instant
+                                    // after this store; the flag is the picker's only
+                                    // mid-switch guard against resuming this parent from
+                                    // its STALE previous-switch `context.rsp`.
+                                    t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                                     t.state = crate::proc::ThreadState::Blocked;
                                     // Timeout backstop: wake after 500 ticks (~5s)
                                     // even if the child never signals.
@@ -4748,6 +4756,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     t.state = crate::proc::ThreadState::Ready;
                                     t.wake_tick = u64::MAX;
                                 } else {
+                                    // INVARIANT: Release-store ctx_rsp_valid=false
+                                    // BEFORE Blocked — same mid-switch stale-RSP guard
+                                    // as the clone3 vfork park above.
+                                    t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                                     t.state = crate::proc::ThreadState::Blocked;
                                     let now = crate::arch::x86_64::irq::get_ticks();
                                     t.wake_tick = now.saturating_add(500);

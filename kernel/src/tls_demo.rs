@@ -144,7 +144,7 @@ fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_ticks: u64)
     loop {
         crate::sched::yield_cpu();
 
-        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+        if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {
             if n > 0 && captured.len() < cap {
                 let take = core::cmp::min(n, cap - captured.len());
                 captured.extend_from_slice(&buf[..take]);
@@ -176,7 +176,7 @@ fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_ticks: u64)
     // Drain any tail bytes the child wrote after we noticed it exited.
     {
         let mut tail = [0u8; 4096];
-        while let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut tail) {
+        while let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail) {
             if n == 0 {
                 break;
             }

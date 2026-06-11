@@ -6048,6 +6048,14 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if pid != 0:
             req["pid"] = pid
         return req
+    if op == "pipe-diag":
+        # One-pipe blocking-write triage: ring occupancy, free space, endpoint
+        # refcounts, parked reader/writer counts.  Discriminates "full+parked
+        # writers" (no drain) vs "empty+parked writers" (lost wake) vs "no
+        # waiters" (blocked elsewhere).
+        if not rest:
+            raise ValueError("pipe-diag requires <pipe_id>")
+        return {"op": "pipe-diag", "id": int(rest[0], 0)}
     if op == "unix-diag":
         # Recv-side readiness probe for one AF_UNIX socket inode.  Reports
         # recv_avail / recv_pushed / recv_popped / shutdown edges + pending
@@ -11787,7 +11795,7 @@ def main():
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
-        "unix-diag",
+        "unix-diag", "pipe-diag",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
