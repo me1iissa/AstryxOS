@@ -1371,9 +1371,30 @@ fn cmd_kill(parts: &[&str]) {
                 orbit_println!("kill: cannot kill idle thread");
             } else {
                 // Mark the target thread as Dead.
+                //
+                // INVARIANT: if the target is currently Running on another
+                // logical processor, its saved kernel RSP has not been
+                // committed — ctx_rsp_valid is stale-true from the thread's
+                // last switch-OUT.  The kstack reaper
+                // (sched::reap_dead_threads_sched) admits a Dead thread for
+                // stack-free only when ctx_rsp_valid==true (i.e. the RSP has
+                // been saved and the CPU has left that stack).  Observing
+                // Dead+ctx_rsp_valid==true on a thread that is still
+                // executing on that stack is a UAF.  Release-store false
+                // BEFORE writing Dead so that switch_context_asm on the peer
+                // CPU re-sets true only AFTER saving the RSP, at which point
+                // the stack is safe to reap.  Non-Running threads already had
+                // their RSP saved at their last switch-out and their
+                // ctx_rsp_valid is correctly true — leave it unchanged.
                 let found = {
                     let mut threads = crate::proc::THREAD_TABLE.lock();
                     if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                        if t.state == crate::proc::ThreadState::Running {
+                            t.ctx_rsp_valid.store(
+                                false,
+                                core::sync::atomic::Ordering::Release,
+                            );
+                        }
                         t.state = crate::proc::ThreadState::Dead;
                         t.exit_code = 137; // SIGKILL
                         true
