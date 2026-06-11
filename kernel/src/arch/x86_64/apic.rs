@@ -485,6 +485,34 @@ pub fn send_ipi(dest_apic_id: u8, vector: u8) {
     while lapic_read(LAPIC_ICR_LO) & (1 << 12) != 0 {}
 }
 
+/// Send a fire-and-forget IPI: program the ICR and return WITHOUT spinning on
+/// the delivery-status bit.
+///
+/// Unlike [`send_ipi`], this never executes the
+/// `while lapic_read(ICR_LO) & DELIVERY_PENDING {}` busy-wait.  That wait is
+/// the documented deadlock hazard for cross-CPU pokes raised from inside an
+/// interrupt handler: two CPUs that each spin waiting for the other's LAPIC to
+/// accept can wedge (the same ISR-to-ISR LAPIC-contention failure that retired
+/// the earlier IPI-based debug-register sync — see
+/// `arch::x86_64::irq::timer_tick`).  A dropped or still-pending poke is
+/// self-healing: the caller (the timer ISR) re-evaluates and re-pokes on the
+/// next tick crossing, so at most one tick of wake latency is lost — never a
+/// permanent hang.
+///
+/// Per Intel SDM Vol. 3A §11.6.1, writing ICR_LOW issues the IPI; the
+/// delivery-status bit is advisory.  Back-to-back writes before the prior IPI
+/// is accepted are allowed (the LAPIC serialises them); the worst case is a
+/// coalesced wake, which for an edge-triggered fixed-vector timer poke is
+/// harmless.
+#[inline]
+pub fn send_ipi_noblock(dest_apic_id: u8, vector: u8) {
+    if !is_enabled() {
+        return;
+    }
+    lapic_write(LAPIC_ICR_HI, (dest_apic_id as u32) << 24);
+    lapic_write(LAPIC_ICR_LO, vector as u32 | ICR_ASSERT);
+}
+
 /// Bootstrap application processors (APs).
 ///
 /// Writes a 16-bit real-mode trampoline at physical 0x8000, then sends the

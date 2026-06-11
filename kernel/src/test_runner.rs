@@ -236,6 +236,9 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
+    total += 1;
+    if test_sibling_timer_stale_poke_curve() { passed += 1; }
+
     // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
@@ -36274,6 +36277,88 @@ fn test_pipe_blocking_write_semantics() -> bool {
     test_println!("  kernel-context supervisor drain (pipe_read_wake) woke parked writer ✓");
 
     test_pass!("pipe blocking write — atomic / blocks-until-drained / atomic-park / concurrent-atomicity / kernel-drain-wake / EAGAIN / EPIPE");
+    true
+}
+
+/// Regression test for the dual-core liveness backstop: the timer ISR's
+/// stale-sibling poke decision (`arch::x86_64::irq::sibling_timer_is_stale`).
+///
+/// Under KVM one vCPU's LAPIC periodic timer can go permanently silent mid-boot
+/// while a sibling keeps the global clock alive.  A halted CPU is woken only by
+/// an interrupt delivered to it (Intel SDM Vol. 2A, HLT); with its own timer
+/// dead and no IRQ routed there it never wakes, stranding its runqueue.  The
+/// fix has the live-clock CPU poke any sibling whose timer has gone stale with a
+/// vector-32 wake IPI.  The real dead-timer condition only manifests under KVM
+/// and cannot be synthesised in-kernel, so this test exercises the pure
+/// staleness predicate that gates the poke, covering the three regimes:
+///   * never-fired sentinel (last_fire == 0)  → not stale (sibling mid-bringup)
+///   * fired within SIBLING_STALE_TICKS        → not stale (healthy/busy)
+///   * silent beyond the staleness window      → stale (poke it)
+/// plus the pre-calibration (tsc_per_tick == 0) no-op guard, and confirms the
+/// monotone wake-IPI counter API is wired.
+fn test_sibling_timer_stale_poke_curve() -> bool {
+    use crate::arch::x86_64::irq::sibling_timer_is_stale as stale;
+
+    // A representative calibrated per-tick TSC span (≈1.0 GHz × 10 ms).  The
+    // predicate is span-relative, so the exact value is immaterial.
+    let per_tick: u64 = 10_000_000;
+    // SIBLING_STALE_TICKS is 3; pick a `now` comfortably past 3 ticks of span.
+    let now: u64 = 1_000_000_000;
+
+    // 1. Pre-calibration guard: tsc_per_tick == 0 → never stale (no division /
+    //    no poke before the timer is even calibrated).
+    if stale(now, now.saturating_sub(per_tick * 100), 0) {
+        test_fail!("sibling_timer_stale_poke",
+            "tsc_per_tick==0 must be treated as not-stale (pre-calibration no-op)");
+        return false;
+    }
+
+    // 2. Never-fired sentinel: last_fire == 0 → not stale (AP still in bringup,
+    //    not a wedged timer).
+    if stale(now, 0, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "last_fire==0 sentinel must be treated as not-stale (sibling mid-bringup)");
+        return false;
+    }
+
+    // 3. Fired within the staleness window → not stale.  At SIBLING_STALE_TICKS
+    //    == 3, a fire 2 ticks ago is fresh.
+    let fired_2_ticks_ago = now.saturating_sub(2 * per_tick);
+    if stale(now, fired_2_ticks_ago, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "a timer that fired 2 ticks ago (< 3-tick window) must NOT be judged stale");
+        return false;
+    }
+
+    // 4. Silent beyond the staleness window → stale (poke it).  A fire 10 ticks
+    //    ago is well past the 3-tick window.
+    let fired_10_ticks_ago = now.saturating_sub(10 * per_tick);
+    if !stale(now, fired_10_ticks_ago, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "a timer silent for 10 ticks (> 3-tick window) MUST be judged stale");
+        return false;
+    }
+
+    // 5. Boundary: exactly at the window edge is NOT stale (strict `>`), one
+    //    span past it IS — confirms the comparison is a clean threshold.
+    let at_edge = now.saturating_sub(3 * per_tick); // == window: now - 3*span
+    if stale(now, at_edge, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "fire exactly at the 3-tick window edge must NOT be stale (strict >)");
+        return false;
+    }
+    let just_past_edge = now.saturating_sub(3 * per_tick + 1);
+    if !stale(now, just_past_edge, per_tick) {
+        test_fail!("sibling_timer_stale_poke",
+            "fire one TSC past the 3-tick window edge MUST be stale");
+        return false;
+    }
+
+    // 6. The monotone wake-IPI counter API is wired and readable (the harness /
+    //    soak asserts a non-zero delta on a real dead-timer KVM boot).
+    let _ = crate::arch::x86_64::irq::sibling_wake_ipi_count();
+
+    test_pass!("sibling-timer stale-poke curve — sentinel / within-window / beyond-window / boundary / counter-wired");
     true
 }
 

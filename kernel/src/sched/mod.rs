@@ -533,6 +533,25 @@ fn reap_dead_threads_sched() {
                 t.is_reapable()
                     && t.tid != current_tid
                     && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+                    // SMP live-stack guard: never reap a thread that is the
+                    // `current` thread on ANY logical processor.  `ctx_rsp_valid`
+                    // alone is insufficient under genuine dual-core scheduling:
+                    // `switch_context_asm` sets it true on switch-OUT and never
+                    // re-clears it on switch-IN, so a thread that was switched in
+                    // and is executing RIGHT NOW on a sibling CPU still reads
+                    // `ctx_rsp_valid == true`.  If such a thread is then marked
+                    // Dead by a concurrent group exit on this CPU, the bare
+                    // `is_reapable() && ctx_rsp_valid` test would free — and
+                    // `push_dead_stack` zero-fills — the kernel stack the sibling
+                    // is still running on, so its next `ret` pops a zeroed return
+                    // slot and the CPU jumps to a corrupted RIP (observed:
+                    // KERNEL_PAGE_FAULT, CR2=0, RIP mid-instruction in an
+                    // unrelated routine).  The per-CPU `current` table is the
+                    // authoritative "executing on a CPU now" signal — see
+                    // `proc::is_tid_current_on_any_cpu`.  Per Intel SDM Vol. 3A
+                    // §4.10 a thread's working set (its kernel stack) must remain
+                    // valid while any CPU executes on it.
+                    && !crate::proc::is_tid_current_on_any_cpu(t.tid)
             })
             .map(|(i, _)| i)
             .collect();

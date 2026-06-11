@@ -977,6 +977,33 @@ pub fn set_current_tid(tid: Tid) {
     PER_CPU_CURRENT_TID[cpu_index()].store(tid, Ordering::Relaxed);
 }
 
+/// True if `tid` is the thread currently running on ANY logical processor.
+///
+/// Scans every CPU's `PER_CPU_CURRENT_TID` slot — not just the caller's — so a
+/// thread that is executing on a sibling CPU is recognised as live regardless
+/// of which CPU asks.  This is the authoritative "is this thread on a CPU right
+/// now" predicate for the reaper: a Dead thread that is still the `current`
+/// thread on another CPU is executing on its kernel stack this very instant, so
+/// freeing (and zero-filling) that stack is a use-after-free that corrupts the
+/// running thread's control flow.
+///
+/// SMP correctness: `set_current_tid` is called on a CPU at the START of its
+/// context switch (before `switch_context_asm`), so the slot for a CPU that has
+/// switched AWAY from `tid` no longer reports it.  A relaxed load per slot is
+/// sufficient — we need only a point-in-time "is it current somewhere" answer,
+/// and the reaper re-checks on every pass, so a thread that leaves a CPU between
+/// two reaper passes is simply reaped on the next pass.  The scan is O(MAX_CPUS)
+/// (≤16 relaxed atomic loads), negligible against the PMM/zero-fill cost the
+/// reaper already pays per freed stack.
+pub fn is_tid_current_on_any_cpu(tid: Tid) -> bool {
+    for slot in PER_CPU_CURRENT_TID.iter() {
+        if slot.load(Ordering::Relaxed) == tid {
+            return true;
+        }
+    }
+    false
+}
+
 /// Set the currently running process's PID (per-CPU).
 ///
 /// Must be called from every `set_current_tid` call site that knows the
