@@ -27,8 +27,34 @@ use spin::Mutex;
 
 use crate::ipc::waitlist::{ring_poll_bell_for, wake_tids, PollBellSource, WaitList};
 
-/// Pipe buffer size (4 KiB).
+/// POSIX write-atomicity threshold (`limits.h` `PIPE_BUF`; 4096 on Linux).
+/// Writes of at most this many bytes land all-or-nothing and never
+/// interleave with a concurrent writer's record (POSIX.1-2017 write(2),
+/// pipe(7)).  This is a *semantic* bound, distinct from the ring capacity
+/// below — POSIX only requires capacity >= PIPE_BUF.
 const PIPE_BUF_SIZE: usize = 4096;
+
+/// Default ring capacity for a newly created pipe — 64 KiB, matching the
+/// Linux default documented in pipe(7) ("Since Linux 2.6.11, the pipe
+/// capacity is 16 pages (i.e., 65,536 bytes ...)").
+///
+/// History: the ring used to be PIPE_BUF-sized (4 KiB, the bare POSIX
+/// minimum).  Combined with the POSIX block-on-full write contract, that
+/// 16×-smaller-than-Linux capacity turned any bursty stdout/stderr
+/// producer into a convoy: during a real-website Firefox page load the
+/// parent's diagnostic stderr (4–8 KiB warning bursts) filled the
+/// launcher pipe, writev(2) on fd 2 parked for seconds at a time, and —
+/// because stderr writes happen under the libc FILE lock — the necko
+/// socket thread serialized behind them, freezing TLS handshake
+/// continuations long enough for image-CDN servers to drop the
+/// connections (observed live: socket thread blocked in writev(fd=2) for
+/// up to 8.7 s mid-handshake while the 4 KiB pipe sat full).
+pub const PIPE_DEFAULT_CAPACITY: usize = 65536;
+
+/// Upper bound accepted from fcntl(F_SETPIPE_SZ), mirroring the default
+/// `/proc/sys/fs/pipe-max-size` limit (1 MiB) that applies to unprivileged
+/// callers on Linux (fcntl(2)).
+pub const PIPE_MAX_CAPACITY: usize = 1 << 20;
 
 /// Next pipe ID.
 static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -36,7 +62,11 @@ static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 /// A kernel pipe — a bounded ring buffer.
 pub struct Pipe {
     pub id: u64,
-    buffer: [u8; PIPE_BUF_SIZE],
+    /// Ring storage.  Heap-allocated so capacity is per-pipe adjustable
+    /// (fcntl F_SETPIPE_SZ) and `PIPE_TABLE`'s `Vec<Pipe>` reallocations
+    /// stay cheap.  Invariant: `buffer.len()` is the pipe capacity, a
+    /// power of two ≥ `PIPE_BUF_SIZE`.
+    buffer: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
     count: usize,
@@ -51,7 +81,7 @@ impl Pipe {
     fn new(id: u64) -> Self {
         Self {
             id,
-            buffer: [0; PIPE_BUF_SIZE],
+            buffer: alloc::vec![0; PIPE_DEFAULT_CAPACITY],
             read_pos: 0,
             write_pos: 0,
             count: 0,
@@ -61,8 +91,38 @@ impl Pipe {
         }
     }
 
+    /// Resize the ring to hold `want` bytes, per fcntl(2) F_SETPIPE_SZ:
+    /// the kernel rounds the request up to the next power of two (with a
+    /// floor of `PIPE_BUF_SIZE` — capacity may never drop below the POSIX
+    /// atomicity bound), refuses to exceed `PIPE_MAX_CAPACITY` with
+    /// `EPERM`, and refuses to shrink below the currently buffered byte
+    /// count with `EBUSY`.  Returns the actual capacity on success.
+    fn set_capacity(&mut self, want: usize) -> Result<usize, i32> {
+        let mut cap = PIPE_BUF_SIZE;
+        while cap < want {
+            cap <<= 1;
+            if cap > PIPE_MAX_CAPACITY {
+                return Err(-1); // EPERM — beyond pipe-max-size
+            }
+        }
+        if self.count > cap {
+            return Err(-16); // EBUSY — unread data would not fit
+        }
+        // Linearize the live bytes into the new ring.
+        let mut nb = alloc::vec![0u8; cap];
+        let old_len = self.buffer.len();
+        for i in 0..self.count {
+            nb[i] = self.buffer[(self.read_pos + i) % old_len];
+        }
+        self.buffer = nb;
+        self.read_pos = 0;
+        self.write_pos = self.count % cap;
+        Ok(cap)
+    }
+
     /// Read up to `buf.len()` bytes from the pipe. Returns bytes read.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let cap = self.buffer.len();
         let to_read = buf.len().min(self.count);
         // SMAP bracket — `buf` typically points to user memory (the
         // syscall layer passes user `buf_ptr` through `from_raw_parts_mut`).
@@ -72,7 +132,7 @@ impl Pipe {
         let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_read {
             buf[i] = self.buffer[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
+            self.read_pos = (self.read_pos + 1) % cap;
         }
         self.count -= to_read;
         to_read
@@ -80,13 +140,14 @@ impl Pipe {
 
     /// Write up to `data.len()` bytes into the pipe. Returns bytes written.
     pub fn write(&mut self, data: &[u8]) -> usize {
-        let space = PIPE_BUF_SIZE - self.count;
+        let cap = self.buffer.len();
+        let space = cap - self.count;
         let to_write = data.len().min(space);
         // SMAP bracket — `data` typically points to user memory.
         let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_write {
             self.buffer[self.write_pos] = data[i];
-            self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;
+            self.write_pos = (self.write_pos + 1) % cap;
         }
         self.count += to_write;
         to_write
@@ -125,7 +186,12 @@ impl Pipe {
 
     /// Free space remaining in the ring buffer.
     pub fn space(&self) -> usize {
-        PIPE_BUF_SIZE - self.count
+        self.buffer.len() - self.count
+    }
+
+    /// Current ring capacity (fcntl F_GETPIPE_SZ).
+    pub fn capacity(&self) -> usize {
+        self.buffer.len()
     }
 }
 
@@ -322,6 +388,35 @@ pub fn pipe_close_reader(pipe_id: u64) {
         // dropped by `retain` above).
         wake_readers_all(pipe_id);
     }
+}
+
+/// Ring capacity of `pipe_id` (fcntl F_GETPIPE_SZ).  `None` = no such pipe.
+pub fn pipe_capacity(pipe_id: u64) -> Option<usize> {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id).map(|p| p.capacity())
+}
+
+/// Set the ring capacity of `pipe_id` (fcntl F_SETPIPE_SZ semantics — see
+/// `Pipe::set_capacity` for the rounding/EBUSY/EPERM contract).  On a
+/// successful GROW, wakes any writer parked on the previously-full ring:
+/// new space is a write-readiness edge exactly like a reader drain, so the
+/// parked writer must re-evaluate (POSIX write(2) blocking contract).
+pub fn pipe_set_capacity(pipe_id: u64, want: usize) -> Result<usize, i32> {
+    let (res, grew) = {
+        let mut pipes = PIPE_TABLE.lock();
+        let pipe = match pipes.iter_mut().find(|p| p.id == pipe_id) {
+            Some(p) => p,
+            None => return Err(-9), // EBADF — pipe vanished
+        };
+        let before = pipe.capacity();
+        let res = pipe.set_capacity(want);
+        let grew = matches!(res, Ok(c) if c > before);
+        (res, grew)
+    };
+    if grew {
+        wake_writers_all(pipe_id);
+    }
+    res
 }
 
 /// Check if a pipe has data.

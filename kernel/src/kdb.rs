@@ -351,6 +351,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "dmesg"          => op_dmesg(req, out),
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
+        "user-mem"       => op_user_mem(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
         // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
@@ -882,6 +883,85 @@ fn op_mem(req: &str, out: &mut String) {
         let _ = write!(hex, "{:02x}", b);
     }
     out.push('{');
+    j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
+    j_kv(out, "len", &alloc::format!("{}", len));
+    j_kv_str(out, "hex", &hex);
+    j_trim_comma(out);
+    out.push('}');
+}
+
+// ── user-mem ─────────────────────────────────────────────────────────────────
+//
+// Request: {"op":"user-mem","pid":N,"addr":"0x...","len":L}  (L ≤ 4096)
+//
+// Read L bytes from PID N's *user* address space.  Translation walks the
+// target process's own PML4 (`virt_to_phys_in`, same walker procmaps uses)
+// page by page, then reads the backing frames through the kernel direct map
+// — no CR3 switch, no SMAP window, safe from the kdb pump regardless of
+// which process is currently scheduled.  Unmapped pages fail the request
+// (partial reads would silently mislead diagnostic decoding).
+//
+// Primary consumer: decoding a parked poller's live pollfd array — the
+// thread-park-audit reports `syscall.arg0` (pollfd*) and `syscall.arg1`
+// (nfds) for a thread inside poll(2); this op then answers "which fds is
+// that thread actually watching", which no fd-table view can.
+fn op_user_mem(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+        Some(a) => a,
+        None => { out.push_str(r#"{"error":"missing 'addr'"}"#); return; }
+    };
+    let len = match extract_field(req, "len").and_then(|s| parse_u64(&s)) {
+        Some(l) if l > 0 && l <= MEM_MAX => l,
+        Some(_) => { out.push_str(r#"{"error":"len out of range (1..=4096)"}"#); return; }
+        None    => { out.push_str(r#"{"error":"missing 'len'"}"#); return; }
+    };
+    if is_kernel_address(addr) {
+        out.push_str(r#"{"error":"addr must be a user-half address (use 'mem' for kernel)"}"#);
+        return;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        out.push_str(r#"{"error":"addr+len overflow"}"#); return;
+    };
+    let cr3 = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => match g.iter().find(|p| p.pid == pid) {
+            Some(p) => p.cr3,
+            None => { let _ = write!(out, r#"{{"error":"no pid {}"}}"#, pid); return; }
+        },
+        None => { out.push_str(r#"{"error":"PROCESS_TABLE busy"}"#); return; }
+    };
+
+    // Translate + copy page by page through the direct map.  The direct
+    // map covers all physical RAM at KERNEL_VIRT_BASE (same convention as
+    // net/e1000.rs::phys_to_virt and mm/cache.rs::PHYS_OFFSET).
+    let mut hex = String::with_capacity((len as usize) * 2);
+    let mut p = addr;
+    while p < end {
+        let page_end = ((p & !0xFFF) + 0x1000).min(end);
+        let phys = match crate::mm::vmm::virt_to_phys_in(cr3, p) {
+            Some(ph) => ph,
+            None => {
+                out.clear();
+                out.push('{');
+                let _ = write!(out, r#""error":"unmapped user page","pid":{},"#, pid);
+                j_str(out, "at"); out.push(':'); j_hex(out, p & !0xFFF);
+                out.push('}');
+                return;
+            }
+        };
+        let kva = astryx_shared::KERNEL_VIRT_BASE + phys;
+        for off in 0..(page_end - p) {
+            let b = unsafe { core::ptr::read_volatile((kva + off) as *const u8) };
+            let _ = write!(hex, "{:02x}", b);
+        }
+        p = page_end;
+    }
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
     j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
     j_kv(out, "len", &alloc::format!("{}", len));
     j_kv_str(out, "hex", &hex);
@@ -2575,6 +2655,12 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
         state: &'static str, entry_rip: u64, rsp: u64,
         wake_tick: u64, clear_child_tid: u64,
         vfork_parent_tid: Option<u64>,
+        /// `Thread::ready_since_tick` — nonzero iff the thread is currently
+        /// waiting on a run queue (stamped Ready, not yet picked).  Exposed
+        /// so a diagnostic reader can compute the live run-queue wait age
+        /// and distinguish "starved Ready thread" from "bell-churn Ready
+        /// thread that runs and re-parks between samples".
+        ready_since_tick: u64,
     }
     let thread_snaps: Vec<ThreadSnap> = match try_lock_brief(&THREAD_TABLE) {
         Some(tt) => tt.iter()
@@ -2591,6 +2677,7 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
                 wake_tick: t.wake_tick,
                 clear_child_tid: t.clear_child_tid,
                 vfork_parent_tid: t.vfork_parent_tid,
+                ready_since_tick: t.ready_since_tick,
             }).collect(),
         None => {
             out.push_str(r#"{"busy":"THREAD_TABLE held","threads":[]}"#);
@@ -2733,12 +2820,26 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
             j_str(out, "rsp"); out.push(':'); j_hex(out, ts.rsp); out.push(',');
             let _ = write!(out, r#""wake_tick":{},"#, ts.wake_tick);
             let _ = write!(out, r#""blocked_for_ticks":{},"#, blocked_for);
+            // Live run-queue wait age: how long this thread has been
+            // continuously Ready without being picked.  0 = not currently
+            // waiting (running/blocked, or picked within the last stamp).
+            // The decisive starvation metric: a large value here means the
+            // anti-starvation escalation in the picker is NOT delivering
+            // CPU to this runnable thread.
+            let ready_for = if ts.ready_since_tick > 0 {
+                tick_now.saturating_sub(ts.ready_since_tick)
+            } else { 0 };
+            let _ = write!(out, r#""ready_for_ticks":{},"#, ready_for);
             match (nr_opt, arg0_opt) {
                 (Some(nr), Some(arg0)) => {
                     out.push_str(r#""syscall":{"#);
                     let _ = write!(out, r#""nr":{},"#, nr);
                     j_kv_str(out, "name", crate::perf::linux_syscall_name(nr));
-                    j_str(out, "arg0"); out.push(':'); j_hex(out, arg0);
+                    j_str(out, "arg0"); out.push(':'); j_hex(out, arg0); out.push(',');
+                    // arg1 (RSI): nfds for poll(2) — lets `user-mem` size the
+                    // pollfd-array read of a parked poller exactly.
+                    j_str(out, "arg1"); out.push(':');
+                    j_hex(out, sample.as_ref().map(|s| s.last_syscall_arg1).unwrap_or(0));
                     out.push_str("},");
                 }
                 _ => {

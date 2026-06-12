@@ -27,6 +27,93 @@ static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
 /// therefore the earliest possible signal of process termination.
 static EXEC_PID: AtomicU64 = AtomicU64::new(0);
 
+/// Render-throttle state for `poll_output()`: tick of the last
+/// framebuffer repaint, and whether drained-but-unrendered text is
+/// pending.  See the throttle comment in `poll_output` — draining the
+/// launcher pipe (which unblocks POSIX-blocked writers) must not be
+/// rate-limited by framebuffer blit speed.
+static LAST_RENDER_TICK: AtomicU64 = AtomicU64::new(0);
+static RENDER_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// One-shot guard for the dedicated launcher-pipe drain thread.
+static DRAIN_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Dedicated kernel-thread drain loop for the launcher stdout/stderr pipe.
+///
+/// `poll_output()` runs only on the BSP main loop, whose iteration latency
+/// is unbounded under load (observed gaps of tens of seconds during a
+/// Firefox page load while the loop was busy elsewhere).  POSIX write(2)
+/// blocks a writer on a full pipe, so when the child's diagnostic output
+/// outruns the BSP drain (observed: >1 MiB of stderr in the first ~40 s of
+/// a page load), every stderr writer in the child parks — including, via
+/// the libc stderr FILE lock, threads that never even hit the full pipe.
+///
+/// This thread decouples drain capacity from the BSP loop: it parks on the
+/// pipe's reader wait-list (`wait_readable`) and is woken DIRECTLY by the
+/// child's `write(2)` (`wake_readers_all`), so the scheduler's fairness —
+/// not the BSP loop's iteration rate — bounds drain latency.  Drained text
+/// is appended to the terminal grid under the TERMINAL lock; rendering
+/// stays with `poll_output()`'s throttled repaint (the RENDER_DIRTY flag).
+fn output_drain_thread() {
+    crate::hal::enable_interrupts();
+    let mut raw = [0u8; 4096];
+    loop {
+        // Snapshot the live exec target (same discipline as poll_output —
+        // never hold TERMINAL across pipe/scheduler calls).
+        let pipe_id = {
+            let guard = TERMINAL.lock();
+            guard.as_ref().and_then(|s| s.running_exec).map(|(_, p)| p)
+        };
+        let Some(pipe_id) = pipe_id else {
+            // No exec running — park on the global poll bell with a 100 ms
+            // resync deadline (bounded sleep; an early bell ring just
+            // re-checks sooner, which is harmless).
+            let now = crate::arch::x86_64::irq::get_ticks();
+            crate::ipc::waitlist::wait_poll_event(now + 10, || false);
+            continue;
+        };
+
+        let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut raw).unwrap_or(0);
+        if n > 0 {
+            let mut guard = TERMINAL.lock();
+            if let Some(state) = guard.as_mut() {
+                let text = core::str::from_utf8(&raw[..n]).unwrap_or("\u{FFFD}");
+                state.write_ansi_str(text);
+            }
+            drop(guard);
+            RENDER_DIRTY.store(true, Ordering::Release);
+            continue; // keep draining while data is flowing
+        }
+
+        // Empty: park until the child's next write wakes us (bounded by a
+        // 1 s resync so an exec swap or missed wake can never strand us).
+        let now = crate::arch::x86_64::irq::get_ticks();
+        match crate::ipc::pipe::wait_readable(pipe_id, now + 100) {
+            crate::ipc::pipe::WaitOutcome::Ready => continue,
+            crate::ipc::pipe::WaitOutcome::Gone => {
+                // Pipe vanished (exec teardown) — bounded idle, then re-snap.
+                crate::ipc::waitlist::wait_poll_event(now + 10, || false);
+            }
+            crate::ipc::pipe::WaitOutcome::Enqueued => {
+                crate::sched::schedule();
+                crate::ipc::pipe::waiter_cleanup_reader(
+                    pipe_id, crate::proc::current_tid());
+            }
+        }
+    }
+}
+
+/// Start the launcher-pipe drain thread (idempotent — first exec wins).
+fn ensure_output_drain_thread() {
+    if DRAIN_THREAD_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = crate::proc::create_kernel_process(
+            "term_out_drain", output_drain_thread as *const () as u64);
+    }
+}
+
 /// Sentinel for "no exec exit code latched yet".  A live exec has not
 /// recorded a code; any value other than this is a real, observed exit
 /// status (including 0 for a clean exit).
@@ -1015,7 +1102,22 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
 
     // Attach pipe to stdout/stderr while the child is still blocked.
     let pipe_id = crate::ipc::pipe::create_pipe();
+    // The launcher pipe's ONLY reader is `poll_output()` on the BSP main
+    // loop, whose iteration latency is unbounded under load (it shares the
+    // loop with VFS probes, the compositor, and net polling — observed
+    // gaps of tens of seconds during a Firefox page load).  Since POSIX
+    // write(2) blocks a writer on a full pipe, an undersized ring turns
+    // the child's stderr into a synchronization point: every thread that
+    // logs a warning parks behind the libc stderr FILE lock until the BSP
+    // loop next drains (observed: the necko socket thread frozen for 8.7 s
+    // mid-TLS-handshake).  Provision the maximum capacity (fcntl(2)
+    // F_SETPIPE_SZ ceiling) so a whole page-load's diagnostic burst fits
+    // without ever blocking the writer.
+    let _ = crate::ipc::pipe::pipe_set_capacity(
+        pipe_id, crate::ipc::pipe::PIPE_MAX_CAPACITY);
     crate::proc::attach_stdout_pipe(pid, pipe_id);
+    // Decouple drain capacity from the BSP loop — see output_drain_thread.
+    ensure_output_drain_thread();
 
     // Now allow the scheduler to run the child.
     crate::proc::unblock_process(pid);
@@ -1276,12 +1378,30 @@ pub fn poll_output() {
         None => return,
     };
 
-    // Append ALL stdout bytes to the terminal grid, then render ONCE.
+    // Append ALL stdout bytes to the terminal grid, then render ONCE —
+    // throttled.  `render_to_surface()` repaints the whole terminal grid
+    // into the framebuffer; on a headless/automated boot nothing observes
+    // intermediate frames, and an unthrottled repaint per drain couples
+    // the pipe's drain throughput to framebuffer blit speed (the drain is
+    // what unblocks writers parked on a full pipe — POSIX write(2)).
+    // Drain ALWAYS; repaint at most once per RENDER_THROTTLE_TICKS, with
+    // a dirty flag so the next eligible call (or the exec-exit path,
+    // which renders unconditionally) shows the pending text.
     for chunk in &chunks {
         let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
         state.write_ansi_str(text);
     }
     if any_data {
+        RENDER_DIRTY.store(true, Ordering::Release);
+    }
+    const RENDER_THROTTLE_TICKS: u64 = 5; // ≥ 50 ms between repaints (≤ 20 fps)
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if RENDER_DIRTY.load(Ordering::Acquire)
+        && now.wrapping_sub(LAST_RENDER_TICK.load(Ordering::Relaxed))
+            >= RENDER_THROTTLE_TICKS
+    {
+        LAST_RENDER_TICK.store(now, Ordering::Relaxed);
+        RENDER_DIRTY.store(false, Ordering::Release);
         state.render_to_surface();
     }
 
