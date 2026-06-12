@@ -81,7 +81,8 @@ GATE_TO_PHASE = {
     "screenshot-actors": "NETWORK/TLS",   # tcp -> screenshot IPDL
     "drawSnapshot":      "RENDER-SETUP",  # screenshot -> composite/draw
     "PNG write":         "ENCODE",        # draw -> PNG magic written
-    "exit_group":        "TEARDOWN",      # PNG -> pid1 exit_group
+    "exit_group":        "TEARDOWN",      # PNG -> pid1 exit_group (any process)
+    "exit-clean":        "TEARDOWN",      # whole FF tree terminated with status 0
 }
 
 
