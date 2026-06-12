@@ -3005,6 +3005,14 @@ pub fn run() -> ! {
         if test_285_anti_starvation_aging() { passed += 1; }
     }
 
+    // ── Test 520: event-wake boost + wakeup-preemption kick ────────────
+    // (see test fn header; POSIX sched(7) prompt-contention contract)
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_520_wakeup_preemption_kick() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -47920,6 +47928,142 @@ fn test_285_anti_starvation_aging() -> bool {
     true
 }
 
+// ── Test 520: event-wake boost + wakeup-preemption kick ──────────────────────
+//
+// Covers the two halves of the wakeup-preemption path (the mechanism that
+// bounds wake-to-run latency for event wakes — futex wake, poll bell, fd
+// readiness — to one timer tick instead of a full quantum):
+//
+//   (a) `proc::wake_ready_event` — a Blocked thread woken by an EVENT becomes
+//       Ready with a temporary priority boost capped at
+//       `base_priority + PRIORITY_BOOST_WAIT`; repeat wakes cannot escalate
+//       past the cap, and a wake of a non-Blocked thread is a no-op.
+//   (b) `sched::kick_preempt_for_wake` — after such a wake, any CPU running a
+//       strictly-lower-priority thread is marked NEED_RESCHEDULE; a
+//       woken-priority of 0 can never kick (no u8 is < 0).
+//
+// Cite POSIX sched(7): under SCHED_OTHER an unblocked thread contends for
+// the CPU promptly; pthread_cond_signal(3p) requires the unblocked thread to
+// contend for the associated mutex as if it had called pthread_mutex_lock()
+// — i.e. wakes must translate into scheduling opportunities, not quantum
+// waits.
+//
+// The synthetic thread (entry=0) is manipulated and marked Dead in ONE
+// THREAD_TABLE critical section so the sibling CPU's picker can never
+// observe it Ready and dispatch it into a jump-to-0.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_520_wakeup_preemption_kick() -> bool {
+    use crate::proc::{ThreadState, THREAD_TABLE, PRIORITY_BOOST_WAIT};
+
+    test_header!("event-wake boost + wakeup-preemption kick");
+
+    let tid = match crate::proc::create_thread_blocked(0, "wake-kick-t", 0) {
+        Some(t) => t,
+        None => {
+            test_fail!("test520", "create_thread_blocked failed");
+            return false;
+        }
+    };
+
+    // ── (a) boost + cap semantics, single critical section ──────────────────
+    let boost_verdict: Result<(u8, u8), &'static str> = {
+        let mut threads = THREAD_TABLE.lock();
+        let res = match threads.iter_mut().find(|t| t.tid == tid) {
+            None => Err("synthetic thread vanished"),
+            Some(th) => {
+                let base = th.base_priority;
+                let cap = base + PRIORITY_BOOST_WAIT;
+                crate::proc::wake_ready_event(th);
+                if th.state != ThreadState::Ready {
+                    Err("wake of Blocked thread did not flip to Ready")
+                } else if th.priority != cap {
+                    Err("wake boost != base + PRIORITY_BOOST_WAIT")
+                } else if !th.wake_boosted {
+                    Err("wake boost did not mark wake_boosted (one-shot flag)")
+                } else {
+                    // Re-wake while Ready: must be a no-op.
+                    crate::proc::wake_ready_event(th);
+                    if th.priority != cap {
+                        Err("wake of non-Blocked thread changed priority")
+                    } else {
+                        // Re-block and wake again: cap must hold (no escalation).
+                        th.state = ThreadState::Blocked;
+                        crate::proc::wake_ready_event(th);
+                        if th.priority != cap {
+                            Err("repeat wake escalated past base + boost cap")
+                        } else {
+                            Ok((base, th.priority))
+                        }
+                    }
+                }
+            }
+        };
+        // Retire the synthetic thread BEFORE the lock drops (see header).
+        if let Some(th) = threads.iter_mut().find(|t| t.tid == tid) {
+            th.state = ThreadState::Dead;
+        }
+        res
+    };
+    match boost_verdict {
+        Ok((base, prio)) => {
+            test_println!("  wake boost: base={} → boosted={} (capped, idempotent) ✓",
+                base, prio);
+        }
+        Err(msg) => {
+            test_fail!("test520", "{}", msg);
+            return false;
+        }
+    }
+
+    // ── (b) kick semantics against the live table ────────────────────────────
+    // The kick is gated OFF by default (see `sched::WAKE_KICK_ENABLED`);
+    // enable it for the assertions below, restore OFF after.
+    crate::sched::set_wake_kick(true);
+    // woken_prio = 0: structurally no thread satisfies `priority < 0`.
+    let kicked_zero = {
+        let threads = THREAD_TABLE.lock();
+        crate::sched::kick_preempt_for_wake(&threads, 0)
+    };
+    if kicked_zero != 0 {
+        crate::sched::set_wake_kick(false);
+        test_fail!("test520", "woken_prio=0 kicked {} CPUs (expected 0)", kicked_zero);
+        return false;
+    }
+    // woken_prio = 255: every Running thread (priority <= PRIORITY_MAX=31)
+    // qualifies — including THIS test-runner thread.  After the call, this
+    // CPU's NEED_RESCHEDULE flag MUST be observable regardless of whether we
+    // or a concurrent timer tick set it (the flag is only consumed by this
+    // CPU's own reschedule points, none of which run inside this test).
+    {
+        let threads = THREAD_TABLE.lock();
+        let _ = crate::sched::kick_preempt_for_wake(&threads, 255);
+    }
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    let flag_set = crate::sched::need_reschedule_flag(cpu);
+    // Gate restored before any early return so the suite's default behaviour
+    // (kick disabled) is preserved for subsequent tests.
+    crate::sched::set_wake_kick(false);
+    if !flag_set {
+        test_fail!("test520",
+            "woken_prio=255 did not set NEED_RESCHEDULE on cpu {} (running thread qualifies)",
+            cpu);
+        return false;
+    }
+    // Gated-off contract: with the gate restored OFF the kick must be inert.
+    let kicked_gated = {
+        let threads = THREAD_TABLE.lock();
+        crate::sched::kick_preempt_for_wake(&threads, 255)
+    };
+    if kicked_gated != 0 {
+        test_fail!("test520", "kick fired while gated OFF ({} CPUs)", kicked_gated);
+        return false;
+    }
+    test_println!("  kick: prio 0 → 0; prio 255 → NEED_RESCHEDULE[{}] set; gated-off inert ✓", cpu);
+
+    test_pass!("event-wake boost + wakeup-preemption kick");
+    true
+}
+
 // ── Test 264: vfork-child TLS page layout (musl posix_spawn unblocker) ───────
 //
 // `proc::alloc_vfork_child_tls(parent_pid)` provisions a per-vfork-child
@@ -48619,6 +48763,7 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            wake_boosted: false,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,
@@ -48909,6 +49054,7 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            wake_boosted: false,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,

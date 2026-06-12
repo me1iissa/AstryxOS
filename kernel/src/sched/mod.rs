@@ -344,6 +344,119 @@ pub fn starve_force_count() -> u64 {
     SCHED_STARVE_FORCE_TOTAL.load(Ordering::Relaxed)
 }
 
+// ── Wakeup preemption (event-wake → reschedule kick) ─────────────────────────
+//
+// POSIX SCHED_OTHER expects an unblocked thread to contend for the CPU
+// promptly (sched(7)); mature schedulers implement this as *wakeup
+// preemption*: the wake path compares the woken task against each CPU's
+// currently-running task and requests a reschedule when the woken task
+// should win.  Without this, a woken thread waits for a full quantum expiry
+// (`TIME_SLICE` = 50 ms) on some CPU before it can even compete — and a
+// multi-hop wake chain (IPC → worker pool → IPC → poller) pays that latency
+// PER HOP.  Measured on the Firefox/BBC workload (2026-06-12): 13–29
+// runnable threads on 2 CPUs turned each hop into hundreds of ms and the
+// 6-hop TLS cert-verify chain into 2–6.5 s of client-Finished latency.
+//
+// `kick_preempt_for_wake` is called by event-wake paths (poll-bell/fd wait
+// lists, futex wakes) AFTER flipping waiters to Ready, with `THREAD_TABLE`
+// still held.  It scans the table for Running threads whose effective
+// priority is strictly below the woken thread's and marks their CPU for
+// reschedule.  The actual switch happens at that CPU's next preemption
+// point — timer-ISR Ring-3 return (≤1 tick), syscall dispatcher tail, or
+// #PF exit — so the kick adds no new IPI machinery and cannot interrupt a
+// kernel-mode critical section.
+//
+// Timer/timeout wakes (`due_wake_scan`) deliberately do NOT kick: a timeout
+// is not a productive event and boosting it would let periodic pollers
+// preempt real work.
+
+/// Runtime gate for the preemption-KICK half of wakeup preemption.
+///
+/// Default OFF — measured 2026-06-12 on the Firefox/BBC workload: kicking on
+/// every event wake evicts whichever thread is running, and on this kernel
+/// that is very often TID 0 (the BSP main loop at PRIORITY_IDLE, which pumps
+/// `net::poll` / X11 / the compositor continuously while it holds the CPU).
+/// Evicting the IO pump on every wake collapsed TCP processing throughput:
+/// TLS client-Finished latency went from median 0.99 s (baseline) to 11.8 s
+/// (kick + ratcheting boost) / 12.3 s akamai-median (kick + one-shot boost),
+/// with stalled-handshake counts exploding 3 → 20-29.  The one-shot wake
+/// BOOST alone (queue-jump at natural reschedule points, nobody evicted
+/// mid-quantum) is the default mechanism; the kick stays available behind
+/// this gate for experiments via `set_wake_kick`.
+pub static WAKE_KICK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Flip the wakeup-preemption kick at runtime (diagnostic/experiment hook).
+pub fn set_wake_kick(v: bool) {
+    WAKE_KICK_ENABLED.store(v, Ordering::Relaxed);
+}
+
+/// Total wake-kicks issued (a CPU was asked to reschedule because an event
+/// wake readied a higher-priority thread).  Diagnostic; exposed via kdb.
+pub static SCHED_WAKE_KICK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`SCHED_WAKE_KICK_TOTAL`].
+pub fn wake_kick_count() -> u64 {
+    SCHED_WAKE_KICK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Ask every CPU currently running a thread of strictly lower priority than
+/// `woken_prio` to reschedule at its next preemption point.
+///
+/// Caller MUST hold `THREAD_TABLE` (the slice passed in is the locked
+/// table), and must have already flipped the woken thread(s) to `Ready` —
+/// the kicked CPU's picker needs to see them.  Returns the number of CPUs
+/// kicked (diagnostic / testable).
+pub fn kick_preempt_for_wake(threads: &[proc::Thread], woken_prio: u8) -> u32 {
+    if !WAKE_KICK_ENABLED.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let mut kicked = 0u32;
+    for t in threads.iter() {
+        if t.state == ThreadState::Running && t.priority < woken_prio {
+            let cpu = t.last_cpu as usize;
+            if cpu < MAX_CPUS && !NEED_RESCHEDULE[cpu].swap(true, Ordering::Release) {
+                kicked += 1;
+            }
+        }
+    }
+    if kicked > 0 {
+        SCHED_WAKE_KICK_TOTAL.fetch_add(kicked as u64, Ordering::Relaxed);
+    }
+    kicked
+}
+
+/// Test/diagnostic read of a CPU's NEED_RESCHEDULE flag (does not clear it).
+pub fn need_reschedule_flag(cpu: usize) -> bool {
+    cpu < MAX_CPUS && NEED_RESCHEDULE[cpu].load(Ordering::Acquire)
+}
+
+// ── Run-queue wait (wake-to-run) latency histogram ───────────────────────────
+//
+// At pick time the picker knows exactly how long the chosen thread sat
+// Ready (`now - ready_since_tick`).  Bucketing that wait into a log2
+// histogram gives a direct, cheap measurement of scheduling latency — the
+// quantity the wakeup-preemption change above is meant to collapse.
+// Buckets (ticks @100 Hz): 0, 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, ≥128.
+pub const PICK_WAIT_BUCKETS: usize = 9;
+pub static SCHED_PICK_WAIT_HIST: [AtomicU64; PICK_WAIT_BUCKETS] =
+    [const { AtomicU64::new(0) }; PICK_WAIT_BUCKETS];
+
+#[inline]
+fn record_pick_wait(age_ticks: u64) {
+    let idx = if age_ticks == 0 { 0 }
+              else { (64 - (age_ticks.min(255)).leading_zeros() as usize).min(PICK_WAIT_BUCKETS - 1) };
+    SCHED_PICK_WAIT_HIST[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the pick-wait histogram (kdb `sched-stats`).
+pub fn pick_wait_hist() -> [u64; PICK_WAIT_BUCKETS] {
+    let mut out = [0u64; PICK_WAIT_BUCKETS];
+    for (i, b) in SCHED_PICK_WAIT_HIST.iter().enumerate() {
+        out[i] = b.load(Ordering::Relaxed);
+    }
+    out
+}
+
 /// Pure helper: the anti-starvation score bonus for a Ready thread that has
 /// been waiting `age` ticks (`age = now - ready_since_tick`, saturating).
 ///
@@ -1736,6 +1849,21 @@ was_emergency_4k={}",
                 // Mark next thread as Running and record which CPU it's on.
                 threads[idx].state = ThreadState::Running;
                 threads[idx].last_cpu = cpu;
+                // Record the run-queue wait this pick ends (wake-to-run
+                // latency histogram; see `SCHED_PICK_WAIT_HIST`).
+                if threads[idx].ready_since_tick != 0 {
+                    record_pick_wait(now.saturating_sub(threads[idx].ready_since_tick));
+                }
+                // Consume a one-shot event-wake boost at dispatch: the boost
+                // exists to win THIS pick (the wakeup-preemption window), not
+                // to privilege the thread's subsequent CPU time.  Leaving it
+                // live lets wake-frequent threads ratchet into a permanently
+                // higher-priority class and starve base-priority work (see
+                // `Thread::wake_boosted` for the measured failure mode).
+                if threads[idx].wake_boosted {
+                    threads[idx].wake_boosted = false;
+                    threads[idx].priority = threads[idx].base_priority;
+                }
                 // This thread got the CPU — its run-queue wait is over.  Clear
                 // the stamp so any escalating anti-starvation bonus resets and
                 // its NEXT Ready episode times a fresh wait from zero.
