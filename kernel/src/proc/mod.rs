@@ -366,6 +366,13 @@ pub fn wake_ready_event(th: &mut Thread) {
     }
     th.state = ThreadState::Ready;
     th.wake_tick = 0;
+    // Boost is runtime-gated (default ON only for firefox-test-core builds;
+    // see `sched::WAKE_BOOST_ENABLED` for the measured rationale).  With the
+    // gate off this function is behaviourally identical to the historical
+    // plain Blocked→Ready flip.
+    if !crate::sched::wake_boost_enabled() {
+        return;
+    }
     let cap = th.base_priority.saturating_add(PRIORITY_BOOST_WAIT);
     if th.priority < cap {
         th.priority = (th.priority + PRIORITY_BOOST_WAIT).min(cap);

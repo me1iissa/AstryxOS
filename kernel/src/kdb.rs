@@ -1561,7 +1561,11 @@ fn op_sched_stats(out: &mut String) {
     out.push_str("],");
     let _ = write!(out, r#""wake_kicks":{},"#,    crate::sched::wake_kick_count());
     let _ = write!(out, r#""starve_forces":{},"#, crate::sched::starve_force_count());
-    let _ = write!(out, r#""ready_depth":{}"#,    crate::sched::ready_depth());
+    let _ = write!(out, r#""ready_depth":{},"#,   crate::sched::ready_depth());
+    let _ = write!(out, r#""wake_boost_enabled":{},"#,
+        crate::sched::wake_boost_enabled());
+    let _ = write!(out, r#""wake_kick_enabled":{}"#,
+        crate::sched::WAKE_KICK_ENABLED.load(core::sync::atomic::Ordering::Relaxed));
     out.push('}');
 }
 

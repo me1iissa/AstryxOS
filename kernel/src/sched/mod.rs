@@ -390,6 +390,34 @@ pub fn set_wake_kick(v: bool) {
     WAKE_KICK_ENABLED.store(v, Ordering::Relaxed);
 }
 
+/// Runtime gate for the one-shot event-wake BOOST (`proc::wake_ready_event`).
+///
+/// Default ON for `firefox-test-core` builds (the workload it was measured
+/// on), OFF otherwise — same gating pattern as the futex cluster-wake
+/// compensation.  Measured 2026-06-12 on the BBC real-website demo: with the
+/// boost, TLS client-Finished latency on the image-CDN conns dropped to
+/// median 1.3–5.5 s (one boot: 26/27 akamai handshakes complete, median
+/// 1.30 s, max 4.55 s — all inside the CDN FIN deadline) and the page wrote
+/// its first full PNG of the session at ~93 s wall.  The boost also
+/// re-orders dispatch around the long-standing flaky libxul
+/// navigation-phase crash family, whose hit-rate in the measured sample
+/// rose (1 PNG / 3 known-family crashes in 4 boots vs ~1/3 failures
+/// baseline, n too small for significance) — keep this toggleable until
+/// that family is root-caused.
+pub static WAKE_BOOST_ENABLED: AtomicBool =
+    AtomicBool::new(cfg!(feature = "firefox-test-core"));
+
+/// Flip the one-shot event-wake boost at runtime.
+pub fn set_wake_boost(v: bool) {
+    WAKE_BOOST_ENABLED.store(v, Ordering::Relaxed);
+}
+
+/// Read the boost gate (used by `proc::wake_ready_event`).
+#[inline]
+pub fn wake_boost_enabled() -> bool {
+    WAKE_BOOST_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Total wake-kicks issued (a CPU was asked to reschedule because an event
 /// wake readied a higher-priority thread).  Diagnostic; exposed via kdb.
 pub static SCHED_WAKE_KICK_TOTAL: AtomicU64 = AtomicU64::new(0);

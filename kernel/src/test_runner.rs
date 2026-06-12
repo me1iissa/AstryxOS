@@ -47965,6 +47965,12 @@ fn test_520_wakeup_preemption_kick() -> bool {
         }
     };
 
+    // The boost is runtime-gated (default ON only in firefox-test-core
+    // builds); enable it for the assertions and restore the prior value
+    // before returning so the rest of the suite sees the build default.
+    let boost_was = crate::sched::wake_boost_enabled();
+    crate::sched::set_wake_boost(true);
+
     // ── (a) boost + cap semantics, single critical section ──────────────────
     let boost_verdict: Result<(u8, u8), &'static str> = {
         let mut threads = THREAD_TABLE.lock();
@@ -48004,6 +48010,8 @@ fn test_520_wakeup_preemption_kick() -> bool {
         }
         res
     };
+    // Restore the build-default boost gate before any return path.
+    crate::sched::set_wake_boost(boost_was);
     match boost_verdict {
         Ok((base, prio)) => {
             test_println!("  wake boost: base={} → boosted={} (capped, idempotent) ✓",
