@@ -40909,6 +40909,13 @@ fn test_518b_sigkill_running_sibling_deferred_free() -> bool {
     //     The victim was killed in "userspace" (never reaches the syscall-tail
     //     drain), so the reaper is the convergence point — it sweeps the last
     //     Dead thread and frees the Zombie's still-`Some` vm_space (fix #3).
+    //
+    // TODO(test518b): reaper timing assumption pre-dates true dual-core; needs
+    // timing-independent rewrite.  A single schedule() call is not guaranteed to
+    // run the reaper on the AP under smp=2 — the reaper may be picked by the peer
+    // CPU on a later tick.  Replace with a bounded spin-until-reaped loop so the
+    // assertion is deterministic regardless of which CPU the scheduler picks.
+    // Tracked in ci/allow-fail.json until the rewrite lands.
     let was_active = crate::sched::is_active();
     if !was_active { crate::sched::enable(); }
     crate::sched::schedule();
