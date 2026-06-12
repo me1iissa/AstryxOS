@@ -35,8 +35,36 @@ static EXEC_PID: AtomicU64 = AtomicU64::new(0);
 static LAST_RENDER_TICK: AtomicU64 = AtomicU64::new(0);
 static RENDER_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// One-shot guard for the dedicated launcher-pipe drain thread.
+/// One-shot guard for the dedicated launcher-pipe drain thread, and the
+/// single source of truth for drain OWNERSHIP of the launcher pipe.
+///
+/// Exactly one consumer may dequeue bytes from a pipe at a time; two
+/// drainers appending to the terminal grid under separate TERMINAL-lock
+/// acquisitions produce interleaved (out-of-order) output.  Once this flag
+/// is `true` the dedicated `output_drain_thread` owns byte consumption of
+/// whatever `running_exec` currently points at, and `poll_output()` must
+/// NOT dequeue from that pipe (it keeps reaping + throttled rendering only).
+///
+/// There is never a window in which NO drainer is responsible for the pipe
+/// (the deadlock class #551 closed): the drain thread never exits — it parks
+/// when no exec is running and re-snapshots `running_exec` on every wake — so
+/// "flag is true" ⟺ "a live drainer owns the pipe".  At exit teardown
+/// `poll_output()` reclaims the final-byte drain by clearing `running_exec`
+/// FIRST (the drain thread then snapshots `None` and releases the pipe) and
+/// only then doing the synchronous tail read.  `PIPE_TABLE`'s lock makes
+/// every read indivisible, so a drain-thread iteration already in flight at
+/// that instant cannot lose or duplicate a byte with the tail read; the only
+/// residual is a possible ordering blip on the very last exit chunk — never
+/// the steady-state interleave this model exists to prevent.
 static DRAIN_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// True when the dedicated drain thread owns byte consumption of the
+/// launcher pipe (so `poll_output()` must skip its own dequeue).  See
+/// [`DRAIN_THREAD_STARTED`] for the ownership model.
+#[inline]
+fn drain_thread_owns_pipe() -> bool {
+    DRAIN_THREAD_STARTED.load(Ordering::Acquire)
+}
 
 /// Dedicated kernel-thread drain loop for the launcher stdout/stderr pipe.
 ///
@@ -1102,17 +1130,20 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
 
     // Attach pipe to stdout/stderr while the child is still blocked.
     let pipe_id = crate::ipc::pipe::create_pipe();
-    // The launcher pipe's ONLY reader is `poll_output()` on the BSP main
-    // loop, whose iteration latency is unbounded under load (it shares the
-    // loop with VFS probes, the compositor, and net polling — observed
-    // gaps of tens of seconds during a Firefox page load).  Since POSIX
-    // write(2) blocks a writer on a full pipe, an undersized ring turns
-    // the child's stderr into a synchronization point: every thread that
-    // logs a warning parks behind the libc stderr FILE lock until the BSP
-    // loop next drains (observed: the necko socket thread frozen for 8.7 s
-    // mid-TLS-handshake).  Provision the maximum capacity (fcntl(2)
-    // F_SETPIPE_SZ ceiling) so a whole page-load's diagnostic burst fits
-    // without ever blocking the writer.
+    // The launcher pipe is drained by the dedicated `output_drain_thread`
+    // (see `ensure_output_drain_thread`), which owns byte consumption once
+    // started; `poll_output()` then only reaps the child and renders the
+    // grid (drain ownership is single — see `DRAIN_THREAD_STARTED`).  The
+    // earlier design drained solely on the BSP main loop, whose iteration
+    // latency is unbounded under load (it shares the loop with VFS probes,
+    // the compositor, and net polling — observed gaps of tens of seconds
+    // during a Firefox page load).  Since POSIX write(2) blocks a writer on
+    // a full pipe, an undersized ring turns the child's stderr into a
+    // synchronization point: every thread that logs a warning parks behind
+    // the libc stderr FILE lock until the pipe next drains (observed: the
+    // necko socket thread frozen for 8.7 s mid-TLS-handshake).  Provision
+    // the maximum capacity (fcntl(2) F_SETPIPE_SZ ceiling) so a whole
+    // page-load's diagnostic burst fits without ever blocking the writer.
     let _ = crate::ipc::pipe::pipe_set_capacity(
         pipe_id, crate::ipc::pipe::PIPE_MAX_CAPACITY);
     crate::proc::attach_stdout_pipe(pid, pipe_id);
@@ -1353,19 +1384,29 @@ pub fn poll_output() {
     let mut raw = [0u8; 4096];
     let mut any_data = false;
 
-    // First pass: read all available data before locking TERMINAL.
-    // `pipe_read_wake` (NOT raw `pipe_read`): this drain is the ONLY
-    // consumer of the launcher pipe, and the child-side writers block on a
-    // full pipe per POSIX write(2)/pipe(7).  A drain that frees room
+    // Steady-state drain ownership: when the dedicated `output_drain_thread`
+    // owns the launcher pipe it is the SOLE byte consumer (see
+    // `DRAIN_THREAD_STARTED`); `poll_output()` must NOT also dequeue, or the
+    // two drainers append to the terminal grid under separate TERMINAL-lock
+    // acquisitions with no ordering and the output interleaves.  In that
+    // mode `poll_output()` does only the throttled render (the drain thread
+    // sets `RENDER_DIRTY`) plus the reap/teardown below.  When no drain
+    // thread owns the pipe (e.g. an exec launched before one was started, or
+    // a build without it) `poll_output()` remains the drainer.
+    //
+    // `pipe_read_wake` (NOT raw `pipe_read`): the child-side writers block on
+    // a full pipe per POSIX.1-2017 write(2)/pipe(7).  A drain that frees room
     // without waking the parked writers strands every child stdout/stderr
     // writer forever (observed live as all Firefox processes wedged in
     // writev(fd=2) once the 4 KiB pipe filled).
     let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
-    loop {
-        let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut raw).unwrap_or(0);
-        if n == 0 { break; }
-        chunks.push(raw[..n].to_vec());
-        any_data = true;
+    if !drain_thread_owns_pipe() {
+        loop {
+            let n = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut raw).unwrap_or(0);
+            if n == 0 { break; }
+            chunks.push(raw[..n].to_vec());
+            any_data = true;
+        }
     }
 
     // Non-blocking waitpid: did the child become a zombie?
@@ -1406,7 +1447,22 @@ pub fn poll_output() {
     }
 
     if let Some((_reaped, code)) = exit_status {
-        // Drain any final bytes the child wrote before exiting.
+        // Exit-teardown ownership handoff: the child is reaped and will write
+        // no more, but the dedicated drain thread may still own the pipe.
+        // Clear `running_exec` FIRST (under the TERMINAL lock) so the drain
+        // thread's NEXT snapshot returns `None` and it releases this pipe;
+        // `poll_output()` then performs the synchronous final-byte read.
+        //
+        // `PIPE_TABLE`'s lock makes every read indivisible, so the brief
+        // window in which a drain-thread iteration already in flight (it
+        // snapshotted `Some(pipe_id)` before this clear) and this tail read
+        // overlap cannot lose or duplicate a byte — whichever acquires the
+        // pipe lock first consumes the remaining bytes and the other reads
+        // zero.  Ordering matters only for the very last chunk at exit, and
+        // both consumers append in arrival order; the steady-state interleave
+        // (the display regression this ownership model fixes) cannot occur
+        // because in steady state `poll_output()` does not dequeue at all.
+        state.running_exec = None;
         drop(guard); // release TERMINAL before pipe_read
         let mut tail = [0u8; 4096];
         let tn = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut tail).unwrap_or(0);
@@ -1427,6 +1483,8 @@ pub fn poll_output() {
         } else {
             state2.write_str_colored("\r\n", DEFAULT_FG);
         }
+        // `running_exec` was already cleared above (the ownership handoff);
+        // this re-assert is idempotent and keeps the teardown self-evident.
         state2.running_exec = None;
         // Latch the reaped child's exit code BEFORE clearing EXEC_PID so a
         // crash-recovery supervisor can read it after the zombie is gone.

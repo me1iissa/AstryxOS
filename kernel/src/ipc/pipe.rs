@@ -231,8 +231,9 @@ pub fn pipe_read(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
     Some(pipe.read(buf))
 }
 
-/// Drain-and-wake helper for KERNEL-context pipe consumers (the exec
-/// supervisors' stdout/stderr drain loops in `gui::terminal::poll_output`
+/// Drain-and-wake helper for KERNEL-context pipe consumers (the launcher
+/// stdout/stderr drainer — the dedicated `gui::terminal::output_drain_thread`,
+/// with `gui::terminal::poll_output` as the fallback drainer and the reaper —
 /// and the demo supervisors).
 ///
 /// `pipe_read` deliberately only advances pipe state; the SYSCALL-layer
@@ -243,7 +244,7 @@ pub fn pipe_read(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
 /// pipe(7), a writer blocked on a full pipe must resume when the reader
 /// frees room, and the parked thread has no timeout.  (Observed live:
 /// every Firefox process wedged in `writev(2, …)` once the 4 KiB launcher
-/// pipe filled, because `poll_output` drained it to empty without ever
+/// pipe filled, because the drainer freed the pipe to empty without ever
 /// waking the parked writers.)  This wrapper makes drain-then-wake the
 /// one-call default for such consumers.
 ///
