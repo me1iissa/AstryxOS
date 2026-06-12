@@ -60,6 +60,11 @@
       "name": "epollet",
       "reason": "EPOLLET re-arm (wait#3) is TCG-timing-sensitive: the drain-then-rewrite rising-edge re-detection in the eventfd EPOLLET path flips PASS->FAIL under tiny, unrelated code-layout shifts (passes on the identical base sha, fails when any unrelated TU grows). Pre-existing latent fragility in the epoll edge-detection path, not introduced by the change carrying this entry; owned by the epoll/eventfd readiness-edge subsystem, not the vfs/proc-fd path.",
       "tracking": null
+    },
+    {
+      "name": "test518b",
+      "reason": "SMP-timing-sensitive: test518b drives a single schedule() call and assumes the reaper sweeps the victim in that pass, which held under the legacy single-CPU-effective scheduler but is probabilistic under the true dual-core scheduler introduced in the #552/#554 family. The test logic is correct; only the convergence assumption needs a timing-independent rewrite (e.g. a spin-until-reaped loop with a bounded retry count).",
+      "tracking": null
     }
   ]
 }

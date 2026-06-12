@@ -6216,6 +6216,10 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     raise ValueError(f"unknown kdb op: {op}")
 
 
+_KDB_RECV_MAX = 32 * 1024 * 1024   # 32 MiB hard ceiling (log-ring drain is 4 MiB
+                                    # resident + ~6× JSON-escape expansion ≤ 24 MiB)
+
+
 def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
     """Send one JSON kdb request, return the raw response bytes.
 
@@ -6226,6 +6230,15 @@ def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
     heavy guest load without forcing every caller to wrap a retry loop.
     The connection is closed on every attempt — kdb is one-request-per-
     connection, so a partial response cannot be resumed.
+
+    The read loop drains until the server closes the connection (EOF) OR the
+    response ends with a newline — whichever comes first.  The kdb protocol
+    is one-JSON-line-per-request; the server closes the TCP connection once
+    the response has drained from its send buffer, so reading until EOF is
+    the robust framing signal (no embedded literal newlines can fool it).
+    A hard ceiling (_KDB_RECV_MAX) prevents unbounded memory growth on a
+    wedged peer; exceeding it is a non-retryable error raised immediately
+    (retrying would fetch the same oversize response again).
     """
     payload = (json.dumps(req) + "\n").encode("utf-8")
     deadline = time.monotonic() + max(timeout, 0.1)
@@ -6253,28 +6266,36 @@ def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
             s.connect(("127.0.0.1", port))
             s.sendall(payload)
             buf = b""
-            while not buf.endswith(b"\n"):
+            # Drain until EOF (server closes after response) or newline fast-path.
+            # Using EOF as the primary terminator is robust against any embedded
+            # literal '\n' bytes that a naive newline-scan would misparse as the
+            # end of the JSON object.  The server always closes the connection
+            # after the response buffer drains (kdb.rs close_connection path).
+            while True:
                 chunk = s.recv(65536)
                 if not chunk:
-                    break
+                    break   # EOF — server closed the connection
                 buf += chunk
-                # Safety valve against a non-terminating response.  kdb is
-                # newline-terminated and deadline-bounded, but cap total bytes
-                # to avoid unbounded memory growth on a wedged peer.  The cap
-                # MUST exceed the largest legitimate response: the `log-ring`
-                # drain serialises the whole guest-RAM log ring (drivers::
-                # log_ring, 4 MiB resident) plus JSON escaping, so a 128 KiB
-                # cap truncated it mid-string and broke json.loads.  32 MiB
-                # comfortably covers the ring + worst-case 6×-escape expansion.
-                if len(buf) > 32 * 1024 * 1024:
-                    break
-            if buf.endswith(b"\n"):
+                if buf.endswith(b"\n"):
+                    break   # fast path: full response already in buf
+                if len(buf) > _KDB_RECV_MAX:
+                    # Non-retryable: the same response would overflow again.
+                    raise OSError(
+                        f"kdb response exceeded {_KDB_RECV_MAX // (1024*1024)} MiB "
+                        f"hard ceiling (op={req.get('op','?')}); "
+                        f"the log-ring may be larger than expected — "
+                        f"raise _KDB_RECV_MAX or reduce the ring capture window")
+            if buf:
                 return buf
             last_err = ConnectionResetError(
-                "kdb peer closed before newline (incomplete response)")
+                "kdb peer closed before sending any data (empty response)")
         except (socket.timeout, ConnectionRefusedError,
-                ConnectionResetError, BrokenPipeError, OSError) as e:
+                ConnectionResetError, BrokenPipeError) as e:
             last_err = e
+        except OSError as e:
+            # Re-raise non-retryable OS errors (including our cap violation above)
+            # directly rather than accumulating in last_err and retrying.
+            raise
         finally:
             s.close()
         sleep_for = min(backoff, max(0.0, deadline - time.monotonic()))

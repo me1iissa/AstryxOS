@@ -120,10 +120,17 @@ else:
                                ("[FF/write]", "getDimensions"),
                                ("[FF/write]", "ScreenshotParent"),
                                ("[FF/write]", "sendQuery"))),
-        ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
-        ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+        ("drawSnapshot",      ("[GATE] drawSnapshot",)),
+        # PNG write — key on the kernel `[GATE] png-write` marker (close-after-
+        # write of the screenshot output file); legacy supervisor lines kept for
+        # full-trace boots.  Mirror of serial-web.py MILESTONES.
+        ("PNG write",         ("[GATE] png-write",
+                               ("[FF-OUT-PNG:", "sig_ok=true"),
                                "/tmp/out.png present", "89504e47", "out.png written")),
         ("exit_group",        ("exit_group(",)),
+        # exit-clean: whole FF tree exited with status 0 — the deepest success rung.
+        # Mirrored from serial-web.py MILESTONES (PR #548 ff/runtime-url-gate-markers).
+        ("exit-clean",        ("[GATE] ff-exit-clean", "[PROC] PID 1 exit_group(0)")),
     ]
     _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
     # pid=1 syscall-count. The serial-web vendored copy is r"pid=1[^\n]*?sc=(\d+)"
