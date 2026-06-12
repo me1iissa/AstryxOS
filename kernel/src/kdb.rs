@@ -74,6 +74,12 @@ struct PendingSession {
     local_port:  u16,
     buf:         Vec<u8>,
     responded:   bool,
+    /// A request line has been claimed for dispatch but the response has not
+    /// been sent yet.  Set under `KDB_SESSIONS` before the dispatcher runs
+    /// OUTSIDE the lock; prevents a concurrent pump caller from re-dispatching
+    /// the same line, and keeps the deferred-close logic (which keys off
+    /// `responded`) from FIN-ing the connection mid-dispatch.
+    dispatching: bool,
 }
 
 static KDB_SESSIONS: Mutex<Vec<PendingSession>> = Mutex::new(Vec::new());
@@ -182,7 +188,7 @@ pub fn pump() {
             if !ss.iter().any(|s| s.remote_ip == *rip && s.remote_port == *rp) {
                 ss.push(PendingSession {
                     remote_ip: *rip, remote_port: *rp, local_port: KDB_PORT,
-                    buf: Vec::new(), responded: false,
+                    buf: Vec::new(), responded: false, dispatching: false,
                 });
             }
         }
@@ -214,19 +220,42 @@ pub fn pump() {
     // connection by its full 4-tuple — closing by `local_port` alone would
     // FIN whichever TCB on KDB_PORT matches first (typically the listener
     // itself), permanently disabling kdb after the very first response.
+    //
+    // CRITICAL: `handle_request` runs OUTSIDE the `KDB_SESSIONS` lock.  kdb
+    // ops can run for seconds (`rip-trace <tid> <ms>` busy-samples for the
+    // full requested window; `thread-park-audit` walks every thread + FD
+    // table).  `pump()` is called concurrently from the BSP main loop and
+    // the dedicated pump thread on the other CPU; holding `KDB_SESSIONS`
+    // (a non-yielding spinlock) across the dispatcher therefore pinned the
+    // sibling CPU in a Ring-0 pause-spin for the entire op — measured
+    // 2026-06-12 via GDB-stub sampling: ~95% of BOTH CPUs inside the
+    // `KDB_SESSIONS` acquire spin during a 3 s `rip-trace`, freezing
+    // net::poll/X11/compositor and grossly distorting any latency being
+    // measured.  The claim/dispatch/commit split below bounds lock hold
+    // times to the buffer scans only.
+    let mut work: Vec<([u8; 4], u16, u16, Vec<u8>)> = Vec::new();
     {
         let mut ss = KDB_SESSIONS.lock();
         for s in ss.iter_mut() {
-            if s.responded { continue; }
+            if s.responded || s.dispatching { continue; }
             if let Some(nl) = s.buf.iter().position(|&b| b == b'\n') {
                 let line = s.buf[..nl].to_vec();
-                let resp = handle_request(&line);
-                let _ = tcp::send_data_to(
-                    s.local_port, s.remote_ip, s.remote_port, resp.as_bytes(),
-                );
-                s.responded = true;
+                s.dispatching = true;
+                work.push((s.remote_ip, s.remote_port, s.local_port, line));
             }
         }
+    }
+    for (rip, rp, lp, line) in work {
+        let resp = handle_request(&line);
+        let _ = tcp::send_data_to(lp, rip, rp, resp.as_bytes());
+        let mut ss = KDB_SESSIONS.lock();
+        if let Some(s) = ss.iter_mut().find(|s| {
+            s.remote_ip == rip && s.remote_port == rp && s.local_port == lp
+        }) {
+            s.responded = true;
+        }
+        // Session reaped mid-dispatch (TCP side closed) → nothing to mark;
+        // the response bytes were already handed to TCP best-effort.
     }
 
     // Close only sessions whose response has fully drained out of the
@@ -373,6 +402,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fault-cache-keys" => op_fault_cache_keys(out),
         "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
+        "sched-stats"      => op_sched_stats(out),
         "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
         "w215-cow-witness" => op_w215_cow_witness(req, out),
@@ -1506,6 +1536,37 @@ fn op_arm_phys(req: &str, out: &mut String) {
         let _ = req;
         out.push_str(r#"{"armed":false,"error":"requires_w215_diag"}"#);
     }
+}
+
+// ── sched-stats ───────────────────────────────────────────────────────────────
+//
+// One-shot scheduler-latency readout:
+//   pick_wait_hist — log2 histogram (ticks @100 Hz) of how long each picked
+//                    thread sat Ready before getting the CPU.  Buckets:
+//                    0, 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, >=128.
+//   wake_kicks     — wakeup-preemption kicks issued (event wake readied a
+//                    higher-priority thread than one currently running).
+//   starve_forces  — anti-starvation backstop force-selects.
+//   ready_depth    — last observed non-idle Ready-peer count (run-queue depth).
+fn op_sched_stats(out: &mut String) {
+    use core::fmt::Write;
+
+    let hist = crate::sched::pick_wait_hist();
+    out.push('{');
+    out.push_str(r#""pick_wait_hist":["#);
+    for (i, v) in hist.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        let _ = write!(out, "{}", v);
+    }
+    out.push_str("],");
+    let _ = write!(out, r#""wake_kicks":{},"#,    crate::sched::wake_kick_count());
+    let _ = write!(out, r#""starve_forces":{},"#, crate::sched::starve_force_count());
+    let _ = write!(out, r#""ready_depth":{},"#,   crate::sched::ready_depth());
+    let _ = write!(out, r#""wake_boost_enabled":{},"#,
+        crate::sched::wake_boost_enabled());
+    let _ = write!(out, r#""wake_kick_enabled":{}"#,
+        crate::sched::WAKE_KICK_ENABLED.load(core::sync::atomic::Ordering::Relaxed));
+    out.push('}');
 }
 
 fn op_tlb_stats(out: &mut String) {

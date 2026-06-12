@@ -421,10 +421,13 @@ fn wake_one_candidate(pid: u64, cand: &Candidate) -> Option<u64> {
     };
 
     let mut threads = crate::proc::THREAD_TABLE.lock();
-    if let Some(th) = threads.iter_mut().find(|th| th.tid == tid) {
-        if th.state == crate::proc::ThreadState::Blocked {
-            th.state    = crate::proc::ThreadState::Ready;
-            th.wake_tick = 0;
+    if let Some(idx) = threads.iter().position(|th| th.tid == tid) {
+        if threads[idx].state == crate::proc::ThreadState::Blocked {
+            // Shared event-wake semantics: boost + wakeup-preemption kick
+            // (see `proc::wake_ready_event` / `sched::kick_preempt_for_wake`).
+            crate::proc::wake_ready_event(&mut threads[idx]);
+            let prio = threads[idx].priority;
+            crate::sched::kick_preempt_for_wake(&threads, prio);
         }
     }
     Some(tid)

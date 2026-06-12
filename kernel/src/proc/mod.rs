@@ -231,6 +231,18 @@ pub struct Thread {
     /// runnable task accrues owed service the longer it is passed over and
     /// eventually becomes the highest-priority choice (longest-waiting wins).
     pub ready_since_tick: u64,
+    /// True while the thread carries an UNCONSUMED event-wake priority boost
+    /// (see `wake_ready_event`).  The boost is a one-shot queue-jump: the
+    /// picker clears `priority` back to `base_priority` (and this flag) the
+    /// moment the thread is dispatched.  Without the one-shot rule a
+    /// wake-frequent population ratchets to a permanently higher priority
+    /// class and starves base-priority CPU-bound threads — measured
+    /// 2026-06-12 on the Firefox/BBC workload as multi-second force-select
+    /// waits (tid 0: 557 ticks; worker tids: 229–353 ticks) and a WORSE
+    /// TLS-handshake latency distribution than no boost at all.  One-shot
+    /// consumption bounds the privilege to the wakeup-preemption window
+    /// while leaving steady-state CPU shares fair.
+    pub wake_boosted: bool,
     /// True when context.rsp holds a valid saved kernel RSP.
     ///
     /// Set to `false` in schedule() just before marking the thread Ready,
@@ -333,6 +345,40 @@ pub const PRIORITY_MAX: u8 = 31;
 pub const PRIORITY_BOOST_WAIT: u8 = 2;
 /// Priority boost given on I/O completion.
 pub const PRIORITY_BOOST_IO: u8 = 1;
+
+/// Flip a `Blocked` thread to `Ready` because the EVENT it was waiting for
+/// occurred (futex wake, fd readiness, poll bell) — as opposed to a timeout.
+///
+/// Applies a ONE-SHOT wait-satisfied priority boost, capped at
+/// `base_priority + PRIORITY_BOOST_WAIT` so repeated wakes cannot escalate a
+/// thread indefinitely.  The boost is a queue-jump only: the picker resets
+/// `priority` to `base_priority` at dispatch (see `Thread::wake_boosted`),
+/// so the privilege covers exactly the wakeup-preemption window and cannot
+/// turn wake frequency into a persistent priority class.  Callers should
+/// follow up with `sched::kick_preempt_for_wake` while still holding
+/// `THREAD_TABLE` so a CPU running lower-priority work actually reschedules.
+///
+/// No-op if the thread is not currently `Blocked`.
+#[inline]
+pub fn wake_ready_event(th: &mut Thread) {
+    if th.state != ThreadState::Blocked {
+        return;
+    }
+    th.state = ThreadState::Ready;
+    th.wake_tick = 0;
+    // Boost is runtime-gated (default ON only for firefox-test-core builds;
+    // see `sched::WAKE_BOOST_ENABLED` for the measured rationale).  With the
+    // gate off this function is behaviourally identical to the historical
+    // plain Blocked→Ready flip.
+    if !crate::sched::wake_boost_enabled() {
+        return;
+    }
+    let cap = th.base_priority.saturating_add(PRIORITY_BOOST_WAIT);
+    if th.priority < cap {
+        th.priority = (th.priority + PRIORITY_BOOST_WAIT).min(cap);
+        th.wake_boosted = true;
+    }
+}
 
 /// 512-byte FXSAVE area, 16-byte aligned.
 #[repr(C, align(16))]
@@ -931,6 +977,7 @@ pub fn init() {
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1230,6 +1277,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1301,6 +1349,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1376,6 +1425,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -3074,6 +3124,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         last_cpu: 0,
         first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent's callee-saved regs (RBP/RBX/R12-R15) into the child.
@@ -3330,6 +3381,7 @@ pub fn fork_process_share_vm(
         last_cpu: 0,
         first_run: true,
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: *parent_regs,
@@ -4025,6 +4077,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         last_cpu: 0,
         first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
         ready_since_tick: 0,
+        wake_boosted: false,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent callee-saved regs into the vfork child for the same

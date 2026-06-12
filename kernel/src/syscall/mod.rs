@@ -2396,14 +2396,23 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
             pid, uaddr, key, key_present, tids_to_wake, other_keys
         );
     }
-    // Wake the threads (no lock held).
+    // Wake the threads (no lock held).  Shared event-wake semantics:
+    // boost + wakeup-preemption kick (see `proc::wake_ready_event` /
+    // `sched::kick_preempt_for_wake`).
     let mut threads = crate::proc::THREAD_TABLE.lock();
+    let mut max_prio: u8 = 0;
+    let mut any_woken = false;
     for wake_tid in tids_to_wake {
         if let Some(t) = threads.iter_mut().find(|t| t.tid == wake_tid) {
             if t.state == crate::proc::ThreadState::Blocked {
-                t.state = crate::proc::ThreadState::Ready;
+                crate::proc::wake_ready_event(t);
+                if t.priority > max_prio { max_prio = t.priority; }
+                any_woken = true;
             }
         }
+    }
+    if any_woken {
+        crate::sched::kick_preempt_for_wake(&threads, max_prio);
     }
 }
 

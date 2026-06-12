@@ -128,13 +128,26 @@ pub fn wake_tids(tids: &[u64]) {
         return;
     }
     let mut threads = crate::proc::THREAD_TABLE.lock();
+    // Event wake: boost-and-ready each parked waiter, tracking the highest
+    // effective priority so the wakeup-preemption kick below can ask any
+    // CPU running lower-priority work to reschedule promptly instead of
+    // letting the woken thread wait out a full quantum (see
+    // `sched::kick_preempt_for_wake`).
+    let mut max_prio: u8 = 0;
+    let mut any_woken = false;
     for &t in tids {
         if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
             if th.state == crate::proc::ThreadState::Blocked {
-                th.state = crate::proc::ThreadState::Ready;
-                th.wake_tick = 0;
+                crate::proc::wake_ready_event(th);
+                if th.priority > max_prio {
+                    max_prio = th.priority;
+                }
+                any_woken = true;
             }
         }
+    }
+    if any_woken {
+        crate::sched::kick_preempt_for_wake(&threads, max_prio);
     }
 }
 

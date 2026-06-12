@@ -10002,17 +10002,9 @@ pub fn sys_futex_linux(
                 }
             };
 
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                        }
-                    }
-                }
-            }
+            // Boost-and-ready each waiter + wakeup-preemption kick (shared
+            // event-wake path; see `ipc::waitlist::wake_tids`).
+            crate::ipc::waitlist::wake_tids(&tids_to_wake);
 
             // Diagnostic: every FUTEX_WAKE is a candidate root cause for a
             // missing-wakeup deadlock.  Logging the (uaddr, woken count, max
@@ -10281,17 +10273,9 @@ pub fn sys_futex_linux(
                 let _ = tids_to_requeue; // live in the waiters map; used above
             }
 
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                        }
-                    }
-                }
-            }
+            // Boost-and-ready each waiter + wakeup-preemption kick (shared
+            // event-wake path; see `ipc::waitlist::wake_tids`).
+            crate::ipc::waitlist::wake_tids(&tids_to_wake);
 
             // Return woken count only — not woken+requeued.  Per futex(2).
             woken as i64
@@ -10408,18 +10392,9 @@ pub fn sys_futex_linux(
             drop(waiters);
 
             // Flip every drained TID Blocked → Ready under one THREAD_TABLE
-            // acquisition (same post-drain pattern as FUTEX_WAKE).
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                        }
-                    }
-                }
-            }
+            // acquisition (same post-drain pattern as FUTEX_WAKE), with the
+            // shared boost + wakeup-preemption kick.
+            crate::ipc::waitlist::wake_tids(&tids_to_wake);
 
             tids_to_wake.len() as i64
         }
