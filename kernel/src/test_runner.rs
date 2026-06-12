@@ -35878,6 +35878,79 @@ fn test_pipe_blocking_write_semantics() -> bool {
 
     test_header!("pipe blocking write — atomic / blocks-until-drained / EAGAIN / EPIPE");
 
+    // Pipes now default to the Linux 64 KiB capacity (pipe(7)); the
+    // exact-fill arithmetic throughout this test was written against the
+    // POSIX-minimum 4 KiB ring, so pin each test pipe back to 4 KiB via
+    // fcntl(2) F_SETPIPE_SZ (returns the actual capacity).
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
+    let pin4k = |wfd: u64| -> i64 {
+        crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, wfd, F_SETPIPE_SZ, 4096, 0, 0, 0)
+    };
+
+    // ── Sub-test 0: capacity defaults + fcntl(F_SETPIPE_SZ/F_GETPIPE_SZ) ──
+    // pipe(7): "the pipe capacity is 16 pages (i.e., 65,536 bytes)".
+    // fcntl(2): F_SETPIPE_SZ rounds the request up (power of two, floor
+    // PIPE_BUF), fails with EBUSY when the new size cannot hold the
+    // buffered bytes, and EPERM beyond the pipe-max-size ceiling.
+    {
+        let mut fds0 = [0u32; 2];
+        let r = crate::syscall::dispatch_linux_kernel(
+            293 /*pipe2*/, fds0.as_mut_ptr() as u64, 0x0800 /*O_NONBLOCK*/, 0, 0, 0, 0);
+        if r != 0 {
+            test_fail!("pipe_blocking_write", "pipe2 for capacity sub-test returned {}", r);
+            return false;
+        }
+        let (rfd0, wfd0) = (fds0[0] as u64, fds0[1] as u64);
+        let cap = crate::syscall::dispatch_linux_kernel(72, wfd0, F_GETPIPE_SZ, 0, 0, 0, 0);
+        if cap != 65536 {
+            test_fail!("pipe_blocking_write",
+                "F_GETPIPE_SZ default returned {} (expected 65536 per pipe(7))", cap);
+            return false;
+        }
+        // Round-up: 5000 → 8192.
+        let cap2 = crate::syscall::dispatch_linux_kernel(72, wfd0, F_SETPIPE_SZ, 5000, 0, 0, 0);
+        if cap2 != 8192 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ(5000) returned {} (expected round-up to 8192)", cap2);
+            return false;
+        }
+        // EBUSY: buffer 5000 bytes, then try to shrink to 4096.
+        let big = alloc::vec![0x5Au8; 5000];
+        let wn = crate::syscall::dispatch_linux_kernel(
+            1 /*write*/, wfd0, big.as_ptr() as u64, big.len() as u64, 0, 0, 0);
+        if wn != 5000 {
+            test_fail!("pipe_blocking_write",
+                "capacity sub-test 5000B write returned {} (expected 5000 on an 8 KiB ring)", wn);
+            return false;
+        }
+        let shr = crate::syscall::dispatch_linux_kernel(72, wfd0, F_SETPIPE_SZ, 4096, 0, 0, 0);
+        if shr != -16 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ shrink below buffered bytes returned {} (expected -EBUSY)", shr);
+            return false;
+        }
+        // EPERM: beyond the 1 MiB pipe-max-size ceiling.
+        let huge = crate::syscall::dispatch_linux_kernel(
+            72, wfd0, F_SETPIPE_SZ, (1u64 << 20) + 1, 0, 0, 0);
+        if huge != -1 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ(>1MiB) returned {} (expected -EPERM)", huge);
+            return false;
+        }
+        // Non-pipe fd → EBADF.  (Use a never-opened high slot — fd 0 can
+        // legitimately be a pipe in the kernel-test harness context.)
+        let nonpipe = crate::syscall::dispatch_linux_kernel(72, 987, F_SETPIPE_SZ, 4096, 0, 0, 0);
+        if nonpipe != -9 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ on non-pipe fd returned {} (expected -EBADF)", nonpipe);
+            return false;
+        }
+        crate::syscall::dispatch_linux_kernel(3, rfd0, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd0, 0, 0, 0, 0, 0);
+        test_println!("  capacity: default 65536, round-up 5000→8192, shrink-EBUSY, >1MiB-EPERM, non-pipe-EBADF ✓");
+    }
+
     // ── Sub-test 1: O_NONBLOCK full pipe → -EAGAIN (atomicity preserved) ──
     // pipe2(O_NONBLOCK) so both ends are non-blocking.
     let mut fds = [0u32; 2];
@@ -35888,6 +35961,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd_nb, wfd_nb) = (fds[0] as u64, fds[1] as u64);
+    if pin4k(wfd_nb) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 1)");
+        return false;
+    }
 
     // Fill the 4 KiB ring exactly (one PIPE_BUF write fits atomically).
     let filler = [0xABu8; 4096];
@@ -36064,6 +36141,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd3, wfd3) = (fds3[0] as u64, fds3[1] as u64);
+    if pin4k(wfd3) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 3)");
+        return false;
+    }
     let pid = crate::proc::current_pid_lockless();
     let pipe_id = crate::syscall::get_pipe_id(pid, wfd3 as usize);
 
@@ -36148,6 +36229,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd4, wfd4) = (fds4[0] as u64, fds4[1] as u64);
+    if pin4k(wfd4) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 4)");
+        return false;
+    }
     let pipe_id4 = crate::syscall::get_pipe_id(pid, wfd4 as usize);
 
     // Pre-fill so that 0 < space < ATOMIC: write 3000 bytes (atomic, fits) →
@@ -36281,6 +36366,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd5, wfd5) = (fds5[0] as u64, fds5[1] as u64);
+    if pin4k(wfd5) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 5)");
+        return false;
+    }
     let pipe_id5 = crate::syscall::get_pipe_id(pid, wfd5 as usize);
     W5_PIPE_ID.store(pipe_id5, Ordering::SeqCst);
 
@@ -36481,6 +36570,10 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd6, wfd6) = (fds6[0] as u64, fds6[1] as u64);
+    if pin4k(wfd6) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 6)");
+        return false;
+    }
     let pipe_id6 = crate::syscall::get_pipe_id(pid, wfd6 as usize);
     W6_PIPE_ID.store(pipe_id6, Ordering::SeqCst);
     W6_PARK_OBSERVED.store(0, Ordering::SeqCst);
@@ -46130,7 +46223,7 @@ fn test_241_kdb_rip_trace_shape() -> bool {
     // (b) record_syscall claims the slot for `bogus_tid` but does NOT
     //     publish a Ring-3 sample.  read_user_rip should still return
     //     None because the rip_sample_seq stays 0.
-    crate::proc::sample::record_syscall(bogus_tid, /*tick*/ 100, /*nr*/ 1, /*arg0*/ 0);
+    crate::proc::sample::record_syscall(bogus_tid, /*tick*/ 100, /*nr*/ 1, /*arg0*/ 0, /*arg1*/ 0);
     let after = crate::proc::sample::read_user_rip(bogus_tid);
     test_println!("  (b) post-record_syscall read_user_rip = {:?}",
                   after.map(|(r, b, s)| (r, b, s)));

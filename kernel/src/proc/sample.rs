@@ -94,6 +94,11 @@ struct TidSlot {
     /// poll/epoll_wait this is the fd-array pointer or epfd; for read/write
     /// it is the fd; for futex it is the uaddr.  Diagnostic-only.
     last_syscall_arg0: AtomicU64,
+    /// Second argument (RSI on x86_64) of the most recent syscall.  For
+    /// poll(2) this is `nfds` — together with `last_syscall_arg0` (the
+    /// pollfd array pointer) it lets the kdb `user-mem` op read and decode
+    /// the exact live pollfd set of a parked poller.  Diagnostic-only.
+    last_syscall_arg1: AtomicU64,
     /// Last user-mode RIP observed for this TID by the per-tick sampler.
     /// Updated every Ring-3 timer-ISR tick, regardless of the silent-for
     /// threshold that gates the serial `[SAMPLE]` emission.  Stays at 0
@@ -131,6 +136,7 @@ static TID_TABLE: [TidSlot; TID_SLOTS] = [
         last_sample_tick: AtomicU64::new(0),
         last_syscall_nr: AtomicU64::new(u64::MAX),
         last_syscall_arg0: AtomicU64::new(0),
+        last_syscall_arg1: AtomicU64::new(0),
         last_user_rip: AtomicU64::new(0),
         last_user_rbp: AtomicU64::new(0),
         last_user_rsp: AtomicU64::new(0),
@@ -157,12 +163,13 @@ fn slot_for(tid: u64) -> &'static TidSlot {
 /// ordering because all four atomics share a cache line (Intel SDM Vol 3A
 /// §8.2.3: WB total-store-order for same-line single-quadword writes).
 #[inline]
-pub fn record_syscall(tid: u64, tick: u64, nr: u64, arg0: u64) {
+pub fn record_syscall(tid: u64, tick: u64, nr: u64, arg0: u64, arg1: u64) {
     let slot = slot_for(tid);
     // Claim the slot (no CAS — last writer wins on hash collisions).
     slot.tid.store(tid, Ordering::Relaxed);
     slot.last_syscall_nr.store(nr, Ordering::Relaxed);
     slot.last_syscall_arg0.store(arg0, Ordering::Relaxed);
+    slot.last_syscall_arg1.store(arg1, Ordering::Relaxed);
     slot.last_syscall_tick.store(tick, Ordering::Relaxed);
 }
 
@@ -180,6 +187,7 @@ pub struct TidSyscallSample {
     pub last_syscall_tick: u64,
     pub last_syscall_nr: u64,
     pub last_syscall_arg0: u64,
+    pub last_syscall_arg1: u64,
     pub last_user_rip: u64,
     pub last_user_rbp: u64,
     pub rip_sample_seq: u64,
@@ -198,6 +206,7 @@ pub fn read_sample(tid: u64) -> Option<TidSyscallSample> {
     // may see a stale tick paired with new nr/arg0 — harmless for diag.
     let last_syscall_nr = slot.last_syscall_nr.load(Ordering::Relaxed);
     let last_syscall_arg0 = slot.last_syscall_arg0.load(Ordering::Relaxed);
+    let last_syscall_arg1 = slot.last_syscall_arg1.load(Ordering::Relaxed);
     let last_syscall_tick = slot.last_syscall_tick.load(Ordering::Relaxed);
     let last_user_rip = slot.last_user_rip.load(Ordering::Relaxed);
     let last_user_rbp = slot.last_user_rbp.load(Ordering::Relaxed);
@@ -208,6 +217,7 @@ pub fn read_sample(tid: u64) -> Option<TidSyscallSample> {
         last_syscall_tick,
         last_syscall_nr,
         last_syscall_arg0,
+        last_syscall_arg1,
         last_user_rip,
         last_user_rbp,
         rip_sample_seq,

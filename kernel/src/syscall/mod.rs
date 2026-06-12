@@ -1109,7 +1109,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         let tid = crate::proc::current_tid();
         let tick = crate::arch::x86_64::irq::TICK_COUNT
             .load(core::sync::atomic::Ordering::Relaxed);
-        crate::proc::sample::record_syscall(tid, tick, num, arg1);
+        crate::proc::sample::record_syscall(tid, tick, num, arg1, arg2);
     }
 
     let result = if crate::subsys::linux::syscall::is_linux_abi() {
