@@ -2572,13 +2572,33 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 }
                 return Ok(count);
             }
-            // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
+            // bit 24 = /dev/urandom | /dev/random  → fill with CSPRNG bytes.
+            //
+            // The stream MUST advance between consecutive reads.  PKCS#11
+            // soft-token modules (the TLS stack Firefox ships is one) run the
+            // FIPS 140-2 §4.9.2 continuous random-number-generator self-test:
+            // each fixed-size block read from the system RNG is compared with
+            // the previous one, and the module fails C_Initialize with
+            // CKR_DEVICE_ERROR when two consecutive blocks are identical
+            // (PKCS#11 v2.40 §5.1.6 error semantics).  The previous generator
+            // here was a pure function of the 10 ms scheduler tick plus the
+            // byte index, so two 32-byte reads landing in the same tick
+            // returned byte-identical blocks → every TLS-capable process lost
+            // its crypto provider at init.  Route through
+            // `security::rand::rand_u64` instead: RDRAND-backed with a
+            // TSC-seeded fallback, and the same chokepoint that ASLR,
+            // AT_RANDOM and getrandom(2) use — so `astryx.rng_seed=`
+            // record-replay determinism covers this path too.  Per random(4),
+            // /dev/random and /dev/urandom may serve the same CSPRNG.
             if flags & 0x0100_0000 != 0 {
-                let t = crate::arch::x86_64::irq::get_ticks();
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    for i in 0..count {
-                        *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8;
+                    let mut i: usize = 0;
+                    while i < count {
+                        let bytes = crate::security::rand::rand_u64().to_le_bytes();
+                        let n = (count - i).min(8);
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(i), n);
+                        i += n;
                     }
                 }
                 return Ok(count);
