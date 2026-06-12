@@ -2927,6 +2927,13 @@ pub fn run() -> ! {
     total += 1;
     if test_298_epollet_eventfd_write_refire() { passed += 1; }
 
+    // ── Test 299: mmap re-picks the base when it loses the placement race ──
+    // Per POSIX mmap(2), a NULL-addr non-FIXED request leaves placement to
+    // the implementation; losing the internal Phase-1→Phase-3 window to a
+    // sibling thread's allocation must re-pick, never return ENOMEM.
+    total += 1;
+    if test_299_mmap_placement_race_repick() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -52063,6 +52070,90 @@ fn test_298_epollet_eventfd_write_refire() -> bool {
 
     if ok {
         test_pass!("EPOLLET eventfd re-fires on every write (Test 298)");
+    }
+    ok
+}
+
+// ── Test 299: mmap re-picks the base when it loses the placement race ─────────
+//
+// sys_mmap chooses the base address (Phase 1) and inserts the VMA (Phase 3)
+// under SEPARATE PROCESS_TABLE acquisitions; a sibling thread's mmap can
+// claim an overlapping range in the window.  Per POSIX mmap(2), when addr is
+// NULL and MAP_FIXED is unset the placement is entirely the implementation's
+// choice — losing the internal race must therefore re-pick a fresh base, not
+// fail.  The regression (spurious ENOMEM for the loser) aborted real
+// multi-threaded workloads whose shared-memory paths release-assert on mmap
+// success.  The test arms a deterministic hook that injects a 1-page squatter
+// VMA at the Phase-1-chosen base (exactly what the winning sibling would
+// install), then asserts the call still succeeds at a non-overlapping
+// address.  Refs: POSIX.1-2017 mmap(2).
+fn test_299_mmap_placement_race_repick() -> bool {
+    use core::sync::atomic::Ordering;
+    test_header!("mmap re-pick on lost placement race (Test 299)");
+    let mut ok = true;
+
+    let pid = crate::proc::current_pid();
+
+    const LEN: u64 = 0x3000;
+    const PROT_RW: u32 = 3; // PROT_READ | PROT_WRITE
+    const MAP_PRIVATE_ANON: u32 = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+
+    // Arm the one-shot squatter injection for our pid, then mmap.
+    crate::syscall::mmap_race_test::SQUATTER_BASE.store(0, Ordering::Release);
+    crate::syscall::mmap_race_test::ARMED_PID.store(pid, Ordering::Release);
+    let ret = crate::syscall::sys_mmap(0, LEN, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0);
+    // Defensive disarm in case the hook did not consume the arm.
+    crate::syscall::mmap_race_test::ARMED_PID.store(0, Ordering::Release);
+    let squatter = crate::syscall::mmap_race_test::SQUATTER_BASE.swap(0, Ordering::AcqRel);
+
+    if squatter == 0 {
+        test_fail!("mmap-repick", "squatter hook did not fire (no race simulated)");
+        return false;
+    }
+    test_println!("  squatter injected at {:#x}", squatter);
+
+    if ret < 0 {
+        test_fail!("mmap-repick",
+            "lost placement race returned error {} (want success at a fresh base)", ret);
+        // Clean up the squatter before bailing.
+        let _ = crate::syscall::sys_munmap(squatter, 0x1000);
+        return false;
+    }
+    let got = ret as u64;
+    test_println!("  mmap returned {:#x}", got);
+
+    // The returned range must not overlap the squatter page.
+    if got < squatter + 0x1000 && squatter < got + LEN {
+        test_fail!("mmap-repick",
+            "returned range [{:#x}..{:#x}) overlaps squatter [{:#x}..{:#x})",
+            got, got + LEN, squatter, squatter + 0x1000);
+        ok = false;
+    }
+
+    // The VMA list must hold both areas with no pairwise overlap (list is
+    // sorted by base; adjacent-pair check is sufficient).
+    {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+            if let Some(space) = p.vm_space.as_ref() {
+                for w in space.areas.windows(2) {
+                    if w[0].base + w[0].length > w[1].base {
+                        test_fail!("mmap-repick",
+                            "overlapping VMAs after re-pick: [{:#x}..{:#x}) and [{:#x}..{:#x})",
+                            w[0].base, w[0].base + w[0].length, w[1].base, w[1].base + w[1].length);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = crate::syscall::sys_munmap(got, LEN);
+    let _ = crate::syscall::sys_munmap(squatter, 0x1000);
+
+    if ok {
+        test_pass!("mmap re-picks a fresh base on lost placement race (Test 299)");
     }
     ok
 }
