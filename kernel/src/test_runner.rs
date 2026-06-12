@@ -1307,6 +1307,11 @@ pub fn run() -> ! {
     total += 1;
     if test_dev_dsp_ioctl_set_format() { passed += 1; }
 
+    // ── Test 520: /dev/urandom — consecutive same-tick blocks differ ───────
+
+    total += 1;
+    if test_dev_urandom_consecutive_blocks_differ() { passed += 1; }
+
     // ── Test 116: mount tmpfs + write/read + umount ────────────────────────
 
     total += 1;
@@ -26289,6 +26294,70 @@ fn test_dev_dsp_open_with_ac97_absent() -> bool {
         test_fail!("dev_dsp_absent", "expected -19 (ENODEV), got {}", fd);
         false
     }
+}
+
+// ── Test 520: /dev/urandom — consecutive same-tick blocks differ ─────────────
+//
+// Regression test for the navigation-killing RNG defect: the /dev/urandom
+// read arm in `vfs::fd_read` derived every byte purely from the 10 ms
+// scheduler tick, so two 32-byte reads inside one tick were byte-identical.
+// PKCS#11 soft-token modules run the FIPS 140-2 §4.9.2 continuous RNG
+// self-test at C_Initialize — consecutive fixed-size blocks from the system
+// RNG must differ, else the module fails with CKR_DEVICE_ERROR and every
+// TLS consumer in the process loses its crypto provider.  This test mirrors
+// that exact access pattern: open → read(32) → close, twice back-to-back
+// (guaranteed to land in the same tick at boot-test speed), plus an
+// advancing-stream check on a single open fd.
+fn test_dev_urandom_consecutive_blocks_differ() -> bool {
+    test_header!("/dev/urandom — consecutive same-tick 32-byte blocks differ");
+
+    let mut blocks = [[0u8; 32]; 2];
+    for block in blocks.iter_mut() {
+        let fd = crate::syscall::sys_open_test("/dev/urandom", 0 /* O_RDONLY */);
+        if fd < 0 {
+            test_fail!("urandom_blocks", "open(/dev/urandom) = {}", fd);
+            return false;
+        }
+        let n = crate::syscall::sys_read_test(fd as usize, block.as_mut_ptr(), 32);
+        let _ = crate::syscall::sys_close_test(fd as usize);
+        if n != 32 {
+            test_fail!("urandom_blocks", "read 32 returned {}", n);
+            return false;
+        }
+    }
+    if blocks[0] == blocks[1] {
+        test_fail!("urandom_blocks",
+            "two consecutive 32-byte reads returned identical blocks");
+        return false;
+    }
+    if blocks[0] == [0u8; 32] || blocks[1] == [0u8; 32] {
+        test_fail!("urandom_blocks", "urandom returned an all-zero block");
+        return false;
+    }
+
+    // Stream must also advance WITHIN one open file description.
+    let fd = crate::syscall::sys_open_test("/dev/urandom", 0);
+    if fd < 0 {
+        test_fail!("urandom_blocks", "re-open(/dev/urandom) = {}", fd);
+        return false;
+    }
+    let mut c = [0u8; 32];
+    let mut d = [0u8; 32];
+    let n1 = crate::syscall::sys_read_test(fd as usize, c.as_mut_ptr(), 32);
+    let n2 = crate::syscall::sys_read_test(fd as usize, d.as_mut_ptr(), 32);
+    let _ = crate::syscall::sys_close_test(fd as usize);
+    if n1 != 32 || n2 != 32 {
+        test_fail!("urandom_blocks", "same-fd reads returned {} / {}", n1, n2);
+        return false;
+    }
+    if c == d {
+        test_fail!("urandom_blocks",
+            "two 32-byte reads on one fd returned identical blocks");
+        return false;
+    }
+
+    test_pass!("/dev/urandom consecutive 32-byte blocks differ (cross-open and same-fd)");
+    true
 }
 
 // ── Test 111: /dev/dsp — open + write when AC97 present ──────────────────────
