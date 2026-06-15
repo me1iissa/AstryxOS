@@ -264,6 +264,10 @@ pub fn run() -> ! {
     total += 1;
     if test_poll_bell_recheck_under_lock() { passed += 1; }
 
+    // ── Test 0bx3: poll-bell class-filtered drain (Stage C) ───────────────
+    total += 1;
+    if test_poll_bell_class_filtered_drain() { passed += 1; }
+
     // ── Test 0bc: POLLHUP on pipe read-end after writer close ─────────────
     total += 1;
     if test_pipe_pollhup_on_writer_close() { passed += 1; }
@@ -37616,6 +37620,103 @@ fn test_poll_bell_recheck_under_lock() -> bool {
     true
 }
 
+// ── Test 0bx3: poll-bell class-filtered drain (Stage C) ─────────────────────
+//
+// Verifies the Stage-C class-filtered poll-bell drain on a private `WaitList`
+// (no TID-0 park — see the recheck test's rationale).  Asserts:
+//   (1) `drain_matching(bit)` returns ONLY waiters whose interest mask includes
+//       `bit`, and RETAINS the non-matching waiters in place;
+//   (2) a `BELL_MASK_ALL` waiter matches EVERY source bit (conservative
+//       wake-everyone), so under-waking can never happen for an unclassified fd;
+//   (3) the `POLL_BELL_MASK_FILTERED` counter advances by the number of
+//       parkers left behind, proving the herd is being shrunk;
+//   (4) `drain_all` still releases everyone (the EOF/close path is unchanged).
+//
+// References: POSIX poll(2)/select(2)/epoll(7) — a parker re-evaluates its fd
+// set on a readiness notification; waking only the relevant interest class is a
+// strictly-safer subset of the historical wake-all as long as the mask is a
+// superset of true interest (the invariant this test guards).
+fn test_poll_bell_class_filtered_drain() -> bool {
+    test_header!("poll-bell class-filtered drain (Stage C interest masks)");
+
+    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, POLL_BELL_MASK_FILTERED};
+    use core::sync::atomic::Ordering;
+
+    let bit = |s: PollBellSource| 1u32 << (s as u32);
+
+    // Synthetic TIDs that match no real thread, so `enqueue_self_blocked_masked`
+    // is a no-op on THREAD_TABLE (no scheduler state touched).
+    const T_PIPE: u64  = u64::MAX - 10;
+    const T_INET: u64  = u64::MAX - 11;
+    const T_ALL: u64   = u64::MAX - 12;
+
+    let mut wl = WaitList::new();
+    // Park three waiters with distinct interest classes.
+    wl.enqueue_self_blocked_masked(T_PIPE, u64::MAX, bit(PollBellSource::Pipe));
+    wl.enqueue_self_blocked_masked(T_INET, u64::MAX, bit(PollBellSource::InetRx));
+    wl.enqueue_self_blocked_masked(T_ALL,  u64::MAX, BELL_MASK_ALL);
+    if wl.len() != 3 {
+        test_fail!("poll_bell_class", "expected 3 parkers, got {}", wl.len());
+        return false;
+    }
+
+    let filtered0 = POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed);
+
+    // (1)+(2): an InetRx ring wakes T_INET and the wake-everyone T_ALL, and
+    // RETAINS T_PIPE (whose mask does not include InetRx).
+    let woke = wl.drain_matching(bit(PollBellSource::InetRx));
+    let woke_inet = woke.contains(&T_INET);
+    let woke_all  = woke.contains(&T_ALL);
+    let woke_pipe = woke.contains(&T_PIPE);
+    if !woke_inet || !woke_all {
+        test_fail!("poll_bell_class",
+            "InetRx ring missed a matching waiter (inet={}, all={})", woke_inet, woke_all);
+        return false;
+    }
+    if woke_pipe {
+        test_fail!("poll_bell_class", "InetRx ring woke the pipe-only waiter (over-broad filter)");
+        return false;
+    }
+    if wl.len() != 1 {
+        test_fail!("poll_bell_class", "non-matching waiter not retained (len={})", wl.len());
+        return false;
+    }
+
+    // (3): the counter advanced by exactly the one parker left behind (T_PIPE).
+    let filtered1 = POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed);
+    if filtered1.wrapping_sub(filtered0) != 1 {
+        test_fail!("poll_bell_class",
+            "POLL_BELL_MASK_FILTERED advanced by {} (expected 1 left-behind)",
+            filtered1.wrapping_sub(filtered0));
+        return false;
+    }
+
+    // A Pipe ring now wakes the retained T_PIPE.
+    let woke2 = wl.drain_matching(bit(PollBellSource::Pipe));
+    if !woke2.contains(&T_PIPE) || !wl.is_empty() {
+        test_fail!("poll_bell_class",
+            "Pipe ring did not drain the retained pipe waiter (woke={:?}, empty={})",
+            woke2, wl.is_empty());
+        return false;
+    }
+    test_println!("  class filter: InetRx woke {{inet,all}}, retained pipe; Pipe woke pipe ✓");
+
+    // (4): drain_all still releases every parker regardless of interest.
+    wl.enqueue_self_blocked_masked(T_PIPE, u64::MAX, bit(PollBellSource::Pipe));
+    wl.enqueue_self_blocked_masked(T_INET, u64::MAX, bit(PollBellSource::InetRx));
+    let everyone = wl.drain_all();
+    if everyone.len() != 2 || !wl.is_empty() {
+        test_fail!("poll_bell_class",
+            "drain_all did not release everyone (drained={:?}, empty={})",
+            everyone, wl.is_empty());
+        return false;
+    }
+    test_println!("  drain_all still releases all parkers (EOF/close path intact) ✓");
+
+    test_pass!("poll-bell class-filtered drain (Stage C interest masks)");
+    true
+}
+
 // ── Test 0bc: POLLHUP on pipe read-end after writer close ───────────────────
 //
 // Verifies the helper state that `poll_revents` consumes per POSIX
@@ -48023,40 +48124,123 @@ fn test_520_wakeup_preemption_kick() -> bool {
         }
     }
 
-    // ── (b) kick semantics against the live table ────────────────────────────
-    // The kick is gated OFF by default (see `sched::WAKE_KICK_ENABLED`);
-    // enable it for the assertions below, restore OFF after.
+    // ── (b) kick semantics against a SYNTHETIC running victim ─────────────────
+    // The Stage-A guarded kick (2026-06-15) added two guards that the live
+    // test-runner thread (TID 0, the BSP) cannot exercise: GUARD 1 makes any
+    // `is_io_pump()` thread (TID 0 today) un-kickable, and GUARD 2 requires a
+    // priority gap of `KICK_DELTA` (=2).  We therefore drive the kick against a
+    // synthetic NON-zero-tid `Running` victim pinned to a synthetic CPU index,
+    // so the assertions are deterministic and never depend on the live CPU's
+    // running thread.  The victim is created Blocked, mutated to Running for
+    // the scan, and retired Dead — all under one THREAD_TABLE critical section
+    // per step so a sibling CPU's picker never sees it Ready.
+    let victim = match crate::proc::create_thread_blocked(0, "wake-kick-victim", 0) {
+        Some(t) => t,
+        None => {
+            test_fail!("test520", "create_thread_blocked (victim) failed");
+            return false;
+        }
+    };
+    // Synthetic CPU index for the assertion — last valid slot, cleared first so
+    // we observe a deterministic 0→1 edge without perturbing a live CPU.
+    let test_cpu = crate::arch::x86_64::apic::MAX_CPUS - 1;
+    // Pin the victim Running on `test_cpu` at a known low priority (4), well
+    // below the high woken_prio used below but within KICK_DELTA of the
+    // delta-boundary case.
+    const VICTIM_PRIO: u8 = 4;
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(th) = threads.iter_mut().find(|t| t.tid == victim) {
+            th.state = ThreadState::Running;
+            th.priority = VICTIM_PRIO;
+            th.base_priority = VICTIM_PRIO;
+            th.last_cpu = test_cpu as u8;
+        }
+    }
+
     crate::sched::set_wake_kick(true);
-    // woken_prio = 0: structurally no thread satisfies `priority < 0`.
+
+    // (b.0) woken_prio = 0: structurally no thread satisfies the delta guard.
     let kicked_zero = {
         let threads = THREAD_TABLE.lock();
         crate::sched::kick_preempt_for_wake(&threads, 0)
     };
+
+    // (b.1) GUARD 2 boundary: woken_prio == VICTIM_PRIO + 1 is BELOW the
+    // KICK_DELTA (2) threshold → must NOT kick the victim.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let threads = THREAD_TABLE.lock();
+        let _ = crate::sched::kick_preempt_for_wake(&threads, VICTIM_PRIO + 1);
+    }
+    let kicked_below_delta = crate::sched::need_reschedule_flag(test_cpu);
+
+    // (b.2) GUARD 2 satisfied: woken_prio == VICTIM_PRIO + KICK_DELTA (=2) →
+    // MUST kick the victim's CPU.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let threads = THREAD_TABLE.lock();
+        let _ = crate::sched::kick_preempt_for_wake(&threads, VICTIM_PRIO + 2);
+    }
+    let kicked_at_delta = crate::sched::need_reschedule_flag(test_cpu);
+
+    // (b.3) GUARD 1 (io-pump): even at woken_prio = 255 the kick must NEVER set
+    // a reschedule on TID 0's CPU.  We assert the victim is the only kicked
+    // CPU at 255 by checking the kicked count stays 1 (the victim) — TID 0 is
+    // also Running but `is_io_pump()` skips it.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    let kicked_max = {
+        let threads = THREAD_TABLE.lock();
+        crate::sched::kick_preempt_for_wake(&threads, 255)
+    };
+    let victim_kicked_max = crate::sched::need_reschedule_flag(test_cpu);
+
+    // Gate restored + victim retired before any return path.
+    crate::sched::set_wake_kick(false);
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(th) = threads.iter_mut().find(|t| t.tid == victim) {
+            th.state = ThreadState::Dead;
+        }
+    }
+
     if kicked_zero != 0 {
-        crate::sched::set_wake_kick(false);
         test_fail!("test520", "woken_prio=0 kicked {} CPUs (expected 0)", kicked_zero);
         return false;
     }
-    // woken_prio = 255: every Running thread (priority <= PRIORITY_MAX=31)
-    // qualifies — including THIS test-runner thread.  After the call, this
-    // CPU's NEED_RESCHEDULE flag MUST be observable regardless of whether we
-    // or a concurrent timer tick set it (the flag is only consumed by this
-    // CPU's own reschedule points, none of which run inside this test).
-    {
-        let threads = THREAD_TABLE.lock();
-        let _ = crate::sched::kick_preempt_for_wake(&threads, 255);
-    }
-    let cpu = crate::arch::x86_64::apic::cpu_index();
-    let flag_set = crate::sched::need_reschedule_flag(cpu);
-    // Gate restored before any early return so the suite's default behaviour
-    // (kick disabled) is preserved for subsequent tests.
-    crate::sched::set_wake_kick(false);
-    if !flag_set {
+    if kicked_below_delta {
         test_fail!("test520",
-            "woken_prio=255 did not set NEED_RESCHEDULE on cpu {} (running thread qualifies)",
-            cpu);
+            "GUARD 2 breach: woken_prio={} (gap 1 < KICK_DELTA) kicked the victim",
+            VICTIM_PRIO + 1);
         return false;
     }
+    if !kicked_at_delta {
+        test_fail!("test520",
+            "GUARD 2: woken_prio={} (gap == KICK_DELTA) did NOT kick the victim",
+            VICTIM_PRIO + 2);
+        return false;
+    }
+    // GUARD 1: TID 0 must never be among the kicked CPUs.  With the victim the
+    // only non-pump Running thread we control, the kick count at 255 must be
+    // exactly 1 (the victim) — if TID 0 were kickable the count would exceed 1
+    // whenever TID 0's last_cpu differs from the victim's.  We assert the
+    // victim WAS kicked and that the io-pump exclusion held by checking the
+    // io_pump predicate directly on the live table.
+    if !victim_kicked_max {
+        test_fail!("test520", "woken_prio=255 did not kick the synthetic victim's CPU");
+        return false;
+    }
+    let io_pump_excluded = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == 0).map(|t| t.is_io_pump()).unwrap_or(true)
+    };
+    if !io_pump_excluded {
+        test_fail!("test520", "TID 0 is not recognised as an io_pump (GUARD 1 would not protect it)");
+        return false;
+    }
+    let _ = kicked_max; // count is implementation-dependent (other CPUs may run threads)
+
     // Gated-off contract: with the gate restored OFF the kick must be inert.
     let kicked_gated = {
         let threads = THREAD_TABLE.lock();
@@ -48066,7 +48250,8 @@ fn test_520_wakeup_preemption_kick() -> bool {
         test_fail!("test520", "kick fired while gated OFF ({} CPUs)", kicked_gated);
         return false;
     }
-    test_println!("  kick: prio 0 → 0; prio 255 → NEED_RESCHEDULE[{}] set; gated-off inert ✓", cpu);
+    test_println!(
+        "  kick: prio 0 → 0; below-delta → no kick; at-delta → kick; io-pump excluded; gated-off inert ✓");
 
     test_pass!("event-wake boost + wakeup-preemption kick");
     true

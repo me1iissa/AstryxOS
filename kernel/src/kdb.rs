@@ -1246,7 +1246,8 @@ fn op_virtio_wait_reset(out: &mut String) {
 
 fn op_bell_stats(out: &mut String) {
     use core::fmt::Write;
-    let (counts, bell_wakes, resync_wakes) = crate::ipc::waitlist::bell_stats();
+    let (counts, bell_wakes, resync_wakes, mask_filtered) =
+        crate::ipc::waitlist::bell_stats();
     let total_wakes = bell_wakes.saturating_add(resync_wakes);
     let bell_ratio_permille = if total_wakes == 0 {
         0u64
@@ -1266,8 +1267,8 @@ fn op_bell_stats(out: &mut String) {
     }
     let _ = write!(
         out,
-        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{}}}"#,
-        bell_wakes, resync_wakes, bell_ratio_permille
+        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{},"mask_filtered":{}}}"#,
+        bell_wakes, resync_wakes, bell_ratio_permille, mask_filtered
     );
 }
 // ── cache-aliasing ────────────────────────────────────────────────────────────
@@ -1564,8 +1565,13 @@ fn op_sched_stats(out: &mut String) {
     let _ = write!(out, r#""ready_depth":{},"#,   crate::sched::ready_depth());
     let _ = write!(out, r#""wake_boost_enabled":{},"#,
         crate::sched::wake_boost_enabled());
-    let _ = write!(out, r#""wake_kick_enabled":{}"#,
+    let _ = write!(out, r#""wake_kick_enabled":{},"#,
         crate::sched::WAKE_KICK_ENABLED.load(core::sync::atomic::Ordering::Relaxed));
+    // Stage-C class-filter efficacy: parkers spared a needless re-scan because
+    // their interest mask did not include the firing readiness source.  A
+    // growing value means the poll-bell thundering herd is being collapsed.
+    let _ = write!(out, r#""poll_bell_mask_filtered":{}"#,
+        crate::ipc::waitlist::POLL_BELL_MASK_FILTERED.load(core::sync::atomic::Ordering::Relaxed));
     out.push('}');
 }
 

@@ -55,6 +55,73 @@ fn memfd_seals_get(inode: u64) -> Option<u32> {
     MEMFD_SEALS.lock().iter().find(|(ino, _)| *ino == inode).map(|(_, m)| *m)
 }
 
+/// Compute the set of `PollBellSource` classes (`bit(s) = 1 << (s as u32)`)
+/// that a single fd `(pid, fd)` can be made ready by.
+///
+/// Used to build a poll/select/epoll parker's interest mask so the Stage-C
+/// class-filtered poll-bell drain wakes it only on the readiness sources it
+/// genuinely depends on — collapsing the global poll-bell thundering herd.
+///
+/// CONSERVATIVE SUPERSET INVARIANT (lost-wakeup safety): an fd whose backing
+/// type cannot be pinned (unknown kind, a regular file / nested epoll fd, an fd
+/// that races a concurrent close/dup2 to a different type, or any lookup error)
+/// maps to [`BELL_MASK_ALL`] — the waiter is then woken by every source.
+/// Under-waking is a hang; over-waking is merely a redundant re-scan, so any
+/// doubt resolves to wake-everyone.  The fd-type predicates are tested in the
+/// SAME order as the `select(2)`/`poll` readiness dispatch (unix BEFORE inet,
+/// because an AF_UNIX fd also satisfies the generic `is_socket_fd` flag); a
+/// reorder would misclassify a unix socket as inet-only and drop its
+/// UnixWrite/UnixRead/UnixShutdown wakes — a real lost wakeup.
+fn bell_mask_for_fd(pid: u64, fd: usize) -> u32 {
+    use crate::ipc::waitlist::PollBellSource as S;
+    let b = |s: S| 1u32 << (s as u32);
+    if crate::syscall::is_pipe_fd(pid, fd) {
+        b(S::Pipe)
+    } else if crate::syscall::is_eventfd_fd(pid, fd) {
+        b(S::Eventfd)
+    } else if crate::syscall::is_unix_socket_fd(pid, fd) {
+        // AF_UNIX readiness arrives from data write (POLLIN), a peer recv
+        // draining the ring (peer POLLOUT), and half-close/connect/accept.
+        b(S::UnixWrite) | b(S::UnixRead) | b(S::UnixShutdown)
+    } else if crate::syscall::is_socket_fd(pid, fd) {
+        // AF_INET/AF_INET6 stream/datagram arrival (must come AFTER the unix
+        // test — unix sockets also carry the generic socket flag).
+        b(S::InetRx)
+    } else if crate::syscall::is_timerfd_fd(pid, fd) {
+        b(S::Timerfd)
+    } else if crate::syscall::is_signalfd_fd(pid, fd) {
+        // signalfd readiness is driven by the signal-injection path.
+        b(S::Signalfd) | b(S::SignalInject)
+    } else if crate::syscall::is_inotify_fd(pid, fd) {
+        b(S::Inotify)
+    } else {
+        // Unknown / unclassifiable / raced / regular-file / nested-epoll fd:
+        // wake conservatively on every source.  NEVER narrow this.
+        crate::ipc::waitlist::BELL_MASK_ALL
+    }
+}
+
+/// Fold [`bell_mask_for_fd`] over a set of watched fds to produce the parker's
+/// interest mask.  ALWAYS OR's in the two cross-cutting catch-all classes
+/// (`Other` and `SignalInject`): `Other` is rung by ad-hoc readiness sources
+/// not yet given a dedicated class (e.g. X11 reply delivery via the bare
+/// `ring_poll_bell`), and `SignalInject` must reach any parker whose temporary
+/// sigmask just admitted a pending signal (`epoll_pwait`/`pselect`/`ppoll`
+/// semantics, POSIX). Both MUST wake everyone, so every parker subscribes to
+/// them unconditionally.
+fn bell_mask_for_fds(pid: u64, fds: impl Iterator<Item = usize>) -> u32 {
+    use crate::ipc::waitlist::PollBellSource as S;
+    let mut mask = (1u32 << (S::Other as u32)) | (1u32 << (S::SignalInject as u32));
+    for fd in fds {
+        mask |= bell_mask_for_fd(pid, fd);
+        // Early-out: once the mask is fully saturated nothing can narrow it.
+        if mask == crate::ipc::waitlist::BELL_MASK_ALL {
+            break;
+        }
+    }
+    mask
+}
+
 /// Add seals to `inode`.  Returns 0 on success, -EPERM/-EINVAL on error.
 fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
     if new_seals & !F_SEAL_ALL_VALID != 0 {
@@ -1491,6 +1558,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let now = crate::arch::x86_64::irq::get_ticks();
                     now + ((timeout_ms as u64) / 10).max(1)
                 };
+                // Stage-C interest mask: read the watched fds out of the user
+                // pollfd array (under SMAP) once, then map each to its
+                // readiness-source classes so the class-filtered poll-bell
+                // drain wakes this poller only on relevant edges.  A negative
+                // pollfd (`fd < 0`, ignored per poll(2)) contributes nothing.
+                // Conservative superset: an unclassifiable fd ⇒ BELL_MASK_ALL.
+                let bell_mask = {
+                    let mut fds: alloc::vec::Vec<usize> =
+                        alloc::vec::Vec::with_capacity(nfds as usize);
+                    for i in 0..nfds as u64 {
+                        let base = (arg1 + i * 8) as *const u8;
+                        let fd_val = unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::read_unaligned(base as *const i32)
+                        };
+                        if fd_val >= 0 {
+                            fds.push(fd_val as usize);
+                        }
+                    }
+                    bell_mask_for_fds(pid, fds.into_iter())
+                };
                 loop {
                     // Park on the global IPC poll bell rather than spin-
                     // sleeping at 100 Hz.  Any pipe write / eventfd post /
@@ -1514,8 +1602,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // side-effect-light readiness probe (it only writes the
                     // idempotent revents bits, recomputed after the wake).
                     let ready_in_window =
-                        crate::ipc::waitlist::wait_poll_event(
-                            deadline_tick, || do_check(false, false) > 0);
+                        crate::ipc::waitlist::wait_poll_event_masked(
+                            deadline_tick, bell_mask, || do_check(false, false) > 0);
                     if !ready_in_window {
                         // We actually parked and woke — pump X11 so replies
                         // appear in socket buffers, and pump the NIC RX ring +
@@ -6098,6 +6186,28 @@ fn sys_select_linux(
                 let now = crate::arch::x86_64::irq::get_ticks();
                 now.saturating_add(((timeout_ms as u64) / 10).max(1))
             };
+            // Stage-C interest mask: every fd this select(2) call requested
+            // (read OR write side) maps to the readiness-source classes it can
+            // be made ready by, so the class-filtered poll-bell drain wakes
+            // this caller only on relevant edges.  Computed once — the fd_set
+            // membership is fixed for the wait (do_rescan only *clears* bits on
+            // ready fds it returns, which happens after the wait completes).
+            // Conservative superset: an unclassifiable fd ⇒ BELL_MASK_ALL.
+            let bell_mask = {
+                let mut fds: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                for fd in 0..nfds {
+                    let byte_off = (fd / 8) as u64;
+                    let bit = 1u8 << (fd % 8);
+                    let r_req = readfds != 0
+                        && fdset_read_bit(readfds, byte_off, bit, kernel_dispatch);
+                    let w_req = writefds != 0
+                        && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
+                    if r_req || w_req {
+                        fds.push(fd);
+                    }
+                }
+                bell_mask_for_fds(pid, fds.into_iter())
+            };
             loop {
                 // Park on the global poll bell — see the matching change
                 // in sys_poll for why this replaces the prior 10 ms tick
@@ -6111,8 +6221,8 @@ fn sys_select_linux(
                 // authoritative bit-clearing `do_rescan` below stays the
                 // single fd_set mutator.
                 let ready_in_window =
-                    crate::ipc::waitlist::wait_poll_event(
-                        deadline_tick, &probe_ready);
+                    crate::ipc::waitlist::wait_poll_event_masked(
+                        deadline_tick, bell_mask, &probe_ready);
                 if !ready_in_window {
                     crate::x11::poll();
                 }
@@ -11550,6 +11660,14 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             now.saturating_add(((timeout_ms as u64) / 10).max(1))
         };
         if fired.is_empty() {
+            // Stage-C interest mask: the readiness-source classes the watched
+            // fds can be made ready by, so the class-filtered poll-bell drain
+            // wakes this epoll_wait parker only on relevant edges.  Computed
+            // once outside the loop — the watch set is fixed for the lifetime
+            // of this epoll_wait call.  Conservative superset: any
+            // unclassifiable fd contributes BELL_MASK_ALL.
+            let bell_mask = bell_mask_for_fds(
+                pid, watches_snap.iter().map(|&(fd, ..)| fd));
             loop {
                 // Park on the global poll bell.  Pipe/eventfd writes ring it
                 // (see `crate::ipc::waitlist::ring_poll_bell`); the scheduler
@@ -11566,8 +11684,8 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
                 // drains us).  The wake-side net/x11 pumps run only when we
                 // actually parked.
                 let ready_in_window =
-                    crate::ipc::waitlist::wait_poll_event(
-                        deadline_tick, &probe_ready);
+                    crate::ipc::waitlist::wait_poll_event_masked(
+                        deadline_tick, bell_mask, &probe_ready);
                 if ready_in_window {
                     do_poll(&mut fired);
                     if !fired.is_empty() { break; }

@@ -321,6 +321,25 @@ impl Thread {
     pub fn is_reapable(&self) -> bool {
         self.state == ThreadState::Dead && self.tid != 0 && self.tid < 0x1000
     }
+
+    /// True for I/O-pump threads that the wakeup-preemption kick
+    /// (`sched::kick_preempt_for_wake`) must NEVER evict.
+    ///
+    /// Today only TID 0 (the BSP main loop) pumps `net::poll` / X11 / the
+    /// compositor continuously at `PRIORITY_IDLE` while holding the CPU.
+    /// Evicting it on every event wake collapsed TCP processing throughput
+    /// historically (median TLS client-Finished latency rose ~12×), so the
+    /// kick scan skips any `is_io_pump()` thread.
+    ///
+    /// FOOTGUN: this is a ROLE predicate, not a bare `tid == 0` test at the
+    /// call site, so the protection travels if a pump thread is ever added.
+    /// If a future ksoftirqd-style net-poller kernel thread is introduced
+    /// (`tid != 0`), it MUST be registered here — otherwise the kick will
+    /// evict it and re-introduce the throughput collapse.
+    #[inline]
+    pub fn is_io_pump(&self) -> bool {
+        self.tid == 0
+    }
 }
 
 // ── Priority Constants (NT-style) ────────────────────────────────────

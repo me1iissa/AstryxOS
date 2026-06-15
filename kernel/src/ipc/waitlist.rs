@@ -30,8 +30,34 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// All operations therefore assume exclusive access via the outer lock and
 /// do not synchronise internally.
 pub struct WaitList {
-    tids: Vec<u64>,
+    tids: Vec<BellWaiter>,
 }
+
+/// A single parker on a `WaitList`, carrying the readiness-source classes the
+/// thread actually depends on (`mask`).  `mask` is a bitset over
+/// `PollBellSource` discriminants — `bit(s) = 1u32 << (s as u32)`.  A drain for
+/// source `S` wakes a waiter iff `mask & (1 << S) != 0`, so a parker is only
+/// disturbed by the classes of readiness it is genuinely waiting on, collapsing
+/// the global poll-bell thundering herd (a TLS-continuation or screenshot-IPC
+/// thread is not re-scheduled by an unrelated socket's readiness edge).
+///
+/// `mask == BELL_MASK_ALL` is the conservative "wake-everyone" sentinel and
+/// matches *every* source bit — used for any waiter whose interest cannot be
+/// statically classified, and for all non-poll-bell callers via the
+/// `enqueue_self_blocked` shim, so their behaviour is byte-for-byte unchanged.
+struct BellWaiter {
+    tid: u64,
+    mask: u32,
+}
+
+/// Conservative "this waiter is interested in every readiness source" sentinel.
+/// Equal to all `N_BELL_SOURCES` low bits set; any per-source `drain_matching`
+/// bit intersects it, so a `BELL_MASK_ALL` waiter is woken by every ring — the
+/// exact semantics of the historical `drain_all`-only path.  Under-waking is a
+/// hang and strictly worse than over-waking, so any unclassifiable interest
+/// MUST fall back to this value (see `wait_poll_event` and the syscall-layer
+/// `bell_mask_for_fd`).
+pub const BELL_MASK_ALL: u32 = (1u32 << N_BELL_SOURCES) - 1;
 
 impl WaitList {
     /// Construct an empty wait list.  `const fn` so it can be used in
@@ -67,7 +93,27 @@ impl WaitList {
     /// The caller invokes `crate::sched::schedule()` after the outer lock
     /// has been dropped.
     pub fn enqueue_self_blocked(&mut self, tid: u64, wake_tick: u64) {
-        self.tids.push(tid);
+        // Shim: a caller that does not (yet) classify its interest is woken by
+        // every readiness source — identical to the historical drain_all-only
+        // behaviour.  Preserves every non-poll-bell caller (gui/terminal.rs,
+        // udp/tcp internal waiters) unchanged.
+        self.enqueue_self_blocked_masked(tid, wake_tick, BELL_MASK_ALL);
+    }
+
+    /// Like [`enqueue_self_blocked`] but records the parker's readiness-source
+    /// interest `mask` so a later `drain_matching` can wake it selectively.
+    ///
+    /// CRITICAL (lost-wakeup discipline): `mask` is written to the wait list
+    /// under the SAME outer (`POLL_BELL`) lock hold as the `Running -> Blocked`
+    /// transition below — exactly as this function takes `THREAD_TABLE` while
+    /// the caller still holds the outer lock.  A `drain_matching` racing in
+    /// that window is serialized on the outer lock and therefore observes the
+    /// fully-formed `BellWaiter { tid, mask }`; no readiness edge can slip
+    /// between the mask write and the state transition.  The caller MUST pass a
+    /// SUPERSET of its true interest (`BELL_MASK_ALL` when unsure) — a too-narrow
+    /// mask is a missed wake.
+    pub fn enqueue_self_blocked_masked(&mut self, tid: u64, wake_tick: u64, mask: u32) {
+        self.tids.push(BellWaiter { tid, mask });
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             // Mirror the SMP context-switch invariant from `sleep_ticks`:
@@ -81,6 +127,34 @@ impl WaitList {
         }
     }
 
+    /// Drain every parker whose interest `mask` intersects `source_bit`,
+    /// returning their TIDs and RETAINING the non-matching waiters in place.
+    ///
+    /// `source_bit` is a single `1 << (PollBellSource as u32)` bit.  A waiter
+    /// matches iff `mask & source_bit != 0`; a `BELL_MASK_ALL` waiter matches
+    /// every source.  This is the class-filtered counterpart to `drain_all`
+    /// (which `ring_poll_bell_for` now uses for per-source readiness rings) —
+    /// `drain_all` stays for unconditional EOF/close/shutdown wakes where every
+    /// parker must be released regardless of interest.
+    pub fn drain_matching(&mut self, source_bit: u32) -> Vec<u64> {
+        let out: Vec<u64> = self
+            .tids
+            .iter()
+            .filter(|w| w.mask & source_bit != 0)
+            .map(|w| w.tid)
+            .collect();
+        if !out.is_empty() {
+            // Diagnostic: count parkers LEFT BEHIND by this filter (the herd
+            // the class filter spared from a needless re-scan).  A non-zero
+            // value proves the filter is shrinking the wake set; see
+            // `POLL_BELL_MASK_FILTERED` and kdb `sched-stats`.
+            POLL_BELL_MASK_FILTERED
+                .fetch_add((self.tids.len() - out.len()) as u64, Ordering::Relaxed);
+            self.tids.retain(|w| w.mask & source_bit == 0);
+        }
+        out
+    }
+
     /// Drain up to `max` parked TIDs and return them to the caller, who is
     /// expected to call `wake_tids` *after* dropping the outer wait-list
     /// lock.  Splitting drain-from-list and flip-thread-state into two
@@ -91,17 +165,20 @@ impl WaitList {
             return Vec::new();
         }
         let n = self.tids.len().min(max);
-        self.tids.drain(..n).collect()
+        self.tids.drain(..n).map(|w| w.tid).collect()
     }
 
     /// Drain every parked TID — used by close-end wakes (EOF) where every
-    /// blocked reader must be released.
+    /// blocked reader must be released regardless of interest mask.
+    /// Semantically `drain_matching(BELL_MASK_ALL)` (every waiter's mask
+    /// intersects the all-ones sentinel), kept as a distinct, intent-revealing
+    /// entry point for the unconditional EOF/close/shutdown wakes.
     pub fn drain_all(&mut self) -> Vec<u64> {
         if self.tids.is_empty() {
             return Vec::new();
         }
         let n = self.tids.len();
-        self.tids.drain(..n).collect()
+        self.tids.drain(..n).map(|w| w.tid).collect()
     }
 
     /// Remove `tid` from the list if present.  Returns `true` if the TID
@@ -111,7 +188,7 @@ impl WaitList {
     /// -> a wake removed us already, treat as success).
     pub fn remove_tid(&mut self, tid: u64) -> bool {
         let before = self.tids.len();
-        self.tids.retain(|&t| t != tid);
+        self.tids.retain(|w| w.tid != tid);
         self.tids.len() < before
     }
 }
@@ -262,6 +339,18 @@ pub static POLL_BELL_BELL_WAKES: AtomicU64 = AtomicU64::new(0);
 /// source is not wired into the bell yet — see `bell_stats()`.
 pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative number of parkers LEFT BEHIND by `drain_matching` (i.e. a
+/// per-source readiness ring fired and the class filter spared a parker whose
+/// interest mask did not include that source).  This is the direct measure of
+/// the thundering-herd collapse Stage C buys: a large value means each
+/// readiness edge wakes only the relevant class instead of every poll/epoll
+/// parker.  Surfaced via kdb `sched-stats`.  Pairs with
+/// `POLL_BELL_RESYNC_WAKES` as a correctness check: if filtering ever caused a
+/// *missed* wake the resync-wake count would rise (the waiter would only
+/// recover at the 1 s resync floor), so a stable resync ratio alongside a
+/// growing filtered count confirms the masks are a correct superset.
+pub static POLL_BELL_MASK_FILTERED: AtomicU64 = AtomicU64::new(0);
+
 /// Park the caller on the global poll bell.  Returns once any IPC
 /// writer has rung the bell, the bounded resync interval elapses, or
 /// the caller is woken for another reason (e.g. signal injection
@@ -315,7 +404,26 @@ pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
 /// dispatcher, and the pipe/eventfd/unix wake paths), so the reverse
 /// edge `PROCESS_TABLE → POLL_BELL` does not exist and the addition is
 /// inversion-free.  `POLL_BELL` is never held across `schedule()`.
-pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool) -> bool {
+pub fn wait_poll_event(caller_deadline: u64, ready_now: impl FnMut() -> bool) -> bool {
+    // Shim for callers that do not classify their interest (gui/terminal.rs,
+    // udp/tcp internal waiters): park interested in every readiness source,
+    // identical to the historical drain_all-only behaviour.
+    wait_poll_event_masked(caller_deadline, BELL_MASK_ALL, ready_now)
+}
+
+/// Class-filtered variant of [`wait_poll_event`].  `mask` is the set of
+/// `PollBellSource` classes (`bit(s) = 1 << (s as u32)`) the caller's watched
+/// fds can actually be made ready by; a per-source `ring_poll_bell_for(S)`
+/// wakes this parker iff `mask & (1 << S) != 0`.  Pass a SUPERSET of true
+/// interest (`BELL_MASK_ALL` for any unclassifiable fd) — under-waking is a
+/// lost wakeup / hang, over-waking is merely a redundant re-scan.  The mask is
+/// recorded under the same `POLL_BELL` hold as the park (see
+/// `enqueue_self_blocked_masked`), so no racing ring can lose the edge.
+pub fn wait_poll_event_masked(
+    caller_deadline: u64,
+    mask: u32,
+    mut ready_now: impl FnMut() -> bool,
+) -> bool {
     /// Maximum ticks to park before the outer loop rescans.  100 ticks
     /// = 1 s at `TICK_HZ=100`.  Pre-wiring this was 100 ms because the
     /// bell missed timerfd / signalfd / inotify / unix-shutdown /
@@ -347,7 +455,7 @@ pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool
         drop(bell);
         return true;
     }
-    bell.enqueue_self_blocked(tid, wake_tick);
+    bell.enqueue_self_blocked_masked(tid, wake_tick, mask);
     // Drop the bell AFTER enqueue but BEFORE schedule(): a wake that
     // arrives between here and schedule() finds us already on the list
     // and flips us Blocked→Ready, so the schedule() (or the scheduler
@@ -385,7 +493,16 @@ pub fn ring_poll_bell() {
 /// times", not "this source woke M waiters".
 pub fn ring_poll_bell_for(source: PollBellSource) {
     BELL_RINGS_BY_SOURCE[source as usize].fetch_add(1, Ordering::Relaxed);
-    let drained = POLL_BELL.lock().drain_all();
+    // Class-filtered drain: wake only parkers whose recorded interest mask
+    // includes this readiness source (plus every `BELL_MASK_ALL` parker).  This
+    // collapses the global poll-bell thundering herd — an InetRx edge no longer
+    // re-schedules ~200 epoll/poll parkers that watch only pipes/eventfds, the
+    // ready-queue churn that starved the latency-critical chain (POSIX
+    // sched(7): a ready thread should contend promptly, but a *not*-ready
+    // thread re-parking on every unrelated edge is pure run-queue overhead).
+    // EOF/close/shutdown paths still call `drain_all` to release everyone.
+    let bit = 1u32 << (source as u32);
+    let drained = POLL_BELL.lock().drain_matching(bit);
     wake_tids(&drained);
 }
 
@@ -397,9 +514,11 @@ pub fn poll_bell_waiter_count() -> usize {
 
 /// Snapshot the per-source bell counters and wake-classification
 /// totals into a fixed-size array.  Returned tuple is
-/// `(per_source_counts, bell_wakes, resync_wakes)`.  Used by the kdb
-/// `bell-stats` op to render an attribution table.
-pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64) {
+/// `(per_source_counts, bell_wakes, resync_wakes, mask_filtered)`.  Used by the
+/// kdb `bell-stats` / `sched-stats` ops to render an attribution table and to
+/// prove the Stage-C class filter is shrinking the wake set
+/// (`mask_filtered` > 0) without raising the resync ratio.
+pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64, u64) {
     let mut counts = [0u64; N_BELL_SOURCES];
     for (i, c) in BELL_RINGS_BY_SOURCE.iter().enumerate() {
         counts[i] = c.load(Ordering::Relaxed);
@@ -408,5 +527,6 @@ pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64) {
         counts,
         POLL_BELL_BELL_WAKES.load(Ordering::Relaxed),
         POLL_BELL_RESYNC_WAKES.load(Ordering::Relaxed),
+        POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed),
     )
 }
