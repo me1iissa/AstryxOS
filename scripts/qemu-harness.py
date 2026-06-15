@@ -6178,6 +6178,18 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "pid": int(rest[0], 0),
                 "addr": f"0x{int(rest[1], 0):x}",
                 "half": half}
+    if op == "futex-key":
+        # Resolve the kernel FutexKey for (pid, uaddr) and report the backing
+        # VMA + the FUTEX_WAITERS bucket on the resolved key (across ALL pids).
+        #   kdb <sid> futex-key <pid> <uaddr>
+        # The decisive cross-process lost-wakeup discriminator: a WAIT in one
+        # process and a WAKE in another rendezvous iff their resolved keys are
+        # identical.  Requires --features kdb.
+        if len(rest) < 2:
+            raise ValueError("futex-key requires <pid> <uaddr>")
+        return {"op": "futex-key",
+                "pid": int(rest[0], 0),
+                "addr": f"0x{int(rest[1], 0):x}"}
     if op == "read-file":
         # Read a slice of a VFS file, returned base64.  Robust extraction
         # primitive — works on any live kdb session regardless of process
@@ -11835,6 +11847,10 @@ def main():
         # struct dump + parked waiters + recent wakes + holder + verdict.
         # See subsys/linux/futex_cluster.rs::recent_wakes_near + op_cond_autopsy.
         "cond-autopsy",
+        # futex-key: resolve the kernel FutexKey (private vs shared) for
+        # (pid, uaddr) + the backing VMA + the FUTEX_WAITERS bucket on that
+        # key across ALL pids.  The cross-process lost-wakeup discriminator.
+        "futex-key",
         # proc-kill: deliver a signal (default SIGKILL) to a guest process.
         "proc-kill",
         # epoll-watch: live epoll interest-set + per-fd readiness/delivered dump

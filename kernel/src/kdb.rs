@@ -422,6 +422,13 @@ pub fn dispatch(req: &str, out: &mut String) {
         // wait-addr report.  Composes the live struct dump + parked waiters +
         // recent wake targets + inferred lock holder into a single verdict.
         "cond-autopsy"   => op_cond_autopsy(req, out),
+        // futex-key: resolve the FutexKey (Private vs Shared) the kernel
+        // computes for one (pid, uaddr), report the backing VMA's
+        // flags+backing variant, and enumerate the FUTEX_WAITERS bucket on
+        // that resolved key (across all processes).  The decisive
+        // cross-process lost-wakeup discriminator: a WAIT in one process and
+        // a WAKE in another rendezvous iff their resolved keys are identical.
+        "futex-key"      => op_futex_key(req, out),
         // Deliver a signal to a guest process (default SIGKILL) — the
         // induced-verdict primitive: terminate a parked process and observe
         // what its supervisor/peer reports.
@@ -3675,6 +3682,163 @@ fn op_proc_kill(req: &str, out: &mut String) {
     let sig = extract_field(req, "sig").and_then(|s| parse_u64(&s)).unwrap_or(9).min(64) as u8;
     let ret = crate::signal::kill(pid, sig);
     let _ = write!(out, r#"{{"op":"proc-kill","pid":{},"sig":{},"ret":{}}}"#, pid, sig, ret);
+}
+
+// ── futex-key ─────────────────────────────────────────────────────────────────
+//
+// Request: {"op":"futex-key","pid":N,"addr":"0x..."}
+//
+// Resolve the [`crate::syscall::FutexKey`] the kernel computes for the futex
+// word at (pid, uaddr) — exactly as both the WAIT and WAKE syscall paths do —
+// and report:
+//   * key_kind: "private" | "shared"
+//   * for shared keys: {mount_idx, inode, byte_off}
+//   * vma: the backing VMA's {base, flags, map_shared, backing} (the raw input
+//     to the key decision)
+//   * bucket: every (pid, tid) parked on the RESOLVED key, ACROSS ALL
+//     PROCESSES — so a cross-process waiter shows up even though the
+//     virtual-address-windowed cond-autopsy (which only scans the same-pid
+//     PRIVATE cluster) cannot see it.
+//
+// Decisive use: a content/socket process WAITs on a process-shared futex and
+// the parent WAKEs the *same* underlying word at a possibly-different uaddr.
+// They rendezvous iff `futex-key` on the waiter's (pid, uaddr) and on the
+// waker's (pid, uaddr) yields the IDENTICAL key.  A `MAP_SHARED` mapping whose
+// key resolves "private" is a lost-wakeup bug (POSIX futex(2): a futex in a
+// process-shared mapping must be keyed by backing-object identity).
+fn op_futex_key(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    use crate::syscall::FutexKey;
+
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+        Some(a) => a,
+        None => { out.push_str(r#"{"error":"missing or bad 'addr'"}"#); return; }
+    };
+    if addr >= astryx_shared::KERNEL_VIRT_BASE {
+        out.push_str(r#"{"error":"addr must be a user (canonical low-half) VA"}"#);
+        return;
+    }
+
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
+    j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
+
+    // ── Raw VMA backing (the input to the key decision) ────────────────
+    // Snapshot the VMA's base/flags/backing under PROCESS_TABLE.  Mirror the
+    // foreign-VmSpace lookup futex_backing_for uses (own VmSpace authoritative;
+    // CLONE_VM children fall back to the CR3-matching parent).
+    #[derive(Clone, Copy)]
+    enum BackKind { Anonymous, File, Device, NoVma, NoSpace }
+    struct VmaInfo { base: u64, flags: u32, map_shared: bool, kind: BackKind,
+                     mount_idx: usize, inode: u64 }
+    let vinfo: VmaInfo = {
+        use crate::mm::vma::{VmBacking, MAP_SHARED};
+        let pt = match try_lock_brief(&PROCESS_TABLE) {
+            Some(g) => g,
+            None => { out.push_str(r#""error":"PROCESS_TABLE busy"}"#); return; }
+        };
+        let classify = |vma: &crate::mm::vma::VmArea| -> VmaInfo {
+            let (kind, mi, ino) = match &vma.backing {
+                VmBacking::Anonymous => (BackKind::Anonymous, 0usize, 0u64),
+                VmBacking::File { mount_idx, inode, .. } => (BackKind::File, *mount_idx, *inode),
+                VmBacking::Device { .. } => (BackKind::Device, 0, 0),
+            };
+            VmaInfo { base: vma.base, flags: vma.flags as u32,
+                      map_shared: vma.flags & MAP_SHARED != 0, kind,
+                      mount_idx: mi, inode: ino }
+        };
+        let lookup = |space: &crate::mm::vma::VmSpace| -> Option<VmaInfo> {
+            space.find_vma(addr).map(classify)
+        };
+        match pt.iter().find(|p| p.pid == pid) {
+            None => VmaInfo { base: 0, flags: 0, map_shared: false,
+                              kind: BackKind::NoSpace, mount_idx: 0, inode: 0 },
+            Some(proc) => {
+                if let Some(space) = proc.vm_space.as_ref() {
+                    lookup(space).unwrap_or(VmaInfo { base: 0, flags: 0, map_shared: false,
+                        kind: BackKind::NoVma, mount_idx: 0, inode: 0 })
+                } else if proc.cr3 != 0 && proc.parent_pid != 0 {
+                    let cr3 = proc.cr3;
+                    match pt.iter().find(|p| p.pid == proc.parent_pid)
+                        .filter(|par| par.cr3 == cr3)
+                        .and_then(|par| par.vm_space.as_ref())
+                        .and_then(lookup)
+                    {
+                        Some(v) => v,
+                        None => VmaInfo { base: 0, flags: 0, map_shared: false,
+                            kind: BackKind::NoVma, mount_idx: 0, inode: 0 },
+                    }
+                } else {
+                    VmaInfo { base: 0, flags: 0, map_shared: false,
+                        kind: BackKind::NoSpace, mount_idx: 0, inode: 0 }
+                }
+            }
+        }
+    };
+    let kind_str = match vinfo.kind {
+        BackKind::Anonymous => "anonymous",
+        BackKind::File      => "file",
+        BackKind::Device    => "device",
+        BackKind::NoVma     => "no-vma",
+        BackKind::NoSpace   => "no-space",
+    };
+    out.push_str(r#""vma":{"#);
+    j_str(out, "base"); out.push(':'); j_hex(out, vinfo.base); out.push(',');
+    let _ = write!(out, r#""flags":"{:#x}","#, vinfo.flags);
+    let _ = write!(out, r#""map_shared":{},"#, vinfo.map_shared);
+    j_kv_str(out, "backing", kind_str);
+    let _ = write!(out, r#""mount_idx":{},"inode":{}"#, vinfo.mount_idx, vinfo.inode);
+    out.push_str("},");
+
+    // ── Resolved FutexKey (the exact value WAIT/WAKE bucket on) ─────────
+    let key = crate::syscall::resolve_futex_key(pid, addr, false);
+    out.push_str(r#""key":{"#);
+    match key {
+        FutexKey::Private(p, u) => {
+            j_kv_str(out, "kind", "private");
+            let _ = write!(out, r#""pid":{},"#, p);
+            j_str(out, "uaddr"); out.push(':'); j_hex(out, u);
+        }
+        FutexKey::Shared { mount_idx, inode, byte_off } => {
+            j_kv_str(out, "kind", "shared");
+            let _ = write!(out, r#""mount_idx":{},"inode":{},"byte_off":{}"#,
+                mount_idx, inode, byte_off);
+        }
+    }
+    out.push_str("},");
+
+    // ── Bucket on the resolved key (across ALL processes) ──────────────
+    // A shared key is process-independent, so its bucket can hold waiters from
+    // several pids — exactly the cross-process rendezvous we must observe.
+    out.push_str(r#""bucket":"#);
+    // Pre-snapshot tid→pid (brief THREAD_TABLE hold) so the bucket emit below
+    // needs no nested lock while FUTEX_WAITERS is held.
+    let tid_pid: Vec<(u64, u64)> = match try_lock_brief(&crate::proc::THREAD_TABLE) {
+        Some(tt) => tt.iter().map(|t| (t.tid, t.pid)).collect(),
+        None => Vec::new(),
+    };
+    match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
+        Some(w) => {
+            out.push('[');
+            if let Some(tids) = w.get(&key) {
+                let mut first = true;
+                for &tid in tids.iter() {
+                    if !first { out.push(','); }
+                    first = false;
+                    let owner_pid = tid_pid.iter().find(|(t, _)| *t == tid)
+                        .map(|(_, p)| *p).unwrap_or(0);
+                    let _ = write!(out, r#"{{"tid":{},"pid":{}}}"#, tid, owner_pid);
+                }
+            }
+            out.push(']');
+        }
+        None => { out.push_str(r#""FUTEX_WAITERS busy""#); }
+    }
+    out.push('}');
 }
 
 fn op_cond_autopsy(req: &str, out: &mut String) {
