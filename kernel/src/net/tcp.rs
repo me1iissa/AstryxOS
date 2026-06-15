@@ -662,6 +662,57 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
 /// Process one segment on an existing connection (lock already held by
 /// caller).  Any reply segments are pushed into `out` for the caller to
 /// transmit *after* releasing the `TCP_CONNECTIONS` lock — see `OutSeg`.
+/// Deliver in-order segment text and an in-order peer FIN, common to every
+/// receive-capable state (RFC 9293 §3.10.7.4 — ESTABLISHED, FIN-WAIT-1 and
+/// FIN-WAIT-2 all "queue the data" arriving on an in-order segment).
+///
+/// Returns `true` if an ACK must be emitted for this segment (it carried
+/// data, an in-order FIN, or out-of-order/duplicate text whose arrival the
+/// peer must be told about so it stops retransmitting), and the FIN bit
+/// observed in-order via `*fin_in_order`.
+///
+/// This does NOT change `conn.state` — the FIN-driven transition is
+/// state-specific and left to the caller (ESTABLISHED → CloseWait,
+/// FIN-WAIT-* → TimeWait).  It only advances `recv_next`, appends delivered
+/// bytes to `recv_buffer`, drains the out-of-order queue, and reports
+/// whether the in-order FIN was consumed.
+fn receive_segment_data(conn: &mut TcpConnection, hdr: &TcpHeader,
+                        payload: &[u8], fin_in_order: &mut bool) -> bool {
+    let mut need_ack = false;
+    *fin_in_order = false;
+
+    if !payload.is_empty() {
+        need_ack = true;
+        let seg_end = hdr.seq_num.wrapping_add(payload.len() as u32);
+        if hdr.seq_num == conn.recv_next {
+            // In-order: append and advance, then drain any now-contiguous
+            // out-of-order segments.
+            conn.recv_buffer.extend_from_slice(payload);
+            conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+            drain_ooo(conn);
+        } else if seq_gt(seg_end, conn.recv_next) {
+            // Out-of-order but carries new data ahead of the gap: buffer it.
+            insert_ooo(conn, hdr.seq_num, payload);
+        }
+        // else: wholly old data — re-ACK only.
+    }
+
+    // FIN occupies the sequence number immediately after the segment's
+    // payload; honour it only when in order (all preceding data delivered).
+    if hdr.flags & FIN != 0 {
+        let fin_seq = hdr.seq_num.wrapping_add(payload.len() as u32);
+        need_ack = true;
+        if fin_seq == conn.recv_next {
+            conn.recv_next = conn.recv_next.wrapping_add(1);
+            *fin_in_order = true;
+        }
+        // Out-of-order FIN: ACK current recv_next so the peer retransmits the
+        // missing data + FIN; do not consume it.
+    }
+
+    need_ack
+}
+
 fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                    out: &mut Vec<OutSeg>) {
     conn.peer_window = hdr.window as u32;
@@ -700,62 +751,16 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                 handle_ack(conn, hdr.ack_num);
             }
 
-            // Receive-side processing per RFC 9293 §3.10.7.4.
-            //
-            // The segment is one of:
-            //   (a) in-order      — seq == recv_next: deliver, then drain any
-            //                        out-of-order segments now contiguous.
-            //   (b) out-of-order  — seq  > recv_next (in window): buffer it
-            //                        and send an immediate duplicate ACK so
-            //                        the peer fast-retransmits the gap
-            //                        (RFC 5681 §3.2).
-            //   (c) old / dup     — seq  < recv_next, or end <= recv_next:
-            //                        already delivered.  Re-ACK so the peer
-            //                        learns recv_next and stops retransmitting.
-            //
-            // `need_ack` is set whenever the segment carried data (or a FIN);
-            // a single cumulative ACK of the (possibly advanced) recv_next is
-            // emitted at the end so an in-order arrival that also drains the
-            // OOO queue does not emit a stale intermediate ACK.
-            let mut need_ack = false;
+            // Receive-side processing per RFC 9293 §3.10.7.4 — deliver in-order
+            // text, buffer out-of-order text (with a duplicate ACK so the peer
+            // fast-retransmits the gap, RFC 5681 §3.2), re-ACK stale text, and
+            // consume an in-order FIN.  A single cumulative ACK of the
+            // (possibly advanced) recv_next is emitted at the end.
+            let mut fin_in_order = false;
+            let need_ack = receive_segment_data(conn, hdr, payload, &mut fin_in_order);
 
-            if !payload.is_empty() {
-                need_ack = true;
-                let seg_end = hdr.seq_num.wrapping_add(payload.len() as u32);
-                if hdr.seq_num == conn.recv_next {
-                    // (a) In-order: append and advance.
-                    conn.recv_buffer.extend_from_slice(payload);
-                    conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
-                    // Deliver any buffered segments that are now contiguous.
-                    drain_ooo(conn);
-                } else if seq_gt(seg_end, conn.recv_next) {
-                    // (b) Out-of-order but carries new data ahead of the gap:
-                    // buffer for later in-order delivery.  (If seq < recv_next
-                    // but the segment straddles recv_next, insert_ooo clamps
-                    // the left edge so only the genuinely new tail is kept.)
-                    insert_ooo(conn, hdr.seq_num, payload);
-                }
-                // else (c): wholly old data — fall through to re-ACK only.
-            }
-
-            // FIN from peer — only honour it when it sits exactly at
-            // recv_next (i.e. all preceding data has been delivered).  A FIN
-            // riding an out-of-order or gap-following segment must NOT advance
-            // recv_next or change state, or the connection would tear down
-            // with a hole still unfilled (RFC 9293 §3.10.7.4: process the FIN
-            // only if the segment is in order).  The FIN occupies the
-            // sequence number immediately after the segment's payload.
-            if hdr.flags & FIN != 0 {
-                let fin_seq = hdr.seq_num.wrapping_add(payload.len() as u32);
-                if fin_seq == conn.recv_next {
-                    conn.recv_next = conn.recv_next.wrapping_add(1);
-                    conn.state = TcpState::CloseWait;
-                    need_ack = true;
-                } else {
-                    // Out-of-order FIN: acknowledge current recv_next so the
-                    // peer retransmits the missing data + FIN.
-                    need_ack = true;
-                }
+            if fin_in_order {
+                conn.state = TcpState::CloseWait;
             }
 
             if need_ack {
@@ -770,34 +775,63 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            // Honor the peer's FIN only when it sits exactly at recv_next
-            // (RFC 9293 §3.10.7.4 / RFC 793 §3.5) — an out-of-order data+FIN
-            // segment must not prematurely close.
-            let fin_at_nxt = (hdr.flags & FIN != 0)
-                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
-            if fin_at_nxt {
-                // Simultaneous close or ACK+FIN in same segment.
-                conn.recv_next = conn.recv_next.wrapping_add(1);
+
+            // RFC 9293 §3.10.7.4: FIN-WAIT-1 is a receive state — in-order
+            // segment text (e.g. a peer's final TLS close_notify riding the
+            // same segment as its FIN) MUST be queued for the application and
+            // acknowledged, exactly as in ESTABLISHED.  A close that only
+            // shut down our write half leaves our read half open, so this
+            // tail must reach `recv_buffer` and be ACKed; otherwise the peer
+            // never sees its data acknowledged and retransmits the data+FIN
+            // segment until it gives up with a RST.
+            let mut fin_in_order = false;
+            let need_ack = receive_segment_data(conn, hdr, payload, &mut fin_in_order);
+
+            // FIN-WAIT-1 transition (RFC 9293 §3.10.7.4):
+            //   * peer FIN in order → simultaneous close (or the peer FIN'd
+            //     before/with the ACK of our FIN).  This stack has no CLOSING
+            //     state, so a peer FIN that arrives before our own FIN is ACKed
+            //     is folded directly into TIME-WAIT — the peer's data is
+            //     drained, its FIN is acknowledged, and a later ACK for our
+            //     outstanding FIN is handled idempotently in TIME-WAIT.
+            //   * otherwise a pure ACK (our FIN acknowledged) → FIN-WAIT-2.
+            if fin_in_order {
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
+            } else if hdr.flags & ACK != 0 {
+                conn.state = TcpState::FinWait2;
+            }
+
+            if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
-            } else if hdr.flags & ACK != 0 {
-                // Pure ACK (no in-order FIN): move to FinWait2.
-                conn.state = TcpState::FinWait2;
             }
         }
 
         TcpState::FinWait2 => {
-            // Honor the peer's FIN only when it sits exactly at recv_next.
-            let fin_at_nxt = (hdr.flags & FIN != 0)
-                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
-            if fin_at_nxt {
-                conn.recv_next = conn.recv_next.wrapping_add(1);
+            if hdr.flags & ACK != 0 {
+                handle_ack(conn, hdr.ack_num);
+            }
+
+            // RFC 9293 §3.10.7.4: FIN-WAIT-2 is a receive state — same as
+            // ESTABLISHED/FIN-WAIT-1, queue in-order text and ACK it.  This is
+            // the heavy-site close pattern: after the application closes its
+            // write half, the server sends a final 24–31 byte appdata segment
+            // (TLS close_notify) coalesced with its FIN.  Dropping that text
+            // and FIN here means we never ACK it, the server retransmits dozens
+            // of times over ~10 minutes, then RSTs — and the fetch never
+            // reaches a terminal state visible to the application.
+            let mut fin_in_order = false;
+            let need_ack = receive_segment_data(conn, hdr, payload, &mut fin_in_order);
+
+            if fin_in_order {
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
+            }
+
+            if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);

@@ -1751,6 +1751,23 @@ pub fn run() -> ! {
         if test_tcp_ooo_fin_guard() { passed += 1; }
     }
 
+    // ── NDE-18: FIN-WAIT-1/2 in-order data+FIN delivery ──────────────────────
+    //
+    // RFC 9293 §3.10.7.4: FIN-WAIT-1 and FIN-WAIT-2 are receive states — an
+    // in-order segment carrying final text (a peer's last TLS close_notify
+    // record) coalesced with its FIN must be queued AND acknowledged, exactly
+    // as in ESTABLISHED.  The earlier FIN-WAIT arms only honoured a bare FIN
+    // (seq+len == recv_next), so a data+FIN segment was dropped entirely: no
+    // ACK, no recv_next advance, no TIME-WAIT transition.  The peer then
+    // retransmits the data+FIN for ~10 minutes and RSTs, so the local fetch
+    // never reaches a terminal state — a heavy real-site close pattern that
+    // wedged the page `load` event forever.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_finwait_data_fin_delivery() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -32180,6 +32197,147 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
 
     socket::socket_close(sid);
     test_pass!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+    true
+}
+
+/// NDE-18: FIN-WAIT-1 / FIN-WAIT-2 must deliver in-order segment text and
+/// honour an in-order FIN, exactly like ESTABLISHED (RFC 9293 §3.10.7.4).
+///
+/// Reproduces the heavy-real-site close pattern observed on the wire: the
+/// local side closes its write half (Established → FIN-WAIT-1 → FIN-WAIT-2),
+/// then the peer sends a final short appdata segment (a TLS close_notify)
+/// COALESCED with its FIN, in order at recv_next.  Before this fix the
+/// FIN-WAIT arms matched only a bare FIN (`seq + payload_len == recv_next`),
+/// so the data+FIN segment was dropped: no ACK, recv_next frozen, no
+/// TIME-WAIT transition — the peer retransmitted until it RST and the fetch
+/// never terminated.  Asserts both FIN-WAIT-2 and FIN-WAIT-1 deliver the
+/// text, advance recv_next past the data + FIN, and reach TIME-WAIT.
+#[cfg(feature = "kdb")]
+fn test_tcp_finwait_data_fin_delivery() -> bool {
+    test_header!("FIN-WAIT-1/2 in-order data+FIN delivery (RFC 9293 §3.10.7.4)");
+
+    use crate::net::tcp;
+
+    // SLIRP gateway as synthetic peer (MAC already ARP-cached) so the ACK
+    // process_segment emits egresses without an ARP poll loop.
+    let peer_ip: [u8; 4] = [10, 0, 2, 2];
+    let our_ip = crate::net::our_ip();
+
+    // The final appdata the peer sends with its FIN — modelled on a 24-byte
+    // TLS close_notify-bearing record (the exact pattern in the wedge pcap).
+    const TAIL: &[u8] = b"\x15\x03\x03\x00\x13_close_notify_pad";
+
+    // recv_next is 1 after test_inject_established; the tail rides at seq 1.
+    let snap = |lp: u16, pp: u16| {
+        tcp::snapshot_connections().into_iter()
+            .find(|c| c.local_port == lp && c.remote_ip == peer_ip
+                   && c.remote_port == pp)
+    };
+
+    // ─── Case A: FIN-WAIT-2 (the dominant wedge state) ───────────────────────
+    const LP2: u16 = 47320;
+    let pp2: u16 = 51301;
+    if let Err(e) = tcp::test_inject_established(LP2, peer_ip, pp2, b"") {
+        test_fail!("tcp_finwait", "inject (FW2) failed: {}", e);
+        return false;
+    }
+    if let Err(e) = tcp::test_set_state(LP2, peer_ip, pp2, tcp::TcpState::FinWait2) {
+        test_fail!("tcp_finwait", "set FinWait2 failed: {}", e);
+        let _ = tcp::close_connection(LP2, peer_ip, pp2);
+        return false;
+    }
+
+    // Peer's data+FIN in order at seq 1.
+    let seg = make_tcp_seg_with_payload(pp2, LP2,
+        1, 0, tcp::PSH | tcp::ACK | tcp::FIN, TAIL);
+    tcp::handle_tcp(peer_ip, our_ip, &seg);
+
+    match snap(LP2, pp2) {
+        Some(c) => {
+            // recv_next must advance past the TAIL bytes AND the FIN.
+            let want_rn = 1 + TAIL.len() as u32 + 1;
+            if c.recv_next != want_rn {
+                test_fail!("tcp_finwait",
+                    "FW2: recv_next={} want {} (data+FIN not consumed → no ACK → peer retransmits → RST)",
+                    c.recv_next, want_rn);
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            if c.recv_buf_len as usize != TAIL.len() {
+                test_fail!("tcp_finwait",
+                    "FW2: recv_buf_len={} want {} (final appdata dropped instead of delivered)",
+                    c.recv_buf_len, TAIL.len());
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            if c.state != tcp::TcpState::TimeWait {
+                test_fail!("tcp_finwait",
+                    "FW2: state={:?} want TimeWait (in-order FIN must terminate the connection)",
+                    c.state);
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            test_println!("  FIN-WAIT-2: data+FIN delivered, recv_next→{}, recv_buf={}, → TimeWait ✓",
+                c.recv_next, c.recv_buf_len);
+        }
+        None => {
+            test_fail!("tcp_finwait", "FW2: TCB vanished after data+FIN");
+            return false;
+        }
+    }
+
+    // ─── Case B: FIN-WAIT-1 (simultaneous-ish close — peer FIN before our FIN ACK) ─
+    const LP1: u16 = 47321;
+    let pp1: u16 = 51302;
+    if let Err(e) = tcp::test_inject_established(LP1, peer_ip, pp1, b"") {
+        test_fail!("tcp_finwait", "inject (FW1) failed: {}", e);
+        return false;
+    }
+    if let Err(e) = tcp::test_set_state(LP1, peer_ip, pp1, tcp::TcpState::FinWait1) {
+        test_fail!("tcp_finwait", "set FinWait1 failed: {}", e);
+        let _ = tcp::close_connection(LP1, peer_ip, pp1);
+        return false;
+    }
+    let seg1 = make_tcp_seg_with_payload(pp1, LP1,
+        1, 0, tcp::PSH | tcp::ACK | tcp::FIN, TAIL);
+    tcp::handle_tcp(peer_ip, our_ip, &seg1);
+
+    match snap(LP1, pp1) {
+        Some(c) => {
+            let want_rn = 1 + TAIL.len() as u32 + 1;
+            if c.recv_next != want_rn {
+                test_fail!("tcp_finwait",
+                    "FW1: recv_next={} want {} (data+FIN not consumed)", c.recv_next, want_rn);
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if c.recv_buf_len as usize != TAIL.len() {
+                test_fail!("tcp_finwait",
+                    "FW1: recv_buf_len={} want {} (final appdata dropped)",
+                    c.recv_buf_len, TAIL.len());
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if c.state != tcp::TcpState::TimeWait {
+                test_fail!("tcp_finwait",
+                    "FW1: state={:?} want TimeWait (in-order peer FIN must terminate)", c.state);
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            test_println!("  FIN-WAIT-1: data+FIN delivered, recv_next→{}, recv_buf={}, → TimeWait ✓",
+                c.recv_next, c.recv_buf_len);
+        }
+        None => {
+            test_fail!("tcp_finwait", "FW1: TCB vanished after data+FIN");
+            return false;
+        }
+    }
+
+    // TimeWait TCBs expire on the TIME_WAIT timer; no explicit close needed,
+    // but issue one as a no-op safety net (close only matches Est/CloseWait).
+    let _ = tcp::close_connection(LP1, peer_ip, pp1);
+    let _ = tcp::close_connection(LP2, peer_ip, pp2);
+    test_pass!("FIN-WAIT-1/2 in-order data+FIN delivery (RFC 9293 §3.10.7.4)");
     true
 }
 
