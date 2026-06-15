@@ -268,6 +268,10 @@ pub fn run() -> ! {
     total += 1;
     if test_poll_bell_class_filtered_drain() { passed += 1; }
 
+    // ── Test 0bx4: poll-bell per-OBJECT targeted drain (intra-class herd) ──
+    total += 1;
+    if test_poll_bell_per_object_drain() { passed += 1; }
+
     // ── Test 0bc: POLLHUP on pipe read-end after writer close ─────────────
     total += 1;
     if test_pipe_pollhup_on_writer_close() { passed += 1; }
@@ -37817,7 +37821,7 @@ fn test_poll_bell_recheck_under_lock() -> bool {
 fn test_poll_bell_class_filtered_drain() -> bool {
     test_header!("poll-bell class-filtered drain (Stage C interest masks)");
 
-    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, POLL_BELL_MASK_FILTERED};
+    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, POLL_BELL_MASK_FILTERED, OBJECT_ID_NONE};
     use core::sync::atomic::Ordering;
 
     let bit = |s: PollBellSource| 1u32 << (s as u32);
@@ -37842,7 +37846,7 @@ fn test_poll_bell_class_filtered_drain() -> bool {
 
     // (1)+(2): an InetRx ring wakes T_INET and the wake-everyone T_ALL, and
     // RETAINS T_PIPE (whose mask does not include InetRx).
-    let woke = wl.drain_matching(bit(PollBellSource::InetRx));
+    let woke = wl.drain_matching(bit(PollBellSource::InetRx), OBJECT_ID_NONE);
     let woke_inet = woke.contains(&T_INET);
     let woke_all  = woke.contains(&T_ALL);
     let woke_pipe = woke.contains(&T_PIPE);
@@ -37870,7 +37874,7 @@ fn test_poll_bell_class_filtered_drain() -> bool {
     }
 
     // A Pipe ring now wakes the retained T_PIPE.
-    let woke2 = wl.drain_matching(bit(PollBellSource::Pipe));
+    let woke2 = wl.drain_matching(bit(PollBellSource::Pipe), OBJECT_ID_NONE);
     if !woke2.contains(&T_PIPE) || !wl.is_empty() {
         test_fail!("poll_bell_class",
             "Pipe ring did not drain the retained pipe waiter (woke={:?}, empty={})",
@@ -37892,6 +37896,132 @@ fn test_poll_bell_class_filtered_drain() -> bool {
     test_println!("  drain_all still releases all parkers (EOF/close path intact) ✓");
 
     test_pass!("poll-bell class-filtered drain (Stage C interest masks)");
+    true
+}
+
+// ── Test 0bx4: poll-bell per-OBJECT targeted drain (intra-class herd) ───────
+//
+// Verifies the per-object targeted wakeup on a private `WaitList`.  This is the
+// intra-class herd collapse: a readiness edge on ONE object of a source class
+// wakes only the parker(s) watching THAT object, not every parker of the class.
+// Asserts the full correctness matrix (no under-wake is the load-bearing one —
+// under-waking is a hang):
+//   (1) a targeted ring `(UnixWrite, A)` wakes the parker pinned to A and the
+//       wake-on-class (BELL_MASK_ALL) parker, and RETAINS the parker pinned to a
+//       DIFFERENT object B (the herd member spared);
+//   (2) a targeted ring `(UnixWrite, B)` then wakes B's parker;
+//   (3) a CLASS-ONLY ring `(UnixWrite, OBJECT_ID_NONE)` — an unattributable edge
+//       — wakes EVERY UnixWrite watcher (both object-pinned and wake-on-class),
+//       the never-under-wake safety net;
+//   (4) an object id is namespaced by source: a `(Pipe, A)` ring does NOT wake a
+//       parker pinned to `(UnixWrite, A)` even though the raw id A collides;
+//   (5) `drain_all` still releases everyone (EOF/close path unchanged).
+//
+// References: POSIX poll(2)/select(2)/epoll(7) readiness-notification semantics;
+// the per-object wake model (a writer wakes only the waiters registered on that
+// object's wait queue, not a global class scan).
+fn test_poll_bell_per_object_drain() -> bool {
+    test_header!("poll-bell per-object targeted drain (intra-class herd collapse)");
+
+    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, OBJECT_ID_NONE};
+
+    let bit = |s: PollBellSource| 1u32 << (s as u32);
+    let uw = bit(PollBellSource::UnixWrite);
+    let pipe_bit = bit(PollBellSource::Pipe);
+
+    // Synthetic TIDs (match no real thread → no THREAD_TABLE side effects).
+    const T_A:   u64 = u64::MAX - 20; // pinned to (UnixWrite, object 100)
+    const T_B:   u64 = u64::MAX - 21; // pinned to (UnixWrite, object 200)
+    const T_ALL: u64 = u64::MAX - 22; // wake-on-class (BELL_MASK_ALL)
+    const OBJ_A: u64 = 100;
+    const OBJ_B: u64 = 200;
+
+    let mut wl = WaitList::new();
+    // Park T_A and T_B as per-object watchers on the SAME source class
+    // (UnixWrite) but DIFFERENT objects; T_ALL is the conservative wake-everyone.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    wl.enqueue_self_blocked_full(T_ALL, u64::MAX, BELL_MASK_ALL, &[]);
+    if wl.len() != 3 {
+        test_fail!("poll_bell_obj", "expected 3 parkers, got {}", wl.len());
+        return false;
+    }
+
+    // (1): targeted ring on object A wakes T_A + T_ALL, RETAINS T_B.
+    let woke = wl.drain_matching(uw, OBJ_A);
+    if !woke.contains(&T_A) || !woke.contains(&T_ALL) {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,A) missed A or ALL (woke={:?})", woke);
+        return false;
+    }
+    if woke.contains(&T_B) {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,A) over-woke the B-object parker (herd not collapsed)");
+        return false;
+    }
+    if wl.len() != 1 {
+        test_fail!("poll_bell_obj", "B-object parker not retained (len={})", wl.len());
+        return false;
+    }
+    test_println!("  targeted (UnixWrite,A) woke {{A,ALL}}, spared B ✓");
+
+    // (2): targeted ring on object B wakes the retained T_B.
+    let woke_b = wl.drain_matching(uw, OBJ_B);
+    if !woke_b.contains(&T_B) || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,B) failed (woke={:?}, empty={})", woke_b, wl.is_empty());
+        return false;
+    }
+    test_println!("  targeted (UnixWrite,B) woke B ✓");
+
+    // (3): CLASS-ONLY ring wakes EVERY UnixWrite watcher (no under-wake).
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    wl.enqueue_self_blocked_full(T_ALL, u64::MAX, BELL_MASK_ALL, &[]);
+    let woke_all = wl.drain_matching(uw, OBJECT_ID_NONE);
+    if !woke_all.contains(&T_A) || !woke_all.contains(&T_B) || !woke_all.contains(&T_ALL) {
+        test_fail!("poll_bell_obj",
+            "class-only UnixWrite ring under-woke (A={}, B={}, ALL={}) — HANG RISK",
+            woke_all.contains(&T_A), woke_all.contains(&T_B), woke_all.contains(&T_ALL));
+        return false;
+    }
+    if !wl.is_empty() {
+        test_fail!("poll_bell_obj", "class-only ring left parkers behind (len={})", wl.len());
+        return false;
+    }
+    test_println!("  class-only UnixWrite ring woke ALL object-watchers (no under-wake) ✓");
+
+    // (4): id namespace is per-source — a (Pipe, A) ring does NOT wake a parker
+    // pinned to (UnixWrite, A) despite the raw id A colliding.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    let cross = wl.drain_matching(pipe_bit, OBJ_A);
+    if cross.contains(&T_A) {
+        test_fail!("poll_bell_obj", "(Pipe,A) wrongly woke a (UnixWrite,A) parker — id namespace leaked across sources");
+        return false;
+    }
+    // The UnixWrite parker must still be present and wakeable by its own source.
+    let woke_self = wl.drain_matching(uw, OBJ_A);
+    if !woke_self.contains(&T_A) || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "(UnixWrite,A) parker not wakeable by its own source after cross-source probe");
+        return false;
+    }
+    test_println!("  object id namespaced by source: (Pipe,A) ≠ (UnixWrite,A) ✓");
+
+    // (5): drain_all still releases everyone regardless of object pins.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    let everyone = wl.drain_all();
+    if everyone.len() != 2 || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "drain_all did not release all object parkers (drained={:?})", everyone);
+        return false;
+    }
+    test_println!("  drain_all releases all object-pinned parkers (EOF/close intact) ✓");
+
+    test_pass!("poll-bell per-object targeted drain (intra-class herd collapse)");
     true
 }
 

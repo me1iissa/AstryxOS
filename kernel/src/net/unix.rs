@@ -504,8 +504,11 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // poller waking on the bell does not contend on TABLE on its
         // re-evaluation pass.
         drop(t);
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // Targeted by `peer_id` — the receiver's socket id, which is exactly
+        // what a peer poller's fd resolves to via `get_unix_socket_id` — so only
+        // pollers on that socket re-scan, not every AF_UNIX poller.
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixWrite, peer_id);
         // Attribute SEQPACKET bytes to the writer.
         crate::proc::proc_metrics::bump_net_write(
             crate::proc::current_pid_lockless(), n as u64);
@@ -519,9 +522,10 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // Wake any poll/epoll/select caller watching the peer fd.  The
         // pre-existing read path returns -EAGAIN when the buffer is empty,
         // so without this kick the caller would wait for the next resync
-        // tick to discover the new bytes.
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // tick to discover the new bytes.  Targeted by `peer_id` (the
+        // receiver's socket id = what the peer poller's fd resolves to).
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixWrite, peer_id);
         // Attribute outbound AF_UNIX bytes to the writer.
         crate::proc::proc_metrics::bump_net_write(
             crate::proc::current_pid_lockless(), n as u64);
@@ -561,6 +565,13 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     // SHUT_RD locally → return 0 (orderly EOF) regardless of any data
     // still queued in our recv_buf.  Matches Linux AF_UNIX behaviour.
     if s.shut_rd { return Ok((0, 0)); }
+
+    // The peer socket id — draining our recv ring makes the PEER's write side
+    // newly POLLOUT-ready, so the UnixRead bell is targeted at `peer_id` (the
+    // object a peer poller's fd resolves to via `get_unix_socket_id`).  Captured
+    // here while the TABLE lock is held, before any drop.  A severed peer
+    // (`u64::MAX`) yields a class-only ring below (harmless: no peer to wake).
+    let peer_id = s.peer_id;
 
     // Number of bytes the drain frees from *our* recv ring.  Draining recv
     // space makes the *peer's* write side newly POLLOUT-ready, so once we
@@ -617,8 +628,16 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     // as `write()` / `shutdown()`).
     drop(t);
     if drained > 0 {
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixRead);
+        // Targeted at the peer's socket id: only a poller on the peer fd (now
+        // POLLOUT-ready) re-scans.  If the peer slot is severed, `peer_id` is
+        // out of range and resolves to no parker — equivalent to a no-op.
+        let obj = if (peer_id as usize) < MAX_UNIX_SOCKETS {
+            peer_id
+        } else {
+            crate::ipc::waitlist::OBJECT_ID_NONE
+        };
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixRead, obj);
     }
     result
 }

@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::ipc::waitlist::{ring_poll_bell_for, wake_tids, PollBellSource, WaitList};
+use crate::ipc::waitlist::{ring_poll_bell_for_obj, wake_tids, PollBellSource, WaitList};
 
 /// Maximum number of concurrent eventfds.
 const MAX_EVENTFDS: usize = 64;
@@ -336,8 +336,9 @@ pub fn wake_readers_all(efd_id: u64) {
     };
     wake_tids(&drained);
     // Also kick the global poll bell so a poll/epoll/select caller
-    // watching this eventfd re-evaluates immediately.
-    ring_poll_bell_for(PollBellSource::Eventfd);
+    // watching this eventfd re-evaluates immediately.  Targeted by `efd_id`
+    // so only pollers watching THIS eventfd re-scan (intra-class herd collapse).
+    ring_poll_bell_for_obj(PollBellSource::Eventfd, efd_id);
 }
 
 /// Best-effort cleanup: remove `tid` from this eventfd's wait list.

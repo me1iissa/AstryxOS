@@ -1272,10 +1272,30 @@ fn op_bell_stats(out: &mut String) {
         if i > 0 { out.push(','); }
         let _ = write!(out, r#""{}":{}"#, name, count);
     }
+    // Intra-class herd profiling: drained-fanout numerator + wasted bell wakes.
+    // mean_fanout = drained_total / sum(per-source ring counts); wasted_ratio =
+    // wasted_bell_wakes / bell_wakes.  A high fanout + high wasted ratio is the
+    // signature the per-object targeting collapses.
+    let drained_total = crate::ipc::waitlist::POLL_BELL_DRAINED_TOTAL
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let wasted_bell = crate::ipc::waitlist::POLL_BELL_WASTED_BELL_WAKES
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let total_rings: u64 = counts.iter().copied().sum();
+    let mean_fanout_permille = if total_rings == 0 {
+        0u64
+    } else {
+        drained_total.saturating_mul(1000) / total_rings
+    };
+    let wasted_ratio_permille = if bell_wakes == 0 {
+        0u64
+    } else {
+        wasted_bell.saturating_mul(1000) / bell_wakes
+    };
     let _ = write!(
         out,
-        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{},"mask_filtered":{}}}"#,
-        bell_wakes, resync_wakes, bell_ratio_permille, mask_filtered
+        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{},"mask_filtered":{},"drained_total":{},"wasted_bell_wakes":{},"mean_fanout_permille":{},"wasted_ratio_permille":{}}}"#,
+        bell_wakes, resync_wakes, bell_ratio_permille, mask_filtered,
+        drained_total, wasted_bell, mean_fanout_permille, wasted_ratio_permille
     );
 }
 // ── cache-aliasing ────────────────────────────────────────────────────────────
