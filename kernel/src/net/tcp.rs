@@ -1373,12 +1373,17 @@ pub fn test_set_state(local_port: u16, remote_ip: Ipv4Address,
 /// response exercises (a reordered/lost segment, a data+FIN that arrives ahead
 /// of the gap) without an e1000+SLIRP round-trip.  `seq` is the segment's
 /// sequence number, `payload` its data, `fin` whether the FIN flag is set.
-/// Any reply segments `process_segment` builds are discarded (the test only
-/// inspects connection state, not the wire ACKs).
+///
+/// Returns `(new_state, recv_buffer_len, reply_segments)`.  `reply_segments`
+/// is the count of segments `process_segment` emitted — non-zero means an ACK
+/// (or dup-ACK) went on the wire, which is the directly-observable symptom of
+/// the receiver having acknowledged the segment (RFC 9293 §3.10.7.4).  A test
+/// that wants to prove the peer's data+FIN was *acknowledged* (and so the peer
+/// stops retransmitting) asserts `reply_segments >= 1`.
 #[cfg(feature = "kdb")]
 pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
                           remote_port: u16, seq: u32, payload: &[u8],
-                          fin: bool) -> Option<(TcpState, usize)> {
+                          fin: bool) -> Option<(TcpState, usize, usize)> {
     let mut conns = TCP_CONNECTIONS.lock();
     let conn = conns.iter_mut().find(|c|
         c.local_port  == local_port
@@ -1396,7 +1401,7 @@ pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
     };
     let mut out: Vec<OutSeg> = Vec::new();
     process_segment(conn, &hdr, payload, &mut out);
-    Some((conn.state, conn.recv_buffer.len()))
+    Some((conn.state, conn.recv_buffer.len(), out.len()))
 }
 
 /// Test-only: read the current recv_next of the Established TCB (so a test

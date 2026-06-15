@@ -32221,11 +32221,14 @@ fn test_tcp_finwait_data_fin_delivery() -> bool {
     // SLIRP gateway as synthetic peer (MAC already ARP-cached) so the ACK
     // process_segment emits egresses without an ARP poll loop.
     let peer_ip: [u8; 4] = [10, 0, 2, 2];
-    let our_ip = crate::net::our_ip();
 
-    // The final appdata the peer sends with its FIN — modelled on a 24-byte
-    // TLS close_notify-bearing record (the exact pattern in the wedge pcap).
-    const TAIL: &[u8] = b"\x15\x03\x03\x00\x13_close_notify_pad";
+    // The final appdata the peer sends with its FIN — a 24-byte TLS
+    // close_notify-bearing record (an encrypted TLS 1.2 alert: 5-byte record
+    // header 0x15/0x0303/len + 19 ciphertext bytes), matching the 24-byte
+    // data+FIN segment observed on the wedge wire.
+    const TAIL: &[u8] = b"\x15\x03\x03\x00\x13_close_notify_pad__";
+    // Compile-time guard: TAIL is exactly the 24-byte wire close_notify.
+    const _: () = assert!(TAIL.len() == 24);
 
     // recv_next is 1 after test_inject_established; the tail rides at seq 1.
     let snap = |lp: u16, pp: u16| {
@@ -32247,41 +32250,47 @@ fn test_tcp_finwait_data_fin_delivery() -> bool {
         return false;
     }
 
-    // Peer's data+FIN in order at seq 1.
-    let seg = make_tcp_seg_with_payload(pp2, LP2,
-        1, 0, tcp::PSH | tcp::ACK | tcp::FIN, TAIL);
-    tcp::handle_tcp(peer_ip, our_ip, &seg);
-
-    match snap(LP2, pp2) {
-        Some(c) => {
-            // recv_next must advance past the TAIL bytes AND the FIN.
-            let want_rn = 1 + TAIL.len() as u32 + 1;
-            if c.recv_next != want_rn {
+    // Peer's data+FIN in order at seq 1.  test_feed_segment drives the real
+    // process_segment path and reports the reply-segment count so the test can
+    // assert the ACK that the bug suppressed actually went on the wire.
+    match tcp::test_feed_segment(LP2, peer_ip, pp2, 1, TAIL, true) {
+        Some((state, buflen, replies)) => {
+            if replies == 0 {
                 test_fail!("tcp_finwait",
-                    "FW2: recv_next={} want {} (data+FIN not consumed → no ACK → peer retransmits → RST)",
-                    c.recv_next, want_rn);
+                    "FW2: data+FIN emitted NO ACK (the exact wire bug → peer retransmits → RST)");
                 let _ = tcp::close_connection(LP2, peer_ip, pp2);
                 return false;
             }
-            if c.recv_buf_len as usize != TAIL.len() {
+            if buflen != TAIL.len() {
                 test_fail!("tcp_finwait",
-                    "FW2: recv_buf_len={} want {} (final appdata dropped instead of delivered)",
-                    c.recv_buf_len, TAIL.len());
+                    "FW2: recv_buf={} want {} (final appdata dropped instead of delivered)",
+                    buflen, TAIL.len());
                 let _ = tcp::close_connection(LP2, peer_ip, pp2);
                 return false;
             }
-            if c.state != tcp::TcpState::TimeWait {
+            if state != tcp::TcpState::TimeWait {
                 test_fail!("tcp_finwait",
                     "FW2: state={:?} want TimeWait (in-order FIN must terminate the connection)",
-                    c.state);
+                    state);
                 let _ = tcp::close_connection(LP2, peer_ip, pp2);
                 return false;
             }
-            test_println!("  FIN-WAIT-2: data+FIN delivered, recv_next→{}, recv_buf={}, → TimeWait ✓",
-                c.recv_next, c.recv_buf_len);
+            // recv_next must have advanced past the TAIL bytes AND the FIN.
+            let want_rn = 1 + TAIL.len() as u32 + 1;
+            match snap(LP2, pp2).map(|c| c.recv_next) {
+                Some(rn) if rn == want_rn => {}
+                other => {
+                    test_fail!("tcp_finwait",
+                        "FW2: recv_next={:?} want {} (data+FIN not fully consumed)", other, want_rn);
+                    let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                    return false;
+                }
+            }
+            test_println!("  FIN-WAIT-2: data+FIN delivered (recv_buf={}), ACKed (replies={}), → TimeWait ✓",
+                buflen, replies);
         }
         None => {
-            test_fail!("tcp_finwait", "FW2: TCB vanished after data+FIN");
+            test_fail!("tcp_finwait", "FW2: TCB vanished / feed returned None");
             return false;
         }
     }
@@ -32298,37 +32307,41 @@ fn test_tcp_finwait_data_fin_delivery() -> bool {
         let _ = tcp::close_connection(LP1, peer_ip, pp1);
         return false;
     }
-    let seg1 = make_tcp_seg_with_payload(pp1, LP1,
-        1, 0, tcp::PSH | tcp::ACK | tcp::FIN, TAIL);
-    tcp::handle_tcp(peer_ip, our_ip, &seg1);
-
-    match snap(LP1, pp1) {
-        Some(c) => {
+    match tcp::test_feed_segment(LP1, peer_ip, pp1, 1, TAIL, true) {
+        Some((state, buflen, replies)) => {
+            if replies == 0 {
+                test_fail!("tcp_finwait",
+                    "FW1: data+FIN emitted NO ACK (peer would retransmit → RST)");
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if buflen != TAIL.len() {
+                test_fail!("tcp_finwait",
+                    "FW1: recv_buf={} want {} (final appdata dropped)", buflen, TAIL.len());
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if state != tcp::TcpState::TimeWait {
+                test_fail!("tcp_finwait",
+                    "FW1: state={:?} want TimeWait (in-order peer FIN must terminate)", state);
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
             let want_rn = 1 + TAIL.len() as u32 + 1;
-            if c.recv_next != want_rn {
-                test_fail!("tcp_finwait",
-                    "FW1: recv_next={} want {} (data+FIN not consumed)", c.recv_next, want_rn);
-                let _ = tcp::close_connection(LP1, peer_ip, pp1);
-                return false;
+            match snap(LP1, pp1).map(|c| c.recv_next) {
+                Some(rn) if rn == want_rn => {}
+                other => {
+                    test_fail!("tcp_finwait",
+                        "FW1: recv_next={:?} want {} (data+FIN not fully consumed)", other, want_rn);
+                    let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                    return false;
+                }
             }
-            if c.recv_buf_len as usize != TAIL.len() {
-                test_fail!("tcp_finwait",
-                    "FW1: recv_buf_len={} want {} (final appdata dropped)",
-                    c.recv_buf_len, TAIL.len());
-                let _ = tcp::close_connection(LP1, peer_ip, pp1);
-                return false;
-            }
-            if c.state != tcp::TcpState::TimeWait {
-                test_fail!("tcp_finwait",
-                    "FW1: state={:?} want TimeWait (in-order peer FIN must terminate)", c.state);
-                let _ = tcp::close_connection(LP1, peer_ip, pp1);
-                return false;
-            }
-            test_println!("  FIN-WAIT-1: data+FIN delivered, recv_next→{}, recv_buf={}, → TimeWait ✓",
-                c.recv_next, c.recv_buf_len);
+            test_println!("  FIN-WAIT-1: data+FIN delivered (recv_buf={}), ACKed (replies={}), → TimeWait ✓",
+                buflen, replies);
         }
         None => {
-            test_fail!("tcp_finwait", "FW1: TCB vanished after data+FIN");
+            test_fail!("tcp_finwait", "FW1: TCB vanished / feed returned None");
             return false;
         }
     }
@@ -32600,7 +32613,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // userspace and reject the peer's retransmission forever.
     let ooo_seq = base.wrapping_add(4);
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, ooo_seq, b"END", true) {
-        Some((state, buflen)) => {
+        Some((state, buflen, replies)) => {
             if state != tcp::TcpState::Established {
                 test_fail!("tcp_ooo_fin_guard",
                     "OOO data+FIN prematurely changed state (expected Established)");
@@ -32611,6 +32624,13 @@ fn test_tcp_ooo_fin_guard() -> bool {
                     "OOO segment was buffered out of order (buflen={})", buflen);
                 return false;
             }
+            // An out-of-order segment must trigger an immediate dup-ACK so the
+            // peer fast-retransmits the gap (RFC 5681 §3.2).
+            if replies == 0 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO segment emitted no dup-ACK (peer would never retransmit the gap)");
+                return false;
+            }
         }
         None => { test_fail!("tcp_ooo_fin_guard", "feed OOO returned None"); return false; }
     }
@@ -32618,7 +32638,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // Now feed the IN-ORDER 4-byte segment that fills the gap (no FIN).  This
     // advances recv_next to base+4 and delivers the data.
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, b"DATA", false) {
-        Some((state, buflen)) => {
+        Some((state, buflen, _replies)) => {
             if state != tcp::TcpState::Established {
                 test_fail!("tcp_ooo_fin_guard",
                     "in-order fill unexpectedly changed state");
@@ -32638,7 +32658,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // moves to CloseWait.
     let fin_seq = base.wrapping_add(4);
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, fin_seq, &[], true) {
-        Some((state, _)) => {
+        Some((state, _, _)) => {
             if state != tcp::TcpState::CloseWait {
                 test_fail!("tcp_ooo_fin_guard",
                     "in-order FIN not honored (state not CloseWait)");
