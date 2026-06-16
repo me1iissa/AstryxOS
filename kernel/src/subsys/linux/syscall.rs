@@ -8134,7 +8134,13 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         // CRITICAL: for file-backed VMAs, each split piece must have its
         // file offset adjusted by (piece.base - original_vma_base) so that
         // demand-paging reads from the correct file position.
-        space.areas.remove(i);
+        //
+        // The original file-backed VMA leaves the address space here (drop its
+        // inode pin) and is replaced by up to three pieces, each of which takes
+        // its own pin below — keeping the pin count equal to the number of live
+        // file-backed VMAs for the inode (mmap(2)/munmap(2)).
+        let original = space.areas.remove(i);
+        crate::mm::vma::unpin_file_vma(&original);
         let overlap_start = vma_base.max(base);
         let overlap_end   = vma_end.min(end);
 
@@ -8173,10 +8179,21 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         }
         let n = pieces.len();
         for piece in pieces.into_iter().rev() {
+            // Each surviving file-backed piece takes a fresh inode pin (balances
+            // the unpin of the original removed above).
+            crate::mm::vma::pin_file_vma(&piece);
             space.areas.insert(i, piece);
         }
         i += n;
     }
+
+    // The VMA edits are done; release PROCESS_TABLE before the (lock-free) PTE
+    // retag and before draining any deferred inode free.  A partial-overlap
+    // split above may have dropped a file-backed VMA's last inode pin (the
+    // shrunk-away remnant of a now-unlinked memfd); run that free now that the
+    // lock is released — the free dance re-acquires PROCESS_TABLE.
+    drop(procs);
+    crate::vfs::drain_pending_inode_frees();
 
     // Walk every page and retag PTEs.  TLB invalidation is coalesced
     // into a single shootdown over [base, end) after the loop so that

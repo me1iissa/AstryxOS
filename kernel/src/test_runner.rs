@@ -2937,6 +2937,16 @@ pub fn run() -> ! {
     total += 1;
     if test_296_proc_fd_reopen_unlinked_memfd() { passed += 1; }
 
+    // ── Test 300: file-backed mmap keeps the inode alive after last fd close ─
+    // mmap(2)/memfd_create(2): a live mapping is a reference to the mapped
+    // object, so close(2) of the last fd to a still-mmap'd memfd must NOT free
+    // the inode — a later demand fault would otherwise read a freed inode and
+    // SIGSEGV.  Drives the real pin (insert_vma), the close-time pin honour, the
+    // hole-punch split pin balance, and the teardown unpin.  Refs: mmap(2),
+    // munmap(2), memfd_create(2), POSIX.
+    total += 1;
+    if test_300_mmap_filebacked_inode_pin() { passed += 1; }
+
     // ── Test 297: eventfd open-file-description refcount across fork/dup ───
     // Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicate descriptors
     // refer to the SAME open file description, and per close(2) the object
@@ -51775,6 +51785,195 @@ fn test_296_proc_fd_reopen_unlinked_memfd() -> bool {
 
     crate::subsys::linux::syscall::sys_close_test(ro_fd as u64);
     test_pass!("/proc/self/fd/<N> re-opens an unlinked memfd (Test 296)");
+    true
+}
+
+// ── Test 300: a file-backed mmap keeps the inode alive after the last fd close ─
+//
+// Per mmap(2): a memory mapping is a reference to the mapped file's underlying
+// object — "the [object] is not deallocated until [...] all mappings have been
+// unmapped".  Per memfd_create(2): the (unlinked) memfd inode "is freed when
+// all references to the file are dropped"; an active mapping is such a
+// reference.  So `close(2)` of the LAST fd to a still-mapped memfd must NOT free
+// the inode — the mapping holds it.  Without the per-mapping inode reference the
+// close frees the ramfs inode out from under the live mapping, and the next
+// demand fault on a not-present page reads a now-missing inode (ramfs read →
+// NotFound), the page-fault handler reports an I/O error, and the process is
+// killed with SIGSEGV.  www.cnn.com's e10s tree (CrossProcessPaint shmem, sqlite
+// shm IPC) issues several `memfd_create` per run and hits exactly this; pages
+// that issue zero memfds (lite.cnn.com / wikipedia / bbc) are unaffected.
+//
+// This test drives the REAL pin/unpin paths:
+//   * `VmSpace::insert_vma` of a `VmBacking::File` takes the inode pin.
+//   * the close-time last-close test (`vfs::close`) honours the pin and does
+//     NOT free the inode while the mapping is live.
+//   * `VmSpace::remove_range` (munmap) and the exit/exec teardown walks drop the
+//     pin; the final drop frees the now-unreferenced unlinked inode.
+//   * a hole-punch split (one file VMA → two) keeps the pin count equal to the
+//     number of live file-backed VMAs.
+//
+// The load-bearing assertion is that, after the last fd is closed while the
+// mapping is live, a direct `read(inode)` on the backing filesystem STILL
+// returns the surface bytes (the exact call that returned NotFound → the
+// `[PF/io-err]` SIGSEGV before the fix).  Refs: mmap(2), munmap(2),
+// memfd_create(2), POSIX.
+#[cfg(any(feature = "test-mode", feature = "test-mode-trace"))]
+fn test_300_mmap_filebacked_inode_pin() -> bool {
+    test_header!("file-backed mmap keeps the inode alive after last fd close (Test 300)");
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace, PROT_READ, PROT_WRITE, MAP_SHARED};
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // 1. Create a real memfd (an unlinked ramfs inode) and write surface bytes.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 { test_fail!("mmap_pin", "memfd_create = {}", fd); return false; }
+    let surf = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("mmap_pin", "write memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // 2. Snapshot (mount_idx, inode) of the memfd from the current fd table.
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref()).map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("mmap_pin", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("mmap_pin", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Baseline: no mapping pin yet.
+    if crate::vfs::inode_pin_count(mnt, ino) != 0 {
+        test_fail!("mmap_pin", "pre-mmap pin count {} (want 0)",
+            crate::vfs::inode_pin_count(mnt, ino));
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // 3. Map the memfd: insert a file-backed VMA into a fresh user VmSpace.  This
+    //    drives the REAL pin (VmSpace::insert_vma → pin_file_vma → pin_inode).
+    let mut vm = match VmSpace::new_user() {
+        Some(vs) => vs,
+        None => {
+            test_fail!("mmap_pin", "VmSpace::new_user() OOM");
+            crate::subsys::linux::syscall::sys_close_test(fd as u64);
+            return false;
+        }
+    };
+    let map_base: u64 = 0x5557_0000_0000;
+    let map_len: u64 = 0x2000; // two pages, so a hole-punch split is meaningful
+    if vm.insert_vma(VmArea {
+        base: map_base, length: map_len,
+        prot: PROT_READ | PROT_WRITE, flags: MAP_SHARED,
+        backing: VmBacking::File { mount_idx: mnt, inode: ino, offset: 0, elf_load_delta: 0 },
+        name: "[mmap-file]",
+    }).is_err() {
+        test_fail!("mmap_pin", "insert_vma(file) failed");
+        crate::proc::free_vm_space(vm);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    if crate::vfs::inode_pin_count(mnt, ino) != 1 {
+        test_fail!("mmap_pin",
+            "after mmap, pin count = {} (want 1) — insert_vma did not pin the file VMA",
+            crate::vfs::inode_pin_count(mnt, ino));
+        crate::proc::free_vm_space(vm);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  mmap of memfd inode {} on mount {} took the inode pin ✓", ino, mnt);
+
+    // 4. THE BUG: close the LAST fd while the mapping is live.  Before the fix the
+    //    close-time last-close test freed the inode (no fd, not pinned); a later
+    //    fault then read a missing inode → SIGSEGV.  With the mapping pin the
+    //    inode MUST survive: a direct read on the backing filesystem still
+    //    returns the surface bytes (the exact call that returned NotFound).
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    let mut rbuf = [0u8; 8];
+    let read_ok = match crate::vfs::fs_at(mnt) {
+        Some((fs, _)) => match fs.read(ino, 0, &mut rbuf) {
+            Ok(n) => n == surf.len() && rbuf == surf,
+            Err(_) => false, // NotFound ⇒ inode was freed = the bug
+        },
+        None => false,
+    };
+    if !read_ok {
+        test_fail!("mmap_pin",
+            "after last-fd close, backing read failed/mismatched (got {:?}) — inode \
+             freed under the live mapping (the [PF/io-err] SIGSEGV root cause)", rbuf);
+        // Best-effort cleanup (the VMA still nominally holds a pin).
+        let _ = vm.remove_range(map_base, map_len);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    if crate::vfs::inode_pin_count(mnt, ino) != 1 {
+        test_fail!("mmap_pin", "post-close pin count = {} (want 1, the live mapping)",
+            crate::vfs::inode_pin_count(mnt, ino));
+        let _ = vm.remove_range(map_base, map_len);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  last-fd close while mapped: inode survives, surface still readable ✓");
+
+    // 5. Hole-punch split balance: munmap the MIDDLE page of the two-page mapping.
+    //    remove_range splits one file VMA into two → pin count must rise to 2
+    //    (one per live file-backed VMA), then the surrounding cleanup brings it
+    //    back to 0.  Punch [map_base+0x800, map_base+0x1000): straddles page 0
+    //    and page 1, leaving a left and a right piece.
+    if vm.remove_range(map_base + 0x800, 0x800).is_err() {
+        test_fail!("mmap_pin", "remove_range(hole-punch) failed");
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    let after_punch = crate::vfs::inode_pin_count(mnt, ino);
+    if after_punch != 2 {
+        test_fail!("mmap_pin",
+            "after hole-punch split, pin count = {} (want 2 = one per surviving file VMA)",
+            after_punch);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  hole-punch split: one file VMA → two, pin count 1→2 (balanced) ✓");
+
+    // 6. Tear the address space down (the process-exit / exec path).  Every
+    //    surviving file VMA unpins; the final unpin of the now-unreferenced
+    //    unlinked inode frees it.  After this the pin count is 0 and the inode is
+    //    gone (a read fails — there is no longer any reference at all).
+    crate::proc::free_vm_space(vm);
+    let final_pins = crate::vfs::inode_pin_count(mnt, ino);
+    if final_pins != 0 {
+        test_fail!("mmap_pin", "after teardown, pin count = {} (want 0 — leaked inode pin)",
+            final_pins);
+        return false;
+    }
+    let post_teardown_freed = match crate::vfs::fs_at(mnt) {
+        Some((fs, _)) => fs.read(ino, 0, &mut rbuf).is_err(), // inode gone now
+        None => true,
+    };
+    if !post_teardown_freed {
+        test_fail!("mmap_pin",
+            "after last unmap the unlinked inode is STILL readable — it should have \
+             been freed once no fd and no mapping reference remained (inode leak)");
+        return false;
+    }
+    test_println!("  full teardown: all pins dropped (count 0), unlinked inode freed ✓");
+
+    test_pass!("file-backed mmap keeps the inode alive after last fd close (Test 300)");
     true
 }
 

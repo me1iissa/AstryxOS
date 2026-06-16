@@ -3811,6 +3811,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         }
         drop(procs);
 
+        // NOTE: do NOT drain deferred inode frees here.  A MAP_FIXED re-map of a
+        // memfd over its own prior mapping unpins the old VMA in Phase 2a and
+        // re-pins the new VMA in Phase 3; draining in this 2a→3 window could free
+        // the inode while the pin count is momentarily zero.  The single drain at
+        // the end of the syscall (after Phase 3 has pinned the new mapping) is
+        // safe — `inode_is_pinned` then vetoes any stale queued free.
+
         // Phase 2b — clear the PTEs and release the backing frames without
         // holding PROCESS_TABLE.  unmap_and_free_range_in serialises on
         // VMM_LOCK + PMM_LOCK internally; concurrent kdb proc-list /
@@ -3897,7 +3904,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         }
     }
 
-    match space.insert_vma(vma) {
+    let ret = match space.insert_vma(vma) {
         Ok(()) => {
             // Lower `mmap_hint` only when this allocation participates in the
             // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
@@ -3932,7 +3939,15 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 -12 // ENOMEM
             }
         }
-    }
+    };
+    // Release PROCESS_TABLE before draining: a MAP_FIXED replacement's Phase-2a
+    // remove_range may have queued an inode free, and the free dance re-acquires
+    // PROCESS_TABLE.  Phase 3 above has already re-pinned the new mapping, so a
+    // self-remap's inode stays referenced across the drain (the queued free is
+    // vetoed by `inode_is_pinned`); only a genuinely orphaned inode is freed.
+    drop(procs);
+    crate::vfs::drain_pending_inode_frees();
+    ret
 }
 
 /// munmap — Unmap a region of the current process's address space.
@@ -3977,6 +3992,11 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
         let _ = space.remove_range(addr, length);
         cr3
     }; // PROCESS_TABLE released here
+
+    // remove_range may have dropped the last inode pin of a file-backed VMA
+    // (e.g. munmap of a still-open-elsewhere memfd's last mapping).  The free is
+    // deferred out of the PROCESS_TABLE critical section above; run it now.
+    crate::vfs::drain_pending_inode_frees();
 
     // ── Phase 2 (lock-free) — clear PTEs and release backing frames. ──────
     crate::mm::vmm::unmap_and_free_range_in(cr3, addr, length);
