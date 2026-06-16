@@ -2214,14 +2214,47 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // recv on a stream whose peer has sent FIN with an empty
                     // buffer must wake and return 0 (RFC 9293 §3.5) — it would
                     // otherwise spin to the deadline since no data will arrive.
-                    while !crate::net::socket::socket_has_data(socket_id)
-                        && !crate::net::socket::socket_is_read_closed(socket_id) {
+                    //
+                    // PARK rather than busy-yield.  The previous loop called
+                    // `sched::yield_cpu()` between polls; that re-readies the
+                    // thread immediately when no other thread is runnable
+                    // (`yield_cpu` never removes the caller from the run set),
+                    // so on an otherwise-idle CPU a blocking recv with no data
+                    // pegs the vCPU at 100% until the deadline — e.g. busybox
+                    // `ping` over a SLIRP user-net that never delivers ICMP echo
+                    // replies spins for the full timeout.  Per recvmsg(2) /
+                    // socket(7), a blocking receive must SLEEP until a datagram
+                    // arrives or the receive timeout fires, not spin.  Park on
+                    // the IPC poll bell (InetRx — rung by the UDP/TCP RX demux
+                    // on datagram/segment arrival — plus SignalInject so a
+                    // delivered signal wakes us promptly for the EINTR check);
+                    // the readiness closure re-runs under the bell lock before
+                    // committing to park, closing the check-and-park lost-wake
+                    // window.  The 1 s resync floor inside `wait_poll_event_*`
+                    // is a backstop; the deadline bounds the total wait.
+                    let bell_mask = (1u32 << (crate::ipc::waitlist::PollBellSource::InetRx as u32))
+                        | (1u32 << (crate::ipc::waitlist::PollBellSource::SignalInject as u32));
+                    loop {
+                        if crate::net::socket::socket_has_data(socket_id)
+                            || crate::net::socket::socket_is_read_closed(socket_id) {
+                            break;
+                        }
                         if signal_pending(pid) { return -4; } // EINTR
-                        crate::net::poll();
-                        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                        let now = crate::arch::x86_64::irq::get_ticks();
+                        if now >= deadline {
                             return -11; // EAGAIN — surfaces as "timed out"
                         }
-                        crate::sched::yield_cpu();
+                        let parked = !crate::ipc::waitlist::wait_poll_event_masked(
+                            deadline, bell_mask,
+                            || crate::net::socket::socket_has_data(socket_id)
+                                || crate::net::socket::socket_is_read_closed(socket_id));
+                        // After an actual park+wake, pump the NIC RX ring + the
+                        // UDP/TCP demux so any wire-side arrival becomes visible
+                        // to the recheck at the loop top (mirrors the poll(2)
+                        // post-park pump).
+                        if parked {
+                            crate::net::poll();
+                        }
                     }
                 }
                 // MSG_PEEK (0x2): non-destructive probe.  We cannot peek
