@@ -454,6 +454,16 @@ pub fn _serial_print(args: fmt::Arguments) {
 
     impl<'a> fmt::Write for WriteAdapter<'a> {
         fn write_str(&mut self, s: &str) -> fmt::Result {
+            // Tee every line that reaches COM1 into the kernel log ring so
+            // that userspace `syslog(2)`/`klogctl` and `/proc/kmsg` can read
+            // the boot log without a serial console.  Best-effort: a failed
+            // `try_lock` (concurrent reader or cross-CPU writer) drops the
+            // chunk rather than block, which is safe inside this IRQ-disabled
+            // critical section.  We tee the raw `s` (before the inline
+            // "\r\n" expansion below) so the ring holds clean "\n"-terminated
+            // lines.
+            crate::util::dmesg::write_str(s);
+
             // Stack-allocated batching buffer.  Bytes accumulate here until
             // we hit FIFO_DEPTH or the input is exhausted; then we commit.
             // Newlines expand to "\r\n" inline, which means a single input

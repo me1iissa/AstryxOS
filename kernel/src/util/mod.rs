@@ -2,3 +2,4 @@
 //! safety contracts.
 
 pub mod no_alloc_fmt;
+pub mod dmesg;

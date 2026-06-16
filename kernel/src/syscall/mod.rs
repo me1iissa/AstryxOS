@@ -5671,6 +5671,133 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, flags: u32) -> i64 {
     count as i64
 }
 
+// ── syslog(2) / klogctl — read the kernel log ring ──────────────────────────
+//
+// `type` (action) values per the published klog ABI (`<sys/klog.h>`,
+// syslog(2) man page).  `dmesg` uses READ_ALL by default; that path is the
+// one that must be correct.  The kernel log ring lives in
+// `crate::util::dmesg` and is fed by a tee in the serial print path.
+const SYSLOG_ACTION_CLOSE:         u64 = 0;
+const SYSLOG_ACTION_OPEN:          u64 = 1;
+const SYSLOG_ACTION_READ:          u64 = 2;
+const SYSLOG_ACTION_READ_ALL:      u64 = 3;
+const SYSLOG_ACTION_READ_CLEAR:    u64 = 4;
+const SYSLOG_ACTION_CLEAR:         u64 = 5;
+const SYSLOG_ACTION_CONSOLE_OFF:   u64 = 6;
+const SYSLOG_ACTION_CONSOLE_ON:    u64 = 7;
+const SYSLOG_ACTION_CONSOLE_LEVEL: u64 = 8;
+const SYSLOG_ACTION_SIZE_UNREAD:   u64 = 9;
+const SYSLOG_ACTION_SIZE_BUFFER:   u64 = 10;
+
+/// syslog(2)/klogctl: read and/or clear the kernel message ring buffer.
+///
+/// `buf`/`len` are only meaningful for the READ family and CONSOLE_LEVEL;
+/// other actions ignore them.  This is a single-user box, so CAP_SYSLOG is
+/// not enforced (per the dispatch decision).
+///
+/// `arg_buf` is the raw user pointer, `arg_len` the raw `int len` argument
+/// (signed in the ABI — a negative `len` is EINVAL for the READ family).
+pub(crate) fn sys_syslog(action: u64, arg_buf: u64, arg_len: u64) -> i64 {
+    // `len` is `int` in the ABI; sign-extend the low 32 bits.
+    let len_signed = (arg_len as u32) as i32 as i64;
+
+    // Helper: copy `bytes` into the user buffer with full validation +
+    // SMAP bracket.  Returns bytes copied or a negative errno.  Only the
+    // first `cap` bytes (the user-supplied `len`) are ever written.
+    fn copy_out(buf: u64, cap: usize, bytes: &[u8]) -> i64 {
+        let n = bytes.len().min(cap);
+        if n == 0 {
+            return 0;
+        }
+        if !crate::syscall::user_ptr_check_bypassed()
+            && !crate::syscall::validate_user_ptr(buf, n)
+        {
+            return -14; // EFAULT
+        }
+        // SAFETY: `n` ≤ `cap`, the destination was range-validated above as a
+        // wholly-user buffer, and `bytes` is a kernel-owned snapshot Vec that
+        // outlives the copy.  The SMAP bracket permits the user write.
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        }
+        n as i64
+    }
+
+    match action {
+        // No-ops: kept for ABI completeness.  Real Linux opens/closes a
+        // /dev/kmsg-style cursor here; we have a single shared ring, so
+        // there is nothing to open or close.
+        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => 0,
+
+        // READ: consume up to `len` unread bytes (oldest unread first).
+        SYSLOG_ACTION_READ => {
+            if arg_buf == 0 || len_signed < 0 {
+                return -22; // EINVAL
+            }
+            if len_signed == 0 {
+                return 0;
+            }
+            let cap = len_signed as usize;
+            let consumed = crate::util::dmesg::DMESG.lock().read_consume(cap);
+            copy_out(arg_buf, cap, &consumed)
+        }
+
+        // READ_ALL / READ_CLEAR: copy the LAST `len` bytes currently in the
+        // ring (non-destructive for READ_ALL; clear afterward for
+        // READ_CLEAR).  This is the action `dmesg` uses by default.
+        SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            if arg_buf == 0 || len_signed < 0 {
+                return -22; // EINVAL
+            }
+            if len_signed == 0 {
+                return 0;
+            }
+            let cap = len_signed as usize;
+            // Snapshot then take the trailing `cap` bytes.
+            let (snap, do_clear) = {
+                let r = crate::util::dmesg::DMESG.lock();
+                (r.snapshot(), action == SYSLOG_ACTION_READ_CLEAR)
+            };
+            let start = snap.len().saturating_sub(cap);
+            let tail = &snap[start..];
+            let copied = copy_out(arg_buf, cap, tail);
+            if copied >= 0 && do_clear {
+                crate::util::dmesg::DMESG.lock().clear();
+            }
+            copied
+        }
+
+        // CLEAR: drop the ring contents.
+        SYSLOG_ACTION_CLEAR => {
+            crate::util::dmesg::DMESG.lock().clear();
+            0
+        }
+
+        // Console-level controls: accepted, no enforcement (we have no
+        // per-level console gating).  CONSOLE_LEVEL validates its range like
+        // the kernel does (1..=8) so callers get the documented EINVAL.
+        SYSLOG_ACTION_CONSOLE_OFF | SYSLOG_ACTION_CONSOLE_ON => 0,
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            if len_signed < 1 || len_signed > 8 {
+                return -22; // EINVAL
+            }
+            0
+        }
+
+        // SIZE_UNREAD: bytes available to a consuming READ.
+        SYSLOG_ACTION_SIZE_UNREAD => {
+            crate::util::dmesg::DMESG.lock().unread_len() as i64
+        }
+
+        // SIZE_BUFFER: total ring capacity.
+        SYSLOG_ACTION_SIZE_BUFFER => crate::util::dmesg::DMESG_CAP as i64,
+
+        // Unknown action.
+        _ => -22, // EINVAL
+    }
+}
+
 // ===== Linux Syscall ABI Compatibility Layer ================================
 //
 // The Linux dispatch body and all Linux-specific helpers have moved to
