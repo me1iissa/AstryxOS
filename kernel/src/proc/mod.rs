@@ -2191,19 +2191,20 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // promptly.  Iterate a snapshot to avoid holding PROCESS_TABLE while calling
     // into PIPE_TABLE / unix socket TABLE (lock ordering: resource table before
     // PROCESS_TABLE).
-    const SOCKET_FD_FLAG: u32 = 0x4000_0000; // bit 30: AF_UNIX or AF_INET socket fd
-    let (pipe_ends, socket_ids, inet_socket_ids, eventfd_ids, pty_ends): (
+    const SOCKET_FD_FLAG: u32 = 0x4000_0000; // bit 30: AF_UNIX/AF_INET/AF_NETLINK socket fd
+    let (pipe_ends, socket_ids, inet_socket_ids, netlink_socket_ids, eventfd_ids, pty_ends): (
         alloc::vec::Vec<(u64, bool)>,
+        alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<(u8, bool)>, // (pair_index, is_master)
     ) = {
         let procs = PROCESS_TABLE.lock();
-        let (mut pipes, mut sockets, mut inet_sockets, mut eventfds, mut ptys) =
+        let (mut pipes, mut sockets, mut inet_sockets, mut netlink_sockets, mut eventfds, mut ptys) =
             (alloc::vec::Vec::new(), alloc::vec::Vec::new(),
              alloc::vec::Vec::new(), alloc::vec::Vec::new(),
-             alloc::vec::Vec::new());
+             alloc::vec::Vec::new(), alloc::vec::Vec::new());
         if let Some(p) = procs.iter().find(|p| p.pid == pid) {
             for f in p.file_descriptors.iter().filter_map(|f| f.as_ref()) {
                 if f.file_type == crate::vfs::FileType::Pipe
@@ -2215,6 +2216,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                     && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                 {
                     sockets.push(f.inode);
+                } else if f.mount_idx == usize::MAX
+                    && f.flags & SOCKET_FD_FLAG != 0
+                    && f.flags & crate::syscall::NETLINK_SOCKET_FLAG != 0
+                {
+                    // AF_NETLINK socket fd: drop one open-file-description ref so
+                    // an inherited socket the parent still holds survives this
+                    // process's exit (last-close frees the socket).
+                    netlink_sockets.push(f.inode);
                 } else if f.mount_idx == usize::MAX
                     && f.flags & SOCKET_FD_FLAG != 0
                     && f.flags & crate::syscall::UNIX_SOCKET_FLAG == 0
@@ -2232,7 +2241,7 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                 }
             }
         }
-        (pipes, sockets, inet_sockets, eventfds, ptys)
+        (pipes, sockets, inet_sockets, netlink_sockets, eventfds, ptys)
     };
     for (pipe_id, is_write) in pipe_ends {
         if is_write {
@@ -2249,6 +2258,10 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // Same last-reference discipline for inherited AF_INET sockets.
     for socket_id in inet_socket_ids {
         crate::net::socket::socket_close(socket_id);
+    }
+    // And for inherited AF_NETLINK sockets — last close frees the socket.
+    for socket_id in netlink_socket_ids {
+        crate::net::netlink::close(socket_id);
     }
     // Drop the exiting process's eventfd open-file-description refs; the
     // slot is freed only when the last reference (parent's fd, in the
@@ -2897,6 +2910,13 @@ fn inc_socket_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
         // this bump the FIRST close in EITHER process destroys the socket for
         // both, dangling the survivor's fd (getpeername → ENOTCONN — the forked
         // dropbear session-child accepted-connection teardown bug).
+        // AF_NETLINK socket: bump the netlink-layer count so the first close
+        // in either process does not free the socket the other still holds.
+        } else if fd.mount_idx == usize::MAX
+            && fd.flags & SOCKET_FD_FLAG != 0
+            && fd.flags & crate::syscall::NETLINK_SOCKET_FLAG != 0
+        {
+            crate::net::netlink::inc_ref(fd.inode);
         } else if fd.mount_idx == usize::MAX
             && fd.flags & SOCKET_FD_FLAG != 0
             && fd.flags & crate::syscall::UNIX_SOCKET_FLAG == 0

@@ -3161,6 +3161,14 @@ pub fn run() -> ! {
         if test_520_wakeup_preemption_kick() { passed += 1; }
     }
 
+    // ── Test 300: AF_NETLINK / NETLINK_ROUTE RTM_GETLINK dump ─────────────
+    // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) → bind → sendmsg(RTM_GETLINK
+    // dump) → recvmsg must return ≥1 RTM_NEWLINK message and an NLMSG_DONE
+    // terminator (RFC 3549; netlink(7), rtnetlink(7)).  Enough for busybox
+    // `ip addr`/`ip link`/`ip route` to enumerate interfaces.
+    total += 1;
+    if test_300_netlink_rtm_getlink_dump() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -40177,6 +40185,149 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
         returned_flags);
 
     test_pass!("recvmsg msg_flags overwrite — sentinel must not survive (PR #129 caveat)");
+    true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 300 — AF_NETLINK / NETLINK_ROUTE RTM_GETLINK dump
+//
+// Drives the full rtnetlink introspection path through the Linux syscall
+// dispatcher exactly as busybox `ip link` does:
+//   socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) → bind(sockaddr_nl) →
+//   sendmsg({ nlmsghdr RTM_GETLINK | NLM_F_REQUEST|NLM_F_DUMP, ifinfomsg }) →
+//   recvmsg(reply).
+// The reply must contain at least one RTM_NEWLINK message (the loopback
+// interface is always present, RFC 1122 §3.2.1.3) and be terminated by an
+// NLMSG_DONE message (RFC 3549 §2.3.2 / netlink(7), rtnetlink(7)).
+// ──────────────────────────────────────────────────────────────────────────────
+fn test_300_netlink_rtm_getlink_dump() -> bool {
+    test_header!("AF_NETLINK RTM_GETLINK dump → RTM_NEWLINK + NLMSG_DONE (Test 300)");
+
+    const AF_NETLINK:    u64 = 16;
+    const SOCK_RAW:      u64 = 3;
+    const NETLINK_ROUTE: u64 = 0;
+    const NLM_F_REQUEST: u16 = 0x01;
+    const NLM_F_DUMP:    u16 = 0x100 | 0x200;
+    const RTM_GETLINK:   u16 = 18;
+    const RTM_NEWLINK:   u16 = 16;
+    const NLMSG_DONE:    u16 = 3;
+
+    // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)
+    let fd = crate::syscall::dispatch_linux_kernel(41, AF_NETLINK, SOCK_RAW, NETLINK_ROUTE, 0, 0, 0);
+    if fd < 0 {
+        test_fail!("netlink", "socket(AF_NETLINK,SOCK_RAW,NETLINK_ROUTE) returned {}", fd);
+        return false;
+    }
+    test_println!("  socket(AF_NETLINK) → fd={}", fd);
+
+    // bind(sockaddr_nl { nl_family=AF_NETLINK; nl_pid=0 (kernel-assign); groups=0 })
+    let mut sa_nl = [0u8; 12];
+    sa_nl[0] = 16; // nl_family = AF_NETLINK
+    let bret = crate::syscall::dispatch_linux_kernel(
+        49, fd as u64, sa_nl.as_ptr() as u64, 12, 0, 0, 0);
+    if bret != 0 {
+        test_fail!("netlink", "bind(sockaddr_nl) returned {}", bret);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  bind(sockaddr_nl) → 0 ✓");
+
+    // getsockname must report a non-zero assigned nl_pid.
+    let mut gn = [0u8; 12];
+    let mut gn_len: u32 = 12;
+    let gret = crate::syscall::dispatch_linux_kernel(
+        51, fd as u64, gn.as_mut_ptr() as u64,
+        (&mut gn_len as *mut u32) as u64, 0, 0, 0);
+    let nl_pid = u32::from_ne_bytes([gn[4], gn[5], gn[6], gn[7]]);
+    if gret != 0 || gn[0] != 16 || nl_pid == 0 {
+        test_fail!("netlink",
+            "getsockname ret={} family={} nl_pid={} (want fam=16, nl_pid!=0)",
+            gret, gn[0], nl_pid);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  getsockname → nl_pid={} ✓", nl_pid);
+
+    // Build the RTM_GETLINK dump request: nlmsghdr + ifinfomsg.
+    //   nlmsghdr { len=16+16=32; type=RTM_GETLINK; flags=REQUEST|DUMP; seq=1; pid=0 }
+    //   ifinfomsg { family=AF_UNSPEC(0); pad; type; index; flags; change } (16 bytes)
+    let seq: u32 = 0x1234;
+    let mut req = [0u8; 32];
+    let total_len: u32 = 32;
+    req[0..4].copy_from_slice(&total_len.to_ne_bytes());          // nlmsg_len
+    req[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());        // nlmsg_type
+    req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes()); // flags
+    req[8..12].copy_from_slice(&seq.to_ne_bytes());              // nlmsg_seq
+    // nlmsg_pid (12..16) = 0; ifinfomsg (16..32) all zero (AF_UNSPEC, dump all).
+
+    // sendmsg(fd, msghdr{iov=[req]}, 0)
+    let mut iov: [u64; 2] = [req.as_mut_ptr() as u64, 32];
+    let mut shdr = [0u64; 7];
+    shdr[2] = iov.as_mut_ptr() as u64; // msg_iov at offset 16
+    shdr[3] = 1u64;                    // msg_iovlen = 1
+    let sret = crate::syscall::dispatch_linux_kernel(
+        46, fd as u64, shdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if sret != 32 {
+        test_fail!("netlink", "sendmsg(RTM_GETLINK) returned {} (want 32)", sret);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  sendmsg(RTM_GETLINK dump) → {} bytes ✓", sret);
+
+    // recvmsg(fd, msghdr{iov=[rxbuf]}, 0)
+    let mut rxbuf = [0u8; 4096];
+    let mut riov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, 4096];
+    let mut rhdr = [0u64; 7];
+    rhdr[2] = riov.as_mut_ptr() as u64;
+    rhdr[3] = 1u64;
+    let rret = crate::syscall::dispatch_linux_kernel(
+        47, fd as u64, rhdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if rret <= 0 {
+        test_fail!("netlink", "recvmsg returned {} (want > 0)", rret);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let n = rret as usize;
+    test_println!("  recvmsg → {} bytes of reply", n);
+
+    // Parse the reply: walk nlmsghdr-framed messages.  Count RTM_NEWLINK
+    // messages and confirm an NLMSG_DONE terminator.  Verify each reply
+    // message echoes our request seq (netlink(7): replies carry nlmsg_seq).
+    let mut newlinks = 0usize;
+    let mut saw_done = false;
+    let mut seq_ok = true;
+    let mut off = 0usize;
+    while off + 16 <= n {
+        let mlen = u32::from_ne_bytes([rxbuf[off], rxbuf[off+1], rxbuf[off+2], rxbuf[off+3]]) as usize;
+        let mtype = u16::from_ne_bytes([rxbuf[off+4], rxbuf[off+5]]);
+        let mseq = u32::from_ne_bytes([rxbuf[off+8], rxbuf[off+9], rxbuf[off+10], rxbuf[off+11]]);
+        if mlen < 16 || off + mlen > n { break; }
+        if mseq != seq { seq_ok = false; }
+        if mtype == RTM_NEWLINK { newlinks += 1; }
+        if mtype == NLMSG_DONE { saw_done = true; }
+        // 4-byte (NLMSG_ALIGNTO) alignment to the next message.
+        off += (mlen + 3) & !3;
+    }
+    test_println!("  parsed: RTM_NEWLINK x{}, NLMSG_DONE={}, seq_ok={}",
+        newlinks, saw_done, seq_ok);
+
+    // Cleanup.
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
+
+    if newlinks == 0 {
+        test_fail!("netlink", "no RTM_NEWLINK messages in dump (want >= 1)");
+        return false;
+    }
+    if !saw_done {
+        test_fail!("netlink", "dump not terminated by NLMSG_DONE");
+        return false;
+    }
+    if !seq_ok {
+        test_fail!("netlink", "a reply message did not echo the request seq {:#x}", seq);
+        return false;
+    }
+
+    test_pass!("AF_NETLINK RTM_GETLINK dump → RTM_NEWLINK + NLMSG_DONE (Test 300)");
     true
 }
 
