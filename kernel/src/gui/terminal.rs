@@ -925,6 +925,31 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // In GUI mode this is intentionally omitted so libxul opens the
         // display and renders into an X11 window on the Xastryx server.
         envp_vec.push("MOZ_HEADLESS=1");
+    } else {
+        // GUI (windowed) mode: collapse the command-line tab to in-process.
+        //
+        // The windowed path opens the command-line URL as an ordinary browser
+        // tab.  An ordinary tab's process model follows the window's
+        // multi-process state, which is seeded from the documented
+        // `MOZ_FORCE_DISABLE_E10S` switch: with the switch set, the chrome
+        // window is created without the remote flag, so the tab's <browser>
+        // is non-remote and its document is parsed, laid out, and rendered
+        // entirely in the parent process.  Because the X11/MOZ_X11 software
+        // compositor already runs in-process (the out-of-process GPU/compositor
+        // child is off by default on this widget backend), the whole pipeline
+        // — layer tree, compositing, and the X11 present — happens in one
+        // process with no cross-process content-init handshake to complete.
+        //
+        // This is the same single-process render path the headless
+        // screenshot path exercises, and it is deliberately NOT applied to
+        // that path: the headless `--screenshot` capture <browser> is created
+        // with an explicit remoteness that an environment default cannot
+        // override (see the note in the shared block below), so forcing the
+        // default off there would only desynchronise its actor routing.  In
+        // windowed mode there is no such explicit-remote browser, so the
+        // switch cleanly selects the in-process tab.
+        // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
+        envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
     }
     envp_vec.extend_from_slice(&[
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
