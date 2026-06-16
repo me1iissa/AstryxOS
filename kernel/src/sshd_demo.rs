@@ -63,11 +63,14 @@ const DROPBEAR_PATH: &str = "/disk/usr/sbin/dropbear";
 ///   3. Capture stdout + serial events
 ///
 /// 6_000 ticks = 60 s @ 100 Hz.  Bump for longer interactive soaks.
-/// Raised to 24_000 (≈240 s @ 100 Hz) so a host-driven `ssh -p N` has a
-/// comfortable live window to complete the TCP 3-way handshake, the SSH-2
-/// transport/kex (RFC 4253), public-key userauth (RFC 4252) and open a
-/// session channel (RFC 4254) before the demo soak tears the daemon down.
-const SSHD_SOAK_TICKS: u64 = 24_000;
+/// Set to `u64::MAX` so the daemon runs *indefinitely*: this is the persistent
+/// SSH/LAN instance, which must never tear dropbear down — it stays up to serve
+/// interactive sessions (and a host-driven `ssh -p N` SSH-2 transport/kex
+/// RFC 4253, public-key userauth RFC 4252, session channel RFC 4254) until the
+/// machine is explicitly halted.  At 100 Hz `u64::MAX` ticks is ~5.8e9 years,
+/// i.e. effectively unbounded; the soak loop below therefore never trips its
+/// deadline branch and keeps the daemon Active for the life of the instance.
+const SSHD_SOAK_TICKS: u64 = u64::MAX;
 
 /// Envp for dropbear.  Kept small + deterministic.  Notable entries:
 ///   - HOME=/root            — dropbear sets supplementary groups before
