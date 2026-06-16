@@ -2753,10 +2753,34 @@ fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
     // no-physical-keyboard display.
     match minor {
         0 => {
-            // GetMap is a no-op for us, but UseExtension must report support.
-            // XkbUseExtension: supported=1, serverMajor=1, serverMinor=0
+            // XkbUseExtension: report the extension as NOT supported for the
+            // client's requested version (the `supported` BOOL in byte 1 is 0).
+            //
+            // Per the X Keyboard Extension Protocol Specification §UseExtension,
+            // a client (libX11's XkbQueryExtension / XkbUseExtension) that sees
+            // supported=0 falls back to the *core* keyboard protocol — it stops
+            // issuing XkbGetMap and instead builds its keymap from
+            // GetKeyboardMapping(101) + GetModifierMapping(119), both of which
+            // this server answers with a complete, non-empty map (see
+            // op_get_keyboard_mapping / op_get_modifier_mapping).  GDK mirrors
+            // this: gdkkeys-x11 sets use_xkb=FALSE and uses the core path.
+            //
+            // We deliberately do NOT try to synthesize a full XkbGetMap reply.
+            // A *complete* XKB client map (key types, the per-keycode
+            // key_sym_map array, modifier maps) is required for correctness:
+            // libX11's XkbKeysymToModifiers walks
+            //   xkb->map->key_sym_map[kc] -> ->kt_index -> xkb->map->types[...]
+            // and dereferences those arrays unconditionally.  An "empty"
+            // (present=0) GetMap reply leaves them NULL, so the very next
+            // GTK keymap query faults on a NULL deref (NULL+4).  Reporting the
+            // extension unsupported routes the client onto the core protocol
+            // we already serve correctly, avoiding a large, fragile XKB map
+            // serializer for a display that has no physical keyboard.
+            //
+            // serverMajor/serverMinor still report a valid version (1.0) so
+            // the negotiation itself is well-formed.
             let mut b = [0u8; 32];
-            b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
+            b[0] = 1; b[1] = 0; w16(&mut b, 2, seq);
             w16(&mut b, 8, 1); w16(&mut b, 10, 0);
             with_client(fd, |c| c.send(&b));
         }

@@ -361,6 +361,44 @@ cp -aL "${ROOTFS}/usr/lib/." "${DISK_USR_LIB}/" 2>/dev/null || true
 # Drop apk's bookkeeping; not useful at runtime.
 rm -rf "${DISK_USR_LIB}/apk" 2>/dev/null || true
 
+# (c1) Generate the GdkPixbuf loaders cache.  Alpine's apk post-install
+# trigger normally runs gdk-pixbuf-query-loaders to build
+# /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache, which indexes the image
+# loader modules in loaders/.  Extracting apks (as we do) does not fire that
+# trigger, so the cache is absent and GdkPixbuf comes up with an EMPTY loader
+# set — gdk_pixbuf_new_from_* then returns NULL and GTK asserts
+# `GDK_IS_PIXBUF (pixbuf)` / faults on the NULL deref before any toplevel is
+# realized on the windowed (--ff-gui) Firefox path.
+#
+# The query tool dlopens each loader to read its format metadata, so it must
+# run against the musl modules.  We run the staged musl
+# gdk-pixbuf-query-loaders under qemu-x86_64 user-mode emulation (with the
+# Alpine rootfs as the sysroot) and rewrite the emitted module paths to the
+# on-target absolute path.  The cache format is documented by
+# gdk-pixbuf-query-loaders(1).  If qemu-user is unavailable the step is
+# skipped (non-fatal) and the GUI path falls back to whatever loaders are
+# statically built into libgdk_pixbuf.
+GDKP_DIR="${DISK_USR_LIB}/gdk-pixbuf-2.0/2.10.0"
+GDKP_QUERY="${ROOTFS}/usr/bin/gdk-pixbuf-query-loaders"
+if [ -d "${GDKP_DIR}/loaders" ] && [ -x "${GDKP_QUERY}" ] && \
+   command -v qemu-x86_64 >/dev/null 2>&1; then
+    if qemu-x86_64 -L "${ROOTFS}" \
+         -E GDK_PIXBUF_MODULEDIR="${ROOTFS}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+         "${GDKP_QUERY}" 2>/dev/null \
+       | sed "s|${ROOTFS}/usr/lib/gdk-pixbuf-2.0|/usr/lib/gdk-pixbuf-2.0|g; \
+              s|^# LoaderDir = ${ROOTFS}|# LoaderDir = |" \
+         > "${GDKP_DIR}/loaders.cache.tmp" 2>/dev/null \
+       && grep -q '^"/usr/lib/gdk-pixbuf-2.0' "${GDKP_DIR}/loaders.cache.tmp"; then
+        mv -f "${GDKP_DIR}/loaders.cache.tmp" "${GDKP_DIR}/loaders.cache"
+        echo "[install-firefox-musl] generated GdkPixbuf loaders.cache ($(grep -c '^"/usr/lib' "${GDKP_DIR}/loaders.cache") loaders)"
+    else
+        rm -f "${GDKP_DIR}/loaders.cache.tmp" 2>/dev/null || true
+        echo "[install-firefox-musl] WARNING: gdk-pixbuf-query-loaders produced no usable cache — GUI image loading may degrade"
+    fi
+elif [ -d "${GDKP_DIR}/loaders" ]; then
+    echo "[install-firefox-musl] NOTE: qemu-x86_64 (qemu-user) not found; skipping GdkPixbuf loaders.cache generation (install with: apt-get install qemu-user)"
+fi
+
 # (c2) Auxiliary data trees under /usr/share/.  Several Alpine packages
 # split runtime data from the .so files: the dynamic loader resolves the
 # stub library by SONAME, but the library reads its real payload from a

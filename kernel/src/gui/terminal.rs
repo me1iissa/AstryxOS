@@ -1065,6 +1065,31 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // switch cleanly selects the in-process tab.
         // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
         envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
+        // GUI-mode (windowed) runtime data that headless mode never needs.
+        // When libxul opens the display it brings up GTK/GDK, which loads
+        // image data through GdkPixbuf and resolves fonts through fontconfig.
+        // Both libraries read a generated index/config file at init time; if
+        // the file is absent they degrade to an EMPTY loader/config set and
+        // later return NULL where a non-NULL object is required — GTK then
+        // asserts `GDK_IS_PIXBUF (pixbuf)` / faults on the NULL deref before a
+        // toplevel is ever realized.  Naming the files explicitly via the
+        // documented environment variables is the robust, path-independent way
+        // to point each library at the data-disk copy.
+        //
+        //   GDK_PIXBUF_MODULE_FILE — absolute path to the loaders cache that
+        //     lists the available image-loader modules.  Documented by
+        //     GdkPixbuf (gdk_pixbuf_io_init / gdk-pixbuf-query-loaders(1)); it
+        //     overrides the compiled-in default cache location.
+        //   FONTCONFIG_FILE / FONTCONFIG_PATH — name the fontconfig
+        //     configuration file and directory.  Documented in
+        //     fonts-conf(5); without them real libfontconfig cannot resolve
+        //     its compiled sysconfdir default on this layout and reports
+        //     "Cannot load default config file".
+        envp_vec.push(
+            "GDK_PIXBUF_MODULE_FILE=/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+        );
+        envp_vec.push("FONTCONFIG_FILE=/etc/fonts/fonts.conf");
+        envp_vec.push("FONTCONFIG_PATH=/etc/fonts");
     }
     envp_vec.extend_from_slice(&[
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
