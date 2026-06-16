@@ -141,6 +141,19 @@ struct UnixSocket {
     creator_pid: u64,
     creator_uid: u32,
     creator_gid: u32,
+    /// Monotonic generation of this slot index, bumped every time the slot is
+    /// recycled ([`reset`]).  Because AF_UNIX socket ids are bare slot indices
+    /// that are reused the instant a slot's last reference drops, any side
+    /// table keyed on the bare index (notably the `SCM_RIGHTS` batch queue,
+    /// `syscall::PENDING_SCM`) risks delivering a *previous* occupant's state
+    /// to the *current* occupant.  Pairing the index with this incarnation
+    /// makes such a stale entry structurally undeliverable: a queued batch
+    /// records the incarnation at enqueue time, and delivery refuses any batch
+    /// whose recorded incarnation differs from the slot's current one.  This
+    /// closes the recycle race independently of the close→drain ordering
+    /// window (see `close`).  `u64` never wraps in practice (one bump per
+    /// socket teardown).
+    incarnation: u64,
 }
 
 impl UnixSocket {
@@ -169,10 +182,16 @@ impl UnixSocket {
             creator_pid: 0,
             creator_uid: 0,
             creator_gid: 0,
+            incarnation: 0,
         }
     }
 
     fn reset(&mut self) {
+        // Bump the slot generation FIRST so any SCM_RIGHTS batch still queued
+        // against the OUTGOING incarnation can never be delivered to the next
+        // occupant of this index (see the `incarnation` field doc and the
+        // `syscall::PENDING_SCM` incarnation guard).
+        self.incarnation = self.incarnation.wrapping_add(1);
         self.state       = UnixState::Free;
         self.kind        = SockKind::Stream;
         self.path_len    = 0;
@@ -952,6 +971,18 @@ pub fn recv_consumed(id: u64) -> u64 {
     if id as usize >= MAX_UNIX_SOCKETS { return 0; }
     let t = TABLE.lock();
     t.0[id as usize].recv_popped
+}
+
+/// Current incarnation (recycle generation) of slot `id` — see the
+/// `UnixSocket::incarnation` field.  An `SCM_RIGHTS` batch records this at
+/// enqueue and delivery refuses a batch whose recorded incarnation differs,
+/// so a stale batch can never reach a recycled slot's new occupant.  Returns
+/// `u64::MAX` (a value no live slot can hold after a real recycle, and which
+/// no batch records) for an out-of-range id so callers fail closed.
+pub fn current_incarnation(id: u64) -> u64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return u64::MAX; }
+    let t = TABLE.lock();
+    t.0[id as usize].incarnation
 }
 
 /// Usable byte-stream capacity of one AF_UNIX socket end's recv ring — the

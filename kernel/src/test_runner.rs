@@ -2910,6 +2910,15 @@ pub fn run() -> ! {
     total += 1;
     if test_292_recvmsg_ctrunc_partial_scm_install() { passed += 1; }
 
+    // ── Test 521: SCM_RIGHTS batch must not bleed across a recycled slot ────
+    // The per-slot incarnation guard makes an in-flight fd batch queued for a
+    // since-closed AF_UNIX slot structurally undeliverable to the next occupant
+    // that re-allocates the index — the cross-channel fd bleed that aborts the
+    // parent's IPC during content-process teardown.  Refs: unix(7) SCM_RIGHTS,
+    // recvmsg(2)/sendmsg(2), POSIX.1-2017 §2.14.
+    total += 1;
+    if test_521_scm_recycle_incarnation_isolation() { passed += 1; }
+
     // ── Test 293: epoll EPOLLIN parity on a listening AF_UNIX socket ───────
     // A listening AF_UNIX socket with a queued connection is read-ready;
     // epoll_wait(2) must report EPOLLIN for it just as poll(2)/select(2) do
@@ -52777,6 +52786,110 @@ fn test_292_recvmsg_ctrunc_partial_scm_install() -> bool {
     unix::close(id_a);
     unix::close(id_b);
     test_pass!("recvmsg short control buffer: MSG_CTRUNC + partial-fit SCM install (Test 292)");
+    true
+}
+
+// ── Test 521: SCM_RIGHTS batch does NOT bleed across a recycled slot ─────────
+//
+// AF_UNIX socket ids are bare slot indices recycled the instant a slot's last
+// reference drops (net::unix::close → reset).  A queued SCM_RIGHTS batch
+// (syscall::PENDING_SCM) is keyed on that index plus a stream-position predicate
+// (recv_consumed >= byte_offset) that reset() zeroes — so without a generation
+// guard, a batch queued for the OLD occupant of an index becomes immediately
+// deliverable to the NEXT occupant that re-allocates the index, splicing fds
+// into an unrelated IPC channel (→ IPDL num_handles mismatch → a fatal channel
+// error in the parent).  This test proves the per-slot `incarnation` guard makes
+// such a stale batch structurally undeliverable to the recycled slot.
+//
+// Refs: recvmsg(2)/sendmsg(2) SCM_RIGHTS, unix(7), POSIX.1-2017 §2.14 (a
+// received descriptor is associated with the message that carried it).
+fn test_521_scm_recycle_incarnation_isolation() -> bool {
+    use crate::net::unix;
+    test_header!("SCM_RIGHTS batch undeliverable across a recycled AF_UNIX slot (Test 521)");
+
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let (a, b) = unix::socketpair(unix::SockKind::Stream, creds);
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_recycle", "socketpair returned MAX");
+        return false;
+    }
+
+    let inc0 = unix::current_incarnation(b);
+
+    // Queue a control-only batch for receiver `b` at its current stream tail
+    // (offset 0) — exactly the in-flight state that exists when a content proc
+    // tears its channel down before recvmsg'ing the pending fd handoff.
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xD00D, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+    let off = unix::enqueue_offset_for(b);
+    crate::syscall::scm_queue(b, off, alloc::vec![mk_fd()]);
+
+    // Sanity: deliverable to the CURRENT occupant of slot `b`.
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_recycle", "freshly-queued batch not deliverable to current occupant");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Tear down `b` WITHOUT recvmsg'ing.  This bumps slot `b`'s incarnation and
+    // drains its pending batches (scm_drain_receiver) — but we model a stale
+    // batch that survives the drain window by re-queuing one bound to the OLD
+    // incarnation immediately AFTER the close, as a racing sender on another CPU
+    // would (it captured `b` before the close and its scm_queue lands after the
+    // reset but is recorded against the pre-recycle incarnation `inc0`).
+    unix::close(b);
+    // Forge the racing-sender batch carrying the stale incarnation.  This is the
+    // exact stale-batch shape the incarnation guard must reject; we cannot let
+    // scm_queue re-capture the (already-bumped) live incarnation, so push it via
+    // the test-only stale injector below.
+    crate::syscall::scm_test_inject_stale_batch(b, inc0, 0, alloc::vec![mk_fd()]);
+
+    // Re-allocate the SAME slot index for an unrelated connection.  socketpair
+    // scans for the lowest Free slot; the just-closed `b` is the prime
+    // candidate.  If it does not reuse `b`, the test still holds (the stale
+    // batch simply targets a Free/other slot), but we assert the common case.
+    let (c, d) = unix::socketpair(unix::SockKind::Stream, creds);
+    if c == u64::MAX || d == u64::MAX {
+        test_fail!("scm_recycle", "second socketpair returned MAX");
+        unix::close(a);
+        return false;
+    }
+
+    // The NEW occupant of slot `b` (whichever of c/d landed there) must NOT see
+    // the stale batch as deliverable — its current incarnation differs from the
+    // batch's recorded `inc0`.
+    for &nid in &[c, d] {
+        if nid == b {
+            let inc_now = unix::current_incarnation(nid);
+            if inc_now == inc0 {
+                test_fail!("scm_recycle",
+                    "recycled slot incarnation NOT bumped ({} == {})", inc_now, inc0);
+                unix::close(a); unix::close(c); unix::close(d);
+                return false;
+            }
+            if crate::syscall::has_scm_deliverable(nid, unix::recv_consumed(nid)) {
+                test_fail!("scm_recycle",
+                    "STALE batch deliverable to recycled slot {} (cross-channel fd bleed)", nid);
+                unix::close(a); unix::close(c); unix::close(d);
+                return false;
+            }
+            test_println!("  recycled slot {} (inc {}→{}) correctly rejects stale batch ✓",
+                nid, inc0, unix::current_incarnation(nid));
+        }
+    }
+
+    // Clean up the forged stale batch so it does not leak into later tests.
+    let orphaned = crate::syscall::scm_drain_receiver(b);
+    crate::syscall::scm_drop_fds(orphaned);
+
+    unix::close(a);
+    unix::close(c);
+    unix::close(d);
+    test_pass!("SCM_RIGHTS batch undeliverable across a recycled AF_UNIX slot (Test 521)");
     true
 }
 

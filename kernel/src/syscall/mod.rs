@@ -548,10 +548,39 @@ where
 ///     merely on the receiver uid.
 struct ScmBatch {
     receiver_id: u64,
+    /// Slot incarnation of `receiver_id` captured at enqueue time (see
+    /// `net::unix::current_incarnation`).  AF_UNIX socket ids are bare,
+    /// immediately-recycled slot indices; a batch keyed only on the index can
+    /// otherwise be delivered to a *different* connection that re-allocated the
+    /// index after the original receiver closed.  Delivery (and the readiness
+    /// predicate) match on BOTH `receiver_id` AND this incarnation equalling
+    /// the slot's CURRENT incarnation, so a stale batch is structurally
+    /// undeliverable regardless of the close→drain ordering window.
+    receiver_incarnation: u64,
     byte_offset: u64,
     fds: Vec<crate::vfs::FileDescriptor>,
 }
 static PENDING_SCM: Mutex<Vec<ScmBatch>> = Mutex::new(Vec::new());
+
+/// True iff a queued batch's recorded incarnation still matches the live slot
+/// it was bound to.  A mismatch means the receiver slot was recycled after the
+/// batch was queued (its index now serves an unrelated connection), so the
+/// batch must NOT be delivered.  `u64::MAX` from `current_incarnation` (an
+/// out-of-range / freed id) also never matches a recorded incarnation, so a
+/// batch for a since-freed slot is likewise treated as stale.
+///
+/// LOCK ORDER: callers of this helper hold `PENDING_SCM`; `current_incarnation`
+/// then briefly takes the unix `TABLE` lock — so the nesting here is
+/// `PENDING_SCM → TABLE`.  This is deadlock-free because NO path acquires
+/// `PENDING_SCM` while already holding `TABLE`: `scm_queue` reads the
+/// incarnation (releasing `TABLE`) BEFORE taking `PENDING_SCM`, and
+/// `net::unix::close` drops `TABLE` BEFORE calling `scm_drain_receiver`
+/// (`unix.rs` drop-then-drain comment).  Keep that invariant if adding new
+/// `scm_*` callers.
+#[inline]
+fn scm_batch_live(b: &ScmBatch) -> bool {
+    b.receiver_incarnation == crate::net::unix::current_incarnation(b.receiver_id)
+}
 
 /// Queue an `SCM_RIGHTS` fd batch for delivery when `receiver_id`'s drained-byte
 /// count reaches `byte_offset` (see [`scm_dequeue`]: the deliver predicate is
@@ -571,7 +600,31 @@ static PENDING_SCM: Mutex<Vec<ScmBatch>> = Mutex::new(Vec::new());
 /// The single `>=` predicate covers both because the caller does the `+1`
 /// adjustment for data frames at enqueue time (see the sendmsg(2) SCM path).
 pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDescriptor>) {
-    PENDING_SCM.lock().push(ScmBatch { receiver_id, byte_offset, fds });
+    // Capture the receiver slot's incarnation NOW so the batch can be matched
+    // to *this* occupant of the index at delivery time.  Read before taking
+    // PENDING_SCM (distinct lock; no nesting against the unix TABLE lock).
+    let receiver_incarnation = crate::net::unix::current_incarnation(receiver_id);
+    PENDING_SCM.lock().push(ScmBatch {
+        receiver_id, receiver_incarnation, byte_offset, fds,
+    });
+}
+
+/// Test-only: queue an `SCM_RIGHTS` batch with an EXPLICIT recorded incarnation,
+/// modelling a racing sender whose `scm_queue` landed against a pre-recycle
+/// incarnation of `receiver_id`.  Used by the slot-recycle isolation regression
+/// (test 521) to forge the exact stale-batch shape the incarnation guard must
+/// reject; never called from the live syscall path (which always records the
+/// slot's current incarnation via [`scm_queue`]).
+#[cfg(feature = "test-mode")]
+pub fn scm_test_inject_stale_batch(
+    receiver_id: u64,
+    receiver_incarnation: u64,
+    byte_offset: u64,
+    fds: Vec<crate::vfs::FileDescriptor>,
+) {
+    PENDING_SCM.lock().push(ScmBatch {
+        receiver_id, receiver_incarnation, byte_offset, fds,
+    });
 }
 
 /// Returns true if `receiver_id` has at least one `SCM_RIGHTS` batch that is
@@ -585,7 +638,9 @@ pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDe
 /// not have to reach back into the net layer while holding PENDING_SCM.
 pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
     let q = PENDING_SCM.lock();
-    q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+    q.iter().any(|b| b.receiver_id == receiver_id
+        && consumed >= b.byte_offset
+        && scm_batch_live(b))
 }
 
 /// Diagnostic-only: snapshot the pending `SCM_RIGHTS` batches queued for
@@ -597,7 +652,7 @@ pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
 pub fn scm_diag_for(receiver_id: u64, consumed: u64) -> alloc::vec::Vec<(u64, usize, bool)> {
     let q = PENDING_SCM.lock();
     q.iter()
-        .filter(|b| b.receiver_id == receiver_id)
+        .filter(|b| b.receiver_id == receiver_id && scm_batch_live(b))
         .map(|b| (b.byte_offset, b.fds.len(), consumed >= b.byte_offset))
         .collect()
 }
@@ -622,7 +677,9 @@ pub fn scm_diag_for(receiver_id: u64, consumed: u64) -> alloc::vec::Vec<(u64, us
 pub fn scm_next_batch_offset(receiver_id: u64, consumed: u64) -> Option<u64> {
     let q = PENDING_SCM.lock();
     q.iter()
-        .filter(|b| b.receiver_id == receiver_id && b.byte_offset > consumed)
+        .filter(|b| b.receiver_id == receiver_id
+            && b.byte_offset > consumed
+            && scm_batch_live(b))
         .map(|b| b.byte_offset)
         .min()
 }
@@ -653,7 +710,9 @@ pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::Fi
     // stable `min_by_key`, which is the best available approximation of send
     // order when the offsets are indistinguishable.
     let pos = q.iter().enumerate()
-        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .filter(|(_, b)| b.receiver_id == receiver_id
+            && consumed >= b.byte_offset
+            && scm_batch_live(b))
         .min_by_key(|(_, b)| b.byte_offset)
         .map(|(i, _)| i)?;
     Some(q.remove(pos).fds)
@@ -678,7 +737,9 @@ pub fn scm_dequeue_with_offset(
 ) -> Option<(u64, Vec<crate::vfs::FileDescriptor>)> {
     let mut q = PENDING_SCM.lock();
     let pos = q.iter().enumerate()
-        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .filter(|(_, b)| b.receiver_id == receiver_id
+            && consumed >= b.byte_offset
+            && scm_batch_live(b))
         .min_by_key(|(_, b)| b.byte_offset)
         .map(|(i, _)| i)?;
     let batch = q.remove(pos);
