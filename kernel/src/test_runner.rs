@@ -2448,6 +2448,13 @@ pub fn run() -> ! {
         if test_240_vfs_truncate_page_cache_coherency() { passed += 1; }
         total += 1;
         if test_241_ramfs_mmap_read_coherency() { passed += 1; }
+        // Test 242: read(2) must consult the page cache before the backing
+        // store — a cache-resident page is served with zero device I/O, so a
+        // contended/dead block device cannot fail a read whose bytes are
+        // cached (the libstdc++-relaunch -EIO class).  See
+        // `mm::cache::read_satisfy` and the read(2) data path in `fd_read`.
+        total += 1;
+        if test_242_read_consults_page_cache() { passed += 1; }
     }
 
     // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
@@ -46157,6 +46164,314 @@ fn test_240_vfs_truncate_page_cache_coherency() -> bool {
     let _ = crate::mm::cache::evict(mount_idx, inode, 0);
     let _ = crate::vfs::remove(path);
     test_pass!("VFS truncate / page-cache coherency (POSIX ftruncate zero-fill)");
+    true
+}
+
+// ── Test 242: read(2) consults the page cache before the backing store ───
+//
+// Regression guard for the read(2)-ignores-the-cache bug: a regular-file
+// `read(2)` went straight to `Filesystem::read` (the backing store) even
+// when the requested pages were already resident in `mm::cache` from a
+// boot-time prepopulate or a prior mmap demand-fault.  Two consequences:
+//
+//   (a) redundant device I/O for cache-resident bytes; and
+//   (b) — the demo-blocking one — a transient backing-store error (a block
+//       device that missed its no-progress deadline under a teardown/fork
+//       storm) failed a read whose exact bytes were sitting in the cache,
+//       turning a benign contention window into an -EIO that aborted the
+//       dynamic loader (`Error loading shared library ...: I/O error`).
+//
+// The fix routes the read(2) data path through `mm::cache::read_satisfy`
+// first, serving the leading run of cache-resident pages with zero device
+// I/O and issuing a backing-store read only for the uncached tail.  This
+// matches the mmap demand-fault path, which already consults the cache.
+//
+// Part A (cache-first + boundary + write coherence) uses a tmpfs file so
+// the (mount, inode) is real; it seeds the cache with a marker that DIFFERS
+// from the inode bytes, so a cache-served read is distinguishable from a
+// backing-store-served one.  Part B (the decisive demo-shaped case) mounts
+// an ext2 image behind a PERMANENTLY-faulting block device, prepopulates
+// the file's cache pages, and proves a read composed exactly as `fd_read`
+// composes it succeeds without ever touching the dead device — then proves
+// that, once the cache is evicted, the same read DOES hit the device and
+// -EIO, confirming the device is genuinely faulting (the cache was the
+// thing that saved the read).
+//
+// References:
+//   - IEEE Std 1003.1-2017 read(2): the bytes returned are the file's
+//     current content; serving them from a cache is invisible to the
+//     caller and an I/O error is distinct from end-of-file.
+//   - IEEE Std 1003.1-2017 write(2)/mmap(2): a write is visible to a
+//     subsequent read of the same file — the cache stays coherent in place
+//     via `mm::cache::update_range`.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_242_read_consults_page_cache() -> bool {
+    test_header!("read(2) consults page cache before backing store (POSIX read(2))");
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    const PAGE: usize = 4096;
+
+    // ══ Part A: cache-first + contiguous-prefix boundary + write coherence ══
+    {
+        let path = "/tmp/test242_readcache.bin";
+        let _ = crate::vfs::remove(path);
+        if let Err(e) = crate::vfs::create_file(path) {
+            test_fail!("test242A", "create_file failed: {:?}", e);
+            return false;
+        }
+        // Inode bytes = three pages of 'A'.  The cache marker will be 'C'.
+        let inode_bytes = alloc::vec![b'A'; 3 * PAGE];
+        if let Err(e) = crate::vfs::write_file(path, &inode_bytes) {
+            test_fail!("test242A", "write_file failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+        let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+            Ok(r) => r,
+            Err(e) => {
+                test_fail!("test242A", "resolve_path failed: {:?}", e);
+                let _ = crate::vfs::remove(path);
+                return false;
+            }
+        };
+
+        // Seed pages 0 and 1 (NOT page 2) with the marker 'C'.  read_satisfy
+        // must serve the contiguous prefix [0, 2*PAGE) from the cache and stop
+        // at the page-2 gap.
+        let mut seeded: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for pg in 0..2u64 {
+            let phys = match crate::mm::pmm::alloc_page() {
+                Some(p) => p,
+                None => {
+                    test_fail!("test242A", "alloc_page failed");
+                    for &s in &seeded { let _ = crate::mm::cache::evict(mount_idx, inode, s); }
+                    let _ = crate::vfs::remove(path);
+                    return false;
+                }
+            };
+            unsafe { core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, b'C', PAGE); }
+            crate::mm::cache::insert(mount_idx, inode, pg * PAGE as u64, phys);
+            seeded.push(pg * PAGE as u64);
+        }
+
+        let cleanup = |seeded: &[u64]| {
+            for &s in seeded { let _ = crate::mm::cache::evict(mount_idx, inode, s); }
+            let _ = crate::vfs::remove(path);
+        };
+
+        // (A1) A whole-file read: cache serves [0, 8192) as 'C', the gap at
+        // page 2 stops the prefix → read_satisfy returns 2*PAGE.
+        let file_size = (3 * PAGE) as u64;
+        let mut buf = alloc::vec![0u8; 3 * PAGE];
+        let served = crate::mm::cache::read_satisfy(mount_idx, inode, 0, file_size, &mut buf);
+        if served != 2 * PAGE {
+            test_fail!("test242A", "read_satisfy served {} bytes; expected {} (prefix up to gap)",
+                served, 2 * PAGE);
+            cleanup(&seeded);
+            return false;
+        }
+        if !buf[..2 * PAGE].iter().all(|&b| b == b'C') {
+            test_fail!("test242A", "served prefix not all 'C' — cache bytes not returned");
+            cleanup(&seeded);
+            return false;
+        }
+        // The tail past the gap must be untouched (still 0): read_satisfy must
+        // never copy past the first non-resident page.
+        if !buf[2 * PAGE..].iter().all(|&b| b == 0) {
+            test_fail!("test242A", "read_satisfy wrote past the cache gap into the uncached tail");
+            cleanup(&seeded);
+            return false;
+        }
+        test_println!("  A1: read_satisfy serves cache prefix [0,8192)='C', stops at gap ✓");
+
+        // (A2) write(2) coherence: a write(2) to a cached page must be visible
+        // to a subsequent read(2).  The write path keeps the cache coherent in
+        // place by calling `mm::cache::update_range` for the written range (see
+        // `fd_write` / `write_file`); invoke that same reconciliation here for
+        // an in-place 100-byte overwrite of page 0, then assert read_satisfy
+        // returns the post-write bytes ('W') for [0,100) and the untouched
+        // cache bytes ('C') beyond.
+        let new_head = alloc::vec![b'W'; 100];
+        crate::mm::cache::update_range(mount_idx, inode, 0, &new_head);
+        let mut buf2 = alloc::vec![0u8; PAGE];
+        let served2 = crate::mm::cache::read_satisfy(mount_idx, inode, 0, file_size, &mut buf2);
+        if served2 != PAGE {
+            test_fail!("test242A", "post-write read_satisfy served {} (expected {})", served2, PAGE);
+            cleanup(&seeded);
+            return false;
+        }
+        if !buf2[..100].iter().all(|&b| b == b'W') || !buf2[100..].iter().all(|&b| b == b'C') {
+            test_fail!("test242A", "write(2) not coherent in cache: [0]={:#x} [100]={:#x}",
+                buf2[0], buf2[100]);
+            cleanup(&seeded);
+            return false;
+        }
+        test_println!("  A2: write(2) propagated into the cached page (update_range) ✓");
+
+        // (A3) an offset at/after EOF: read_satisfy returns 0 (POSIX read(2)
+        // returns no bytes past end-of-file) so the caller falls through to the
+        // backing store, which applies its own EOF clamp.
+        let mut buf3 = alloc::vec![0u8; PAGE];
+        let served3 = crate::mm::cache::read_satisfy(
+            mount_idx, inode, 100 * PAGE as u64, file_size, &mut buf3);
+        if served3 != 0 {
+            test_fail!("test242A", "read_satisfy past EOF served {} (expected 0)", served3);
+            cleanup(&seeded);
+            return false;
+        }
+        test_println!("  A3: offset past EOF → read_satisfy 0 (caller falls to backing store) ✓");
+
+        // (A4) EOF clamp within a cached page: a read whose buffer extends past
+        // i_size must NOT return the cache frame's zero-padded tail as content.
+        // Shrink the conceptual file to 100 bytes and read a full page — only
+        // the 100 in-file bytes (from the cached page) may be served.
+        let mut buf4 = alloc::vec![0u8; PAGE];
+        let served4 = crate::mm::cache::read_satisfy(mount_idx, inode, 0, 100, &mut buf4);
+        if served4 != 100 {
+            test_fail!("test242A", "EOF clamp: read_satisfy served {} (expected 100)", served4);
+            cleanup(&seeded);
+            return false;
+        }
+        test_println!("  A4: read past EOF within a cached page clamps to i_size ✓");
+
+        cleanup(&seeded);
+    }
+
+    // ══ Part B: end-to-end — a cache hit serves a read with a DEAD device ══
+    {
+        use crate::drivers::block::MutableMemoryBlockDevice;
+        use crate::vfs::ext2::Ext2Fs;
+        use crate::vfs::FileSystemOps;
+
+        // An 8 KiB contiguous file on inode 11 (the libstdc++-relaunch shape:
+        // the loader reads the head of a shared object that is already cached).
+        let payload: alloc::vec::Vec<u8> =
+            (0..8 * 1024u32).map(|i| ((i * 17 + 3) & 0xFF) as u8).collect();
+
+        // Build the fixture through a clean device, snapshot the image.
+        let backing = alloc::sync::Arc::new(MutableMemoryBlockDevice::new(build_ext2_test_image()));
+        {
+            let fs = Ext2Fs::new(alloc::boxed::Box::new(ArcDevShim(backing.clone())))
+                .expect("clean mount for fixture");
+            if fs.write(11, 0, &payload).expect("write 8K") != payload.len() {
+                test_fail!("test242B", "short write building fixture");
+                return false;
+            }
+        }
+        let clean_img = backing.snapshot();
+
+        // The file's data sectors (logical blocks 0..8) — arm the fault over
+        // the whole file so EVERY data read fails (a permanently-dead device).
+        let (lba0, _scount) = {
+            let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(clean_img.clone()));
+            let fs = Ext2Fs::new(dev).expect("remount clean for probe");
+            match fs.resolve_block_sectors_for_test(11, 0) {
+                Some(v) => v,
+                None => { test_fail!("test242B", "resolve block 0 sectors"); return false; }
+            }
+        };
+        let (lba_last, slast) = {
+            let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(clean_img.clone()));
+            let fs = Ext2Fs::new(dev).expect("remount clean for probe2");
+            match fs.resolve_block_sectors_for_test(11, 7) {
+                Some(v) => v,
+                None => { test_fail!("test242B", "resolve block 7 sectors"); return false; }
+            }
+        };
+
+        let fs = Ext2Fs::new(alloc::boxed::Box::new(FaultInjectBlockDevice {
+            inner: alloc::sync::Arc::new(MutableMemoryBlockDevice::new(clean_img.clone())),
+            fault_lo: lba0,
+            fault_hi: lba_last + slast as u64,
+            remaining: core::sync::atomic::AtomicU32::new(u32::MAX), // permanently dead
+        })).expect("mount behind permanently-faulting device");
+
+        // Synthetic mount index that no real mount uses, so the cache keys are
+        // private to this test.  read_satisfy only reads the global cache by
+        // key; it never consults the mount table.
+        let syn_mount: usize = 0x7E42;
+        let inode: u64 = 11;
+
+        // Prepopulate the file's two pages into the cache (boot prepopulate).
+        let mut seeded: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for pg in 0..2u64 {
+            let phys = match crate::mm::pmm::alloc_page() {
+                Some(p) => p,
+                None => {
+                    test_fail!("test242B", "alloc_page");
+                    for &s in &seeded { let _ = crate::mm::cache::evict(syn_mount, inode, s); }
+                    return false;
+                }
+            };
+            let off = (pg as usize) * PAGE;
+            let dst = (PHYS_OFF + phys) as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(dst, 0, PAGE);
+                core::ptr::copy_nonoverlapping(payload.as_ptr().add(off), dst, PAGE);
+            }
+            crate::mm::cache::insert(syn_mount, inode, pg * PAGE as u64, phys);
+            seeded.push(pg * PAGE as u64);
+        }
+
+        // Compose exactly as fd_read does: cache-first, fall to fs.read only for
+        // the uncached tail.  With the whole file cached, fs.read is never
+        // called → the dead device is never touched → success.
+        let fsize = payload.len() as u64;
+        let read_like_fd = |fs: &Ext2Fs, mount: usize, inode: u64, off: u64, buf: &mut [u8]|
+            -> Result<usize, crate::vfs::VfsError>
+        {
+            let cached = crate::mm::cache::read_satisfy(mount, inode, off, fsize, buf);
+            if cached >= buf.len() {
+                Ok(cached)
+            } else {
+                let tail = fs.read(inode, off + cached as u64, &mut buf[cached..])?;
+                Ok(cached + tail)
+            }
+        };
+
+        let mut got = alloc::vec![0xEEu8; payload.len()];
+        match read_like_fd(&fs, syn_mount, inode, 0, &mut got) {
+            Ok(n) if n == payload.len() && got == payload => {
+                test_println!("  B1: full read served from cache, dead device untouched ✓");
+            }
+            Ok(n) => {
+                test_fail!("test242B", "cache-served read wrong: n={} bytes_match={}",
+                    n, got == payload);
+                for &s in &seeded { let _ = crate::mm::cache::evict(syn_mount, inode, s); }
+                return false;
+            }
+            Err(e) => {
+                test_fail!("test242B",
+                    "cache-served read EIO'd ({:?}) — the cache should have satisfied it \
+                     with ZERO device I/O", e);
+                for &s in &seeded { let _ = crate::mm::cache::evict(syn_mount, inode, s); }
+                return false;
+            }
+        }
+
+        // Now evict the cache and prove the device REALLY faults — otherwise B1
+        // would be vacuous (a no-op fault injector).  The same composed read
+        // must now reach fs.read and surface -EIO (mapped from the device).
+        for &s in &seeded { let _ = crate::mm::cache::evict(syn_mount, inode, s); }
+        seeded.clear();
+        let mut got2 = alloc::vec![0xEEu8; payload.len()];
+        match read_like_fd(&fs, syn_mount, inode, 0, &mut got2) {
+            Err(crate::vfs::VfsError::Io) => {
+                test_println!("  B2: with cache evicted, the dead device EIOs (fault is real) ✓");
+            }
+            Err(e) => {
+                test_fail!("test242B", "post-evict read returned unexpected error {:?} (expected Io)", e);
+                return false;
+            }
+            Ok(n) => {
+                test_fail!("test242B",
+                    "post-evict read returned Ok({}) over a permanently-dead device — \
+                     the fault injector is not actually faulting, B1 would be vacuous", n);
+                return false;
+            }
+        }
+    }
+
+    test_pass!("read(2) consults page cache before backing store (POSIX read(2))");
     true
 }
 

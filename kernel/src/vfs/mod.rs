@@ -2804,12 +2804,60 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             }
 
             let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+
+            // ── Forward page-cache read shortcut ──────────────────────────────
+            //
+            // Serve the leading run of cache-resident pages straight from the
+            // page cache, issuing a backing-store read ONLY for the uncached
+            // tail.  This brings `read(2)` into agreement with the mmap
+            // demand-fault path, which already consults the cache (it installs a
+            // PTE on a cache hit and only calls `fs.read` on a miss).  A file
+            // whose pages are already resident — e.g. a boot-time-prepopulated
+            // shared library being re-`read(2)` by the dynamic loader — is then
+            // served with ZERO device I/O, so a transient backing-store error
+            // (a contended block device under teardown load) can never fail a
+            // read whose bytes are already cached.  Per POSIX read(2) (IEEE Std
+            // 1003.1-2017) the data returned is the file's current content;
+            // serving it from the cache is invisible to the caller, and the
+            // `write(2)`/`truncate(2)` paths keep the cache coherent in place
+            // (`mm::cache::update_range` / `truncate_range`), so the cached
+            // bytes equal the bytes a fresh device read would return.
+            //
+            // The cache's last frame for a file is zero-padded past `i_size`, so
+            // `read_satisfy` is given the file size to clamp the served prefix to
+            // EOF (POSIX read(2): only bytes up to end-of-file are returned).
+            // The size is read from the inode metadata (an inode-cache hit on the
+            // hot path); on any stat error we skip the cache shortcut and let the
+            // backing-store read apply its own EOF clamp.
+            let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+            let cached_prefix = if mount_idx != usize::MAX {
+                match fs.stat(inode) {
+                    Ok(st) => crate::mm::cache::read_satisfy(
+                        mount_idx, inode, offset, st.size, buffer,
+                    ),
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+
             // Drop MOUNTS before the FS read: the read may fault on the
             // user buffer pages (file-backed VMA), and the page-fault
             // handler also needs MOUNTS — same-thread recursion (#82).
-            let n = {
-                let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
-                fs.read(inode, offset, &mut buffer)?
+            //
+            // Only the tail `[offset + cached_prefix, offset + count)` that the
+            // cache did not cover is read from the backing store.  When the
+            // whole request was served from the cache the device is never
+            // touched.
+            let n = if cached_prefix >= count {
+                cached_prefix
+            } else {
+                let tail_n = fs.read(
+                    inode,
+                    offset + cached_prefix as u64,
+                    &mut buffer[cached_prefix..],
+                )?;
+                cached_prefix + tail_n
             };
 
             // Reverse-direction page-cache coherency (closes the ramfs/tmpfs/
@@ -2824,7 +2872,9 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             // write to the underlying file object and must be visible to a later
             // `read(2)`.  Block-backed filesystems are unaffected (their cache and
             // on-disk bytes already agree via `cache::update_range`, so the
-            // overlay copies identical bytes).  See `mm::cache::read_through`.
+            // overlay copies identical bytes).  The bytes already served from the
+            // cache prefix above are equally authoritative; overlaying the full
+            // span is idempotent for them.  See `mm::cache::read_through`.
             if n > 0 && mount_idx != usize::MAX {
                 crate::mm::cache::read_through(mount_idx, inode, offset, &mut buffer[..n]);
             }

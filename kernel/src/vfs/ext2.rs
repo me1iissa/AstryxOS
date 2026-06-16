@@ -625,26 +625,60 @@ impl Ext2Fs {
         }
     }
 
-    /// Sector read with a bounded retry for transient device errors.
+    /// Sector read with a bounded, yielding retry for transient device errors.
     ///
     /// A block device may report a *retryable* condition (a queue-full / busy
-    /// timeout that resolves once the device drains) as an error.  Treating
+    /// timeout that resolves once the device drains, or a request that hit the
+    /// device's no-progress deadline under contention) as an error.  Treating
     /// such a transient failure as a hard error — and worse, as end-of-file —
     /// would poison the page cache with zeros (see `read_inode_data`).  We
     /// therefore retry a small, bounded number of times before surfacing the
-    /// error to the caller.  This is NOT a substitute for genuine error
-    /// handling: after the retry budget is exhausted the error propagates so
-    /// the read path can fail the covering read rather than silently truncate
-    /// it.  POSIX read(2): a read interrupted by an error returns -1, not a
+    /// error to the caller.
+    ///
+    /// The retry budget has two phases:
+    ///
+    ///   1. A few **immediate** attempts, for a one-shot glitch that clears
+    ///      without rescheduling (the original behaviour).
+    ///   2. A bounded run of **yield-then-retry** attempts.  Under a heavy
+    ///      teardown / fork storm a HEALTHY block device can still miss its
+    ///      per-request no-progress deadline simply because the requesting
+    ///      thread was descheduled long enough for the deadline to lapse while
+    ///      sibling threads saturated the CPU and the request queue.  Spinning
+    ///      immediately just burns the next deadline the same way; instead we
+    ///      `yield_cpu()` so the device's in-flight requests can complete and
+    ///      the contention drains, then retry.  This rides out a transient
+    ///      contention window without failing a read whose data the device is
+    ///      perfectly capable of returning.
+    ///
+    /// This is NOT a substitute for genuine error handling: the budget is
+    /// bounded, so after it is exhausted the error propagates and a genuinely
+    /// wedged or dead device still fails the covering read rather than hanging
+    /// forever.  POSIX read(2): a read interrupted by an error returns -1, not a
     /// short count that masquerades as EOF.
     fn read_sectors_retry(&self, sector: u64, count: u16, buf: &mut [u8])
         -> Result<(), &'static str>
     {
-        // 3 attempts total (1 + 2 retries): enough to ride out a momentary
-        // queue-full / yield window without unbounded spinning on a hard fault.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last = Ok(());
-        for _ in 0..MAX_ATTEMPTS {
+        // Phase 1: immediate attempts for a glitch that clears without yielding.
+        const IMMEDIATE_ATTEMPTS: u32 = 3;
+        // Phase 2: yield-then-retry attempts for a contended-but-healthy device.
+        // Bounded so a dead device still fails in finite time: with the device's
+        // ~1 s no-progress deadline this caps the worst case at roughly a few
+        // seconds before the error surfaces.
+        const YIELD_RETRY_ATTEMPTS: u32 = 5;
+
+        let mut last = self.read_sectors_inner(sector, count, buf);
+        if last.is_ok() {
+            return Ok(());
+        }
+        for _ in 1..IMMEDIATE_ATTEMPTS {
+            last = self.read_sectors_inner(sector, count, buf);
+            if last.is_ok() {
+                return Ok(());
+            }
+        }
+        // Phase 2: give the contended device room to drain between attempts.
+        for _ in 0..YIELD_RETRY_ATTEMPTS {
+            crate::sched::yield_cpu();
             last = self.read_sectors_inner(sector, count, buf);
             if last.is_ok() {
                 return Ok(());

@@ -667,6 +667,116 @@ pub fn read_through(mount_idx: usize, inode: u64, offset: u64, buf: &mut [u8]) {
     }
 }
 
+/// Satisfy a `read(2)` of the file range `[offset, offset + buf.len())` from the
+/// page cache where possible, copying cache-resident pages into `buf` and
+/// returning the length of the **contiguous leading prefix** that was served.
+///
+/// This is the read-path cache shortcut: a regular-file `read(2)` whose pages
+/// are already resident in the page cache is served straight from those frames
+/// with ZERO backing-store I/O, exactly as a unified-page-cache kernel does.
+/// The mmap demand-fault path already consults the cache (it installs a PTE on
+/// a cache hit and only issues `fs.read` on a miss); this brings `read(2)` into
+/// agreement so the two paths share one source of truth.  Per POSIX read(2)
+/// (IEEE Std 1003.1-2017): the data returned by `read()` is the file's current
+/// content; whether it comes from a cache or the backing store is an
+/// implementation detail invisible to the caller.  Because the `write(2)` path
+/// keeps every overlapping cache page current in place (see
+/// [`update_range`]) and `truncate(2)` reconciles the cache (see
+/// [`truncate_range`]), the cache frame and the backing-store bytes always
+/// agree, so serving from the cache returns identical bytes to a fresh device
+/// read — but without the I/O.
+///
+/// ## Why a contiguous prefix
+///
+/// The cache is sparse: an arbitrary subset of a file's pages may be resident.
+/// Returning only the leading run of fully-resident pages keeps the caller's
+/// fall-through logic trivial: it issues ONE backing-store read for the
+/// remaining `[offset + served, offset + buf.len())` tail and is done.  The
+/// common case this targets — a fully-prepopulated shared library (e.g. the
+/// boot-time page-cache prepopulate loads every page of `libstdc++.so.6`) — is
+/// served entirely from the cache (`served == buf.len()` for any in-bounds
+/// read), so the device is never touched.  A partially-resident file degrades
+/// to the prefix served from cache plus one device read for the tail.
+///
+/// The scan stops at the first page that is NOT cache-resident.
+///
+/// ## EOF clamp
+///
+/// The page cache holds whole 4 KiB frames even for the file's last,
+/// partially-valid page (the prepopulate path zero-fills the tail past
+/// `i_size`).  Serving that frame verbatim would return zero bytes that lie
+/// PAST end-of-file as if they were file content — a `read(2)` whose `buf` is
+/// larger than the file would then over-report its byte count.  The caller
+/// therefore passes `file_size`; the served range is clamped to
+/// `[offset, min(offset + buf.len(), file_size))` so the prefix never includes
+/// a byte at or beyond EOF.  Per POSIX read(2): a read that reaches end-of-file
+/// returns only the bytes up to EOF.
+///
+/// Returns the number of bytes copied into `buf` (`0` on a cold first page, an
+/// EOF-clamped prefix when the request runs past `file_size`, and
+/// `min(buf.len(), file_size - offset)` when every covered page is resident).
+///
+/// Safety: each cache entry's `phys` is alive while the cache lock is held (the
+/// cache holds a reference), so the `PHYS_OFF + phys` read lands in valid memory
+/// (Intel SDM Vol. 3A §4.10.5 higher-half identity map).  The lock is held only
+/// across the small per-page copies; no FS or PMM dispatch happens under it.
+pub fn read_satisfy(
+    mount_idx: usize,
+    inode: u64,
+    offset: u64,
+    file_size: u64,
+    buf: &mut [u8],
+) -> usize {
+    if buf.is_empty() || mount_idx == usize::MAX || offset >= file_size {
+        return 0;
+    }
+    const PAGE: u64 = 4096;
+    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+    let start = offset;
+    // Clamp the request to end-of-file: the cache's last frame is zero-padded
+    // past `i_size`, and those bytes are NOT file content.
+    let end = core::cmp::min(offset.saturating_add(buf.len() as u64), file_size);
+    if end <= start {
+        return 0;
+    }
+    // First page-aligned offset covering `start`.
+    let mut page = start & !(PAGE - 1);
+
+    let cache = PAGE_CACHE.lock();
+    let mut served: usize = 0;
+    while page < end {
+        let entry = match cache.get(&(mount_idx, inode, page)) {
+            Some(e) => e,
+            // First gap: stop.  The prefix served so far is contiguous from
+            // `offset`; the caller reads the remainder from the backing store.
+            None => break,
+        };
+        // [page, page+PAGE) ∩ [start, end) in file coordinates.
+        let slice_start = core::cmp::max(page, start);
+        let slice_end = core::cmp::min(page + PAGE, end);
+        debug_assert!(slice_start < slice_end);
+        let cache_off = (slice_start - page) as usize;
+        let buf_off = (slice_start - start) as usize;
+        let n = (slice_end - slice_start) as usize;
+        // Only a CONTIGUOUS prefix is served: if a previous page was missing we
+        // would have broken out already, so `buf_off == served` holds here.
+        debug_assert_eq!(buf_off, served);
+        let src = (PHYS_OFFSET + entry.phys + cache_off as u64) as *const u8;
+        let dst = unsafe { buf.as_mut_ptr().add(buf_off) };
+        // SAFETY: cache page is 4 KiB; cache_off + n ≤ PAGE by construction.
+        // `buf[buf_off..buf_off+n]` is in-bounds because slice_end ≤ end =
+        // start + buf.len().  Source (PMM frame) and destination (caller
+        // buffer) are distinct allocations.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, n);
+        }
+        served += n;
+        page += PAGE;
+    }
+    served
+}
+
 /// Bring the page cache into coherence with a file that has just been
 /// resized from `old_size` to `new_size` bytes.
 ///
