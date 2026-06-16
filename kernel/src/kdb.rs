@@ -21,8 +21,22 @@ pub const KDB_PORT: u16 = 9999;
 
 /// Maximum request line size.  Safeguards against a misbehaving client.
 const MAX_REQ_BYTES:  usize = 16 * 1024;
-/// Maximum response size written back in one segment.
-const MAX_RESP_BYTES: usize = 32 * 1024;
+/// Maximum response size before the global truncation guard trips.
+///
+/// Raised from 32 KiB to 256 KiB so the `read-file` op can return a 128 KiB raw
+/// chunk (≈ 175 KiB base64 + envelope) in ONE round-trip.  Each kdb request is
+/// one-shot-TCP processed on the next `net::poll()` pump cycle, so the round-trip
+/// COUNT — not the byte volume — dominates extraction wall-time.  Measured cost
+/// of a single read-file request under guest load: 16 KiB ≈ 0.9 s, 128 KiB
+/// ≈ 2.0 s, but 256 KiB jumps to ≈ 16 s (the larger response overruns the TCP
+/// receive window and stalls on a retransmit timeout).  128 KiB is the knee:
+/// a 2 MB extraction is ~16 round-trips ≈ 33 s, inside the live window before
+/// Firefox-exit teardown starves the pump, and stays under the window wall.
+/// Other ops self-cap at their own local budgets (dmesg/stack walk), so the only
+/// behavioural change is that `read-file` responses up to this size pass through
+/// intact instead of being truncated mid-base64.  The host `_kdb_recv` reads
+/// until EOF and imposes its own `_KDB_RECV_MAX` ceiling.
+const MAX_RESP_BYTES: usize = 256 * 1024;
 
 // ── Dmesg ring buffer ────────────────────────────────────────────────────────
 //
@@ -1024,9 +1038,16 @@ fn op_user_mem(req: &str, out: &mut String) {
 // begins with the 8-byte PNG signature (W3C PNG §5.2 / ISO 15948) — a cheap
 // "is this a real PNG?" check the host can read off the first chunk.
 
-/// Max raw bytes per read-file chunk.  16384 raw -> ceil(16384/3)*4 = 21848
-/// base64 chars, comfortably under the 32 KiB MAX_RESP_BYTES kdb response cap.
-const READ_FILE_CHUNK: u64 = 16384;
+/// Max raw bytes per read-file chunk.  131072 raw -> ceil(131072/3)*4 = 174764
+/// base64 chars (+ ~110-byte JSON envelope), under the 256 KiB MAX_RESP_BYTES
+/// cap.  Sized to the measured latency knee: a single read-file request costs
+/// ≈ 0.9 s at 16 KiB, ≈ 2.0 s at 128 KiB, but ≈ 16 s at 256 KiB (the response
+/// overruns the TCP receive window and stalls).  128 KiB minimises
+/// round-trips × per-trip-latency for a multi-MB pull: a 2 MB file is
+/// ~16 round-trips ≈ 33 s — inside the live window before FF-exit teardown
+/// starves the pump.  16 KiB (the previous value) was ~128 round-trips ≈ 2 min
+/// and lost the race.  The host loops `offset += n` until `eof`.
+const READ_FILE_CHUNK: u64 = 128 * 1024;
 
 /// Single-entry snapshot for the in-flight `read-file` extraction.
 ///

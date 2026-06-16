@@ -11217,7 +11217,16 @@ def cmd_kdb_read_png(args):
     path       = args.path
     dst        = args.dst
     timeout    = float(getattr(args, "timeout", 10.0) or 10.0)
-    max_chunks = 4096  # generous ceiling; a 16 KiB chunk × 4096 = 64 MiB cap
+    # Match the kernel READ_FILE_CHUNK (128 KiB — the measured latency knee).
+    # Each kdb request is one-shot TCP processed on the next net::poll() pump
+    # cycle, so the round-trip COUNT dominates extraction wall-time (a single
+    # request is ~0.9 s at 16 KiB, ~2.0 s at 128 KiB, but ~16 s at 256 KiB where
+    # the response overruns the TCP window). 128 KiB pulls a 2 MB file in ~16
+    # round-trips (~33 s) instead of ~128 (~2 min), finishing inside the live
+    # window before Firefox-exit teardown starves the pump. The kernel caps len
+    # at READ_FILE_CHUNK and the host loops offset += n until eof.
+    chunk_len  = 128 * 1024
+    max_chunks = 8192  # generous ceiling; 128 KiB × 8192 = 1 GiB cap
 
     chunks: list[bytes] = []
     offset = 0
@@ -11225,7 +11234,7 @@ def cmd_kdb_read_png(args):
     sig_png: Optional[bool] = None
 
     for _ in range(max_chunks):
-        req = {"op": "read-file", "path": path, "offset": offset, "len": 16384}
+        req = {"op": "read-file", "path": path, "offset": offset, "len": chunk_len}
         try:
             raw = _kdb_recv(port, req, timeout=timeout)
             resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
