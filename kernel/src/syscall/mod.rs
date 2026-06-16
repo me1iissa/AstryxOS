@@ -3213,7 +3213,21 @@ pub(crate) fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) ->
             }
             0
         }
-        TIOCSCTTY | TIOCNOTTY => 0,  // controlling-tty stubs
+        TIOCSCTTY => {
+            // Associate the calling process's session with this terminal.
+            // Per POSIX tty_ioctl(4) / setsid(2): when a session leader
+            // acquires a controlling terminal, the terminal's foreground
+            // process group is set to the session leader's process group.
+            // Seed `fg_pgid` with the caller's pgid so job-control signal
+            // generation (^C → SIGINT) has a valid target even when userspace
+            // never issues an explicit tcsetpgrp(3)/TIOCSPGRP.
+            let pgid = crate::proc::current_pgid();
+            if pgid != 0 {
+                crate::drivers::pty::set_fg_pgid(pty_n, pgid);
+            }
+            0
+        }
+        TIOCNOTTY => 0,  // detach controlling tty — stub
         TIOCGETSID => {
             if !arg_ptr.is_null() {
                 let pid = crate::proc::current_pid() as i32;
@@ -3274,7 +3288,18 @@ pub(crate) fn sys_pty_slave_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) -> 
             }
             0
         }
-        TIOCSCTTY | TIOCNOTTY => 0,
+        TIOCSCTTY => {
+            // See `sys_pty_master_ioctl`: seed the foreground process group
+            // with the controlling session leader's pgid (POSIX tty_ioctl(4)).
+            // A shell typically issues TIOCSCTTY on its SLAVE fd after setsid(2),
+            // so this slave-side arm is the one real shells exercise.
+            let pgid = crate::proc::current_pgid();
+            if pgid != 0 {
+                crate::drivers::pty::set_fg_pgid(pty_n, pgid);
+            }
+            0
+        }
+        TIOCNOTTY => 0,
         TIOCGETSID => {
             if !arg_ptr.is_null() {
                 let pid = crate::proc::current_pid() as i32;

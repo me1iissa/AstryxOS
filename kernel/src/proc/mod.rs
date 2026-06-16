@@ -1096,6 +1096,19 @@ pub fn current_pid_lockless() -> Pid {
     PER_CPU_CURRENT_PID[cpu_index()].load(Ordering::Relaxed)
 }
 
+/// Process-group ID of the currently running process (0 if unknown).
+///
+/// Used by the controlling-terminal association path (`TIOCSCTTY`): per POSIX
+/// `tty_ioctl(4)` / `setsid(2)`, when a session leader acquires a controlling
+/// terminal, that terminal's foreground process group is set to the session
+/// leader's process group.  Reading it lets the PTY record a sane default
+/// `fg_pgid` even when userspace never issues an explicit `tcsetpgrp(3)`.
+pub fn current_pgid() -> u32 {
+    let pid = current_pid_lockless();
+    let procs = PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid).map(|p| p.pgid).unwrap_or(0)
+}
+
 /// Get the currently running process's PID.
 pub fn current_pid() -> Pid {
     let tid = current_tid();

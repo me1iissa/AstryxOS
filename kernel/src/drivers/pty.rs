@@ -28,7 +28,7 @@ use spin::Mutex;
 
 use crate::drivers::tty::{Termios, Winsize, NCCS,
     ICRNL, INLCR, IGNCR, OPOST, ONLCR, CS8, CREAD, CLOCAL,
-    ECHO, ECHOE, ICANON, ISIG, IEXTEN,
+    ECHO, ECHOE, ICANON, ISIG, IEXTEN, NOFLSH,
     VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN,
     VSTART, VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT};
 use crate::ipc::waitlist::{ring_poll_bell_for_obj, wake_tids, PollBellSource, WaitList};
@@ -247,51 +247,147 @@ pub fn free(n: u8) {
 /// The return value is the number of *input* bytes consumed from `data` (POSIX
 /// `write(2)` semantics), bounded by `m2s` capacity; echo is best-effort and
 /// capacity-bounded so a flood never grows `s2m` unboundedly.
+///
+/// ## Signal generation (job control)
+///
+/// When the slave line discipline has `ISIG` set and is in canonical
+/// (cooked) mode — the interactive-shell default (see `const_default_termios`)
+/// — the special control characters generate a job-control signal to the
+/// terminal's foreground process group instead of being queued as input, per
+/// POSIX `termios(3)` "Special Characters" and the ISIG description:
+///
+///   * `VINTR` (`^C`, default 3)  → `SIGINT`
+///   * `VQUIT` (`^\`, default 28) → `SIGQUIT`
+///   * `VSUSP` (`^Z`, default 26) → `SIGTSTP`
+///
+/// The signal goes to the foreground pgrp recorded by `tcsetpgrp(3)` /
+/// `ioctl(TIOCSPGRP)` (`fg_pgid`); a shell sets that to its launched
+/// pipeline's pgid, so `^C` interrupts the running command, not the shell.
+/// Unless `NOFLSH` is set, generating the signal also flushes the pending
+/// input queue (`m2s`) so a half-typed line is discarded, matching the
+/// canonical terminal behaviour.  When `ISIG` is clear or the slave is in
+/// raw mode (`!ICANON` — an editor/pager/`less` owns the keystrokes), the
+/// control byte is passed through unchanged.
+///
+/// The actual signal delivery (`signal::kill(-pgid, sig)`) takes
+/// `PROCESS_TABLE`, so it is performed AFTER `PAIRS` is dropped — the same
+/// lock-order discipline the wake helpers follow (`*_WAITERS`/`PROCESS_TABLE`
+/// never nested under `PAIRS`).
 pub fn master_write(n: u8, data: &[u8]) -> usize {
-    let mut pairs = PAIRS.lock();
-    if let Some(Some(p)) = pairs.get_mut(n as usize) {
-        let iflag = p.termios.c_iflag;
-        let echo = p.termios.c_lflag & ECHO != 0;
-        // Output processing for the echo mirrors slave_write (OPOST|ONLCR).
-        let oproc = p.termios.c_oflag & OPOST != 0 && p.termios.c_oflag & ONLCR != 0;
-        let mut consumed = 0usize;
-        for &raw in data {
-            // IGNCR: drop a CR before it reaches the input queue (still counts
-            // as consumed — the byte was processed, just discarded).
-            if raw == b'\r' && iflag & IGNCR != 0 {
-                consumed += 1;
-                continue;
-            }
-            // ICRNL: CR→NL.  INLCR: NL→CR.  (Mutually applied per byte.)
-            let ch = if raw == b'\r' && iflag & ICRNL != 0 {
-                b'\n'
-            } else if raw == b'\n' && iflag & INLCR != 0 {
-                b'\r'
-            } else {
-                raw
-            };
-            if BUF_CAP.saturating_sub(p.m2s.len()) < 1 {
-                break; // input queue full — stop, report input consumed so far
-            }
-            p.m2s.push(ch);
-            // ECHO of this processed input character onto the slave output.
-            if echo {
-                if ch == b'\n' && oproc {
-                    // Echoed newline → CR-NL (clean Enter), space permitting.
-                    if BUF_CAP.saturating_sub(p.s2m.len()) >= 2 {
-                        p.s2m.push(b'\r');
-                        p.s2m.push(b'\n');
+    // Signal to deliver to the foreground pgrp after dropping PAIRS, if a
+    // control character was recognised: (pgid, signo).  Collected under the
+    // lock, delivered after, so PROCESS_TABLE is never taken under PAIRS.
+    let mut pending_signal: Option<(u32, u8)> = None;
+    let consumed = {
+        let mut pairs = PAIRS.lock();
+        if let Some(Some(p)) = pairs.get_mut(n as usize) {
+            let iflag = p.termios.c_iflag;
+            let lflag = p.termios.c_lflag;
+            let echo = lflag & ECHO != 0;
+            let isig = lflag & ISIG != 0;
+            let cooked = lflag & ICANON != 0;
+            let noflsh = lflag & NOFLSH != 0;
+            let vintr = p.termios.c_cc[VINTR];
+            let vquit = p.termios.c_cc[VQUIT];
+            let vsusp = p.termios.c_cc[VSUSP];
+            let fg = p.fg_pgid;
+            // Output processing for the echo mirrors slave_write (OPOST|ONLCR).
+            let oproc = p.termios.c_oflag & OPOST != 0 && p.termios.c_oflag & ONLCR != 0;
+            let mut consumed = 0usize;
+            for &raw in data {
+                // Job-control signal generation (ISIG in cooked mode).  The
+                // control byte is consumed for signal generation and NOT
+                // queued as input; only the FIRST recognised control byte in
+                // this write generates a signal (a single keypress).  Per
+                // termios(3), the comparison is against the *raw* byte (the
+                // c_cc[] entries are stored as raw control codes), checked
+                // before ICRNL/INLCR translation.
+                if isig && cooked && pending_signal.is_none() {
+                    let sig = if raw == vintr {
+                        Some(crate::signal::SIGINT)
+                    } else if raw == vquit {
+                        Some(crate::signal::SIGQUIT)
+                    } else if raw == vsusp {
+                        Some(crate::signal::SIGTSTP)
+                    } else {
+                        None
+                    };
+                    if let Some(signo) = sig {
+                        // Echo the control character as `^C` / `^\` / `^Z`
+                        // (a printable caret + the letter) so the terminal
+                        // shows the interrupt, matching the conventional
+                        // cooked-terminal display.  Best-effort, space-bounded.
+                        if echo {
+                            let letter = b'@'.wrapping_add(raw); // raw 3 → 'C'
+                            if BUF_CAP.saturating_sub(p.s2m.len()) >= 2 {
+                                p.s2m.push(b'^');
+                                p.s2m.push(letter);
+                            }
+                        }
+                        // Unless NOFLSH, discard the pending (half-typed) input
+                        // line — the canonical-terminal flush on signal.
+                        if !noflsh {
+                            p.m2s.clear();
+                        }
+                        // Record the target; deliver after PAIRS is dropped.
+                        // fg_pgid==0 means no foreground pgrp was ever set
+                        // (TIOCSPGRP never called) — drop the signal silently
+                        // rather than broadcasting to pgid 0.
+                        if fg != 0 {
+                            pending_signal = Some((fg, signo));
+                        }
+                        consumed += 1;
+                        continue;
                     }
-                } else if BUF_CAP.saturating_sub(p.s2m.len()) >= 1 {
-                    p.s2m.push(ch);
                 }
+                // IGNCR: drop a CR before it reaches the input queue (still counts
+                // as consumed — the byte was processed, just discarded).
+                if raw == b'\r' && iflag & IGNCR != 0 {
+                    consumed += 1;
+                    continue;
+                }
+                // ICRNL: CR→NL.  INLCR: NL→CR.  (Mutually applied per byte.)
+                let ch = if raw == b'\r' && iflag & ICRNL != 0 {
+                    b'\n'
+                } else if raw == b'\n' && iflag & INLCR != 0 {
+                    b'\r'
+                } else {
+                    raw
+                };
+                if BUF_CAP.saturating_sub(p.m2s.len()) < 1 {
+                    break; // input queue full — stop, report input consumed so far
+                }
+                p.m2s.push(ch);
+                // ECHO of this processed input character onto the slave output.
+                if echo {
+                    if ch == b'\n' && oproc {
+                        // Echoed newline → CR-NL (clean Enter), space permitting.
+                        if BUF_CAP.saturating_sub(p.s2m.len()) >= 2 {
+                            p.s2m.push(b'\r');
+                            p.s2m.push(b'\n');
+                        }
+                    } else if BUF_CAP.saturating_sub(p.s2m.len()) >= 1 {
+                        p.s2m.push(ch);
+                    }
+                }
+                consumed += 1;
             }
-            consumed += 1;
+            consumed
+        } else {
+            0
         }
-        consumed
-    } else {
-        0
+    };
+    // PAIRS is dropped — now safe to take PROCESS_TABLE for signal delivery.
+    if let Some((pgid, signo)) = pending_signal {
+        // kill(-pgid, sig): deliver to every process in the foreground group.
+        // signal::kill already implements the negative-pid pgrp fan-out
+        // (POSIX kill(2): "If pid is negative ... sig shall be sent to all
+        // processes ... whose process group ID is equal to the absolute
+        // value of pid").
+        let target = -(pgid as i64) as u64;
+        crate::signal::kill(target, signo);
     }
+    consumed
 }
 
 /// Read from the master side (data written by slave).
