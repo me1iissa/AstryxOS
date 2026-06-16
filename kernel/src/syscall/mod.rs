@@ -1867,6 +1867,17 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                         if f.file_type == crate::vfs::FileType::EventFd {
                             crate::ipc::eventfd::close(f.inode);
                         }
+                        // Drop the PTY end ref too: a CLOEXEC-marked master/
+                        // slave purged at execve must not silently leak its
+                        // reference, or the peer would never see hang-up.
+                        // dec_master/dec_slave lock only PAIRS + the PTY
+                        // wait-lists (never PROCESS_TABLE), so this is order-
+                        // safe under the `p` borrow.
+                        match f.file_type {
+                            crate::vfs::FileType::PtyMaster => { crate::drivers::pty::dec_master(f.inode as u8); }
+                            crate::vfs::FileType::PtySlave  => { crate::drivers::pty::dec_slave(f.inode as u8); }
+                            _ => {}
+                        }
                     }
                 }
                 if matches!(fd_slot, Some(f) if f.cloexec) {
@@ -4571,6 +4582,14 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
     if fd_clone.file_type == crate::vfs::FileType::EventFd {
         crate::ipc::eventfd::inc_ref(fd_clone.inode);
     }
+    // PTY master/slave: the duplicate is one more open reference on that end,
+    // so close(2) on either fd must not prematurely hang up the peer (pts(4)).
+    // inc_master/inc_slave lock only PAIRS (PROCESS_TABLE → PAIRS order holds).
+    match fd_clone.file_type {
+        crate::vfs::FileType::PtyMaster => crate::drivers::pty::inc_master(fd_clone.inode as u8),
+        crate::vfs::FileType::PtySlave  => crate::drivers::pty::inc_slave(fd_clone.inode as u8),
+        _ => {}
+    }
 
     // Find lowest free fd
     for i in 0..proc.file_descriptors.len() {
@@ -4643,6 +4662,14 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
     if fd_clone.file_type == crate::vfs::FileType::EventFd {
         crate::ipc::eventfd::inc_ref(fd_clone.inode);
     }
+    // PTY master/slave: the duplicate is one more open reference on that end.
+    // dup2()ing the slave onto fds 0/1/2 is exactly how an `ssh -tt` login
+    // sets up the shell's stdio, so this must count (pts(4)).
+    match fd_clone.file_type {
+        crate::vfs::FileType::PtyMaster => crate::drivers::pty::inc_master(fd_clone.inode as u8),
+        crate::vfs::FileType::PtySlave  => crate::drivers::pty::inc_slave(fd_clone.inode as u8),
+        _ => {}
+    }
 
     // Grow the table if needed
     while proc.file_descriptors.len() <= new_fd {
@@ -4670,6 +4697,15 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
         // A displaced eventfd loses one open-file-description ref too.
         if prev.file_type == crate::vfs::FileType::EventFd {
             crate::ipc::eventfd::close(prev.inode);
+        }
+        // A displaced PTY end loses one open reference; reaching zero hangs up
+        // the peer (pts(4)).  dec_master/dec_slave wake the peer and may reap
+        // the pair; they lock only PAIRS + the PTY wait-lists, never
+        // PROCESS_TABLE, so calling them under the procs lock is order-safe.
+        match prev.file_type {
+            crate::vfs::FileType::PtyMaster => { crate::drivers::pty::dec_master(prev.inode as u8); }
+            crate::vfs::FileType::PtySlave  => { crate::drivers::pty::dec_slave(prev.inode as u8); }
+            _ => {}
         }
     }
     proc.file_descriptors[new_fd] = Some(fd_clone);
@@ -5096,9 +5132,44 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         if crate::ipc::signalfd::is_readable(get_signalfd_id(pid, fd)) { events & POLLIN } else { 0 }
     } else if is_inotify_fd(pid, fd) {
         if crate::ipc::inotify::is_readable(get_inotify_id(pid, fd)) { events & POLLIN } else { 0 }
+    } else if let Some((is_master, pty_n)) = pty_fd_info(pid, fd) {
+        // PTY master/slave poll readiness (pts(4), pty(7), POSIX poll(2) on a
+        // terminal).  A queue with data ⇒ POLLIN on the reader; the write side
+        // never blocks (capped ring) so POLLOUT is always set; peer-close ⇒
+        // POLLHUP on the surviving end (reported unconditionally per poll(2),
+        // and coexisting with POLLIN while the reader drains the tail then
+        // observes EOF).
+        let mut rev = events & POLLOUT;
+        let (has_data, hung_up) = if is_master {
+            (crate::drivers::pty::master_readable(pty_n),
+             crate::drivers::pty::master_hung_up(pty_n))
+        } else {
+            (crate::drivers::pty::slave_readable(pty_n),
+             crate::drivers::pty::slave_hung_up(pty_n))
+        };
+        if has_data { rev |= events & POLLIN; }
+        if hung_up {
+            rev |= POLLHUP;          // unconditional per poll(2)
+            rev |= events & POLLIN;  // readable-for-EOF so read() returns 0
+        }
+        rev
     } else {
         events & (POLLIN | POLLOUT) // regular file always ready
     }
+}
+
+/// If `fd` is a PTY master/slave, returns `(is_master, pair_index)`.  Mirrors
+/// the helper in the Linux subsystem; kept here so `poll_revents` (used by the
+/// blocking select/poll rescan) can compute PTY terminal readiness.
+fn pty_fd_info(pid: u64, fd: usize) -> Option<(bool, u8)> {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+        .and_then(|f| match f.file_type {
+            crate::vfs::FileType::PtyMaster => Some((true,  f.inode as u8)),
+            crate::vfs::FileType::PtySlave  => Some((false, f.inode as u8)),
+            _ => None,
+        })
 }
 
 /// Returns true if `fd` is a console fd or is not currently open in `pid`.

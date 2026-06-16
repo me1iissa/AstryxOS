@@ -2192,16 +2192,18 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // into PIPE_TABLE / unix socket TABLE (lock ordering: resource table before
     // PROCESS_TABLE).
     const SOCKET_FD_FLAG: u32 = 0x4000_0000; // bit 30: AF_UNIX or AF_INET socket fd
-    let (pipe_ends, socket_ids, inet_socket_ids, eventfd_ids): (
+    let (pipe_ends, socket_ids, inet_socket_ids, eventfd_ids, pty_ends): (
         alloc::vec::Vec<(u64, bool)>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
+        alloc::vec::Vec<(u8, bool)>, // (pair_index, is_master)
     ) = {
         let procs = PROCESS_TABLE.lock();
-        let (mut pipes, mut sockets, mut inet_sockets, mut eventfds) =
+        let (mut pipes, mut sockets, mut inet_sockets, mut eventfds, mut ptys) =
             (alloc::vec::Vec::new(), alloc::vec::Vec::new(),
-             alloc::vec::Vec::new(), alloc::vec::Vec::new());
+             alloc::vec::Vec::new(), alloc::vec::Vec::new(),
+             alloc::vec::Vec::new());
         if let Some(p) = procs.iter().find(|p| p.pid == pid) {
             for f in p.file_descriptors.iter().filter_map(|f| f.as_ref()) {
                 if f.file_type == crate::vfs::FileType::Pipe
@@ -2223,10 +2225,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                     inet_sockets.push(f.inode);
                 } else if f.file_type == crate::vfs::FileType::EventFd {
                     eventfds.push(f.inode);
+                } else if f.file_type == crate::vfs::FileType::PtyMaster {
+                    ptys.push((f.inode as u8, true));
+                } else if f.file_type == crate::vfs::FileType::PtySlave {
+                    ptys.push((f.inode as u8, false));
                 }
             }
         }
-        (pipes, sockets, inet_sockets, eventfds)
+        (pipes, sockets, inet_sockets, eventfds, ptys)
     };
     for (pipe_id, is_write) in pipe_ends {
         if is_write {
@@ -2250,6 +2256,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // semantics, mirroring the socket/pipe handling above.
     for efd_id in eventfd_ids {
         crate::ipc::eventfd::close(efd_id);
+    }
+    // Drop each PTY end this process held open; reaching zero on the master
+    // hangs up the slave (so a still-running shell's read returns EOF) and
+    // vice versa (so dropbear's master pump sees the shell exit).  This is the
+    // close-on-exit half of the `ssh -tt` relay (pts(4), pty(7)).
+    for (pty_n, is_master) in pty_ends {
+        if is_master { crate::drivers::pty::dec_master(pty_n); }
+        else         { crate::drivers::pty::dec_slave(pty_n); }
     }
 
     // Release POSIX file locks held by this process (C1).
@@ -2944,6 +2958,24 @@ fn inc_eventfd_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
     }
 }
 
+/// Bump the PTY master/slave open-count for every PTY fd the child inherits
+/// via fork/vfork/clone-without-`CLONE_FILES`.  Same open-file-description
+/// rule (POSIX.1-2017 §2.14, fork(2)): the child's inherited descriptors are
+/// additional references to the same PTY end, so each must count — otherwise
+/// the child's pre-execve close scrub would drop the parent's master/slave
+/// reference to zero and hang up the still-live peer (pts(4)), giving the
+/// shell a spurious EOF.  This is exactly the `ssh -tt` shape: the server
+/// forks with the master fd inherited, then the child opens/dup2s the slave.
+fn inc_pty_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
+    for fd in fds.iter().filter_map(|f| f.as_ref()) {
+        match fd.file_type {
+            crate::vfs::FileType::PtyMaster => crate::drivers::pty::inc_master(fd.inode as u8),
+            crate::vfs::FileType::PtySlave  => crate::drivers::pty::inc_slave(fd.inode as u8),
+            _ => {}
+        }
+    }
+}
+
 /// Drop the pipe-end refcount associated with a single `FileDescriptor`
 /// that is about to be cleared (e.g. by `close(2)`, by `execve(2)`'s
 /// `FD_CLOEXEC` purge, or by `dup2(2)` overwriting an existing slot).
@@ -3033,6 +3065,10 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     // And eventfd slots — the child's pre-exec close-on-exec scrub must
     // not free a counter the parent still posts to (AudioIPC waker case).
     inc_eventfd_refs_for_fork(&fds);
+    // And PTY master/slave ends — the child must not hang up the peer when it
+    // closes its inherited copy (the `ssh -tt` login-shell case; see
+    // `inc_pty_refs_for_fork`).
+    inc_pty_refs_for_fork(&fds);
 
     // Enforce RLIMIT_NPROC: count non-zombie processes.
     {
@@ -3302,6 +3338,8 @@ pub fn fork_process_share_vm(
     inc_pipe_refs_for_fork(&fds);
     // And eventfd open-file-description refs (see `inc_eventfd_refs_for_fork`).
     inc_eventfd_refs_for_fork(&fds);
+    // And PTY master/slave ends (see `inc_pty_refs_for_fork`).
+    inc_pty_refs_for_fork(&fds);
 
     // RLIMIT_NPROC.
     {
@@ -4022,6 +4060,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     inc_pipe_refs_for_fork(&fds);
     // And eventfd open-file-description refs (see `inc_eventfd_refs_for_fork`).
     inc_eventfd_refs_for_fork(&fds);
+    // And PTY master/slave ends (see `inc_pty_refs_for_fork`).
+    inc_pty_refs_for_fork(&fds);
 
     // Get parent's TLS base from thread struct.
     let parent_tls = {

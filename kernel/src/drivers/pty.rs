@@ -31,6 +31,7 @@ use crate::drivers::tty::{Termios, Winsize, NCCS,
     ECHO, ECHOE, ICANON, ISIG, IEXTEN,
     VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN,
     VSTART, VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT};
+use crate::ipc::waitlist::{ring_poll_bell_for_obj, wake_tids, PollBellSource, WaitList};
 
 /// Maximum simultaneous PTY pairs.
 const MAX_PTYS: usize = 16;
@@ -60,6 +61,23 @@ pub struct PtyPair {
     /// by `tcsetpgrp(3)`; v1 returns 0 if never set (POSIX leaves the
     /// return value implementation-defined for an un-associated TTY).
     pub fg_pgid: u32,
+    /// Number of currently-open MASTER descriptors for this pair.  Bumped on
+    /// `/dev/ptmx` open (which allocates the pair, so it starts at 1) and on
+    /// `dup`; decremented on close.  When it reaches 0 the slave side is
+    /// "hung up": a slave `read(2)` returns 0 (EOF) and a slave `poll(2)`
+    /// reports `POLLHUP` (pts(4) / pty(7): closing the last master fd hangs
+    /// up the slave, like SIGHUP on a real terminal).
+    pub master_open: u32,
+    /// Number of currently-open SLAVE descriptors.  Bumped on `/dev/pts/N`
+    /// open and `dup`; decremented on close.  When it reaches 0 the master
+    /// side sees EOF / `POLLHUP` symmetrically.
+    pub slave_open: u32,
+    /// Sticky flag: set the first time the slave is opened.  Distinguishes
+    /// "slave never opened yet" (right after `alloc()` — the master must block,
+    /// not EOF, since the server is about to fork a child that opens the slave)
+    /// from "slave was opened and has since fully closed" (master EOF).  pts(4):
+    /// the master sees hang-up only after the slave actually existed.
+    pub slave_ever_opened: bool,
 }
 
 impl PtyPair {
@@ -80,6 +98,9 @@ impl PtyPair {
                 ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0,
             },
             fg_pgid: 0,
+            master_open: 0,
+            slave_open: 0,
+            slave_ever_opened: false,
         }
     }
 }
@@ -121,6 +142,27 @@ const fn const_default_termios() -> Termios {
 static PAIRS: Mutex<[Option<PtyPair>; MAX_PTYS]> =
     Mutex::new([const { None }; MAX_PTYS]);
 
+// Per-pair reader wait lists, kept OUTSIDE `PAIRS` so `PAIRS` is never held
+// across `schedule()`.  Lock order mirrors the pipe driver
+// (`crate::ipc::pipe`): a waiter takes `*_WAITERS` then briefly `PAIRS` to
+// re-check the condition; a writer/closer takes `PAIRS`, drops it, then takes
+// `*_WAITERS` to wake.  No path holds both at once, so the two orders agree.
+//
+// `SLAVE_READ_WAITERS[n]` parks a thread blocked in `read(slave)` on an empty
+// `m2s`; woken when a master write feeds `m2s` or the master hangs up.
+// `MASTER_READ_WAITERS[n]` is the symmetric list for `read(master)` on `s2m`.
+static SLAVE_READ_WAITERS:  Mutex<[Option<WaitList>; MAX_PTYS]> =
+    Mutex::new([const { None }; MAX_PTYS]);
+static MASTER_READ_WAITERS: Mutex<[Option<WaitList>; MAX_PTYS]> =
+    Mutex::new([const { None }; MAX_PTYS]);
+
+/// Outcome of a `wait_*_readable` prepare-to-park, mirroring the pipe driver's
+/// `WaitOutcome`.  `Ready` = the condition (data, or peer hang-up giving EOF)
+/// is already satisfied; `Enqueued` = the caller is parked and MUST call
+/// `crate::sched::schedule()`; `Gone` = the pair was freed (treat as EOF).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitOutcome { Ready, Enqueued, Gone }
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 /// Allocate a new PTY pair.  Returns the PTY index (= slave number N) or
@@ -139,6 +181,11 @@ pub fn alloc() -> Option<u8> {
                     ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0,
                 },
                 fg_pgid: 0,
+                // Opening /dev/ptmx both allocates the pair AND returns the
+                // master fd, so the master starts with one open reference.
+                master_open: 1,
+                slave_open: 0,
+                slave_ever_opened: false,
             });
             crate::serial_println!("[PTY] Allocated pair {}", i);
             return Some(i as u8);
@@ -177,12 +224,31 @@ pub fn free(n: u8) {
 // ── I/O ───────────────────────────────────────────────────────────────────────
 
 /// Write to the master side (data appears on slave's read buffer).
+///
+/// Bytes land in the slave's input queue (`m2s`).  If the slave's line
+/// discipline has `ECHO` set (`termios c_lflag & ECHO`, the cooked-terminal
+/// default), each byte is also echoed to the slave's OUTPUT — i.e. copied into
+/// `s2m`, the master's read side — so a remote terminal driving the master
+/// (an `ssh -tt` server) sees what it typed.  Per termios(3): echo is governed
+/// by the SLAVE termios, evaluated as the slave receives input, and emitted on
+/// the slave's output path.  An interactive program that switches the slave to
+/// raw mode (clearing `ECHO`) takes over echo itself (its own line editor), so
+/// this kernel echo correctly goes silent then.  Returns bytes accepted into
+/// `m2s` (flow control is driven by the input queue; the echo is best-effort).
 pub fn master_write(n: u8, data: &[u8]) -> usize {
     let mut pairs = PAIRS.lock();
     if let Some(Some(p)) = pairs.get_mut(n as usize) {
         let space = BUF_CAP.saturating_sub(p.m2s.len());
         let to_copy = data.len().min(space);
         p.m2s.extend_from_slice(&data[..to_copy]);
+        // ECHO: copy the just-received input to the slave output (= master
+        // read side) when the slave termios requests it.  Bounded by the
+        // s2m capacity so a flooded echo never grows the ring unboundedly.
+        if p.termios.c_lflag & ECHO != 0 && to_copy > 0 {
+            let echo_space = BUF_CAP.saturating_sub(p.s2m.len());
+            let echo_n = to_copy.min(echo_space);
+            p.s2m.extend_from_slice(&data[..echo_n]);
+        }
         to_copy
     } else {
         0
@@ -244,6 +310,220 @@ pub fn slave_readable(n: u8) -> bool {
         .and_then(|s| s.as_ref())
         .map(|p| !p.m2s.is_empty())
         .unwrap_or(false)
+}
+
+// ── Open-count / hang-up tracking ───────────────────────────────────────────
+//
+// pts(4) / pty(7): closing the LAST master fd hangs up the slave (slave reads
+// then return 0/EOF and slave poll reports POLLHUP); symmetrically, closing
+// the last slave fd makes the master see EOF/POLLHUP.  These counts let the
+// read/poll paths distinguish "empty but peer still open → block" from
+// "peer fully closed → EOF".
+
+/// Bump the master open-count (a `dup` of a master fd).  `/dev/ptmx` open does
+/// NOT call this — `alloc()` seeds `master_open = 1`.
+pub fn inc_master(n: u8) {
+    let mut pairs = PAIRS.lock();
+    if let Some(Some(p)) = pairs.get_mut(n as usize) {
+        p.master_open = p.master_open.saturating_add(1);
+    }
+}
+
+/// Bump the slave open-count (open of `/dev/pts/N`, or a `dup`).  Sets the
+/// sticky `slave_ever_opened` flag so the master's hang-up edge only fires
+/// after the slave has actually existed (see `master_hung_up`).
+pub fn inc_slave(n: u8) {
+    let mut pairs = PAIRS.lock();
+    if let Some(Some(p)) = pairs.get_mut(n as usize) {
+        p.slave_open = p.slave_open.saturating_add(1);
+        p.slave_ever_opened = true;
+    }
+}
+
+/// Drop one master reference.  When it reaches 0 the slave is hung up: wake any
+/// slave reader parked on an empty `m2s` so it observes EOF, and ring the poll
+/// bell so a slave `poll(2)` re-evaluates and sees `POLLHUP`.  Returns the
+/// remaining master count (0 ⇒ the pair may now be reaped when the slave side
+/// is also gone — see `maybe_free`).
+pub fn dec_master(n: u8) -> u32 {
+    let remaining = {
+        let mut pairs = PAIRS.lock();
+        match pairs.get_mut(n as usize) {
+            Some(Some(p)) => {
+                p.master_open = p.master_open.saturating_sub(1);
+                p.master_open
+            }
+            _ => return 0,
+        }
+    };
+    if remaining == 0 {
+        // Slave side is now hung up — wake its readers so an empty read
+        // returns 0 (EOF) instead of blocking forever, and notify pollers.
+        wake_slave_readers(n);
+    }
+    maybe_free(n);
+    remaining
+}
+
+/// Drop one slave reference; symmetric to `dec_master`.
+pub fn dec_slave(n: u8) -> u32 {
+    let remaining = {
+        let mut pairs = PAIRS.lock();
+        match pairs.get_mut(n as usize) {
+            Some(Some(p)) => {
+                p.slave_open = p.slave_open.saturating_sub(1);
+                p.slave_open
+            }
+            _ => return 0,
+        }
+    };
+    if remaining == 0 {
+        wake_master_readers(n);
+    }
+    maybe_free(n);
+    remaining
+}
+
+/// Reap the pair once BOTH ends are fully closed.  Called from the close path;
+/// a no-op while either end still has an open fd (pts(4): the slave node and
+/// the pair exist only while the pair is in use).
+fn maybe_free(n: u8) {
+    let both_gone = {
+        let pairs = PAIRS.lock();
+        match pairs.get(n as usize).and_then(|s| s.as_ref()) {
+            Some(p) => p.master_open == 0 && p.slave_open == 0,
+            None => false,
+        }
+    };
+    if both_gone {
+        free(n);
+        // Drop any stale wait-list slots for the reaped pair.
+        SLAVE_READ_WAITERS.lock()[n as usize]  = None;
+        MASTER_READ_WAITERS.lock()[n as usize] = None;
+    }
+}
+
+/// True when the SLAVE side is hung up (last master fd closed).  A slave
+/// `read(2)` of an empty `m2s` then returns 0 (EOF); a slave `poll(2)` reports
+/// `POLLHUP`.  A freed/unknown pair counts as hung up (EOF, not a spin).
+pub fn slave_hung_up(n: u8) -> bool {
+    let pairs = PAIRS.lock();
+    match pairs.get(n as usize).and_then(|s| s.as_ref()) {
+        Some(p) => p.master_open == 0,
+        None => true,
+    }
+}
+
+/// True when the MASTER side is hung up (last slave fd closed).  Symmetric to
+/// `slave_hung_up`.  Note: while the slave has never been opened
+/// (`slave_open == 0` right after `alloc()`), the master is NOT yet hung up —
+/// the slave fd is expected to open shortly (an `ssh -tt` server opens the
+/// master, forks, and the child opens the slave).  We therefore only treat the
+/// master as hung up once a slave HAS been opened and then all closed.  That
+/// transition is tracked by `slave_ever_opened`.
+pub fn master_hung_up(n: u8) -> bool {
+    let pairs = PAIRS.lock();
+    match pairs.get(n as usize).and_then(|s| s.as_ref()) {
+        Some(p) => p.slave_open == 0 && p.slave_ever_opened,
+        None => true,
+    }
+}
+
+// ── Blocking-read prepare-to-park (mirrors crate::ipc::pipe) ─────────────────
+
+/// Prepare to block a `read(slave)` that found `m2s` empty.  Re-checks the
+/// condition (data available, OR slave hung up giving EOF) under the wait-list
+/// lock to close the check-and-park lost-wakeup window, then parks the caller.
+/// The caller MUST `schedule()` on `Enqueued`.
+pub fn wait_slave_readable(n: u8, wake_tick: u64) -> WaitOutcome {
+    let tid = crate::proc::current_tid();
+    let mut waiters = SLAVE_READ_WAITERS.lock();
+    let outcome = {
+        let pairs = PAIRS.lock();
+        match pairs.get(n as usize).and_then(|s| s.as_ref()) {
+            None => WaitOutcome::Gone,
+            // Data, or master-closed (EOF) — proceed without parking.
+            Some(p) if !p.m2s.is_empty() || p.master_open == 0 => WaitOutcome::Ready,
+            Some(_) => WaitOutcome::Enqueued,
+        }
+    };
+    if matches!(outcome, WaitOutcome::Ready | WaitOutcome::Gone) {
+        return outcome;
+    }
+    let slot = &mut waiters[n as usize];
+    if slot.is_none() { *slot = Some(WaitList::new()); }
+    slot.as_mut().unwrap().enqueue_self_blocked(tid, wake_tick);
+    drop(waiters);
+    WaitOutcome::Enqueued
+}
+
+/// Symmetric prepare-to-park for `read(master)` on an empty `s2m`.
+pub fn wait_master_readable(n: u8, wake_tick: u64) -> WaitOutcome {
+    let tid = crate::proc::current_tid();
+    let mut waiters = MASTER_READ_WAITERS.lock();
+    let outcome = {
+        let pairs = PAIRS.lock();
+        match pairs.get(n as usize).and_then(|s| s.as_ref()) {
+            None => WaitOutcome::Gone,
+            Some(p) if !p.s2m.is_empty() || (p.slave_open == 0 && p.slave_ever_opened)
+                => WaitOutcome::Ready,
+            Some(_) => WaitOutcome::Enqueued,
+        }
+    };
+    if matches!(outcome, WaitOutcome::Ready | WaitOutcome::Gone) {
+        return outcome;
+    }
+    let slot = &mut waiters[n as usize];
+    if slot.is_none() { *slot = Some(WaitList::new()); }
+    slot.as_mut().unwrap().enqueue_self_blocked(tid, wake_tick);
+    drop(waiters);
+    WaitOutcome::Enqueued
+}
+
+/// Wake every thread parked in `read(slave)` on pair `n`, and ring the poll
+/// bell so slave-watching pollers re-evaluate.  Called after a master write
+/// feeds `m2s` and on slave hang-up.  `PAIRS` must NOT be held by the caller
+/// (lock order: `*_WAITERS` is taken here with no `PAIRS` hold).
+pub fn wake_slave_readers(n: u8) {
+    let drained = {
+        let mut waiters = SLAVE_READ_WAITERS.lock();
+        match waiters[n as usize].as_mut() {
+            Some(list) => list.drain_all(),
+            None => Vec::new(),
+        }
+    };
+    wake_tids(&drained);
+    ring_poll_bell_for_obj(PollBellSource::Pty, n as u64);
+}
+
+/// Wake every thread parked in `read(master)` on pair `n`; symmetric.
+pub fn wake_master_readers(n: u8) {
+    let drained = {
+        let mut waiters = MASTER_READ_WAITERS.lock();
+        match waiters[n as usize].as_mut() {
+            Some(list) => list.drain_all(),
+            None => Vec::new(),
+        }
+    };
+    wake_tids(&drained);
+    ring_poll_bell_for_obj(PollBellSource::Pty, n as u64);
+}
+
+/// Best-effort cleanup: drop `tid` from pair `n`'s slave-read wait list after a
+/// timed-out / interrupted park, so a stale entry is never left behind.
+pub fn waiter_cleanup_slave(n: u8, tid: u64) {
+    let mut waiters = SLAVE_READ_WAITERS.lock();
+    if let Some(list) = waiters[n as usize].as_mut() {
+        list.remove_tid(tid);
+    }
+}
+
+/// Symmetric cleanup for a master-read waiter.
+pub fn waiter_cleanup_master(n: u8, tid: u64) {
+    let mut waiters = MASTER_READ_WAITERS.lock();
+    if let Some(list) = waiters[n as usize].as_mut() {
+        list.remove_tid(tid);
+    }
 }
 
 // ── Window size ───────────────────────────────────────────────────────────────

@@ -76,6 +76,7 @@ pub fn watch_key_for_test(source_bit: u32, object_id: u64) -> ObjWatch {
         7 => PollBellSource::SignalInject,
         8 => PollBellSource::InetRx,
         9 => PollBellSource::UnixRead,
+        10 => PollBellSource::Pty,
         _ => PollBellSource::Other,
     };
     ObjWatch { source, object_id }
@@ -436,20 +437,29 @@ pub enum PollBellSource {
     /// write-space wake).  Distinct from `UnixWrite` (data-arrival, which
     /// makes the reader `POLLIN`-ready) so kdb attribution stays honest.
     UnixRead     = 9,
+    /// `crate::drivers::pty` master/slave I/O — data arrival on a PTY ring,
+    /// recv-side write-space wake, and the master/slave hang-up edge that
+    /// makes the surviving end `POLLIN`/`POLLHUP`-ready (peer-close EOF).
+    /// Rung per pair index so a `poll`/`select` caller watching one PTY only
+    /// re-evaluates on that pair's edges (intra-class herd collapse).  Without
+    /// it a PTY-driven event loop (an `ssh -tt` login shell's stdin, the
+    /// server's master pump) would only re-check on the 1 s resync floor.
+    /// See pts(4) / pty(7) and the POSIX `poll(2)` terminal semantics.
+    Pty          = 10,
     /// Catch-all for ad-hoc readiness sources that have not yet been
     /// given their own variant (kept last for ABI tail-stability).
-    Other        = 10,
+    Other        = 11,
 }
 
 /// Number of `PollBellSource` variants — keep in sync with the enum.
-pub const N_BELL_SOURCES: usize = 11;
+pub const N_BELL_SOURCES: usize = 12;
 
 /// Stable string label for each `PollBellSource`, used by kdb to
 /// render the per-source counters.  Indexed by the enum's discriminant.
 pub const BELL_SOURCE_NAMES: [&str; N_BELL_SOURCES] = [
     "pipe", "eventfd", "unix_write", "unix_shutdown",
     "timerfd", "signalfd", "inotify", "signal_inject", "inet_rx",
-    "unix_read", "other",
+    "unix_read", "pty", "other",
 ];
 
 /// Per-source ring counters.  Bumped (Relaxed) at every successful
@@ -460,7 +470,7 @@ pub static BELL_RINGS_BY_SOURCE: [AtomicU64; N_BELL_SOURCES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
 
 /// Cumulative number of `wait_poll_event` calls that woke via a bell

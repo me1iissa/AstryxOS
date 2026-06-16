@@ -129,6 +129,13 @@ fn bell_watch_for_fds(
         } else if crate::syscall::is_inotify_fd(pid, fd) {
             pin(&mut objects, &mut class_mask, S::Inotify,
                 crate::syscall::get_inotify_id(pid, fd));
+        } else if let Some((_is_master, pty_n)) = pty_fd_info(pid, fd) {
+            // PTY master/slave: pin the Pty source by pair index so a poll/
+            // select caller watching one PTY only re-evaluates on that pair's
+            // edges (master write feeds the slave, slave write / echo feeds the
+            // master, hang-up on either end).  ring_poll_bell_for_obj(Pty, n)
+            // is fired by the write and close paths.
+            pin(&mut objects, &mut class_mask, S::Pty, pty_n as u64);
         } else {
             // Unknown / regular-file / nested-epoll / raced fd: wake on EVERY
             // source.  Saturated mask means objects no longer matter.
@@ -1384,6 +1391,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             if crate::syscall::is_inotify_fd(pid, fd) {
                 crate::ipc::inotify::close(crate::syscall::get_inotify_id(pid, fd));
+            }
+            // If it's a PTY master/slave, drop one open reference on that end.
+            // Reaching zero on the master hangs up the slave (slave reads
+            // return 0/EOF, slave poll reports POLLHUP) and vice versa; the
+            // wake + poll-bell fire from dec_master/dec_slave, and the pair is
+            // reaped once BOTH ends are fully closed (pts(4), pty(7)).  Snapshot
+            // the (is_master, index) BEFORE crate::vfs::close drops the fd.
+            if let Some((is_master, pty_n)) = pty_fd_info(pid as u64, fd) {
+                if is_master { crate::drivers::pty::dec_master(pty_n); }
+                else         { crate::drivers::pty::dec_slave(pty_n); }
             }
             // If it's an epoll fd, remove the EpollInstance — but ONLY
             // when this close is dropping the LAST FileDescriptor that
@@ -5774,11 +5791,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 436: close_range(first, last, flags) — close a range of fds
         // (also mapped at 355 for backwards compat, but 436 is the correct x86_64 number)
         436 | 355 => {
-            let pid = crate::proc::current_pid_lockless();
             let first = arg1 as usize;
             let last = (arg2 as usize).min(4095);
+            // Delegate each fd to close(2) (nr 3) rather than calling
+            // `crate::vfs::close` directly: the close(2) arm runs the typed-fd
+            // teardown (pipe/socket/eventfd/timerfd/signalfd/inotify/epoll and
+            // PTY master/slave reference drops).  Routing the raw vfs close here
+            // would skip those, leaking refcounts and — for a PTY end — never
+            // hanging up the peer.  close_range(low, ~0, 0) is exactly the
+            // post-fork fd-scrub a posix_spawn/login child runs, so it must
+            // honour the same per-fd close semantics (close_range(2)).
             for fd in first..=last {
-                let _ = crate::vfs::close(pid, fd);
+                let _ = dispatch(3, fd as u64, 0, 0, 0, 0, 0);
             }
             0
         }
@@ -6124,6 +6148,17 @@ fn sys_select_linux(
             crate::ipc::signalfd::is_readable(crate::syscall::get_signalfd_id(pid, fd))
         } else if crate::syscall::is_inotify_fd(pid, fd) {
             crate::ipc::inotify::is_readable(crate::syscall::get_inotify_id(pid, fd))
+        } else if let Some((is_master, pty_n)) = pty_fd_info(pid, fd) {
+            // PTY: readable when its read-side queue has data OR the peer hung
+            // up (so the userspace read(2) returns 0/EOF) — per select(2) a
+            // hung-up terminal end is reported readable.  pts(4) / pty(7).
+            if is_master {
+                crate::drivers::pty::master_readable(pty_n)
+                    || crate::drivers::pty::master_hung_up(pty_n)
+            } else {
+                crate::drivers::pty::slave_readable(pty_n)
+                    || crate::drivers::pty::slave_hung_up(pty_n)
+            }
         } else {
             true // regular file: always ready
         };
@@ -6782,6 +6817,78 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
             Ok(n) => n as i64,
             Err(e) => e,
         };
+    } else if let Some((is_master, pty_n)) = pty_fd_info(pid, fd as usize) {
+        // PTY master/slave read with full terminal semantics (pts(4), pty(7),
+        // POSIX read(2) on a terminal).  A slave read drains the master→slave
+        // queue (m2s); a master read drains the slave→master queue (s2m).  An
+        // empty queue with the PEER end still open BLOCKS (or returns -EAGAIN
+        // when O_NONBLOCK); EOF (0) is returned only when the peer has fully
+        // hung up — for the slave that means the last master fd closed, and
+        // symmetrically for the master.  Replaces the prior `fd_read` arm,
+        // which returned -EAGAIN on an empty buffer regardless of O_NONBLOCK
+        // and never blocked — making `/bin/sh` on a freshly-allocated PTY see
+        // a non-data read and exit instead of waiting for typed input.
+        // Per POSIX read(2): a zero-byte read returns 0 immediately and must
+        // NOT block, even on an empty queue.  Guard before the blocking loop.
+        if count == 0 { return 0; }
+        // Validate the destination buffer for real user-mode callers (CWE-823);
+        // kernel-dispatch test callers pass kernel-resident buffers and bypass.
+        if !crate::syscall::user_ptr_check_bypassed()
+            && !crate::syscall::validate_user_ptr(buf as u64, count)
+        {
+            return -14; // EFAULT
+        }
+        let nonblock = fd_is_nonblocking(pid, fd as usize);
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+        loop {
+            // master_read/slave_read copy into the user `buf`; bracket that
+            // store with the SMAP UserGuard (STAC) so a CR4.SMAP-set kernel
+            // does not #PF writing a user page (Intel SDM Vol. 3A §4.6.1).  The
+            // guard is scoped to the copy only — it is dropped before any
+            // schedule() below so we never park with AC=1.
+            let (n, hung_up) = if is_master {
+                let n = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    crate::drivers::pty::master_read(pty_n, buf)
+                };
+                (n, crate::drivers::pty::master_hung_up(pty_n))
+            } else {
+                let n = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    crate::drivers::pty::slave_read(pty_n, buf)
+                };
+                (n, crate::drivers::pty::slave_hung_up(pty_n))
+            };
+            if n > 0 {
+                // A slave read that drained m2s frees input-queue room; a
+                // master/slave write side could be space-blocked, but PTY
+                // writes never block in this design (they cap at BUF_CAP and
+                // return short), so no writer wake is needed here.
+                return n as i64;
+            }
+            // Empty drain: EOF if the peer hung up, else block (or EAGAIN).
+            if hung_up { return 0; }            // peer closed → EOF
+            if nonblock { return -11; }         // EAGAIN
+            if signal_pending(pid) { return -4; } // EINTR
+            let tid = crate::proc::current_tid();
+            let outcome = if is_master {
+                crate::drivers::pty::wait_master_readable(pty_n, u64::MAX)
+            } else {
+                crate::drivers::pty::wait_slave_readable(pty_n, u64::MAX)
+            };
+            match outcome {
+                crate::drivers::pty::WaitOutcome::Ready => continue,
+                crate::drivers::pty::WaitOutcome::Gone  => return 0, // freed → EOF
+                crate::drivers::pty::WaitOutcome::Enqueued => {
+                    crate::sched::schedule();
+                    if is_master {
+                        crate::drivers::pty::waiter_cleanup_master(pty_n, tid);
+                    } else {
+                        crate::drivers::pty::waiter_cleanup_slave(pty_n, tid);
+                    }
+                }
+            }
+        }
     }
 
     // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
@@ -7608,6 +7715,11 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     // ── PTY: /dev/pts/N → return slave fd ────────────────────────────────
     if path.starts_with("/dev/pts/") {
         if let Ok(n) = path["/dev/pts/".len()..].parse::<u8>() {
+            // Reject opens of a freed/never-allocated pair (pts(4): the slave
+            // node exists only while the pair is allocated).
+            if !crate::drivers::pty::is_alive(n) {
+                return -2; // ENOENT
+            }
             let fd = crate::vfs::FileDescriptor::pty_slave(n);
             let mut procs = crate::proc::PROCESS_TABLE.lock();
             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -7616,6 +7728,14 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
                     p.file_descriptors.len() - 1
                 });
                 p.file_descriptors[slot] = Some(fd);
+                // Count this slave reference (sets slave_ever_opened) so the
+                // master's hang-up edge fires only after the slave existed.
+                // Done while STILL holding PROCESS_TABLE so the install+inc is
+                // atomic against a concurrent same-process exit_group scanning
+                // the fd table (which would otherwise dec a slot whose inc had
+                // not yet landed).  inc_slave locks only PAIRS — PROCESS_TABLE
+                // → PAIRS order holds, no re-entry.
+                crate::drivers::pty::inc_slave(n);
                 return slot as i64;
             }
         }
@@ -11229,10 +11349,20 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
             0 // stub: never delivers events
         }
         Some((inode, _flags, false, false, crate::vfs::FileType::PtyMaster, _)) => {
-            if crate::drivers::pty::master_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
+            // POLLIN when the master read side (s2m) has data; POLLOUT always
+            // (capped ring never blocks); POLLHUP when the slave hung up — set
+            // unconditionally and alongside POLLIN so a draining reader sees
+            // EOF (pts(4), pty(7), poll(2)).
+            let mut ev = EPOLLOUT;
+            if crate::drivers::pty::master_readable(inode as u8) { ev |= EPOLLIN; }
+            if crate::drivers::pty::master_hung_up(inode as u8) { ev |= EPOLLHUP | EPOLLIN; }
+            ev
         }
         Some((inode, _flags, false, false, crate::vfs::FileType::PtySlave, _)) => {
-            if crate::drivers::pty::slave_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
+            let mut ev = EPOLLOUT;
+            if crate::drivers::pty::slave_readable(inode as u8) { ev |= EPOLLIN; }
+            if crate::drivers::pty::slave_hung_up(inode as u8) { ev |= EPOLLHUP | EPOLLIN; }
+            ev
         }
         Some((inode, flags, false, false, _, mount_idx)) => {
             // Pipe — readable end signals EPOLLIN on data and EPOLLHUP on
@@ -11527,6 +11657,21 @@ fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
         .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
         .map(|f| (f.flags & 0x0800) != 0)
         .unwrap_or(false)
+}
+
+/// If `fd` is a PTY master or slave, returns `(is_master, pair_index)`.
+/// Used by the read path to drive the block-vs-EAGAIN-vs-EOF terminal
+/// semantics (pts(4) / pty(7)) that the generic `fd_read` arm cannot express
+/// (it has no schedule point).
+fn pty_fd_info(pid: u64, fd: usize) -> Option<(bool, u8)> {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+        .and_then(|f| match f.file_type {
+            crate::vfs::FileType::PtyMaster => Some((true,  f.inode as u8)),
+            crate::vfs::FileType::PtySlave  => Some((false, f.inode as u8)),
+            _ => None,
+        })
 }
 
 /// Returns true if a deliverable (pending && !blocked) signal is queued for `pid`.

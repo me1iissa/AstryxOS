@@ -259,6 +259,18 @@ pub fn run() -> ! {
         if test_276b_pty_stat_ttyname() { passed += 1; }
     }
 
+    // ── Test 277p: PTY master↔slave data relay + block/EOF/hangup ────────
+    // Exercises the interactive-login data path: master write → slave read,
+    // slave write → master read, an empty slave read with the master open is
+    // NOT EOF, and closing the master gives the slave EOF.  Registered in the
+    // early-priority block (the blocking-pipe suite below wedges under
+    // dual-core on this branch, so a late registration would never run).
+    #[cfg(any(feature = "test-mode", feature = "pivot-e-test"))]
+    {
+        total += 1;
+        if test_277p_pty_data_relay() { passed += 1; }
+    }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
@@ -20754,6 +20766,21 @@ fn test_pty() -> bool {
         test_println!("  slave_read → {:?} ✓", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
     }
 
+    // The slave's default termios has ECHO set, so the master_write above also
+    // echoed `msg` onto the master read side (s2m) — per termios(3).  Drain
+    // that echo before the slave→master leg so the master read sees only the
+    // slave's own write.  (This validates the echo path too: the echoed bytes
+    // must equal `msg`.)
+    let mut echo = [0u8; 16];
+    let en = crate::drivers::pty::master_read(pty_n, &mut echo);
+    if &echo[..en] != msg {
+        test_fail!("pty", "ECHO: master read {:?}, want echo of {:?}", &echo[..en], msg);
+        ok = false;
+    } else {
+        test_println!("  master_read drains ECHO of master_write → {:?} ✓",
+            core::str::from_utf8(&echo[..en]).unwrap_or("?"));
+    }
+
     // Write to slave → readable on master
     let resp = b"world";
     crate::drivers::pty::slave_write(pty_n, resp);
@@ -38025,10 +38052,10 @@ fn test_poll_bell_source_attribution() -> bool {
     }
 
     // Ring one of each tagged source.  Update the array length any time
-    // a new source variant lands in `PollBellSource` (currently 10 tagged
+    // a new source variant lands in `PollBellSource` (currently 11 tagged
     // variants — `Other` stays untagged by design so it can absorb
     // ad-hoc callers without skewing the per-source attribution).
-    let sources_to_ring: [PollBellSource; 10] = [
+    let sources_to_ring: [PollBellSource; 11] = [
         PollBellSource::Pipe,
         PollBellSource::Eventfd,
         PollBellSource::UnixWrite,
@@ -38039,6 +38066,7 @@ fn test_poll_bell_source_attribution() -> bool {
         PollBellSource::SignalInject,
         PollBellSource::InetRx,
         PollBellSource::UnixRead,
+        PollBellSource::Pty,
     ];
     for s in &sources_to_ring {
         ring_poll_bell_for(*s);
@@ -51366,6 +51394,165 @@ fn test_276b_pty_stat_ttyname() -> bool {
     let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
 
     if ok { test_pass!("PTY slave stat consistency — ttyname(3) substrate (Test 276b)"); }
+    ok
+}
+
+/// Test 277p — PTY master↔slave data relay, block-vs-EOF, and hang-up EOF.
+///
+/// This is the data path an interactive `ssh -tt` login depends on: the SSH
+/// server writes typed bytes to the PTY master, which must become readable on
+/// the slave (the shell's stdin); the shell's stdout writes to the slave, which
+/// must become readable on the master.  An empty slave read while the master is
+/// open must NOT be EOF (the shell would otherwise read end-of-input and exit
+/// immediately), and EOF is delivered only when the last master fd closes
+/// (pts(4), pty(7), POSIX read(2)/poll(2) terminal semantics).
+///
+/// The data-relay legs use the syscall dispatch (buffered data → reads return
+/// at once).  The "empty read is not EOF" and "closed master → EOF" legs use
+/// the driver helpers directly (a truly-blocking dispatch read would wedge the
+/// single-threaded test runner; we instead assert the predicate the blocking
+/// loop keys on — `slave_hung_up` / `master_hung_up` plus buffer emptiness).
+fn test_277p_pty_data_relay() -> bool {
+    test_header!("PTY data relay — master↔slave + block/EOF/hangup (Test 277p)");
+
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    const SYS_READ:  u64 = 0;
+    const SYS_WRITE: u64 = 1;
+    const SYS_OPEN:  u64 = 2;
+    const SYS_CLOSE: u64 = 3;
+    const SYS_IOCTL: u64 = 16;
+    const TIOCGPTN:  u64 = 0x8004_5430;
+    const O_RDWR:    u64 = 2;
+
+    // ── open master + slave ──────────────────────────────────────────────
+    let ptmx = b"/dev/ptmx\0";
+    let master = dispatch(SYS_OPEN, ptmx.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if master < 0 { test_fail!("277p/open ptmx", "→ {}", master); return false; }
+
+    let mut pty_n: u32 = 0xFFFF_FFFF;
+    let _ = dispatch(SYS_IOCTL, master as u64, TIOCGPTN,
+                     &mut pty_n as *mut u32 as u64, 0, 0, 0);
+    if pty_n > 15 { test_fail!("277p/TIOCGPTN", "→ {}", pty_n); return false; }
+    let n = pty_n as u8;
+
+    let mut slave_path = [0u8; 16];
+    let prefix = b"/dev/pts/";
+    slave_path[..prefix.len()].copy_from_slice(prefix);
+    let plen = if pty_n < 10 {
+        slave_path[prefix.len()] = b'0' + (pty_n as u8);
+        prefix.len() + 1
+    } else {
+        slave_path[prefix.len()] = b'1';
+        slave_path[prefix.len() + 1] = b'0' + ((pty_n - 10) as u8);
+        prefix.len() + 2
+    };
+    slave_path[plen] = 0;
+    let slave = dispatch(SYS_OPEN, slave_path.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if slave < 0 { test_fail!("277p/open pts", "→ {}", slave); return false; }
+
+    // ── 1: master write "ls\n" → slave read returns "ls\n" (not EOF) ──────
+    let m2s_msg = b"ls\n";
+    let w = dispatch(SYS_WRITE, master as u64, m2s_msg.as_ptr() as u64,
+                     m2s_msg.len() as u64, 0, 0, 0);
+    let mut rx = [0u8; 32];
+    let r = dispatch(SYS_READ, slave as u64, rx.as_mut_ptr() as u64,
+                     rx.len() as u64, 0, 0, 0);
+    if w != m2s_msg.len() as i64 || r != m2s_msg.len() as i64
+        || &rx[..r.max(0) as usize] != m2s_msg
+    {
+        test_fail!("277p/m2s", "master write {} / slave read {} data {:?}",
+            w, r, &rx[..r.max(0) as usize]);
+        ok = false;
+    } else {
+        test_println!("  277p-1 master→slave {:?} → {} bytes ✓",
+            core::str::from_utf8(m2s_msg).unwrap_or("?"), r);
+    }
+
+    // ── 2: slave write "out" → master read returns "out" ─────────────────
+    // NOTE: the slave defaults to ECHO|ICANON, so step 1's "ls\n" was echoed
+    // into the master read side (s2m).  Drain that echo first so this leg sees
+    // only the slave's own write.
+    let mut echo = [0u8; 32];
+    let _ = dispatch(SYS_READ, master as u64, echo.as_mut_ptr() as u64,
+                     echo.len() as u64, 0, 0, 0);
+    let s2m_msg = b"out";
+    let w = dispatch(SYS_WRITE, slave as u64, s2m_msg.as_ptr() as u64,
+                     s2m_msg.len() as u64, 0, 0, 0);
+    let mut rx = [0u8; 32];
+    let r = dispatch(SYS_READ, master as u64, rx.as_mut_ptr() as u64,
+                     rx.len() as u64, 0, 0, 0);
+    if w != s2m_msg.len() as i64 || r != s2m_msg.len() as i64
+        || &rx[..r.max(0) as usize] != s2m_msg
+    {
+        test_fail!("277p/s2m", "slave write {} / master read {} data {:?}",
+            w, r, &rx[..r.max(0) as usize]);
+        ok = false;
+    } else {
+        test_println!("  277p-2 slave→master {:?} → {} bytes ✓",
+            core::str::from_utf8(s2m_msg).unwrap_or("?"), r);
+    }
+
+    // ── 3: empty slave read with master OPEN must NOT be EOF ──────────────
+    // The buffer (m2s) is now empty and the master is still open, so the
+    // blocking read loop's predicate must be "block", i.e. NOT readable AND
+    // NOT hung-up.  (A real dispatched read would park here, so assert the
+    // predicate directly rather than calling read.)
+    let readable = crate::drivers::pty::slave_readable(n);
+    let hung_up  = crate::drivers::pty::slave_hung_up(n);
+    if readable || hung_up {
+        test_fail!("277p/no-eof",
+            "empty slave read should BLOCK (readable={} hung_up={}) — not EOF/data",
+            readable, hung_up);
+        ok = false;
+    } else {
+        test_println!("  277p-3 empty slave read with master open → BLOCK (not EOF) ✓");
+    }
+
+    // ── 4: poll readiness — slave POLLIN after a master write ────────────
+    let pid = crate::proc::current_pid_lockless();
+    let _ = dispatch(SYS_WRITE, master as u64, b"x".as_ptr() as u64, 1, 0, 0, 0);
+    let rev = crate::syscall::poll_revents(pid, slave as usize, 0x0001 /*POLLIN*/);
+    if rev & 0x0001 == 0 {
+        test_fail!("277p/poll", "slave poll after master write → revents={:#x}, want POLLIN", rev);
+        ok = false;
+    } else {
+        test_println!("  277p-4 slave poll after master write → POLLIN ✓");
+    }
+    // Drain that byte so the next leg starts from an empty queue.
+    let mut drain = [0u8; 4];
+    let _ = dispatch(SYS_READ, slave as u64, drain.as_mut_ptr() as u64, 4, 0, 0, 0);
+
+    // ── 5: closing the MASTER hangs up the slave → slave read EOF ─────────
+    let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+    if !crate::drivers::pty::slave_hung_up(n) {
+        test_fail!("277p/hangup", "after master close, slave_hung_up should be true");
+        ok = false;
+    } else {
+        // With the master closed and m2s empty, a slave read returns 0 (EOF).
+        let r = dispatch(SYS_READ, slave as u64, rx.as_mut_ptr() as u64,
+                         rx.len() as u64, 0, 0, 0);
+        if r != 0 {
+            test_fail!("277p/hangup-eof", "slave read after master close → {} (want 0/EOF)", r);
+            ok = false;
+        } else {
+            test_println!("  277p-5 master close → slave read returns 0 (EOF) ✓");
+        }
+    }
+
+    // ── 6: slave poll after hang-up reports POLLHUP ──────────────────────
+    let rev = crate::syscall::poll_revents(pid, slave as usize, 0x0001 | 0x0010);
+    if rev & 0x0010 == 0 {
+        test_fail!("277p/pollhup", "slave poll after master close → revents={:#x}, want POLLHUP", rev);
+        ok = false;
+    } else {
+        test_println!("  277p-6 slave poll after master close → POLLHUP ✓");
+    }
+
+    let _ = dispatch(SYS_CLOSE, slave as u64, 0, 0, 0, 0, 0);
+
+    if ok { test_pass!("PTY data relay — master↔slave + block/EOF/hangup (Test 277p)"); }
     ok
 }
 

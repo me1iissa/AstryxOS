@@ -2627,9 +2627,17 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             }
         }
         FileType::PtyMaster => {
+            // Non-blocking drain.  The Linux read path (`sys_read_linux`) owns
+            // the blocking + EOF loop; here (readv / kernel-dispatch callers)
+            // we return data, EOF (Ok(0)) on slave hang-up, or WouldBlock on an
+            // empty-but-open queue.  pts(4) / pty(7).
             let pty_n = inode as u8;
             if !crate::drivers::pty::master_readable(pty_n) {
-                return Err(VfsError::WouldBlock);
+                return if crate::drivers::pty::master_hung_up(pty_n) {
+                    Ok(0) // slave fully closed → EOF
+                } else {
+                    Err(VfsError::WouldBlock)
+                };
             }
             let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
             Ok(crate::drivers::pty::master_read(pty_n, slice))
@@ -2637,7 +2645,11 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
         FileType::PtySlave => {
             let pty_n = inode as u8;
             if !crate::drivers::pty::slave_readable(pty_n) {
-                return Err(VfsError::WouldBlock);
+                return if crate::drivers::pty::slave_hung_up(pty_n) {
+                    Ok(0) // master fully closed → EOF
+                } else {
+                    Err(VfsError::WouldBlock)
+                };
             }
             let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
             Ok(crate::drivers::pty::slave_read(pty_n, slice))
@@ -3203,14 +3215,28 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
          fd.open_path.clone())
     };
 
-    // PTY write paths
+    // PTY write paths.  A master write feeds the slave's input queue (m2s),
+    // possibly with ECHO to the master read side; a slave write feeds the
+    // master's input queue (s2m).  After the buffer mutation we wake any
+    // reader parked on that queue and ring the poll bell so a poll/select/epoll
+    // caller watching the far end re-evaluates immediately (pts(4), pty(7),
+    // POSIX poll(2)).  The wake helpers take their own wait-list locks with no
+    // PAIRS hold, so they are called after master_write/slave_write return.
     let data = unsafe { core::slice::from_raw_parts(buf, count) };
     match file_type {
         FileType::PtyMaster => {
-            return Ok(crate::drivers::pty::master_write(inode as u8, data));
+            let n = crate::drivers::pty::master_write(inode as u8, data);
+            // m2s gained data → wake slave readers.  ECHO (if any) also pushed
+            // to s2m → wake master readers so the echo is observable.
+            crate::drivers::pty::wake_slave_readers(inode as u8);
+            crate::drivers::pty::wake_master_readers(inode as u8);
+            return Ok(n);
         }
         FileType::PtySlave => {
-            return Ok(crate::drivers::pty::slave_write(inode as u8, data));
+            let n = crate::drivers::pty::slave_write(inode as u8, data);
+            // s2m gained data → wake master readers.
+            crate::drivers::pty::wake_master_readers(inode as u8);
+            return Ok(n);
         }
         _ => {}
     }
