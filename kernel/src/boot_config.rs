@@ -80,6 +80,12 @@ const MAX_URL_LEN: usize = 2048;
 /// Key for the runtime target URL token.
 const FF_URL_KEY: &[u8] = b"astryx.ff_url=";
 
+/// Key for the runtime GUI-mode token.  When present as `astryx.ff_gui=1` in
+/// the `opt/astryx/cmdline` blob, the launch path runs Firefox in X11/GUI mode
+/// (no `--headless`, no `--screenshot`, `MOZ_HEADLESS` unset) so it connects to
+/// the in-kernel Xastryx server on `DISPLAY=:0` and paints into a real window.
+const FF_GUI_KEY: &[u8] = b"astryx.ff_gui=1";
+
 /// Read the QEMU `opt/astryx/cmdline` fw_cfg blob and extract a validated
 /// `astryx.ff_url=<url>` value.  Returns `None` when the blob is missing,
 /// the token is absent, or the value fails validation — callers fall back to
@@ -108,6 +114,41 @@ pub fn ff_url_override() -> Option<String> {
     let mut buf = [0u8; MAX_CMDLINE_LEN];
     let n = fw_cfg_read_file(b"opt/astryx/cmdline", &mut buf)?;
     parse_ff_url(&buf[..n])
+}
+
+/// Read the QEMU `opt/astryx/cmdline` fw_cfg blob and report whether the
+/// `astryx.ff_gui=1` token is present.  Returns `false` when the blob is
+/// missing or the token is absent (the default headless behaviour).
+///
+/// Like [`ff_url_override`] this is a stack-only fw_cfg read with no heap
+/// allocation, safe to call from the firefox-test launch path.  The token is
+/// carried in the SAME `opt/astryx/cmdline` blob as `astryx.ff_url=` (fw_cfg
+/// permits a single named entry), so the harness appends both into one string.
+#[cfg(feature = "firefox-test-core")]
+pub fn ff_gui_mode() -> bool {
+    // Confirm the fw_cfg device is present (selector 0x0000 returns "QEMU").
+    let mut sig = [0u8; 4];
+    unsafe {
+        fw_cfg_select(FW_CFG_SIG_SEL);
+        for b in sig.iter_mut() {
+            *b = crate::hal::inb(FW_CFG_PORT_DATA);
+        }
+    }
+    if sig != FW_CFG_SIG_MAGIC {
+        return false;
+    }
+
+    let mut buf = [0u8; MAX_CMDLINE_LEN];
+    match fw_cfg_read_file(b"opt/astryx/cmdline", &mut buf) {
+        Some(n) => parse_ff_gui(&buf[..n]),
+        None => false,
+    }
+}
+
+/// Return `true` iff the `astryx.ff_gui=1` token appears in the cmdline blob.
+/// Exposed for unit tests; see [`self_tests`].
+fn parse_ff_gui(buf: &[u8]) -> bool {
+    find_token(buf, FF_GUI_KEY).is_some()
 }
 
 /// Extract and validate the `astryx.ff_url=` value from a cmdline blob.
@@ -292,6 +333,15 @@ pub fn self_tests() -> usize {
         parse_ff_url(b"astryx.ff_url=https://a b").as_deref() == Some("https://a"),
         "space truncates value"
     );
+
+    // GUI-mode token detection (carried in the same cmdline blob).
+    check!(parse_ff_gui(b"astryx.ff_gui=1"), "gui token present");
+    check!(
+        parse_ff_gui(b"astryx.ff_url=https://lite.cnn.com astryx.ff_gui=1"),
+        "gui token alongside url"
+    );
+    check!(!parse_ff_gui(b"astryx.ff_url=https://lite.cnn.com"), "gui token absent");
+    check!(!parse_ff_gui(b"astryx.ff_gui=0"), "gui token explicitly off");
 
     crate::serial_println!("[BOOTCFG/SELFTEST] PASS ({} asserts)", n);
     n

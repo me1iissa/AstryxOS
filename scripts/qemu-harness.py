@@ -3521,12 +3521,25 @@ def cmd_start(args):
     # kernel reads at boot (boot_config.rs reads `astryx.ff_url=<url>`), so a
     # site change needs no rebuild.  `ff_url` was already validated (scheme /
     # length / printable / no-comma) near the top of cmd_start.
+    # Both the URL override and the GUI-mode flag ride in the SAME
+    # opt/astryx/cmdline fw_cfg blob (fw_cfg permits one entry per name), so
+    # assemble a single space-separated token string and emit one -fw_cfg.
+    ff_gui = bool(getattr(args, "ff_gui", False))
+    cmdline_tokens = []
     if ff_url:
+        cmdline_tokens.append(f"astryx.ff_url={ff_url}")
+    if ff_gui:
+        cmdline_tokens.append("astryx.ff_gui=1")
+    if cmdline_tokens:
+        blob = " ".join(cmdline_tokens)
         extra_qemu_args += [
             "-fw_cfg",
-            f"name=opt/astryx/cmdline,string=astryx.ff_url={ff_url}",
+            f"name=opt/astryx/cmdline,string={blob}",
         ]
-        print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
+        if ff_url:
+            print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
+        if ff_gui:
+            print("[HARNESS] ff-gui mode: ON (Firefox X11/windowed)", file=sys.stderr)
 
     # When `xeyes-test` is in the feature set, the kernel boots an Alpine
     # X11 binary that needs a real framebuffer for any visible window to
@@ -3635,6 +3648,9 @@ def cmd_start(args):
         # Runtime firefox-test target URL (--ff-url), delivered via fw_cfg.
         # "" / absent when the compiled CMDLINE_* default is used.  Additive.
         "ff_url":       ff_url or "",
+        # Runtime firefox-test GUI/X11 windowed mode (--ff-gui), delivered via
+        # the same fw_cfg cmdline blob.  False = headless (compiled default).
+        "ff_gui":       bool(getattr(args, "ff_gui", False)),
         # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
         # If oracle_stub_pid is 0 the stub wasn't launched (default).
         "oracle_stub_port": oracle_stub_port,
@@ -11611,6 +11627,20 @@ def main():
                                "fast local-render win, or --ff-url "
                                "https://bbc.com/news.  Additive: omit to keep "
                                "the compiled CMDLINE_* default.")
+    p_start.add_argument("--ff-gui", action="store_true", dest="ff_gui",
+                          help="Run Firefox in X11/GUI (windowed) mode instead "
+                               "of headless.  The harness appends "
+                               "`astryx.ff_gui=1` to the SAME opt/astryx/cmdline "
+                               "fw_cfg blob (combined with --ff-url), and the "
+                               "kernel (boot_config::ff_gui_mode) drops "
+                               "`--headless`/`--screenshot` from the Firefox "
+                               "command line and omits MOZ_HEADLESS so libxul "
+                               "calls XOpenDisplay() and paints into a real "
+                               "window on the in-kernel Xastryx server "
+                               "(DISPLAY=:0).  Capture the composited desktop "
+                               "with `screendump <sid> <out.png>`.  No rebuild "
+                               "needed (same firefox-test-core build serves "
+                               "both modes).")
     p_start.add_argument("--pcap", action="store_true", dest="pcap",
                           help="FORCE host-side packet capture ON for this "
                                "boot, even a non-FF one.  Captures ALL guest "

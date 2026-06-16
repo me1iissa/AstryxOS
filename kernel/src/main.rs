@@ -1289,9 +1289,21 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // fixed (`/tmp/out.png`) and is registered with the VFS so the
             // close-after-write hook can emit the `[GATE] png-write` marker for
             // exactly that file.
-            const CMDLINE_MUSL_132_BASE: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
-            const CMDLINE_MUSL_ESR_BASE: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
-            const CMDLINE_GLIBC_BASE:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
+            const CMDLINE_MUSL_132_BASE: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --window-size 1366,8000 --screenshot /tmp/out.png";
+            const CMDLINE_MUSL_ESR_BASE: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --window-size 1366,8000 --screenshot /tmp/out.png";
+            const CMDLINE_GLIBC_BASE:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --window-size 1366,8000 --screenshot /tmp/out.png";
+            // GUI/X11 variants: NO `--headless` (so libxul calls XOpenDisplay /
+            // gdk_display_open and connects to the in-kernel Xastryx server on
+            // DISPLAY=:0) and NO `--screenshot` (the headless-only output flag).
+            // A real top-level window is created, mapped, and painted via X11
+            // PutImage into the compositor framebuffer.  Selected at runtime by
+            // the `astryx.ff_gui=1` fw_cfg token (boot_config::ff_gui_mode), so
+            // the same build serves both headless and GUI demos with no rebuild.
+            // The --window-size is kept to a single-screen size (the SVGA
+            // framebuffer is 1366×768 by default) so the window fits the display.
+            const CMDLINE_MUSL_132_GUI: &str = "/disk/usr/lib/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance --window-size 1280,720";
+            const CMDLINE_MUSL_ESR_GUI: &str = "/disk/usr/lib/firefox-esr/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance --window-size 1280,720";
+            const CMDLINE_GLIBC_GUI:    &str = "/disk/opt/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance --window-size 1280,720";
             // Compiled default target URL (used when no `astryx.ff_url=` override
             // is supplied via fw_cfg).
             const DEFAULT_FF_URL: &str = "https://1.1.1.1/";
@@ -1315,10 +1327,19 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 musl_esr_stat.as_ref().map(|s| s.size).map_err(|e| *e),
                 glibc_stat.as_ref().map(|s| s.size).map_err(|e| *e),
             );
+            // Runtime GUI-mode selection (astryx.ff_gui=1).  When set, run the
+            // X11/windowed variant of whichever binary is present and tell the
+            // spawn path to omit MOZ_HEADLESS so libxul opens the display.
+            let gui_mode = boot_config::ff_gui_mode();
+            crate::gui::terminal::FF_GUI_MODE
+                .store(gui_mode, core::sync::atomic::Ordering::Release);
+            serial_println!("[FFTEST] launch mode: {}", if gui_mode { "GUI/X11" } else { "headless" });
             let cmdline_base = if musl_132_stat.is_ok() {
-                CMDLINE_MUSL_132_BASE
+                if gui_mode { CMDLINE_MUSL_132_GUI } else { CMDLINE_MUSL_132_BASE }
             } else if musl_esr_stat.is_ok() {
-                CMDLINE_MUSL_ESR_BASE
+                if gui_mode { CMDLINE_MUSL_ESR_GUI } else { CMDLINE_MUSL_ESR_BASE }
+            } else if gui_mode {
+                CMDLINE_GLIBC_GUI
             } else {
                 CMDLINE_GLIBC_BASE
             };
