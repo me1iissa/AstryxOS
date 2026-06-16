@@ -49,6 +49,21 @@ firefox-test-core = ["heap-canary"]
 # `dump_futex_wait_stack` rbp-chain walker) — trace is a strict superset of the
 # functional core, never a standalone.
 firefox-test-trace = ["firefox-test-core"]
+# `ff-png-serial-emit` — opt-in for the FULL [FF-OUT-PNG-B64:…] base64 chunk
+# stream that re-encodes Firefox's rendered /tmp/out.png over COM1.  OFF by
+# default because that stream is one synchronous `serial_println!` per 57 input
+# bytes (RFC 2045 §6.8 MIME line), i.e. ~36 800 UART writes for a 2 MB PNG; at
+# ~88 µs per port-I/O VM-exit (Intel SDM Vol. 3C §25 I/O-instruction VM-exits)
+# that is several minutes of CPU0 emit time, and while it runs it starves the
+# kdb pump thread that `qemu-harness.py kdb-read-png` reads through.  With this
+# feature OFF, `ff_out_png::emit_out_png()` still emits the single-line
+# `[FF-OUT-PNG:path=… size=… sig_ok=… complete=…]` summary marker (so the
+# harness knows the PNG is written and complete) but skips the chunk flood; the
+# PNG stays in the guest VFS for the non-baud-bound `kdb-read-png` live read.
+# Enable only when serial is the ONLY extraction channel (no `kdb` feature) or
+# to reproduce the historical serial-stream wire format.  Implies
+# `firefox-test-core` because the emit lives on the firefox-test boot path.
+ff-png-serial-emit = ["firefox-test-core"]
 # `ff-stderr-mirror` — JUST the [FF/stderr] / [FF/write] stdout/stderr mirror,
 # without the rest of the `firefox-test-trace` firehose ([POLL_RET],
 # [VFS/resolve], futex traces).  Lets a perf-profile boot capture a child

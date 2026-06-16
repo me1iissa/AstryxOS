@@ -6,28 +6,57 @@
 //! framebuffer at that point still shows the AstryxOS boot splash, so the
 //! existing `[SCREENSHOT-B64:…]` stream (which carries the framebuffer) does
 //! NOT carry Firefox's rendered output. This module reads `/tmp/out.png` back
-//! through the kernel VFS and emits it over serial as a DISTINCT base64 marker
-//! stream so the host can reconstruct the byte-exact file:
+//! through the kernel VFS and reports it over serial.
+//!
+//! # Default: a single summary marker, no byte stream
+//!
+//! Every firefox-test boot emits exactly one summary line the moment the PNG is
+//! a structurally complete file:
 //!
 //! ```text
-//! [FF-OUT-PNG:path=/tmp/out.png size=<N> sig_ok=<bool>]
+//! [FF-OUT-PNG:path=/tmp/out.png size=<N> sig_ok=<bool> complete=<bool>]
+//! ```
+//!
+//! That single line tells the host the PNG is written, its byte size, and that
+//! it has a valid signature + `IEND` trailer — enough for the harness to switch
+//! to a live VFS read (`qemu-harness.py kdb-read-png`), which is NOT baud-bound
+//! and returns a 2 MB PNG in seconds.  The rendered bytes stay in the guest VFS
+//! ramdisk; serial carries only the one-line marker.
+//!
+//! # Opt-in: the full base64 byte stream (`ff-png-serial-emit`)
+//!
+//! When the kernel is built with `--features ff-png-serial-emit`, the same call
+//! ALSO streams the byte-exact PNG over COM1 as a DISTINCT base64 marker stream
+//! so a host with no kdb channel can still reconstruct the file:
+//!
+//! ```text
+//! [FF-OUT-PNG:path=/tmp/out.png size=<N> sig_ok=<bool> complete=<bool>]
 //! [FF-OUT-PNG-B64:0/M] <up to 76 base64 chars>
 //! [FF-OUT-PNG-B64:1/M] ...
 //! ...
 //! [FF-OUT-PNG-END]
 //! ```
 //!
+//! This stream is OFF by default: it is one synchronous `serial_println!` per
+//! 57 input bytes (RFC 2045 §6.8 MIME line), i.e. ~36 800 UART writes for a
+//! 2 MB PNG; at ~88 µs per port-I/O VM-exit (Intel SDM Vol. 3C §25
+//! I/O-instruction VM-exits) that is several minutes of CPU0 emit time, during
+//! which it starves the kdb pump thread the live read depends on.  Enable it
+//! only when serial is the sole extraction channel.
+//!
 //! The encoding is standard base64 (RFC 4648 §4) with `=` padding; each data
 //! line carries 57 input bytes → 76 output characters (the MIME line length,
 //! RFC 2045 §6.8). The PNG signature is the 8-byte magic of W3C/ISO 15948 PNG
 //! (89 50 4E 47 0D 0A 1A 0A).
 //!
-//! The host-side decoder is `scripts/qemu-harness.py read-ff-png`, which is
-//! kept entirely separate from `read-png` (the framebuffer decoder) so the two
-//! extraction paths never collide.
+//! The host-side decoders are `scripts/qemu-harness.py kdb-read-png` (live VFS
+//! read — the default, fast path) and `read-ff-png` (the serial-stream decoder,
+//! used only when `ff-png-serial-emit` is enabled).  Both are kept entirely
+//! separate from `read-png` (the framebuffer decoder) so the extraction paths
+//! never collide.
 //!
-//! This module is compiled only under the `firefox-test` feature; it is inert
-//! (and absent) in every other build, so it cannot affect other tests.
+//! This module is compiled only under the `firefox-test-core` feature; it is
+//! inert (and absent) in every other build, so it cannot affect other tests.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -61,15 +90,19 @@ fn is_complete_png(bytes: &[u8]) -> bool {
     bytes[iend_at..iend_at + 8] == PNG_IEND_TRAILER
 }
 
-/// Standard base64 alphabet (RFC 4648 §4, Table 1).
+/// Standard base64 alphabet (RFC 4648 §4, Table 1). Used only by the opt-in
+/// serial byte stream; absent in the default build.
+#[cfg(feature = "ff-png-serial-emit")]
 const B64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Input bytes per emitted line: 57 → exactly 76 base64 characters
 /// (RFC 2045 §6.8 MIME line length).
+#[cfg(feature = "ff-png-serial-emit")]
 const CHUNK_BYTES: usize = 57;
 
 /// Maximum encoded bytes for one `CHUNK_BYTES` group: ceil(57/3)*4 = 76.
+#[cfg(feature = "ff-png-serial-emit")]
 const MAX_ENC_LEN: usize = 76;
 
 /// Base64-encode one input group (≤ `CHUNK_BYTES` bytes) into `out`, returning
@@ -77,6 +110,8 @@ const MAX_ENC_LEN: usize = 76;
 ///
 /// Pure function (no I/O, no allocation) so the encoding is unit-testable and
 /// identical in shape to the `[SCREENSHOT-B64]` encoder in `test_runner.rs`.
+/// Compiled only under the opt-in serial byte stream.
+#[cfg(feature = "ff-png-serial-emit")]
 fn b64_encode_group(src: &[u8], out: &mut [u8; MAX_ENC_LEN]) -> usize {
     let mut enc_len = 0usize;
     let mut i = 0usize;
@@ -112,20 +147,28 @@ fn b64_encode_group(src: &[u8], out: &mut [u8; MAX_ENC_LEN]) -> usize {
     enc_len
 }
 
-/// Read `/tmp/out.png` back from the VFS and emit it over serial as the
-/// `[FF-OUT-PNG-B64:…]` marker stream for host extraction. Returns `true` iff a
-/// COMPLETE PNG (valid signature + IEND trailer) was streamed.
+/// Read `/tmp/out.png` back from the VFS and report it over serial. Returns
+/// `true` iff the file is a COMPLETE PNG (valid signature + IEND trailer).
+///
+/// Default behaviour (any firefox-test build): emit exactly the one-line
+/// `[FF-OUT-PNG:path=… size=… sig_ok=… complete=…]` summary marker. The
+/// rendered bytes stay in the guest VFS for the host to pull live via
+/// `qemu-harness.py kdb-read-png` (not baud-bound). NO byte stream is emitted,
+/// so the call cannot starve the kdb pump thread or add minutes of UART time.
+///
+/// Opt-in (`--features ff-png-serial-emit`): a COMPLETE PNG is ADDITIONALLY
+/// streamed as the `[FF-OUT-PNG-B64:…]` / `[FF-OUT-PNG-END]` marker stream for a
+/// host with no kdb channel. See the module docs for the cost rationale.
 ///
 /// Best-effort and side-effect-free with respect to the boot: any failure
-/// (file absent, read error, empty, bad signature) is reported on a single
-/// `[FF-OUT-PNG:…]` line and the function returns `false` without emitting a
-/// data stream — it never panics and never blocks the shutdown path. Firefox
-/// having failed to write a screenshot is a normal, expected outcome that must
-/// not wedge the boot.
+/// (file absent, read error, empty, bad signature) is reported on the single
+/// `[FF-OUT-PNG:…]` line and the function returns `false` — it never panics and
+/// never blocks the shutdown path. Firefox having failed to write a screenshot
+/// is a normal, expected outcome that must not wedge the boot.
 ///
 /// When called speculatively from the poll loop (file may still be mid-write),
-/// the `complete=false` early return lets the caller probe again next tick
-/// rather than stream a truncated image.
+/// the `complete=false` return lets the caller probe again next tick rather
+/// than treat a truncated image as final.
 pub fn emit_out_png() -> bool {
     const PNG_PATH: &str = "/tmp/out.png";
 
@@ -147,28 +190,40 @@ pub fn emit_out_png() -> bool {
     let sig_ok = size >= 8 && bytes[..8] == PNG_SIGNATURE;
     let complete = is_complete_png(&bytes);
 
+    // The summary marker is ALWAYS emitted — it is one line regardless of PNG
+    // size, so it carries no baud-rate cost. The harness keys on this line to
+    // learn the PNG is written and complete, then reads the bytes live via the
+    // kdb VFS path (`qemu-harness.py kdb-read-png`).
     serial_println!(
         "[FF-OUT-PNG:path={} size={} sig_ok={} complete={}]",
         PNG_PATH, size, sig_ok, complete
     );
 
-    if size == 0 {
-        // Nothing to stream — header line already reported the empty file.
-        serial_println!("[FF-OUT-PNG-END]");
+    if size == 0 || !complete {
+        // Empty, mid-write, or corrupt: nothing to stream and not yet final.
+        // The summary line above already reported the state; let the caller
+        // retry on the next probe (complete=false) rather than act on a
+        // partial image.
         return false;
     }
 
-    if !complete {
-        // File present but not yet a complete PNG (still mid-write, or
-        // corrupt). Do NOT stream a partial image; report and let the caller
-        // retry on the next probe.
-        serial_println!("[FF-OUT-PNG-END]");
-        return false;
-    }
+    // A complete PNG is present. Stream the byte-exact base64 marker stream ONLY
+    // under the opt-in feature — it is the multi-minute, kdb-starving path that
+    // is redundant whenever the live kdb VFS read is available (the default).
+    #[cfg(feature = "ff-png-serial-emit")]
+    emit_b64_stream(&bytes, size);
 
+    true
+}
+
+/// Emit the byte-exact `[FF-OUT-PNG-B64:…]` chunk stream + `[FF-OUT-PNG-END]`
+/// terminator for `bytes` (a verified-complete PNG of length `size`). Compiled
+/// only under `ff-png-serial-emit`; absent and zero-cost otherwise.
+#[cfg(feature = "ff-png-serial-emit")]
+fn emit_b64_stream(bytes: &[u8], size: usize) {
     // Ceiling division for the chunk count (matches the existing
-    // `[SCREENSHOT-B64]` encoder); the header line above already told the host
-    // the byte size for a sanity cross-check.
+    // `[SCREENSHOT-B64]` encoder); the summary line already told the host the
+    // byte size for a sanity cross-check.
     let total_chunks = (size + CHUNK_BYTES - 1) / CHUNK_BYTES;
 
     for chunk_idx in 0..total_chunks {
@@ -188,5 +243,4 @@ pub fn emit_out_png() -> bool {
     }
 
     serial_println!("[FF-OUT-PNG-END]");
-    true
 }
