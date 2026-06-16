@@ -131,14 +131,37 @@ pub fn socket_setsockopt(id: u64, level: u64, optname: u64, val: u32) -> i32 {
         Some(s) => s,
         None => return -9, // EBADF
     };
+    // When SO_RCVBUF is set on a *bound* UDP socket we must propagate the
+    // cap to the per-port UDP receive buffer (which enforces it in the RX
+    // path, per `setsockopt(2)`).  TCP is analogous: the per-connection
+    // `recv_buffer` cap lives on the TCB, so propagate to `tcp::set_option`.
+    // Capture what's needed under the SOCKETS lock, then release it before
+    // touching the protocol lock — lock order is socket → protocol, never
+    // inverted.
+    let mut udp_rcvbuf_update: Option<(u16, usize)> = None;
+    let mut tcp_opt_update: Option<(u16, u32)> = None;
     match (level, optname) {
         (SOL_SOCKET,  SO_REUSEADDR) => { sock.reuseaddr = val != 0; }
         (SOL_SOCKET,  SO_KEEPALIVE) => { sock.keepalive = val != 0; }
-        (SOL_SOCKET,  SO_RCVBUF)    => { sock.rcvbuf    = val; }
+        (SOL_SOCKET,  SO_RCVBUF)    => {
+            sock.rcvbuf = val;
+            if sock.socket_type == SocketType::Udp && sock.bound {
+                udp_rcvbuf_update = Some((sock.local_port, val as usize));
+            } else if sock.socket_type == SocketType::Tcp && sock.bound {
+                tcp_opt_update = Some((sock.local_port, val));
+            }
+        }
         (SOL_SOCKET,  SO_SNDBUF)    => { sock.sndbuf    = val; }
         (SOL_SOCKET,  SO_LINGER)    => { sock.linger    = val != 0; }
         (IPPROTO_TCP, TCP_NODELAY)  => { sock.nodelay   = val != 0; }
         _ => {} // ignore unknown options
+    }
+    drop(sockets);
+    if let Some((port, rcvbuf)) = udp_rcvbuf_update {
+        super::udp::set_rcvbuf(port, rcvbuf);
+    }
+    if let Some((port, rcvbuf)) = tcp_opt_update {
+        super::tcp::set_option(port, None, None, Some(rcvbuf), None);
     }
     0
 }
@@ -184,6 +207,18 @@ pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
         port
     };
 
+    // If the application set SO_RCVBUF before bind (the common pattern for
+    // a high-throughput datagram consumer), carry that cap into the new
+    // UDP binding.  The `Socket.rcvbuf` initial value (87380) marks "not
+    // explicitly set"; only a different value is treated as an override,
+    // so an untouched socket keeps the UDP `net.core.rmem_default` cap.
+    let udp_rcvbuf_override = if sock.socket_type == SocketType::Udp
+        && sock.rcvbuf != 87380 {
+        Some(sock.rcvbuf as usize)
+    } else {
+        None
+    };
+
     match sock.socket_type {
         SocketType::Udp => {
             // Bind will be done on first recv.
@@ -196,6 +231,10 @@ pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
 
     sock.local_port = actual_port;
     sock.bound = true;
+    drop(sockets);
+    if let Some(rcvbuf) = udp_rcvbuf_override {
+        super::udp::set_rcvbuf(actual_port, rcvbuf);
+    }
     Ok(())
 }
 

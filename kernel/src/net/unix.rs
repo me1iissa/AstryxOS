@@ -18,6 +18,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 // ── Limits ───────────────────────────────────────────────────────────────────
@@ -141,6 +142,19 @@ struct UnixSocket {
     creator_pid: u64,
     creator_uid: u32,
     creator_gid: u32,
+    /// Monotonic generation of this slot index, bumped every time the slot is
+    /// recycled ([`reset`]).  Because AF_UNIX socket ids are bare slot indices
+    /// that are reused the instant a slot's last reference drops, any side
+    /// table keyed on the bare index (notably the `SCM_RIGHTS` batch queue,
+    /// `syscall::PENDING_SCM`) risks delivering a *previous* occupant's state
+    /// to the *current* occupant.  Pairing the index with this incarnation
+    /// makes such a stale entry structurally undeliverable: a queued batch
+    /// records the incarnation at enqueue time, and delivery refuses any batch
+    /// whose recorded incarnation differs from the slot's current one.  This
+    /// closes the recycle race independently of the close→drain ordering
+    /// window (see `close`).  `u64` never wraps in practice (one bump per
+    /// socket teardown).
+    incarnation: u64,
 }
 
 impl UnixSocket {
@@ -169,10 +183,25 @@ impl UnixSocket {
             creator_pid: 0,
             creator_uid: 0,
             creator_gid: 0,
+            incarnation: 0,
         }
     }
 
-    fn reset(&mut self) {
+    /// Recycle the slot, bumping its incarnation.  `idx` is the slot's own
+    /// table index; it is needed to keep the lock-free `SLOT_INCARNATION`
+    /// mirror in lockstep with the authoritative `self.incarnation` (both
+    /// mutated only here, under the `TABLE` lock).
+    fn reset(&mut self, idx: usize) {
+        // Bump the slot generation FIRST so any SCM_RIGHTS batch still queued
+        // against the OUTGOING incarnation can never be delivered to the next
+        // occupant of this index (see the `incarnation` field doc and the
+        // `syscall::PENDING_SCM` incarnation guard).
+        self.incarnation = self.incarnation.wrapping_add(1);
+        // Publish the new generation to the lock-free mirror so the SCM
+        // delivery predicates observe it without taking the TABLE lock.
+        // Done under the TABLE lock (this method's only caller context), so
+        // no writer-writer race; the matching reads are wait-free.
+        SLOT_INCARNATION[idx].store(self.incarnation, Ordering::Release);
         self.state       = UnixState::Free;
         self.kind        = SockKind::Stream;
         self.path_len    = 0;
@@ -245,6 +274,31 @@ unsafe impl Send for Table {}
 
 static TABLE: Mutex<Table> = Mutex::new(Table([UnixSocket::ZERO; MAX_UNIX_SOCKETS]));
 
+/// Lock-free mirror of each slot's recycle generation (`UnixSocket.incarnation`).
+///
+/// The authoritative value lives in the TABLE-protected `UnixSocket.incarnation`
+/// and is bumped only in `reset()`.  This array shadows it so that the
+/// `SCM_RIGHTS` delivery predicates (which run while holding the `PENDING_SCM`
+/// lock) can read the current incarnation WITHOUT re-acquiring the unix `TABLE`
+/// lock — see `current_incarnation`.
+///
+/// Why a lock-free mirror matters for lock ordering: the atomic SCM-send path
+/// commits a frame's bytes AND queues its fd batch under ONE held `TABLE` lock
+/// (so no concurrent sender can interleave bytes between the byte-offset capture
+/// and the byte append — see `scm_send_frame_atomic`).  That nests
+/// `TABLE → PENDING_SCM`.  Were the delivery predicates to take `TABLE` while
+/// holding `PENDING_SCM` (the old `current_incarnation` did), the two would
+/// invert and deadlock.  Reading the incarnation from this atomic mirror makes
+/// `PENDING_SCM` a true leaf with respect to `TABLE`, so the nesting is strictly
+/// one-directional (`TABLE → PENDING_SCM`) and deadlock-free.
+///
+/// Updated under the `TABLE` lock (in `reset`, the single incarnation mutator),
+/// so a writer can never race another writer; readers are wait-free.
+static SLOT_INCARNATION: [AtomicU64; MAX_UNIX_SOCKETS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; MAX_UNIX_SOCKETS]
+};
+
 impl UnixSocket { const ZERO: Self = Self::zeroed(); }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -270,7 +324,7 @@ pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
     let mut t = TABLE.lock();
     for (i, s) in t.0.iter_mut().enumerate() {
         if s.state == UnixState::Free {
-            s.reset();
+            s.reset(i);
             s.state       = UnixState::Unbound;
             s.kind        = kind;
             s.ref_count   = 1;
@@ -353,7 +407,7 @@ pub fn connect(id: u64, path: &[u8], _client_creds: PeerCreds) -> i64 {
         let mut found = u64::MAX;
         for (i, s) in t.0.iter_mut().enumerate() {
             if i as u64 != id && s.state == UnixState::Free {
-                s.reset();
+                s.reset(i);
                 s.state       = UnixState::Connected;
                 s.kind        = server_kind;
                 s.peer_id     = id;
@@ -426,7 +480,7 @@ pub fn socketpair(kind: SockKind, creds: PeerCreds) -> (u64, u64) {
     for (i, s) in t.0.iter_mut().enumerate() {
         if s.state == UnixState::Free {
             if a == u64::MAX {
-                s.reset();
+                s.reset(i);
                 s.state       = UnixState::Connected;
                 s.kind        = kind;
                 s.ref_count   = 1; // one reference: fd[0] returned by socketpair(2)
@@ -435,7 +489,7 @@ pub fn socketpair(kind: SockKind, creds: PeerCreds) -> (u64, u64) {
                 s.creator_gid = creds.gid;
                 a = i as u64;
             } else {
-                s.reset();
+                s.reset(i);
                 s.state       = UnixState::Connected;
                 s.kind        = kind;
                 s.ref_count   = 1; // one reference: fd[1] returned by socketpair(2)
@@ -504,8 +558,11 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // poller waking on the bell does not contend on TABLE on its
         // re-evaluation pass.
         drop(t);
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // Targeted by `peer_id` — the receiver's socket id, which is exactly
+        // what a peer poller's fd resolves to via `get_unix_socket_id` — so only
+        // pollers on that socket re-scan, not every AF_UNIX poller.
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixWrite, peer_id);
         // Attribute SEQPACKET bytes to the writer.
         crate::proc::proc_metrics::bump_net_write(
             crate::proc::current_pid_lockless(), n as u64);
@@ -519,14 +576,188 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // Wake any poll/epoll/select caller watching the peer fd.  The
         // pre-existing read path returns -EAGAIN when the buffer is empty,
         // so without this kick the caller would wait for the next resync
-        // tick to discover the new bytes.
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // tick to discover the new bytes.  Targeted by `peer_id` (the
+        // receiver's socket id = what the peer poller's fd resolves to).
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixWrite, peer_id);
         // Attribute outbound AF_UNIX bytes to the writer.
         crate::proc::proc_metrics::bump_net_write(
             crate::proc::current_pid_lockless(), n as u64);
     }
     if n == 0 { -11 } else { n as i64 }
+}
+
+/// Outcome of an atomic `SCM_RIGHTS`-carrying `sendmsg(2)` frame commit.
+pub struct ScmFrameResult {
+    /// Bytes of this frame accepted into the peer recv ring.  Matches the
+    /// `write` STREAM contract: a partial write reports the count queued, and
+    /// only a frame that queued ZERO data bytes reports `total == 0` (the
+    /// caller turns that into -EAGAIN).
+    pub total: usize,
+    /// The peer (receiver) socket id, for the post-unlock poll-bell ring.
+    /// `u64::MAX` on the error path (no peer to wake).
+    pub peer_id: u64,
+    /// `0` on success; a negative errno when the connection was not writable at
+    /// all (peer gone / SHUT_WR / not connected).  The caller returns this
+    /// verbatim, exactly as the per-iovec `write` path would.
+    pub error: i64,
+    /// The fd batch when it was NOT committed to `PENDING_SCM` (error path, or
+    /// a data-bearing frame that queued zero bytes and will be retried in full
+    /// by the writer).  The caller — holding no lock — must release these
+    /// references via `syscall::scm_drop_fds` (CWE-772).  `None` when the batch
+    /// was committed (PENDING_SCM now owns the references) or there were no fds.
+    pub unqueued_fds: Option<Vec<crate::vfs::FileDescriptor>>,
+}
+
+/// Atomically commit one `SCM_RIGHTS`-carrying `sendmsg(2)` frame to a STREAM
+/// AF_UNIX peer: capture the bind offset, push the frame's data bytes, and
+/// queue the ancillary fd batch — all under ONE held `TABLE` lock.
+///
+/// # Why one critical section (the bug this closes)
+/// The previous send path performed three separate critical sections per SCM
+/// frame: (1) capture the peer's recv-stream offset (`enqueue_offset_for`,
+/// TABLE lock), (2) queue the fd batch bound to that offset (`scm_queue`,
+/// PENDING_SCM lock), and (3) push the data bytes (`write`, TABLE lock), with
+/// the locks dropped between each step.  Two concurrent `sendmsg(2)`s to the
+/// SAME peer could then interleave: sender B captures the SAME offset as
+/// sender A before A's bytes are pushed, so both batches bind to a stream
+/// position that does not uniquely identify their own frame's bytes — the
+/// receiver dequeues an SCM batch at a byte position carrying a DIFFERENT
+/// frame's data.  A length-prefixed IPC reader (e.g. an IPDL channel) then
+/// parses a frame whose announced handle count disagrees with the descriptors
+/// present and aborts the channel.  Per recvmsg(2) / unix(7) / POSIX.1-2017
+/// §2.14 a received descriptor is associated with the data of the message that
+/// carried it; the two must be delivered together and not interleaved with an
+/// unrelated send.
+///
+/// Holding `TABLE` across the offset capture, the byte push, AND the batch
+/// enqueue makes the (bytes, fd-batch, byte_offset) triple a single indivisible
+/// unit: no other sender can advance `recv_pushed` between this frame's
+/// byte-offset capture and its byte append, so the recorded `byte_offset`
+/// always names bytes that belong to THIS frame.  This mirrors the canonical
+/// AF_UNIX semantics where a message's data and its ancillary fds are appended
+/// to the peer receive queue as one indivisible item.
+///
+/// # Lock order / deadlock-freedom
+/// This nests `TABLE → PENDING_SCM` (`scm_queue` takes only `PENDING_SCM`).
+/// That is safe because the `SCM_RIGHTS` delivery predicates no longer take
+/// `TABLE` while holding `PENDING_SCM`: `current_incarnation` reads the
+/// lock-free `SLOT_INCARNATION` mirror.  So `PENDING_SCM` is a leaf with
+/// respect to `TABLE` and the nesting is strictly one-directional — the two
+/// can never invert.
+///
+/// `data_chunks` are kernel-owned copies of the frame's iovec data (already
+/// SMAP-copied by the caller).  `bind_data_frame` is `true` for a data-bearing
+/// frame (bind to first-byte-touch `T + 1`) and `false` for a control-only
+/// frame (bind to the tail `T`, immediately deliverable) — the same predicate
+/// the caller computes from the iovec lengths.  `fds` is the already
+/// ref-bumped descriptor batch to deliver.
+pub fn scm_send_frame_atomic(
+    id: u64,
+    data_chunks: &[Vec<u8>],
+    bind_data_frame: bool,
+    fds: Vec<crate::vfs::FileDescriptor>,
+) -> ScmFrameResult {
+    if id as usize >= MAX_UNIX_SOCKETS {
+        return ScmFrameResult {
+            total: 0, peer_id: u64::MAX, error: -9, unqueued_fds: Some(fds),
+        };
+    }
+    let mut t = TABLE.lock();
+    // Same writability checks as `write` (POSIX send(2) / IEEE 1003.1 §shutdown).
+    let (peer_id, kind) = {
+        let s = &t.0[id as usize];
+        if s.state != UnixState::Connected || s.shut_wr || s.peer_closed {
+            drop(t);
+            return ScmFrameResult {
+                total: 0, peer_id: u64::MAX, error: -32, unqueued_fds: Some(fds),
+            };
+        }
+        (s.peer_id, s.kind)
+    };
+    // Mutual-pairing gate (see `write`): the resolved peer must still point
+    // back at us, else the slot was recycled and the bytes must not be
+    // injected into an unrelated connection.
+    if peer_id as usize >= MAX_UNIX_SOCKETS
+        || t.0[peer_id as usize].state != UnixState::Connected
+        || t.0[peer_id as usize].peer_id != id
+    {
+        drop(t);
+        return ScmFrameResult {
+            total: 0, peer_id: u64::MAX, error: -32, unqueued_fds: Some(fds),
+        };
+    }
+
+    // Capture the frame's START stream-position (the peer's next-push offset)
+    // BEFORE pushing — atomic with the push because TABLE is held throughout,
+    // so no concurrent sender can advance `recv_pushed` in between.
+    let frame_start = t.0[peer_id as usize].enqueue_offset();
+    let has_data = data_chunks.iter().any(|c| !c.is_empty());
+    let mut total = 0usize;
+    if kind == SockKind::SeqPacket {
+        // SEQPACKET: the whole frame is ONE message — all bytes land or none
+        // do (POSIX SOCK_SEQPACKET, no partial datagram).  Concatenate the
+        // frame's chunks and push as a single boundary-preserving message,
+        // recording the message length.  If the message does not fit (ring or
+        // length-queue full), nothing is pushed and the fds are handed back for
+        // release (the writer retries the whole frame, cmsg re-attached).
+        let mut msg: Vec<u8> = Vec::new();
+        for chunk in data_chunks { msg.extend_from_slice(chunk); }
+        let peer = &mut t.0[peer_id as usize];
+        let queued = (peer.seq_tail + SEQ_QUEUE_CAP - peer.seq_head) % SEQ_QUEUE_CAP;
+        if !msg.is_empty() && (queued >= SEQ_QUEUE_CAP - 1 || msg.len() > peer.recv_space()) {
+            drop(t);
+            return ScmFrameResult { total: 0, peer_id, error: 0, unqueued_fds: Some(fds) };
+        }
+        if !msg.is_empty() {
+            let n = peer.push(&msg); // n == msg.len() (space checked above)
+            peer.seq_lens[peer.seq_tail] = n as u32;
+            peer.seq_tail = (peer.seq_tail + 1) % SEQ_QUEUE_CAP;
+            total = n;
+        }
+    } else {
+        // STREAM: byte-stream — partial writes permitted (POSIX send(2)).  Push
+        // every chunk in one critical section; stop at the first chunk the ring
+        // cannot fully accept, matching the per-iovec semantics of the old path.
+        for chunk in data_chunks {
+            if chunk.is_empty() { continue; }
+            let n = t.0[peer_id as usize].push(chunk);
+            total += n;
+            if n < chunk.len() { break; } // ring filled mid-chunk → short write
+        }
+    }
+
+    // Decide whether to commit the fd batch.  A control-only frame (no data
+    // bytes at all) always commits as a 0-byte readable ancillary message.  A
+    // data-bearing frame commits only when at least one byte landed: a fully
+    // -EAGAIN frame (total == 0) is retried IN FULL by the userspace stream
+    // writer with its control message re-attached, so committing here would
+    // duplicate the fds (CWE-675).
+    if !has_data {
+        // Control-only: bind to the tail T (immediately deliverable).
+        // `frame_start == enqueue_offset()` is the current tail.
+        crate::syscall::scm_queue(peer_id, frame_start, fds);
+        drop(t);
+        ScmFrameResult { total, peer_id, error: 0, unqueued_fds: None }
+    } else if total > 0 {
+        // Data-bearing: first-byte-touch contract — bind to T + 1 when the
+        // caller requested the data-frame binding (recvmsg(2) / unix(7) /
+        // POSIX.1-2017 §2.14: ancillary data delivered with the recvmsg that
+        // returns the data it accompanies).  Queued WHILE the bytes are still
+        // covered by the held TABLE lock — i.e. before the bytes are visible
+        // to a concurrent reader — so a peer recvmsg can never drain past the
+        // batch's offset before the batch is in PENDING_SCM (no strand).
+        let bind = if bind_data_frame { frame_start + 1 } else { frame_start };
+        crate::syscall::scm_queue(peer_id, bind, fds);
+        drop(t);
+        ScmFrameResult { total, peer_id, error: 0, unqueued_fds: None }
+    } else {
+        // Data-bearing but zero bytes landed (ring full): do NOT queue; hand
+        // the fds back to the caller for reference release (it took them
+        // before this call).  total == 0 → caller reports -EAGAIN.
+        drop(t);
+        ScmFrameResult { total: 0, peer_id, error: 0, unqueued_fds: Some(fds) }
+    }
 }
 
 pub fn read(id: u64, buf: &mut [u8]) -> i64 {
@@ -561,6 +792,13 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     // SHUT_RD locally → return 0 (orderly EOF) regardless of any data
     // still queued in our recv_buf.  Matches Linux AF_UNIX behaviour.
     if s.shut_rd { return Ok((0, 0)); }
+
+    // The peer socket id — draining our recv ring makes the PEER's write side
+    // newly POLLOUT-ready, so the UnixRead bell is targeted at `peer_id` (the
+    // object a peer poller's fd resolves to via `get_unix_socket_id`).  Captured
+    // here while the TABLE lock is held, before any drop.  A severed peer
+    // (`u64::MAX`) yields a class-only ring below (harmless: no peer to wake).
+    let peer_id = s.peer_id;
 
     // Number of bytes the drain frees from *our* recv ring.  Draining recv
     // space makes the *peer's* write side newly POLLOUT-ready, so once we
@@ -617,8 +855,16 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     // as `write()` / `shutdown()`).
     drop(t);
     if drained > 0 {
-        crate::ipc::waitlist::ring_poll_bell_for(
-            crate::ipc::waitlist::PollBellSource::UnixRead);
+        // Targeted at the peer's socket id: only a poller on the peer fd (now
+        // POLLOUT-ready) re-scans.  If the peer slot is severed, `peer_id` is
+        // out of range and resolves to no parker — equivalent to a no-op.
+        let obj = if (peer_id as usize) < MAX_UNIX_SOCKETS {
+            peer_id
+        } else {
+            crate::ipc::waitlist::OBJECT_ID_NONE
+        };
+        crate::ipc::waitlist::ring_poll_bell_for_obj(
+            crate::ipc::waitlist::PollBellSource::UnixRead, obj);
     }
     result
 }
@@ -736,7 +982,7 @@ pub fn close(id: u64) {
     // ref_count == 1 (or 0 for legacy slots created before this field
     // was added — treat as "last reference").
     let peer_id = s.peer_id;
-    s.reset();
+    s.reset(id as usize);
     let mut ring = false;
     let mut peer_was_connected = false;
     if (peer_id as usize) < MAX_UNIX_SOCKETS {
@@ -933,6 +1179,24 @@ pub fn recv_consumed(id: u64) -> u64 {
     if id as usize >= MAX_UNIX_SOCKETS { return 0; }
     let t = TABLE.lock();
     t.0[id as usize].recv_popped
+}
+
+/// Current incarnation (recycle generation) of slot `id` — see the
+/// `UnixSocket::incarnation` field.  An `SCM_RIGHTS` batch records this at
+/// enqueue and delivery refuses a batch whose recorded incarnation differs,
+/// so a stale batch can never reach a recycled slot's new occupant.  Returns
+/// `u64::MAX` (a value no live slot can hold after a real recycle, and which
+/// no batch records) for an out-of-range id so callers fail closed.
+pub fn current_incarnation(id: u64) -> u64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return u64::MAX; }
+    // Read the lock-free mirror — NOT the TABLE-protected field.  The SCM
+    // delivery predicates call this while holding the `PENDING_SCM` lock; the
+    // atomic SCM-send path holds `TABLE` and then takes `PENDING_SCM`.  Reading
+    // the incarnation here without the TABLE lock keeps `PENDING_SCM` a leaf
+    // with respect to `TABLE`, so the only nesting is `TABLE → PENDING_SCM`
+    // and the two cannot invert into a deadlock.  `SLOT_INCARNATION` is kept in
+    // lockstep with the authoritative `UnixSocket.incarnation` in `reset()`.
+    SLOT_INCARNATION[id as usize].load(Ordering::Acquire)
 }
 
 /// Usable byte-stream capacity of one AF_UNIX socket end's recv ring — the

@@ -136,6 +136,46 @@ impl VmArea {
     }
 }
 
+/// Take one inode reference for a file-backed VMA, or do nothing for any other
+/// backing.  Every live `VmBacking::File` VMA holds exactly one such reference.
+///
+/// Per `mmap(2)` / `memfd_create(2)`, a memory mapping is a reference to the
+/// mapped file's underlying object: the object "is not freed until [...] all
+/// mappings have been unmapped".  An open fd is *not* the only reference — a
+/// mapping that outlives the last fd (e.g. a `memfd` whose creating fd has been
+/// `close(2)`d while it is still mapped) must keep the inode alive on its own.
+/// Without this reference, a later demand fault on a not-present page of such a
+/// mapping reads a freed inode and the process is killed.
+///
+/// The reference is a counted pin keyed on `(mount_idx, inode)` in the VFS
+/// layer; the inode is freed only once no open fd, no other pin, and now no
+/// mapping reference remains.  Balance every pin with exactly one
+/// [`unpin_file_vma`] when the VMA ceases to exist (unmap / split-away /
+/// process exit / exec teardown).  Non-file backings (anonymous, device,
+/// SysV-SHM `Device`) have no inode and are a no-op.
+pub(crate) fn pin_file_vma(vma: &VmArea) {
+    if let VmBacking::File { mount_idx, inode, .. } = &vma.backing {
+        crate::vfs::pin_inode(*mount_idx, *inode);
+    }
+}
+
+/// Drop the inode reference taken by [`pin_file_vma`] for a file-backed VMA, or
+/// do nothing for any other backing.  Call exactly once when a
+/// `VmBacking::File` VMA leaves the address space (full unmap, the consumed
+/// half of a split, exec/exit teardown).
+///
+/// Uses the DEFERRED unpin (`vfs::unpin_inode_deferred`): every caller here runs
+/// with `PROCESS_TABLE` or the address-space `mm_sem` held, and the eventual
+/// inode-free re-acquires `PROCESS_TABLE` (non-reentrant `spin::Mutex`).  The
+/// decrement happens now; if it was the last reference the inode is queued and
+/// freed by `vfs::drain_pending_inode_frees`, which every caller invokes after
+/// releasing its address-space locks.
+pub(crate) fn unpin_file_vma(vma: &VmArea) {
+    if let VmBacking::File { mount_idx, inode, .. } = &vma.backing {
+        crate::vfs::unpin_inode_deferred(*mount_idx, *inode);
+    }
+}
+
 /// Classification of a page-fault access, decoded from the x86 error code.
 ///
 /// The three variants partition the access into at most one of
@@ -963,10 +1003,16 @@ impl VmSpace {
         #[cfg(not(feature = "fork-cow-trace"))]
         let _ = (total_pages_cow, total_pages_shared);
 
-        // Copy VMA list to child.
+        // Copy VMA list to child.  Each file-backed VMA duplicated into the
+        // child is a new, independent mapping reference to the same inode, so it
+        // takes its own pin (POSIX fork(2): the child's mappings are duplicates
+        // of the parent's; file mappings remain references to the same object).
+        // The child's later exit/exec teardown unpins these one-for-one.
         let mut child_areas = Vec::with_capacity(self.areas.len());
         for vma in &self.areas {
-            child_areas.push(vma.clone());
+            let cloned = vma.clone();
+            pin_file_vma(&cloned);
+            child_areas.push(cloned);
         }
 
         // Child gets a fresh, independent `mm_sem`.  Parent and child are now
@@ -1044,6 +1090,12 @@ impl VmSpace {
         // Find insertion point (sorted by base)
         let pos = self.areas.iter().position(|v| v.base > vma.base)
             .unwrap_or(self.areas.len());
+        // A file-backed VMA entering the address space takes one inode pin so
+        // the mapping keeps the backing inode alive independently of any open
+        // fd (mmap(2): the object is not freed until all mappings are unmapped).
+        // Balanced by the unpin in `remove_range`, the mprotect-split path, and
+        // the exit/exec teardown walks.
+        pin_file_vma(&vma);
         self.areas.insert(pos, vma);
         // W216 H_5j-B: notify the PFH install loop that the VMA list changed.
         self.generation.fetch_add(1, Ordering::Release);
@@ -1079,8 +1131,10 @@ impl VmSpace {
             }
 
             if vma.base >= base && vma.end() <= end {
-                // Completely contained — remove
-                self.areas.remove(i);
+                // Completely contained — remove.  A file-backed VMA leaving the
+                // address space drops its inode pin (POSIX munmap(2)).
+                let removed = self.areas.remove(i);
+                unpin_file_vma(&removed);
                 continue;
             }
 
@@ -1118,7 +1172,15 @@ impl VmSpace {
                     backing: right_backing,
                     name: vma.name,
                 };
-                self.areas.remove(i);
+                // Hole-punch: one file-backed VMA becomes two.  Drop the pin of
+                // the original and take a fresh pin for each surviving half so
+                // the pin count equals the number of live file-backed VMAs
+                // referencing the inode (mmap(2): the inode stays mapped by both
+                // halves).  `left`/`right` carry the same (mount_idx, inode).
+                let removed = self.areas.remove(i);
+                unpin_file_vma(&removed);
+                pin_file_vma(&right);
+                pin_file_vma(&left);
                 self.areas.insert(i, right);
                 self.areas.insert(i, left);
                 i += 2;
@@ -1128,8 +1190,13 @@ impl VmSpace {
             if vma.base < base {
                 // Overlap on the right side — shrink (left portion kept).
                 // The kept portion starts at vma.base with unchanged offset.
+                // The VMA is removed and re-inserted as ONE surviving VMA, so
+                // the pin count is unchanged: unpin on remove, pin on re-insert
+                // (same inode) nets zero.
                 let mut vma = self.areas.remove(i);
+                unpin_file_vma(&vma);
                 vma.length = base - vma.base;
+                pin_file_vma(&vma);
                 self.areas.insert(i, vma);
                 i += 1;
                 continue;
@@ -1138,7 +1205,10 @@ impl VmSpace {
             // Overlap on the left side — shrink from left.
             // The kept portion starts at `end`, which is `end - old_base`
             // bytes into the original VMA.  Advance the file offset accordingly.
+            // One surviving VMA — pin count unchanged (unpin/pin net zero on the
+            // same inode; the offset change does not alter the pin key).
             let mut vma = self.areas.remove(i);
+            unpin_file_vma(&vma);
             let old_base = vma.base;
             let left_delta = end - old_base;
             if let VmBacking::File { offset, .. } = &mut vma.backing {
@@ -1146,6 +1216,7 @@ impl VmSpace {
             }
             vma.base = end;
             vma.length -= left_delta;
+            pin_file_vma(&vma);
             self.areas.insert(i, vma);
             i += 1;
         }

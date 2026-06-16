@@ -372,18 +372,39 @@ pub fn starve_force_count() -> u64 {
 
 /// Runtime gate for the preemption-KICK half of wakeup preemption.
 ///
-/// Default OFF — measured 2026-06-12 on the Firefox/BBC workload: kicking on
-/// every event wake evicts whichever thread is running, and on this kernel
-/// that is very often TID 0 (the BSP main loop at PRIORITY_IDLE, which pumps
-/// `net::poll` / X11 / the compositor continuously while it holds the CPU).
-/// Evicting the IO pump on every wake collapsed TCP processing throughput:
-/// TLS client-Finished latency went from median 0.99 s (baseline) to 11.8 s
-/// (kick + ratcheting boost) / 12.3 s akamai-median (kick + one-shot boost),
-/// with stalled-handshake counts exploding 3 → 20-29.  The one-shot wake
-/// BOOST alone (queue-jump at natural reschedule points, nobody evicted
-/// mid-quantum) is the default mechanism; the kick stays available behind
-/// this gate for experiments via `set_wake_kick`.
-pub static WAKE_KICK_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Default ON only for `firefox-test-core` builds (the workload it was
+/// re-designed and measured for), OFF for every other build — same gating
+/// pattern as `WAKE_BOOST_ENABLED`.  Instantly reversible at runtime via
+/// `set_wake_kick`.
+///
+/// ## IO-pump-protected design (2026-06-15)
+///
+/// The earlier blanket kick was OFF by default because it evicted whichever
+/// thread was running, and on this kernel that is very often TID 0 — the BSP
+/// main loop at `PRIORITY_IDLE`, which pumps `net::poll` / X11 / the compositor
+/// continuously while holding the CPU.  Evicting the IO pump on every wake
+/// collapsed TCP throughput (a probed measurement put median TLS
+/// client-Finished latency at 0.99 s baseline → 11.8 s with the blanket kick;
+/// per the #560 observer-effect note that figure was taken under kdb probing
+/// and is suspect in magnitude, but the direction — the pump must not be
+/// evicted — is real).  `kick_preempt_for_wake` now carries two guards that
+/// make the kick the precise inverse of that failure:
+///
+///   * GUARD 1 (identity): `Thread::is_io_pump()` threads are skipped, so the
+///     only IO pump (TID 0) is structurally un-evictable.
+///   * GUARD 2 (delta): a CPU is only kicked when the woken thread is at least
+///     `KICK_DELTA` priority levels above the running one, so same-base-priority
+///     libxul worker churn does not hair-trigger reschedules.
+///
+/// The kick still only sets `NEED_RESCHEDULE`, consumed at the existing
+/// preemption points (timer-ISR Ring-3 return, syscall-dispatcher tail, #PF
+/// exit); it adds no IPI and cannot interrupt `switch_context_asm`, so it does
+/// not perturb the #552/#555 dual-core park/reclaim invariants.  Per POSIX
+/// sched(7), an unblocked SCHED_OTHER thread should contend for the CPU
+/// promptly — the kick turns a higher-priority wake into a prompt scheduling
+/// opportunity instead of a full-quantum wait.
+pub static WAKE_KICK_ENABLED: AtomicBool =
+    AtomicBool::new(cfg!(feature = "firefox-test-core"));
 
 /// Flip the wakeup-preemption kick at runtime (diagnostic/experiment hook).
 pub fn set_wake_kick(v: bool) {
@@ -438,9 +459,26 @@ pub fn kick_preempt_for_wake(threads: &[proc::Thread], woken_prio: u8) -> u32 {
     if !WAKE_KICK_ENABLED.load(Ordering::Relaxed) {
         return 0;
     }
+    /// Minimum priority gap (woken vs running) required to issue a kick.  A
+    /// gap of `PRIORITY_BOOST_WAIT` (2) means a wake-boosted worker
+    /// (base 8 → boosted 10) crosses a same-base-priority running peer (8),
+    /// but micro-wakes within the same band do not thrash the run queue.
+    const KICK_DELTA: u8 = 2;
     let mut kicked = 0u32;
     for t in threads.iter() {
-        if t.state == ThreadState::Running && t.priority < woken_prio {
+        // GUARD 1 (identity): never evict an I/O pump.  Today only TID 0 pumps
+        // net::poll / X11 / the compositor; evicting it collapsed TCP
+        // throughput (see WAKE_KICK_ENABLED).  Role predicate, not a bare
+        // tid==0, so the protection travels to any future registered pump.
+        if t.is_io_pump() {
+            continue;
+        }
+        // GUARD 2 (delta): require a real priority gap.  `priority + KICK_DELTA
+        // <= woken_prio` (saturating, so a near-u8::MAX running priority simply
+        // never qualifies rather than wrapping).
+        if t.state == ThreadState::Running
+            && t.priority.saturating_add(KICK_DELTA) <= woken_prio
+        {
             let cpu = t.last_cpu as usize;
             if cpu < MAX_CPUS && !NEED_RESCHEDULE[cpu].swap(true, Ordering::Release) {
                 kicked += 1;
@@ -456,6 +494,16 @@ pub fn kick_preempt_for_wake(threads: &[proc::Thread], woken_prio: u8) -> u32 {
 /// Test/diagnostic read of a CPU's NEED_RESCHEDULE flag (does not clear it).
 pub fn need_reschedule_flag(cpu: usize) -> bool {
     cpu < MAX_CPUS && NEED_RESCHEDULE[cpu].load(Ordering::Acquire)
+}
+
+/// Test-only: clear a CPU's NEED_RESCHEDULE flag so a kick assertion can
+/// observe a deterministic 0→1 edge on a synthetic CPU index without
+/// perturbing a live CPU.  Compiled out of production builds.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+pub fn clear_need_reschedule_for_test(cpu: usize) {
+    if cpu < MAX_CPUS {
+        NEED_RESCHEDULE[cpu].store(false, Ordering::Release);
+    }
 }
 
 // ── Run-queue wait (wake-to-run) latency histogram ───────────────────────────

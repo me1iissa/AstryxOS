@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::ipc::waitlist::{ring_poll_bell_for, wake_tids, PollBellSource, WaitList};
+use crate::ipc::waitlist::{ring_poll_bell_for_obj, wake_tids, PollBellSource, WaitList};
 
 /// POSIX write-atomicity threshold (`limits.h` `PIPE_BUF`; 4096 on Linux).
 /// Writes of at most this many bytes land all-or-nothing and never
@@ -599,8 +599,9 @@ pub fn wake_readers_all(pipe_id: u64) {
     wake_tids(&drained);
     // Also kick the global poll bell so any poll/epoll/select caller
     // watching this pipe re-evaluates immediately rather than waiting
-    // for its resync tick.
-    ring_poll_bell_for(PollBellSource::Pipe);
+    // for its resync tick.  Targeted by `pipe_id` so only pollers watching
+    // THIS pipe re-scan, not every pipe poller (intra-class herd collapse).
+    ring_poll_bell_for_obj(PollBellSource::Pipe, pipe_id);
 }
 
 /// Wake every writer parked on `pipe_id`.
@@ -617,7 +618,7 @@ pub fn wake_writers_all(pipe_id: u64) {
         }
     };
     wake_tids(&drained);
-    ring_poll_bell_for(PollBellSource::Pipe);
+    ring_poll_bell_for_obj(PollBellSource::Pipe, pipe_id);
 }
 
 /// Best-effort cleanup: remove `tid` from this pipe's reader wait list.

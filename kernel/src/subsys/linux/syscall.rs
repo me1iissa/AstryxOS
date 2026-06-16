@@ -55,6 +55,91 @@ fn memfd_seals_get(inode: u64) -> Option<u32> {
     MEMFD_SEALS.lock().iter().find(|(ino, _)| *ino == inode).map(|(_, m)| *m)
 }
 
+/// Build the per-OBJECT watch set for a poll/select/epoll parker — the
+/// intra-class herd collapse.  Returns `(class_mask, objects)`:
+///
+/// * `class_mask` — the wake-on-CLASS bitset: the cross-cutting always-wake
+///   classes (`Other`, `SignalInject`), plus the source bit of any watched fd
+///   whose backing object could not be pinned to a concrete id (unknown /
+///   regular-file / nested-epoll / raced fd, OR a resolver that returned the
+///   `u64::MAX` not-found sentinel).  A source in `class_mask` wakes the parker
+///   on ANY edge of that class — the conservative, never-under-wake fallback.
+/// * `objects` — the concrete `(source, object_id)` pins for fds that DID
+///   resolve to a stable object.  A targeted `ring_poll_bell_for_obj(S, id)`
+///   wakes this parker only when `(S, id)` is in this list.
+///
+/// CRITICAL (no under-wake): a source class is recorded in EXACTLY ONE place per
+/// fd — `objects` when pinnable, else `class_mask`.  But the same source class
+/// can appear in BOTH across DIFFERENT fds (e.g. one AF_UNIX fd pins object 5
+/// while an unclassifiable fd forces UnixWrite into `class_mask`); that is
+/// correct and still a superset — `class_mask` then makes EVERY UnixWrite edge
+/// wake this parker, which over-wakes but never under-wakes.  The fd-type
+/// dispatch order matches the `select(2)`/`poll` readiness dispatch (unix
+/// BEFORE the generic socket flag) so a unix socket is never misclassified
+/// as inet-only and never drops its UnixWrite/UnixRead/UnixShutdown wakes.
+///
+/// AF_UNIX fds subscribe to THREE classes (`UnixWrite` data-in, `UnixRead` peer
+/// write-space, `UnixShutdown` half-close/connect).  The object id is the SAME
+/// for all three (the socket's own id), so all three are pinned to it — a
+/// targeted ring of any of the three on that object reaches this parker.
+fn bell_watch_for_fds(
+    pid: u64,
+    fds: impl Iterator<Item = usize>,
+) -> (u32, alloc::vec::Vec<crate::ipc::waitlist::ObjWatch>) {
+    use crate::ipc::waitlist::{ObjWatch, PollBellSource as S, BELL_MASK_ALL, OBJECT_ID_NONE};
+    // Cross-cutting always-wake classes (must reach every parker).
+    let mut class_mask = (1u32 << (S::Other as u32)) | (1u32 << (S::SignalInject as u32));
+    let mut objects: alloc::vec::Vec<ObjWatch> = alloc::vec::Vec::new();
+    // Helper: pin `(source, id)` if `id` resolved, else fall back to wake-on-class.
+    let mut pin = |objects: &mut alloc::vec::Vec<ObjWatch>,
+                   class_mask: &mut u32,
+                   source: S,
+                   id: u64| {
+        if id == OBJECT_ID_NONE {
+            *class_mask |= 1u32 << (source as u32); // not-found → wake-on-class
+        } else {
+            objects.push(ObjWatch { source, object_id: id });
+        }
+    };
+    for fd in fds {
+        // Dispatch order matches select/poll readiness (unix BEFORE the generic
+        // socket flag).  Each branch either pins a concrete object or — for an
+        // unclassifiable fd — saturates `class_mask` to wake-on-everything.
+        if crate::syscall::is_pipe_fd(pid, fd) {
+            pin(&mut objects, &mut class_mask, S::Pipe,
+                crate::syscall::get_pipe_id(pid, fd));
+        } else if crate::syscall::is_eventfd_fd(pid, fd) {
+            pin(&mut objects, &mut class_mask, S::Eventfd,
+                crate::syscall::get_eventfd_id(pid, fd));
+        } else if crate::syscall::is_unix_socket_fd(pid, fd) {
+            let id = crate::syscall::get_unix_socket_id(pid, fd);
+            pin(&mut objects, &mut class_mask, S::UnixWrite, id);
+            pin(&mut objects, &mut class_mask, S::UnixRead, id);
+            pin(&mut objects, &mut class_mask, S::UnixShutdown, id);
+        } else if crate::syscall::is_socket_fd(pid, fd) {
+            pin(&mut objects, &mut class_mask, S::InetRx,
+                crate::syscall::get_socket_id(pid, fd));
+        } else if crate::syscall::is_timerfd_fd(pid, fd) {
+            // timerfd fires from an ISR with no id in scope (class-only ring), so
+            // pin would never match; subscribe by class instead.
+            class_mask |= 1u32 << (S::Timerfd as u32);
+        } else if crate::syscall::is_signalfd_fd(pid, fd) {
+            class_mask |=
+                (1u32 << (S::Signalfd as u32)) | (1u32 << (S::SignalInject as u32));
+        } else if crate::syscall::is_inotify_fd(pid, fd) {
+            pin(&mut objects, &mut class_mask, S::Inotify,
+                crate::syscall::get_inotify_id(pid, fd));
+        } else {
+            // Unknown / regular-file / nested-epoll / raced fd: wake on EVERY
+            // source.  Saturated mask means objects no longer matter.
+            class_mask = BELL_MASK_ALL;
+            objects.clear();
+            return (class_mask, objects);
+        }
+    }
+    (class_mask, objects)
+}
+
 /// Add seals to `inode`.  Returns 0 on success, -EPERM/-EINVAL on error.
 fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
     if new_seals & !F_SEAL_ALL_VALID != 0 {
@@ -1491,6 +1576,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let now = crate::arch::x86_64::irq::get_ticks();
                     now + ((timeout_ms as u64) / 10).max(1)
                 };
+                // Per-object interest set: read the watched fds out of the user
+                // pollfd array (under SMAP) once, then map each to its concrete
+                // readiness object so the per-object poll-bell drain wakes this
+                // poller only on edges of the EXACT pipes/sockets/eventfds it
+                // watches (intra-class herd collapse).  A negative pollfd
+                // (`fd < 0`, ignored per poll(2)) contributes nothing.
+                // Conservative superset: an unclassifiable fd ⇒ wake-on-class.
+                let (bell_mask, bell_objects) = {
+                    let mut fds: alloc::vec::Vec<usize> =
+                        alloc::vec::Vec::with_capacity(nfds as usize);
+                    for i in 0..nfds as u64 {
+                        let base = (arg1 + i * 8) as *const u8;
+                        let fd_val = unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::read_unaligned(base as *const i32)
+                        };
+                        if fd_val >= 0 {
+                            fds.push(fd_val as usize);
+                        }
+                    }
+                    bell_watch_for_fds(pid, fds.into_iter())
+                };
                 loop {
                     // Park on the global IPC poll bell rather than spin-
                     // sleeping at 100 Hz.  Any pipe write / eventfd post /
@@ -1514,8 +1621,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // side-effect-light readiness probe (it only writes the
                     // idempotent revents bits, recomputed after the wake).
                     let ready_in_window =
-                        crate::ipc::waitlist::wait_poll_event(
-                            deadline_tick, || do_check(false, false) > 0);
+                        crate::ipc::waitlist::wait_poll_event_obj(
+                            deadline_tick, bell_mask, &bell_objects,
+                            || do_check(false, false) > 0);
                     if !ready_in_window {
                         // We actually parked and woke — pump X11 so replies
                         // appear in socket buffers, and pump the NIC RX ring +
@@ -2189,25 +2297,26 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize).to_vec()
             };
-            // SCM_RIGHTS first-byte bind: capture the peer's recv-stream
-            // position BEFORE any data iovec of this frame is pushed, so a
-            // queued ancillary fd batch binds to the FIRST byte of the frame
-            // it accompanies — not its tail.  Per recvmsg(2) / unix(7) /
-            // POSIX.1-2017, the ancillary SCM_RIGHTS data is delivered with
-            // the message data it accompanies; the receiver's IPC reader
-            // parses a frame whose header announces N handles and requires
-            // those fds on the SAME recvmsg that first returns the frame's
-            // bytes.  Binding to the tail (post-push) withholds the fds until
-            // the reader has drained EVERY byte of the frame, which fails when
-            // the reader consumes the frame in pieces (e.g. reads the header,
-            // sees num_handles>=1, then expects the fds already present) —
-            // surfacing as a fatal "needs unreceived descriptors".  The
-            // deliver predicate is `recv_consumed >= byte_offset`
-            // (syscall/mod.rs scm_dequeue); with byte_offset = the frame's
-            // starting recv position, the batch becomes deliverable the
-            // instant the reader pops the frame's first byte.  Computed once
-            // here (under the unix TABLE lock, briefly) for unix sockets only.
-            // Sender's own AF_UNIX socket id (for the writable-gate below).
+            // SCM_RIGHTS atomicity: a single sendmsg(2) carrying SCM_RIGHTS must
+            // commit its data bytes AND its ancillary fd batch to the peer as one
+            // indivisible unit — per recvmsg(2) / unix(7) / POSIX.1-2017 §2.14,
+            // the ancillary descriptors are associated with the data of the
+            // message that carried them and are delivered with the recvmsg that
+            // returns that data.  The byte push and the fd-batch enqueue must
+            // therefore NOT be separable critical sections: were they split (as
+            // in the prior code — capture the bind offset under the TABLE lock,
+            // queue the batch under the PENDING_SCM lock, then push the bytes
+            // under the TABLE lock again, dropping the lock between each), two
+            // concurrent same-peer sendmsg(2)s could interleave so that one
+            // frame's fd batch binds to a stream position carrying ANOTHER
+            // frame's bytes.  The receiver then dequeues an SCM batch at the
+            // wrong byte boundary; a length-prefixed IPC reader (an IPDL channel)
+            // parses a frame whose announced handle count disagrees with the
+            // descriptors present and aborts the channel.  Below, when the frame
+            // carries SCM_RIGHTS over an AF_UNIX socket, the bind-offset capture,
+            // the byte push, and the batch enqueue all run inside ONE held unix
+            // TABLE lock via `net::unix::scm_send_frame_atomic`, so no other
+            // sender can advance the peer's recv stream between them.
             let scm_sender_unix_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
                 crate::syscall::get_unix_socket_id(pid, fd)
             } else {
@@ -2218,53 +2327,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 u64::MAX
             };
-            let scm_bind_offset: u64 = if scm_bind_peer_id != u64::MAX {
-                crate::net::unix::enqueue_offset_for(scm_bind_peer_id)
-            } else {
-                0
-            };
-            // Whether this frame carries any data bytes — known from the iovec
-            // lengths BEFORE the push, so the SCM batch can be queued ahead of
-            // the data it accompanies (see the ordering note below).  A frame
-            // with at least one non-empty iovec is data-bearing.
+            // Whether this frame carries any data bytes (at least one non-empty
+            // iovec).  A data-bearing frame's batch binds to first-byte-touch
+            // (T+1); a control-only frame's binds to the tail (T).  Passed to the
+            // atomic send as `bind_data_frame`.
             let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
-            // First-byte-accepted gate for the SCM_RIGHTS batch.  The batch is
-            // queued BEFORE the data push (the ordering invariant below), but it
-            // must only be queued if at least one byte of THIS frame will be
-            // accepted into the peer ring — otherwise the push loop returns
-            // -EAGAIN with `total == 0` (nothing queued), the whole sendmsg(2)
-            // reports -EAGAIN, and a userspace stream writer retries the entire
-            // frame from the start WITH its control message re-attached.  Were
-            // the batch queued unconditionally, that retry would enqueue a
-            // SECOND batch for the same frame — duplicating the fds on the peer
-            // (CWE-675 / a double-delivery of the ancillary descriptors).  A
-            // DATA-bearing frame thus queues its batch only when the peer ring
-            // has room for >=1 byte (net::unix::writable, the same predicate
-            // that gates whether write() returns >0 vs -EAGAIN).  A control-ONLY
-            // frame (no data bytes) carries nothing to push and is a 0-byte
-            // readable ancillary message in its own right (recvmsg(2), unix(7)
-            // SCM_RIGHTS); it is always queued regardless of ring fullness.
-            let scm_first_byte_will_land = if !frame_has_data {
-                true
-            } else if scm_sender_unix_id != u64::MAX {
-                crate::net::unix::writable(scm_sender_unix_id)
-            } else {
-                false
-            };
             let mut total = 0usize;
-            // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
-            // bytes are pushed into the peer's recv ring.  The data push and the
-            // batch enqueue are separate critical sections (net::unix TABLE lock
-            // vs PENDING_SCM lock); if the bytes became readable first, a peer
-            // recvmsg(2) could drain the frame's bytes and compute its read cap
-            // (scm_next_batch_offset) BEFORE the batch was visible, deliver no
-            // fds, and strand the batch past the reader's position — the
-            // intermittent "needs unreceived descriptors" on the cross-process
-            // channel.  Queuing the batch first (bound to the pre-push offset)
-            // guarantees the batch is in PENDING_SCM before any of its
-            // accompanying bytes can be read, so the reader's cap always stops at
-            // it.  Per recvmsg(2) / unix(7) / POSIX.1-2017 §2.14, the ancillary
-            // data is delivered with the data it accompanies.
+            // The extracted SCM_RIGHTS fd batch (if any) to commit atomically
+            // with the frame's bytes below.  Populated by the extraction block;
+            // consumed by `scm_send_frame_atomic`.
+            let mut scm_fds_to_send: Option<Vec<crate::vfs::FileDescriptor>> = None;
             // Handle SCM_RIGHTS in msg_control (Unix sockets only).
             // msghdr layout (x86_64): msg_control at byte-offset 32 (u64 index 4),
             // msg_controllen at byte-offset 40 (u64 index 5).
@@ -2303,15 +2375,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         (0u64, 0usize, 0usize, 0i32, 0i32)
                     }
                 };
-                // `scm_first_byte_will_land` gate: skip the entire SCM_RIGHTS
-                // clone/ref-bump/enqueue when no byte of this data-bearing frame
-                // will be accepted (peer ring full).  The push loop will then
-                // return -EAGAIN with total==0 and the writer retries the WHOLE
-                // frame (cmsg included) — so queuing here would double the batch.
-                // Gating before the clone also avoids taking fd references we
-                // would otherwise have to release (CWE-772).  A control-only
-                // frame always lands (scm_first_byte_will_land == true).
-                if ctrl_ptr != 0 && ctrl_len >= 16 && scm_first_byte_will_land {
+                // Extract the SCM_RIGHTS fd batch (clone + ref-bump) but do NOT
+                // queue it here.  The batch is committed atomically WITH the
+                // frame's bytes by `scm_send_frame_atomic` below, so that the
+                // (bytes, fd-batch, byte_offset) triple is a single indivisible
+                // unit on the peer (no concurrent sender can interleave between
+                // the byte-offset capture and the byte append).  The atomic send
+                // also handles the full-ring case: a data-bearing frame whose
+                // bytes do not land (-EAGAIN, total==0) is retried in full by the
+                // writer, so the batch is NOT queued and the references are
+                // released — `scm_send_frame_atomic` returns the un-queued fds
+                // for that release (CWE-772).  Extraction is therefore
+                // unconditional on cmsg validity (no `writable` pre-gate).
+                if ctrl_ptr != 0 && ctrl_len >= 16 {
                     const SOL_SOCKET_I32: i32 = 1;
                     const SCM_RIGHTS_I32: i32 = 1;
                     if cmsg_level == SOL_SOCKET_I32 && cmsg_type == SCM_RIGHTS_I32 && cmsg_len > 16 {
@@ -2402,62 +2478,80 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 }).collect()
                             } else { Vec::new() }
                         };
-                        if !sender_fds.is_empty() {
-                            let peer_id = scm_bind_peer_id;
-                            if peer_id != u64::MAX {
-                                // Bind the fd batch so it co-delivers with the
-                                // recvmsg that returns the FIRST byte of this
-                                // frame — the first-byte-touch delivery contract
-                                // (recvmsg(2) / unix(7) / POSIX.1-2017 §2.14:
-                                // ancillary data is delivered with the data it
-                                // accompanies).  `scm_bind_offset` was captured
-                                // BEFORE the data-push loop, so it is the stream
-                                // position T where the frame begins.
-                                //
-                                // The deliver predicate is `recv_consumed >=
-                                // byte_offset` (syscall/mod.rs scm_dequeue).
-                                // Popping the frame's first byte advances
-                                // recv_consumed from T to T+1, so to gate the
-                                // batch on "the reader has touched (begun
-                                // consuming) this frame" we bind a DATA-bearing
-                                // frame to T+1 — deliverable the instant the
-                                // first byte is popped, and NOT before any byte
-                                // of the frame is read.  A control-only frame
-                                // (no data bytes) carries no bytes to touch; it
-                                // sits at the stream tail and must be immediately
-                                // readable as a 0-byte ancillary message, so it
-                                // binds to T (==tail) and the predicate fires at
-                                // once.  This keeps the dequeue predicate uniform
-                                // (`>=`) while honouring both cases.  `frame_has_data`
-                                // is computed from the iovec lengths above (the
-                                // batch is queued before the push, so `total` is
-                                // not yet known here).
-                                let bind_offset = if frame_has_data {
-                                    scm_bind_offset + 1
-                                } else {
-                                    scm_bind_offset
-                                };
-                                crate::syscall::scm_queue(peer_id, bind_offset, sender_fds);
-                                // Wake any poller/epoll_wait parked on the peer
-                                // fd so it re-evaluates and discovers the new
-                                // readable (ancillary) message immediately,
-                                // rather than waiting for the resync floor.
-                                // PENDING_SCM and the unix TABLE lock are both
-                                // already released here (scm_queue takes only
-                                // PENDING_SCM, briefly), so this honours the
-                                // drop-the-lock-before-ring discipline.
-                                crate::ipc::waitlist::ring_poll_bell_for(
-                                    crate::ipc::waitlist::PollBellSource::UnixWrite);
-                            }
+                        // Stash the extracted batch for the atomic commit below.
+                        // The bind offset and the byte push are captured/applied
+                        // together under one TABLE lock there (the fix); we do
+                        // NOT bind to a separately-captured offset here.
+                        if !sender_fds.is_empty() && scm_bind_peer_id != u64::MAX {
+                            scm_fds_to_send = Some(sender_fds);
+                        } else if !sender_fds.is_empty() {
+                            // No resolvable peer (not connected): release the
+                            // references taken above so they do not leak
+                            // (CWE-772), then fall through — the byte push will
+                            // surface the connection error.
+                            crate::syscall::scm_drop_fds(sender_fds);
                         }
                     }
                 }
             }
-            // Push the frame's data bytes AFTER the SCM_RIGHTS batch is queued
-            // (see the ordering note above): the batch is now in PENDING_SCM, so
-            // the instant these bytes become readable a peer recvmsg(2) will cap
-            // its read at the batch and deliver it.  `total` accumulates the
-            // bytes accepted by the transport for the syscall return value.
+            // SCM_RIGHTS frame over an AF_UNIX socket: commit the bytes AND the
+            // fd batch atomically (one held unix TABLE lock) so a concurrent
+            // same-peer sendmsg(2) cannot interleave between the byte-offset
+            // capture and the byte append (recvmsg(2) / unix(7) / POSIX.1-2017
+            // §2.14).  This replaces the per-iovec push loop for THIS frame.
+            if let Some(fds) = scm_fds_to_send.take() {
+                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+                    alloc::vec::Vec::with_capacity(iovecs_owned.len());
+                for iov in &iovecs_owned {
+                    let base = iov[0] as *const u8;
+                    let slen = iov[1] as usize;
+                    if slen == 0 { continue; }
+                    // SMAP bracket — copy the user iov buffer into a kernel Vec
+                    // before the net layer (which takes locks) runs.
+                    let data_owned: alloc::vec::Vec<u8> = {
+                        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                        unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
+                    };
+                    chunks.push(data_owned);
+                }
+                let res = crate::net::unix::scm_send_frame_atomic(
+                    unix_id, &chunks, frame_has_data, fds);
+                // Release any fds the atomic send did not commit (connection
+                // error, or a data-bearing frame whose bytes did not land and
+                // will be retried in full) — CWE-772.  Done with no lock held.
+                if let Some(undelivered) = res.unqueued_fds {
+                    crate::syscall::scm_drop_fds(undelivered);
+                }
+                if res.error != 0 {
+                    return res.error;
+                }
+                total += res.total;
+                if res.peer_id != u64::MAX {
+                    // Wake any poller/epoll_wait parked on the peer fd so it
+                    // discovers the new bytes and/or the deliverable ancillary
+                    // message.  TABLE/PENDING_SCM are released (scm_send_frame_
+                    // atomic dropped them), honouring the ring-without-lock rule.
+                    crate::ipc::waitlist::ring_poll_bell_for_obj(
+                        crate::ipc::waitlist::PollBellSource::UnixWrite, res.peer_id);
+                    if res.total > 0 {
+                        crate::proc::proc_metrics::bump_net_write(
+                            crate::proc::current_pid_lockless(), res.total as u64);
+                    }
+                }
+                // A data-bearing frame that queued zero bytes (ring full) reports
+                // -EAGAIN, exactly as the per-iovec path would (total still 0).
+                if total == 0 && frame_has_data {
+                    return -11;
+                }
+                return total as i64;
+            }
+            // Non-SCM fast path (AF_UNIX frame with no ancillary fds, or AF_INET):
+            // push the frame's data bytes per-iovec.  An SCM_RIGHTS AF_UNIX frame
+            // was already committed atomically above and returned; reaching here
+            // means `scm_fds_to_send` was None, so this loop carries no fds and
+            // the byte stream and ancillary-fd accounting cannot desync.  `total`
+            // accumulates the bytes accepted for the syscall return value.
             for iov in &iovecs_owned {
                 let base = iov[0] as *const u8;
                 let slen = iov[1] as usize;
@@ -6098,6 +6192,28 @@ fn sys_select_linux(
                 let now = crate::arch::x86_64::irq::get_ticks();
                 now.saturating_add(((timeout_ms as u64) / 10).max(1))
             };
+            // Per-object interest set: every fd this select(2) call requested
+            // (read OR write side) maps to its concrete readiness object, so the
+            // per-object poll-bell drain wakes this caller only on edges of the
+            // exact fds it watches (intra-class herd collapse).  Computed once —
+            // the fd_set membership is fixed for the wait (do_rescan only
+            // *clears* bits on ready fds it returns, after the wait completes).
+            // Conservative superset: an unclassifiable fd ⇒ wake-on-class.
+            let (bell_mask, bell_objects) = {
+                let mut fds: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                for fd in 0..nfds {
+                    let byte_off = (fd / 8) as u64;
+                    let bit = 1u8 << (fd % 8);
+                    let r_req = readfds != 0
+                        && fdset_read_bit(readfds, byte_off, bit, kernel_dispatch);
+                    let w_req = writefds != 0
+                        && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
+                    if r_req || w_req {
+                        fds.push(fd);
+                    }
+                }
+                bell_watch_for_fds(pid, fds.into_iter())
+            };
             loop {
                 // Park on the global poll bell — see the matching change
                 // in sys_poll for why this replaces the prior 10 ms tick
@@ -6111,8 +6227,8 @@ fn sys_select_linux(
                 // authoritative bit-clearing `do_rescan` below stays the
                 // single fd_set mutator.
                 let ready_in_window =
-                    crate::ipc::waitlist::wait_poll_event(
-                        deadline_tick, &probe_ready);
+                    crate::ipc::waitlist::wait_poll_event_obj(
+                        deadline_tick, bell_mask, &bell_objects, &probe_ready);
                 if !ready_in_window {
                     crate::x11::poll();
                 }
@@ -8004,7 +8120,13 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         // CRITICAL: for file-backed VMAs, each split piece must have its
         // file offset adjusted by (piece.base - original_vma_base) so that
         // demand-paging reads from the correct file position.
-        space.areas.remove(i);
+        //
+        // The original file-backed VMA leaves the address space here (drop its
+        // inode pin) and is replaced by up to three pieces, each of which takes
+        // its own pin below — keeping the pin count equal to the number of live
+        // file-backed VMAs for the inode (mmap(2)/munmap(2)).
+        let original = space.areas.remove(i);
+        crate::mm::vma::unpin_file_vma(&original);
         let overlap_start = vma_base.max(base);
         let overlap_end   = vma_end.min(end);
 
@@ -8043,10 +8165,21 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         }
         let n = pieces.len();
         for piece in pieces.into_iter().rev() {
+            // Each surviving file-backed piece takes a fresh inode pin (balances
+            // the unpin of the original removed above).
+            crate::mm::vma::pin_file_vma(&piece);
             space.areas.insert(i, piece);
         }
         i += n;
     }
+
+    // The VMA edits are done; release PROCESS_TABLE before the (lock-free) PTE
+    // retag and before draining any deferred inode free.  A partial-overlap
+    // split above may have dropped a file-backed VMA's last inode pin (the
+    // shrunk-away remnant of a now-unlinked memfd); run that free now that the
+    // lock is released — the free dance re-acquires PROCESS_TABLE.
+    drop(procs);
+    crate::vfs::drain_pending_inode_frees();
 
     // Walk every page and retag PTEs.  TLB invalidation is coalesced
     // into a single shootdown over [base, end) after the loop so that
@@ -11550,6 +11683,15 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             now.saturating_add(((timeout_ms as u64) / 10).max(1))
         };
         if fired.is_empty() {
+            // Per-object interest set: the concrete readiness objects the
+            // watched fds resolve to, so the per-object poll-bell drain wakes
+            // this epoll_wait parker only on edges of the EXACT fds it watches
+            // (intra-class herd collapse — the dominant cost on the heavy
+            // multi-thread FF render).  Computed once outside the loop — the
+            // watch set is fixed for the lifetime of this epoll_wait call.
+            // Conservative superset: any unclassifiable fd ⇒ wake-on-class.
+            let (bell_mask, bell_objects) = bell_watch_for_fds(
+                pid, watches_snap.iter().map(|&(fd, ..)| fd));
             loop {
                 // Park on the global poll bell.  Pipe/eventfd writes ring it
                 // (see `crate::ipc::waitlist::ring_poll_bell`); the scheduler
@@ -11566,8 +11708,8 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
                 // drains us).  The wake-side net/x11 pumps run only when we
                 // actually parked.
                 let ready_in_window =
-                    crate::ipc::waitlist::wait_poll_event(
-                        deadline_tick, &probe_ready);
+                    crate::ipc::waitlist::wait_poll_event_obj(
+                        deadline_tick, bell_mask, &bell_objects, &probe_ready);
                 if ready_in_window {
                     do_poll(&mut fired);
                     if !fired.is_empty() { break; }

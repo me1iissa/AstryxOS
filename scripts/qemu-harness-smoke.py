@@ -918,6 +918,115 @@ def run_kdb_read_png_check():
     print()
 
 
+def run_render_extract_check():
+    """
+    Tier 1.5 host-only check: render-and-extract.py kdb-first extraction +
+    serial fallback ordering.
+
+    No QEMU.  Loads render-and-extract.py and monkeypatches its `_run_harness`
+    to serve synthetic harness JSON for `grep` (the [FF-OUT-PNG:…] summary
+    marker) and the two extractors (`kdb-read-png`, `read-ff-png`).  Asserts:
+
+      * the one-line marker is parsed into {size, sig_ok, complete}
+      * the DEFAULT order tries kdb-read-png FIRST and, on success, never calls
+        read-ff-png (fallback_used == False) — this is the whole point of the
+        fast path: the slow serial decoder must not run when kdb works
+      * when kdb-read-png fails, it FALLS BACK to read-ff-png and reports
+        fallback_used == True
+
+    Locks the orchestration contract against drift in either the harness JSON
+    field names or the extractor preference order.
+    """
+    print("=== Tier 1.5: render-and-extract kdb-first + fallback (host-only) ===")
+    print()
+    import importlib.util
+    import types
+
+    rae_path = HARNESS.parent / "render-and-extract.py"
+    check("render-and-extract.py present", rae_path.exists(), str(rae_path))
+    if not rae_path.exists():
+        print()
+        return
+
+    spec = importlib.util.spec_from_file_location("qh_rae_load", str(rae_path))
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["render-and-extract.py", "--help"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    check("_extract importable", hasattr(mod, "_extract"))
+    check("_parse_marker importable", hasattr(mod, "_parse_marker"))
+    if not hasattr(mod, "_extract"):
+        print()
+        return
+
+    # ── marker parse ──────────────────────────────────────────────────────────
+    line = ("[FF-OUT-PNG:path=/tmp/out.png size=2097152 sig_ok=true "
+            "complete=true]")
+    m = mod._parse_marker({"matches": [line]})
+    check("marker size parsed", m is not None and m.get("size") == 2097152, str(m))
+    check("marker sig_ok parsed", bool(m and m.get("sig_ok")), str(m))
+    check("marker complete parsed", bool(m and m.get("complete")), str(m))
+
+    # ── kdb-first: kdb succeeds → serial decoder never runs ───────────────────
+    calls = []
+
+    def _fake_run_kdb_ok(args, timeout=None):
+        calls.append(list(args))
+        sub = args[0]
+        if sub == "kdb-read-png":
+            return (0, {"ok": True, "bytes": 2097152, "is_png": True,
+                        "size_match": True, "guest_size": 2097152}, "")
+        if sub == "read-ff-png":
+            return (0, {"ok": True, "bytes": 2097152, "size_match": True,
+                        "chunks": 36792}, "")
+        return (0, {"ok": False}, "")
+
+    orig_run = mod._run_harness
+    try:
+        mod._run_harness = _fake_run_kdb_ok
+        ext = mod._extract("smoke-sid", Path("/tmp/_rae_smoke.png"),
+                           prefer_serial=False, timeout_ms=5000)
+        check("kdb-first ok=true", bool(ext.get("ok")), str(ext))
+        check("kdb-first method=kdb-read-png",
+              ext.get("method") == "kdb-read-png", str(ext))
+        check("kdb-first did NOT fall back to serial",
+              ext.get("fallback_used") is False, str(ext))
+        used_serial = any(c and c[0] == "read-ff-png" for c in calls)
+        check("kdb-first never invoked read-ff-png", not used_serial,
+              f"calls={calls}")
+
+        # ── kdb fails → falls back to read-ff-png ─────────────────────────────
+        calls.clear()
+
+        def _fake_run_kdb_fail(args, timeout=None):
+            calls.append(list(args))
+            sub = args[0]
+            if sub == "kdb-read-png":
+                return (1, {"ok": False, "error": "kdb io failed: timed out"}, "")
+            if sub == "read-ff-png":
+                return (0, {"ok": True, "bytes": 2097152, "size_match": True,
+                            "chunks": 36792}, "")
+            return (0, {"ok": False}, "")
+
+        mod._run_harness = _fake_run_kdb_fail
+        ext2 = mod._extract("smoke-sid", Path("/tmp/_rae_smoke.png"),
+                            prefer_serial=False, timeout_ms=5000)
+        check("fallback ok=true", bool(ext2.get("ok")), str(ext2))
+        check("fallback method=read-ff-png",
+              ext2.get("method") == "read-ff-png", str(ext2))
+        check("fallback_used flagged true",
+              ext2.get("fallback_used") is True, str(ext2))
+    finally:
+        mod._run_harness = orig_run
+    print()
+
+
 def run_blk_trace_argv_check():
     """
     Tier 1.5 host-only check: blk-trace drain/flush CLI + `start --build-only`.
@@ -1234,6 +1343,7 @@ def main():
     run_snapgate_argv_check()
     run_read_ff_png_check()
     run_kdb_read_png_check()
+    run_render_extract_check()
     run_blk_trace_argv_check()
     run_pcap_argv_check()
 

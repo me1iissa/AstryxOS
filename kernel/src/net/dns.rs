@@ -180,11 +180,28 @@ fn parse_response(data: &[u8], expected_id: u16) -> Option<Ipv4Address> {
     None
 }
 
-/// Skip a DNS name in the packet (handles compression pointers).
-/// Returns the new offset after the name.
+/// Maximum number of compression-pointer jumps tolerated while parsing a
+/// single DNS name (RFC 1035 §4.1.4).  A well-formed name needs at most one
+/// jump; a hostile or corrupt response can chain pointers — or point a label
+/// at itself (`0xC0 0x0C` at offset 12 → ptr 12) — to make `skip_dns_name`
+/// loop forever, since a self-referential in-bounds offset never trips the
+/// `offset >= data.len()` bound.  That hangs the in-kernel resolver thread
+/// (CWE-835, "Loop with Unreachable Exit Condition").  A DNS message is at
+/// most 64 KiB, so capping the hop count strictly bounds the walk; past the
+/// limit we return `None` (the reply is treated as malformed).  The
+/// nameserver is attacker-influenceable (DHCP option, `set_nameserver`, or an
+/// off-path spoofer winning the txid+port race), so this guard is a hard
+/// requirement, not a robustness nicety.
+const MAX_DNS_NAME_JUMPS: usize = 32;
+
+/// Skip a DNS name in the packet (handles compression pointers, RFC 1035
+/// §4.1.4).  Returns the new offset after the name, or `None` if the name is
+/// malformed (truncated, out of bounds, or exceeds `MAX_DNS_NAME_JUMPS`
+/// compression jumps — the cyclic-pointer DoS guard, CWE-835).
 fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
     let mut jumped = false;
     let mut result_offset = 0usize;
+    let mut jumps = 0usize;
 
     loop {
         if offset >= data.len() { return None; }
@@ -196,7 +213,11 @@ fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
         }
 
         if len & 0xC0 == 0xC0 {
-            // Compression pointer (2 bytes)
+            // Compression pointer (2 bytes).  Bound the jump count so a
+            // self-referential or chained pointer cannot loop forever
+            // (RFC 1035 §4.1.4, CWE-835).
+            jumps += 1;
+            if jumps > MAX_DNS_NAME_JUMPS { return None; }
             if !jumped {
                 result_offset = offset + 2;
             }
@@ -211,6 +232,17 @@ fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
     }
 
     Some(if jumped { result_offset } else { offset })
+}
+
+/// Test-only: drive the private `skip_dns_name` parser directly so a
+/// regression test can prove a cyclic / self-referential compression pointer
+/// returns `None` (the CWE-835 guard) instead of looping forever, and that a
+/// well-formed name still parses (RFC 1035 §4.1.4).  Available under the test
+/// profiles so CI exercises the guard.
+#[cfg(any(feature = "test-mode", feature = "kdb", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn test_skip_dns_name(data: &[u8], offset: usize) -> Option<usize> {
+    skip_dns_name(data, offset)
 }
 
 /// Resolve a hostname to an IPv6 address (AAAA record).

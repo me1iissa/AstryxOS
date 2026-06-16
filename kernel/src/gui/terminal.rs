@@ -18,6 +18,14 @@ use spin::Mutex;
 /// mutex acquisition in the common idle case.
 static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// When `true`, Firefox (and any subsequently launched GUI client) runs in
+/// X11/GUI mode: `spawn_async` omits `MOZ_HEADLESS=1` from the child envp so
+/// libxul takes the `gdk_display_open()` / `XOpenDisplay()` branch and paints
+/// into a real window on the in-kernel Xastryx server (`DISPLAY=:0`) instead of
+/// the headless screenshot path.  Set once at FF launch from the boot-config
+/// `astryx.ff_gui=1` fw_cfg token; default `false` (headless).
+pub static FF_GUI_MODE: AtomicBool = AtomicBool::new(false);
+
 /// PID of the most recently launched async child process.  0 = none.
 /// Stored so that `is_firefox_running()` can consult the thread table
 /// directly and detect exit even before `poll_output()` has reaped the
@@ -1003,13 +1011,22 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         _ => LD_PATH_GLIBC,
     };
 
-    let envp: &[&str] = &[
+    // GUI mode (astryx.ff_gui=1): run Firefox connected to the in-kernel
+    // Xastryx X11 server and paint into a real window, instead of the headless
+    // screenshot path.  The only env-var difference is MOZ_HEADLESS, which is
+    // omitted in GUI mode (see the conditional push below); everything else is
+    // identical.  Built as a Vec so the single variable can be included or
+    // skipped without duplicating the whole block.
+    let gui_mode = FF_GUI_MODE.load(Ordering::Acquire);
+    let mut envp_vec: alloc::vec::Vec<&str> = alloc::vec![
         "HOME=/home/user",
         "PATH=/bin:/disk/bin",
         "TCCDIR=/disk/lib/tcc",
         "TMPDIR=/tmp",
         "DISPLAY=:0",
         "GDK_BACKEND=x11",
+    ];
+    if !gui_mode {
         // Tell Firefox to run headless even when DISPLAY is set.  libxul
         // checks gfxPlatform::IsHeadless() / nsAppRunner XRE_main and skips
         // gdk_display_open() / XOpenDisplay() entirely on this branch.  Our
@@ -1019,7 +1036,12 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // (and the equivalent `--headless` argv flag) as the canonical
         // headless-mode trigger.
         // See: https://firefox-source-docs.mozilla.org/widget/headless.html
-        "MOZ_HEADLESS=1",
+        //
+        // In GUI mode this is intentionally omitted so libxul opens the
+        // display and renders into an X11 window on the Xastryx server.
+        envp_vec.push("MOZ_HEADLESS=1");
+    }
+    envp_vec.extend_from_slice(&[
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
         // NB: we intentionally do NOT set MOZ_DISABLE_NONLOCAL_CONNECTIONS on
         // this (website-render) branch.  gecko treats the variable as a boolean
@@ -1121,7 +1143,8 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Defined by glibc's dynamic linker; see ld.so(8) §LD_DEBUG.
         "LD_DEBUG=files",
         "LD_DEBUG_OUTPUT=/tmp/lddbg",
-    ];
+    ]);
+    let envp: &[&str] = &envp_vec;
 
     // Spawn blocked so we can attach the pipe before the child can run.
     // linux_abi / subsystem are set inside create_user_process_with_args_blocked.

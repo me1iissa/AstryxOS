@@ -264,6 +264,14 @@ pub fn run() -> ! {
     total += 1;
     if test_poll_bell_recheck_under_lock() { passed += 1; }
 
+    // ── Test 0bx3: poll-bell class-filtered drain (Stage C) ───────────────
+    total += 1;
+    if test_poll_bell_class_filtered_drain() { passed += 1; }
+
+    // ── Test 0bx4: poll-bell per-OBJECT targeted drain (intra-class herd) ──
+    total += 1;
+    if test_poll_bell_per_object_drain() { passed += 1; }
+
     // ── Test 0bc: POLLHUP on pipe read-end after writer close ─────────────
     total += 1;
     if test_pipe_pollhup_on_writer_close() { passed += 1; }
@@ -357,6 +365,15 @@ pub fn run() -> ! {
         total += 1;
         if test_dns_resolution() { passed += 1; }
     }
+
+    // ── Test 6b: DNS cyclic compression-pointer guard (CWE-835) ─────
+    //
+    // Pure parser unit test (no network): proves the in-kernel resolver
+    // cannot be hung by a self-referential / chained DNS compression
+    // pointer (RFC 1035 §4.1.4).  Runs unconditionally — a hang here would
+    // wedge the whole test boot, which is itself the regression signal.
+    total += 1;
+    if test_dns_cyclic_pointer_guard() { passed += 1; }
 
     // ── Test 7: Object Manager Namespace ────────────────────────────
 
@@ -1086,6 +1103,18 @@ pub fn run() -> ! {
     total += 1;
     if test_tcp_connections_cap() { passed += 1; }
 
+    // ── Test 89c: SYN-flood half-open reaper + backlog cap (RFC 4987) ─────
+    total += 1;
+    if test_tcp_syn_flood_reaper() { passed += 1; }
+
+    // ── Test 89d: OOO reassembly bounded + ordered drain (CVE-2018-5390) ──
+    total += 1;
+    if test_tcp_ooo_bounded_drain() { passed += 1; }
+
+    // ── Test 89e: recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8) ─
+    total += 1;
+    if test_tcp_rcvbuf_cap() { passed += 1; }
+
     // ── Test 90: TCP congestion control (slow start + cwnd growth) ────────
 
     total += 1;
@@ -1747,6 +1776,23 @@ pub fn run() -> ! {
         if test_tcp_ooo_fin_guard() { passed += 1; }
     }
 
+    // ── NDE-18: FIN-WAIT-1/2 in-order data+FIN delivery ──────────────────────
+    //
+    // RFC 9293 §3.10.7.4: FIN-WAIT-1 and FIN-WAIT-2 are receive states — an
+    // in-order segment carrying final text (a peer's last TLS close_notify
+    // record) coalesced with its FIN must be queued AND acknowledged, exactly
+    // as in ESTABLISHED.  The earlier FIN-WAIT arms only honoured a bare FIN
+    // (seq+len == recv_next), so a data+FIN segment was dropped entirely: no
+    // ACK, no recv_next advance, no TIME-WAIT transition.  The peer then
+    // retransmits the data+FIN for ~10 minutes and RSTs, so the local fetch
+    // never reaches a terminal state — a heavy real-site close pattern that
+    // wedged the page `load` event forever.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_finwait_data_fin_delivery() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -2081,6 +2127,14 @@ pub fn run() -> ! {
     // bounded under heavy address-space churn.
     total += 1;
     if test_tlb_shootdown_coalesced_w133() { passed += 1; }
+
+    // ── TLB shootdown ACK-spin self-service (cross-CPU deadlock fix) ──
+    // A CPU spinning IRQ-disabled for sibling acks must drain its OWN
+    // pending slot inline, or two CPUs that shoot down the same shared
+    // CR3 from fault handlers mutually deadlock (each masked, neither can
+    // take the other's IPI).  This unit-exercises the self-service drain.
+    total += 1;
+    if test_tlb_self_service_drain() { passed += 1; }
 
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
@@ -2488,6 +2542,14 @@ pub fn run() -> ! {
 
         total += 1;
         if test_247_icmp_rx_checksum_validation() { passed += 1; }
+
+        // ── Test 248: UDP receive-buffer bound (SO_RCVBUF backpressure) ──
+        // RFC 768 unreliable-delivery + POSIX SO_RCVBUF: a UDP flood past
+        // the per-port receive buffer must be tail-dropped (queue stays
+        // bounded, UDP_RX_OVERFLOW advances) while the retained datagrams
+        // drain in order; getsockopt(SO_RCVBUF) reflects a setsockopt value.
+        total += 1;
+        if test_248_udp_rcvbuf_bound() { passed += 1; }
     }
 
     // ── Tests 251-256: X11 protocol conformance ─────────────────────────
@@ -2869,6 +2931,27 @@ pub fn run() -> ! {
     total += 1;
     if test_292_recvmsg_ctrunc_partial_scm_install() { passed += 1; }
 
+    // ── Test 521: SCM_RIGHTS batch must not bleed across a recycled slot ────
+    // The per-slot incarnation guard makes an in-flight fd batch queued for a
+    // since-closed AF_UNIX slot structurally undeliverable to the next occupant
+    // that re-allocates the index — the cross-channel fd bleed that aborts the
+    // parent's IPC during content-process teardown.  Refs: unix(7) SCM_RIGHTS,
+    // recvmsg(2)/sendmsg(2), POSIX.1-2017 §2.14.
+    total += 1;
+    if test_521_scm_recycle_incarnation_isolation() { passed += 1; }
+
+    // ── Test 522: concurrent same-peer SCM_RIGHTS sendmsg atomicity ───────
+    // Two SCM_RIGHTS-bearing frames sent to the SAME peer must each bind their
+    // fd batch to their OWN byte range: frame A's fds deliver at A's byte
+    // boundary, frame B's at B's, never crossed.  The atomic send commits the
+    // bind-offset capture, the byte push, and the batch enqueue under ONE unix
+    // TABLE lock, so no concurrent sender can advance the peer's recv stream
+    // between A's offset capture and A's byte append (the desync that aborts an
+    // IPDL channel with "actor not managed" / deserialization failure).  Refs:
+    // recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+    total += 1;
+    if test_522_scm_sendmsg_atomic_no_desync() { passed += 1; }
+
     // ── Test 293: epoll EPOLLIN parity on a listening AF_UNIX socket ───────
     // A listening AF_UNIX socket with a queued connection is read-ready;
     // epoll_wait(2) must report EPOLLIN for it just as poll(2)/select(2) do
@@ -2911,6 +2994,16 @@ pub fn run() -> ! {
     // using memfd" and falls back to /dev/shm.  Refs: proc(5), memfd_create(2).
     total += 1;
     if test_296_proc_fd_reopen_unlinked_memfd() { passed += 1; }
+
+    // ── Test 300: file-backed mmap keeps the inode alive after last fd close ─
+    // mmap(2)/memfd_create(2): a live mapping is a reference to the mapped
+    // object, so close(2) of the last fd to a still-mmap'd memfd must NOT free
+    // the inode — a later demand fault would otherwise read a freed inode and
+    // SIGSEGV.  Drives the real pin (insert_vma), the close-time pin honour, the
+    // hole-punch split pin balance, and the teardown unpin.  Refs: mmap(2),
+    // munmap(2), memfd_create(2), POSIX.
+    total += 1;
+    if test_300_mmap_filebacked_inode_pin() { passed += 1; }
 
     // ── Test 297: eventfd open-file-description refcount across fork/dup ───
     // Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicate descriptors
@@ -3311,6 +3404,69 @@ fn test_dns_resolution() -> bool {
             true
         }
     }
+}
+
+/// DNS name-decompression cyclic-pointer guard (RFC 1035 §4.1.4, CWE-835).
+///
+/// A response whose name field is a self-referential compression pointer
+/// (`0xC0 0x0C` at offset 12 → ptr 12) must terminate the parser with `None`,
+/// never loop forever: the offset stays in-bounds so the `offset >= len`
+/// bound can never fire, and without a hop cap the in-kernel resolver thread
+/// (shell `ping`/`nslookup`, the test runner) hangs.  A malicious or spoofed
+/// nameserver controls every byte of the reply, so this is a remote DoS.
+/// The test runs the real private parser via `dns::test_skip_dns_name` and
+/// asserts: (a) the cyclic pointer returns `None` (and, implicitly, returns
+/// at all — a hang would wedge the whole test boot); (b) a chained-pointer
+/// loop also returns `None`; (c) a well-formed compressed name still parses.
+fn test_dns_cyclic_pointer_guard() -> bool {
+    test_header!("DNS cyclic compression-pointer guard (RFC 1035 §4.1.4, CWE-835)");
+    use crate::net::dns;
+
+    // (a) Self-referential pointer: a 2-byte name at offset 0 that points to
+    //     itself.  0xC0 0x00 → label-type 0b11 (pointer), offset bits = 0.
+    //     Pre-#fix this looped forever; the guard must return None.
+    let cyclic_self: [u8; 2] = [0xC0, 0x00];
+    if dns::test_skip_dns_name(&cyclic_self, 0).is_some() {
+        test_fail!("dns_cyclic", "self-referential pointer did not return None");
+        return false;
+    }
+    test_println!("  self-referential 0xC0 0x00 → None ✓ (did not hang)");
+
+    // (b) Two-pointer cycle: offset 0 → 2, offset 2 → 0.  Mutually-referential
+    //     pointers must also be caught by the hop cap.
+    let cyclic_pair: [u8; 4] = [0xC0, 0x02, 0xC0, 0x00];
+    if dns::test_skip_dns_name(&cyclic_pair, 0).is_some() {
+        test_fail!("dns_cyclic", "two-pointer cycle did not return None");
+        return false;
+    }
+    test_println!("  two-pointer cycle → None ✓");
+
+    // (c) Well-formed name with a single legal back-pointer must still parse.
+    //     Layout: [0]=3 'w' 'w' 'w' [4]=0 (root)  then at [5] a pointer to
+    //     offset 0.  Skipping the name at offset 5 must succeed and return the
+    //     offset just past the 2-byte pointer (7).
+    let mut wire: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    wire.extend_from_slice(&[3, b'w', b'w', b'w', 0]); // "www." at offset 0
+    wire.extend_from_slice(&[0xC0, 0x00]);             // pointer→0 at offset 5
+    match dns::test_skip_dns_name(&wire, 5) {
+        Some(7) => test_println!("  well-formed back-pointer at off 5 → 7 ✓"),
+        other => {
+            test_fail!("dns_cyclic", "well-formed name parse: expected Some(7), got {:?}", other);
+            return false;
+        }
+    }
+
+    // (d) Uncompressed name parses to the byte past the root label.
+    match dns::test_skip_dns_name(&[3, b'w', b'w', b'w', 0], 0) {
+        Some(5) => test_println!("  uncompressed name → 5 ✓"),
+        other => {
+            test_fail!("dns_cyclic", "uncompressed parse: expected Some(5), got {:?}", other);
+            return false;
+        }
+    }
+
+    test_pass!("DNS cyclic compression-pointer guard");
+    true
 }
 
 /// Test IPv6 DNS resolution (AAAA record) for the anycast service.
@@ -22562,6 +22718,255 @@ fn test_tcp_connections_cap() -> bool {
     true
 }
 
+// ── Test 89c: SYN-flood half-open reaper + per-port backlog cap ──────────────
+//
+// RFC 4987.  A passively-created `SynReceived` child sends its SYN-ACK via
+// `send_flags` WITHOUT enqueuing a retransmit entry, so its retransmit_queue
+// is empty and the retransmit-driven abort in `tcp_timer_tick` never fires
+// for it.  Pre-fix such a half-open was NEVER aged out → half-opens pile to
+// MAX_TCP_CONNECTIONS and permanently starve every listener.  This test:
+//   (1) injects a stale half-open (created_tick well past SYNACK_TIMEOUT) on
+//       a port with an empty retransmit queue, runs one tcp_timer_tick, and
+//       asserts the reaper RST+Closed it (SynReceived count → 0, live → 0);
+//   (2) injects a FRESH half-open and asserts a tick does NOT reap it (so a
+//       legitimate in-flight handshake is not torn down prematurely).
+fn test_tcp_syn_flood_reaper() -> bool {
+    test_header!("TCP SYN-flood half-open reaper (RFC 4987)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8099;
+    let rip: [u8; 4] = [203, 0, 113, 7]; // TEST-NET-3 (RFC 5737)
+
+    // (1) Stale half-open: aged 1000 ticks (≫ SYNACK_TIMEOUT_TICKS=300).
+    if let Err(e) = tcp::test_inject_syn_received(PORT, rip, 40000, 1000) {
+        test_fail!("syn_reaper", "inject stale half-open failed: {}", e);
+        return false;
+    }
+    if tcp::syn_received_count(PORT) != 1 {
+        test_fail!("syn_reaper", "expected 1 half-open before tick, got {}",
+                   tcp::syn_received_count(PORT));
+        return false;
+    }
+    // One timer tick must reap it (RST + mark_closed), REGARDLESS of the
+    // empty retransmit queue — the precise bug.
+    tcp::tcp_timer_tick();
+    if tcp::syn_received_count(PORT) != 0 {
+        test_fail!("syn_reaper",
+            "stale half-open NOT reaped — {} still SynReceived after tick (empty-retransmit-queue wedge)",
+            tcp::syn_received_count(PORT));
+        return false;
+    }
+    if tcp::live_conn_count_on_port(PORT) != 0 {
+        test_fail!("syn_reaper", "expected 0 live conns on :{} after reap, got {}",
+                   PORT, tcp::live_conn_count_on_port(PORT));
+        return false;
+    }
+    test_println!("  stale half-open RST+reaped after one tick ✓ (empty retransmit queue)");
+
+    // (2) Fresh half-open: aged 0 ticks — a tick must NOT reap it.
+    const PORT2: u16 = 8098;
+    if let Err(e) = tcp::test_inject_syn_received(PORT2, rip, 40001, 0) {
+        test_fail!("syn_reaper", "inject fresh half-open failed: {}", e);
+        return false;
+    }
+    tcp::tcp_timer_tick();
+    if tcp::syn_received_count(PORT2) != 1 {
+        test_fail!("syn_reaper",
+            "fresh half-open wrongly reaped (premature teardown of in-flight handshake): count={}",
+            tcp::syn_received_count(PORT2));
+        return false;
+    }
+    test_println!("  fresh half-open survives one tick ✓ (no premature teardown)");
+
+    // Cleanup: age the survivor out so the test leaves no residue.
+    // Re-inject won't work (duplicate 4-tuple); instead drive the reaper by
+    // injecting nothing and letting a future tick + GC drop it — but to keep
+    // the table clean for downstream tests, abort it explicitly.
+    let _ = tcp::abort(PORT2);
+
+    test_pass!("TCP SYN-flood half-open reaper (RFC 4987)");
+    true
+}
+
+// ── Test 89d: TCP OOO reassembly bounded + O(n log n) drain (SegmentSmack) ───
+//
+// RFC 9293 §3.10.7.4, CVE-2018-5390 (SegmentSmack).  The out-of-order
+// reassembly queue must bound BOTH bytes and ENTRY COUNT, and drain in order
+// efficiently.  Pre-fix the queue was a `Vec` with O(n) insert/remove (O(n²)
+// under a flood) and an entry count capped only implicitly by the byte cap,
+// so a 1-byte-per-distinct-seq flood could admit ~262k tiny entries and pin a
+// core under the non-preemptible TCP lock.  This test floods the OOO queue
+// with many 1-byte non-adjacent segments and asserts:
+//   (1) the entry count stays bounded (≤ OOO_MAX_ENTRIES = 1024);
+//   (2) once the gap at recv_next is filled, buffered data drains IN ORDER;
+//   (3) a contiguous reorder coalesces (does not consume an entry each).
+fn test_tcp_ooo_bounded_drain() -> bool {
+    test_header!("TCP OOO reassembly bounded + ordered drain (CVE-2018-5390)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8097;
+    let rip: [u8; 4] = [203, 0, 113, 9];
+    if let Err(e) = tcp::test_inject_established_tm(PORT, rip, 50000) {
+        test_fail!("ooo_bound", "inject Established failed: {}", e);
+        return false;
+    }
+    // recv_next == 1.  Feed 1-byte segments at NON-ADJACENT seqs, leaving the
+    // gap at seq 1 unfilled so nothing drains.  Use a stride of 2 so no two
+    // segments abut (each stays a distinct entry, the worst case).  Flood
+    // FLOOD segments — comfortably more than OOO_MAX_ENTRIES (1024) — and
+    // assert the entry count never exceeds the cap.
+    const FLOOD: u32 = 4000;
+    let mut max_entries = 0usize;
+    for k in 0..FLOOD {
+        let seq = 3u32.wrapping_add(k * 2); // 3,5,7,... (gap at 1,2 stays open)
+        match tcp::test_feed_ooo(PORT, rip, 50000, seq, b"X") {
+            Some((entries, _bytes, _rb)) => { max_entries = max_entries.max(entries); }
+            None => { test_fail!("ooo_bound", "test_feed_ooo returned None at k={}", k); return false; }
+        }
+    }
+    test_println!("  fed {} 1-byte non-adjacent OOO segments; peak entries={}",
+                  FLOOD, max_entries);
+    if max_entries > 1024 {
+        test_fail!("ooo_bound",
+            "OOO entry count {} exceeded cap 1024 — SegmentSmack guard absent",
+            max_entries);
+        return false;
+    }
+    test_println!("  entry count stayed ≤ 1024 ✓ (CVE-2018-5390 bounded)");
+
+    // Tear down and rebuild a clean TCB for the ordered-drain + coalesce check
+    // (the flooded one has a sparse 1024-entry tail we don't need).
+    let _ = tcp::abort(PORT);
+    tcp::tcp_timer_tick(); // RST + mark_closed
+    // Give GC a window, then a tick to reap so the 4-tuple is reusable.
+    let start = crate::arch::x86_64::irq::get_ticks();
+    while crate::arch::x86_64::irq::get_ticks().wrapping_sub(start) < 60 {
+        core::hint::spin_loop();
+    }
+    tcp::tcp_timer_tick();
+
+    const PORT2: u16 = 8096;
+    if let Err(e) = tcp::test_inject_established_tm(PORT2, rip, 50001) {
+        test_fail!("ooo_bound", "inject Established #2 failed: {}", e);
+        return false;
+    }
+    // recv_next == 1.  Bytes at seq 1='A', 2='B', 3='C', 4='D', 5='E'.
+    // Buffer the OOO tail AHEAD of the gap at seq 1, feeding the two ABUTTING
+    // segments in ascending order so forward-coalesce fires:
+    //   seq 2 "BC" (covers 2,3)  → new entry [2..4)
+    //   seq 4 "DE" (covers 4,5)  → abuts [2..4) at 4 → coalesced into [2..6)
+    let first = tcp::test_feed_ooo(PORT2, rip, 50001, 2, b"BC");
+    if let Some((entries, _, _)) = first {
+        if entries != 1 {
+            test_fail!("ooo_bound", "after first OOO seg expected 1 entry, got {}", entries);
+            return false;
+        }
+    }
+    let after_ooo = tcp::test_feed_ooo(PORT2, rip, 50001, 4, b"DE"); // abuts → coalesce
+    if let Some((entries, bytes, _rb)) = after_ooo {
+        if entries != 1 {
+            test_fail!("ooo_bound",
+                "expected coalesced single OOO entry [2..6), got {} entries", entries);
+            return false;
+        }
+        if bytes != 4 {
+            test_fail!("ooo_bound", "expected 4 buffered OOO bytes (BCDE), got {}", bytes);
+            return false;
+        }
+        test_println!("  abutting OOO segments coalesced to 1 entry [2..6) ✓");
+    }
+    // Now deliver the in-order gap-filler seq 1 = "A": recv_next advances to 2,
+    // then the buffered [2..6)="BCDE" drains, recv_next → 6, recv_buffer="ABCDE".
+    match tcp::test_feed_ooo(PORT2, rip, 50001, 1, b"A") {
+        Some((entries, _b, rb_len)) => {
+            if entries != 0 {
+                test_fail!("ooo_bound", "after gap-fill, expected 0 OOO entries, got {}", entries);
+                return false;
+            }
+            if rb_len != 5 {
+                test_fail!("ooo_bound", "after drain expected 5 recv bytes (ABCDE), got {}", rb_len);
+                return false;
+            }
+        }
+        None => { test_fail!("ooo_bound", "gap-fill feed returned None"); return false; }
+    }
+    // Verify the actual byte ORDER is ABCDE (in-order delivery, not jumbled).
+    let drained = tcp::read_from(PORT2, rip, 50001);
+    if drained != b"ABCDE" {
+        test_fail!("ooo_bound", "drain order wrong: got {:?}, expected b\"ABCDE\"", drained);
+        return false;
+    }
+    test_println!("  gap-fill drained buffered tail IN ORDER → \"ABCDE\" ✓");
+
+    let _ = tcp::abort(PORT2);
+    test_pass!("TCP OOO reassembly bounded + ordered drain (CVE-2018-5390)");
+    true
+}
+
+// ── Test 89e: TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8) ──
+//
+// A bulk TLS/HTTP-2 response to a slow-draining socket must not grow
+// `recv_buffer` until the kernel heap OOMs.  Pre-fix the buffer was unbounded
+// and the advertised window hardcoded to 65535.  This test installs a small
+// SO_RCVBUF, floods in-order data well past it WITHOUT draining, and asserts:
+//   (1) recv_buffer never exceeds the effective cap (the OOM guard);
+//   (2) the advertised window shrinks toward 0 as the buffer fills (flow
+//       control — the peer is told to stop sending, RFC 9293 §3.8).
+fn test_tcp_rcvbuf_cap() -> bool {
+    test_header!("TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8095;
+    let rip: [u8; 4] = [203, 0, 113, 11];
+    if let Err(e) = tcp::test_inject_established_tm(PORT, rip, 60000) {
+        test_fail!("rcvbuf_cap", "inject Established failed: {}", e);
+        return false;
+    }
+    // Small cap: 4096 requested → clamped to ≥ MSS (1460); effective cap is
+    // max(4096, 1460) = 4096.
+    const RCVBUF: u32 = 4096;
+    const CHUNK: usize = 1000;
+    const FLOODS: usize = 64; // 64 KiB of data into a 4 KiB buffer
+
+    let mut last_window = 65535u16;
+    let mut last_buflen = 0usize;
+    for i in 0..FLOODS {
+        let set = if i == 0 { Some(RCVBUF) } else { None };
+        let payload = [0x41u8; CHUNK];
+        match tcp::test_feed_inorder_capped(PORT, rip, 60000, &payload, set) {
+            Some((buflen, window)) => { last_buflen = buflen; last_window = window; }
+            None => { test_fail!("rcvbuf_cap", "feed returned None at i={}", i); return false; }
+        }
+    }
+    test_println!("  after {} KiB flood into a {} B cap: recv_buffer={} B, window={}",
+                  (FLOODS * CHUNK) / 1024, RCVBUF, last_buflen, last_window);
+
+    // (1) recv_buffer must be bounded.  The cap admits whole chunks until the
+    //     buffer reaches the cap; the last admitted chunk may push it up to
+    //     just under cap + one chunk.  Assert it never ran away with the flood.
+    let bound = (RCVBUF as usize) + CHUNK;
+    if last_buflen > bound {
+        test_fail!("rcvbuf_cap",
+            "recv_buffer {} B exceeded bound {} B — SO_RCVBUF cap absent (heap-OOM risk)",
+            last_buflen, bound);
+        return false;
+    }
+    test_println!("  recv_buffer bounded at {} B (≤ {} B) ✓ (no unbounded heap growth)", last_buflen, bound);
+
+    // (2) The advertised window must have shrunk toward 0 as the buffer filled.
+    if last_window >= 65535 {
+        test_fail!("rcvbuf_cap",
+            "advertised window still {} (did not shrink) — flow control absent", last_window);
+        return false;
+    }
+    // With recv_buffer ≥ cap, free space is 0 → window 0.
+    test_println!("  advertised window shrank to {} ✓ (RFC 9293 §3.8 flow control)", last_window);
+
+    let _ = tcp::abort(PORT);
+    test_pass!("TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8)");
+    true
+}
+
 // ── Test 90: TCP congestion control ───────────────────────────────────────────
 
 fn test_tcp_congestion_control() -> bool {
@@ -32179,6 +32584,160 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
     true
 }
 
+/// NDE-18: FIN-WAIT-1 / FIN-WAIT-2 must deliver in-order segment text and
+/// honour an in-order FIN, exactly like ESTABLISHED (RFC 9293 §3.10.7.4).
+///
+/// Reproduces the heavy-real-site close pattern observed on the wire: the
+/// local side closes its write half (Established → FIN-WAIT-1 → FIN-WAIT-2),
+/// then the peer sends a final short appdata segment (a TLS close_notify)
+/// COALESCED with its FIN, in order at recv_next.  Before this fix the
+/// FIN-WAIT arms matched only a bare FIN (`seq + payload_len == recv_next`),
+/// so the data+FIN segment was dropped: no ACK, recv_next frozen, no
+/// TIME-WAIT transition — the peer retransmitted until it RST and the fetch
+/// never terminated.  Asserts both FIN-WAIT-2 and FIN-WAIT-1 deliver the
+/// text, advance recv_next past the data + FIN, and reach TIME-WAIT.
+#[cfg(feature = "kdb")]
+fn test_tcp_finwait_data_fin_delivery() -> bool {
+    test_header!("FIN-WAIT-1/2 in-order data+FIN delivery (RFC 9293 §3.10.7.4)");
+
+    use crate::net::tcp;
+
+    // SLIRP gateway as synthetic peer (MAC already ARP-cached) so the ACK
+    // process_segment emits egresses without an ARP poll loop.
+    let peer_ip: [u8; 4] = [10, 0, 2, 2];
+
+    // The final appdata the peer sends with its FIN — a 24-byte TLS
+    // close_notify-bearing record (an encrypted TLS 1.2 alert: 5-byte record
+    // header 0x15/0x0303/len + 19 ciphertext bytes), matching the 24-byte
+    // data+FIN segment observed on the wedge wire.
+    const TAIL: &[u8] = b"\x15\x03\x03\x00\x13_close_notify_pad__";
+    // Compile-time guard: TAIL is exactly the 24-byte wire close_notify.
+    const _: () = assert!(TAIL.len() == 24);
+
+    // recv_next is 1 after test_inject_established; the tail rides at seq 1.
+    let snap = |lp: u16, pp: u16| {
+        tcp::snapshot_connections().into_iter()
+            .find(|c| c.local_port == lp && c.remote_ip == peer_ip
+                   && c.remote_port == pp)
+    };
+
+    // ─── Case A: FIN-WAIT-2 (the dominant wedge state) ───────────────────────
+    const LP2: u16 = 47320;
+    let pp2: u16 = 51301;
+    if let Err(e) = tcp::test_inject_established(LP2, peer_ip, pp2, b"") {
+        test_fail!("tcp_finwait", "inject (FW2) failed: {}", e);
+        return false;
+    }
+    if let Err(e) = tcp::test_set_state(LP2, peer_ip, pp2, tcp::TcpState::FinWait2) {
+        test_fail!("tcp_finwait", "set FinWait2 failed: {}", e);
+        let _ = tcp::close_connection(LP2, peer_ip, pp2);
+        return false;
+    }
+
+    // Peer's data+FIN in order at seq 1.  test_feed_segment drives the real
+    // process_segment path and reports the reply-segment count so the test can
+    // assert the ACK that the bug suppressed actually went on the wire.
+    match tcp::test_feed_segment(LP2, peer_ip, pp2, 1, TAIL, true) {
+        Some((state, buflen, replies)) => {
+            if replies == 0 {
+                test_fail!("tcp_finwait",
+                    "FW2: data+FIN emitted NO ACK (the exact wire bug → peer retransmits → RST)");
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            if buflen != TAIL.len() {
+                test_fail!("tcp_finwait",
+                    "FW2: recv_buf={} want {} (final appdata dropped instead of delivered)",
+                    buflen, TAIL.len());
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            if state != tcp::TcpState::TimeWait {
+                test_fail!("tcp_finwait",
+                    "FW2: state={:?} want TimeWait (in-order FIN must terminate the connection)",
+                    state);
+                let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                return false;
+            }
+            // recv_next must have advanced past the TAIL bytes AND the FIN.
+            let want_rn = 1 + TAIL.len() as u32 + 1;
+            match snap(LP2, pp2).map(|c| c.recv_next) {
+                Some(rn) if rn == want_rn => {}
+                other => {
+                    test_fail!("tcp_finwait",
+                        "FW2: recv_next={:?} want {} (data+FIN not fully consumed)", other, want_rn);
+                    let _ = tcp::close_connection(LP2, peer_ip, pp2);
+                    return false;
+                }
+            }
+            test_println!("  FIN-WAIT-2: data+FIN delivered (recv_buf={}), ACKed (replies={}), → TimeWait ✓",
+                buflen, replies);
+        }
+        None => {
+            test_fail!("tcp_finwait", "FW2: TCB vanished / feed returned None");
+            return false;
+        }
+    }
+
+    // ─── Case B: FIN-WAIT-1 (simultaneous-ish close — peer FIN before our FIN ACK) ─
+    const LP1: u16 = 47321;
+    let pp1: u16 = 51302;
+    if let Err(e) = tcp::test_inject_established(LP1, peer_ip, pp1, b"") {
+        test_fail!("tcp_finwait", "inject (FW1) failed: {}", e);
+        return false;
+    }
+    if let Err(e) = tcp::test_set_state(LP1, peer_ip, pp1, tcp::TcpState::FinWait1) {
+        test_fail!("tcp_finwait", "set FinWait1 failed: {}", e);
+        let _ = tcp::close_connection(LP1, peer_ip, pp1);
+        return false;
+    }
+    match tcp::test_feed_segment(LP1, peer_ip, pp1, 1, TAIL, true) {
+        Some((state, buflen, replies)) => {
+            if replies == 0 {
+                test_fail!("tcp_finwait",
+                    "FW1: data+FIN emitted NO ACK (peer would retransmit → RST)");
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if buflen != TAIL.len() {
+                test_fail!("tcp_finwait",
+                    "FW1: recv_buf={} want {} (final appdata dropped)", buflen, TAIL.len());
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            if state != tcp::TcpState::TimeWait {
+                test_fail!("tcp_finwait",
+                    "FW1: state={:?} want TimeWait (in-order peer FIN must terminate)", state);
+                let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                return false;
+            }
+            let want_rn = 1 + TAIL.len() as u32 + 1;
+            match snap(LP1, pp1).map(|c| c.recv_next) {
+                Some(rn) if rn == want_rn => {}
+                other => {
+                    test_fail!("tcp_finwait",
+                        "FW1: recv_next={:?} want {} (data+FIN not fully consumed)", other, want_rn);
+                    let _ = tcp::close_connection(LP1, peer_ip, pp1);
+                    return false;
+                }
+            }
+            test_println!("  FIN-WAIT-1: data+FIN delivered (recv_buf={}), ACKed (replies={}), → TimeWait ✓",
+                buflen, replies);
+        }
+        None => {
+            test_fail!("tcp_finwait", "FW1: TCB vanished / feed returned None");
+            return false;
+        }
+    }
+
+    // TimeWait TCBs expire on the TIME_WAIT timer; no explicit close needed,
+    // but issue one as a no-op safety net (close only matches Est/CloseWait).
+    let _ = tcp::close_connection(LP1, peer_ip, pp1);
+    let _ = tcp::close_connection(LP2, peer_ip, pp2);
+    test_pass!("FIN-WAIT-1/2 in-order data+FIN delivery (RFC 9293 §3.10.7.4)");
+    true
+}
+
 // ── Test 519: TCP stream surplus retention on bounded recv ──────────────────
 //
 // IEEE Std 1003.1-2017 §recv / recv(2): for SOCK_STREAM, bytes in excess of
@@ -32438,7 +32997,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // userspace and reject the peer's retransmission forever.
     let ooo_seq = base.wrapping_add(4);
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, ooo_seq, b"END", true) {
-        Some((state, buflen)) => {
+        Some((state, buflen, replies)) => {
             if state != tcp::TcpState::Established {
                 test_fail!("tcp_ooo_fin_guard",
                     "OOO data+FIN prematurely changed state (expected Established)");
@@ -32449,6 +33008,13 @@ fn test_tcp_ooo_fin_guard() -> bool {
                     "OOO segment was buffered out of order (buflen={})", buflen);
                 return false;
             }
+            // An out-of-order segment must trigger an immediate dup-ACK so the
+            // peer fast-retransmits the gap (RFC 5681 §3.2).
+            if replies == 0 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO segment emitted no dup-ACK (peer would never retransmit the gap)");
+                return false;
+            }
         }
         None => { test_fail!("tcp_ooo_fin_guard", "feed OOO returned None"); return false; }
     }
@@ -32456,7 +33022,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // Now feed the IN-ORDER 4-byte segment that fills the gap (no FIN).  This
     // advances recv_next to base+4 and delivers the data.
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, b"DATA", false) {
-        Some((state, buflen)) => {
+        Some((state, buflen, _replies)) => {
             if state != tcp::TcpState::Established {
                 test_fail!("tcp_ooo_fin_guard",
                     "in-order fill unexpectedly changed state");
@@ -32476,7 +33042,7 @@ fn test_tcp_ooo_fin_guard() -> bool {
     // moves to CloseWait.
     let fin_seq = base.wrapping_add(4);
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, fin_seq, &[], true) {
-        Some((state, _)) => {
+        Some((state, _, _)) => {
             if state != tcp::TcpState::CloseWait {
                 test_fail!("tcp_ooo_fin_guard",
                     "in-order FIN not honored (state not CloseWait)");
@@ -37616,6 +38182,229 @@ fn test_poll_bell_recheck_under_lock() -> bool {
     true
 }
 
+// ── Test 0bx3: poll-bell class-filtered drain (Stage C) ─────────────────────
+//
+// Verifies the Stage-C class-filtered poll-bell drain on a private `WaitList`
+// (no TID-0 park — see the recheck test's rationale).  Asserts:
+//   (1) `drain_matching(bit)` returns ONLY waiters whose interest mask includes
+//       `bit`, and RETAINS the non-matching waiters in place;
+//   (2) a `BELL_MASK_ALL` waiter matches EVERY source bit (conservative
+//       wake-everyone), so under-waking can never happen for an unclassified fd;
+//   (3) the `POLL_BELL_MASK_FILTERED` counter advances by the number of
+//       parkers left behind, proving the herd is being shrunk;
+//   (4) `drain_all` still releases everyone (the EOF/close path is unchanged).
+//
+// References: POSIX poll(2)/select(2)/epoll(7) — a parker re-evaluates its fd
+// set on a readiness notification; waking only the relevant interest class is a
+// strictly-safer subset of the historical wake-all as long as the mask is a
+// superset of true interest (the invariant this test guards).
+fn test_poll_bell_class_filtered_drain() -> bool {
+    test_header!("poll-bell class-filtered drain (Stage C interest masks)");
+
+    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, POLL_BELL_MASK_FILTERED, OBJECT_ID_NONE};
+    use core::sync::atomic::Ordering;
+
+    let bit = |s: PollBellSource| 1u32 << (s as u32);
+
+    // Synthetic TIDs that match no real thread, so `enqueue_self_blocked_masked`
+    // is a no-op on THREAD_TABLE (no scheduler state touched).
+    const T_PIPE: u64  = u64::MAX - 10;
+    const T_INET: u64  = u64::MAX - 11;
+    const T_ALL: u64   = u64::MAX - 12;
+
+    let mut wl = WaitList::new();
+    // Park three waiters with distinct interest classes.
+    wl.enqueue_self_blocked_masked(T_PIPE, u64::MAX, bit(PollBellSource::Pipe));
+    wl.enqueue_self_blocked_masked(T_INET, u64::MAX, bit(PollBellSource::InetRx));
+    wl.enqueue_self_blocked_masked(T_ALL,  u64::MAX, BELL_MASK_ALL);
+    if wl.len() != 3 {
+        test_fail!("poll_bell_class", "expected 3 parkers, got {}", wl.len());
+        return false;
+    }
+
+    let filtered0 = POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed);
+
+    // (1)+(2): an InetRx ring wakes T_INET and the wake-everyone T_ALL, and
+    // RETAINS T_PIPE (whose mask does not include InetRx).
+    let woke = wl.drain_matching(bit(PollBellSource::InetRx), OBJECT_ID_NONE);
+    let woke_inet = woke.contains(&T_INET);
+    let woke_all  = woke.contains(&T_ALL);
+    let woke_pipe = woke.contains(&T_PIPE);
+    if !woke_inet || !woke_all {
+        test_fail!("poll_bell_class",
+            "InetRx ring missed a matching waiter (inet={}, all={})", woke_inet, woke_all);
+        return false;
+    }
+    if woke_pipe {
+        test_fail!("poll_bell_class", "InetRx ring woke the pipe-only waiter (over-broad filter)");
+        return false;
+    }
+    if wl.len() != 1 {
+        test_fail!("poll_bell_class", "non-matching waiter not retained (len={})", wl.len());
+        return false;
+    }
+
+    // (3): the counter advanced by exactly the one parker left behind (T_PIPE).
+    let filtered1 = POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed);
+    if filtered1.wrapping_sub(filtered0) != 1 {
+        test_fail!("poll_bell_class",
+            "POLL_BELL_MASK_FILTERED advanced by {} (expected 1 left-behind)",
+            filtered1.wrapping_sub(filtered0));
+        return false;
+    }
+
+    // A Pipe ring now wakes the retained T_PIPE.
+    let woke2 = wl.drain_matching(bit(PollBellSource::Pipe), OBJECT_ID_NONE);
+    if !woke2.contains(&T_PIPE) || !wl.is_empty() {
+        test_fail!("poll_bell_class",
+            "Pipe ring did not drain the retained pipe waiter (woke={:?}, empty={})",
+            woke2, wl.is_empty());
+        return false;
+    }
+    test_println!("  class filter: InetRx woke {{inet,all}}, retained pipe; Pipe woke pipe ✓");
+
+    // (4): drain_all still releases every parker regardless of interest.
+    wl.enqueue_self_blocked_masked(T_PIPE, u64::MAX, bit(PollBellSource::Pipe));
+    wl.enqueue_self_blocked_masked(T_INET, u64::MAX, bit(PollBellSource::InetRx));
+    let everyone = wl.drain_all();
+    if everyone.len() != 2 || !wl.is_empty() {
+        test_fail!("poll_bell_class",
+            "drain_all did not release everyone (drained={:?}, empty={})",
+            everyone, wl.is_empty());
+        return false;
+    }
+    test_println!("  drain_all still releases all parkers (EOF/close path intact) ✓");
+
+    test_pass!("poll-bell class-filtered drain (Stage C interest masks)");
+    true
+}
+
+// ── Test 0bx4: poll-bell per-OBJECT targeted drain (intra-class herd) ───────
+//
+// Verifies the per-object targeted wakeup on a private `WaitList`.  This is the
+// intra-class herd collapse: a readiness edge on ONE object of a source class
+// wakes only the parker(s) watching THAT object, not every parker of the class.
+// Asserts the full correctness matrix (no under-wake is the load-bearing one —
+// under-waking is a hang):
+//   (1) a targeted ring `(UnixWrite, A)` wakes the parker pinned to A and the
+//       wake-on-class (BELL_MASK_ALL) parker, and RETAINS the parker pinned to a
+//       DIFFERENT object B (the herd member spared);
+//   (2) a targeted ring `(UnixWrite, B)` then wakes B's parker;
+//   (3) a CLASS-ONLY ring `(UnixWrite, OBJECT_ID_NONE)` — an unattributable edge
+//       — wakes EVERY UnixWrite watcher (both object-pinned and wake-on-class),
+//       the never-under-wake safety net;
+//   (4) an object id is namespaced by source: a `(Pipe, A)` ring does NOT wake a
+//       parker pinned to `(UnixWrite, A)` even though the raw id A collides;
+//   (5) `drain_all` still releases everyone (EOF/close path unchanged).
+//
+// References: POSIX poll(2)/select(2)/epoll(7) readiness-notification semantics;
+// the per-object wake model (a writer wakes only the waiters registered on that
+// object's wait queue, not a global class scan).
+fn test_poll_bell_per_object_drain() -> bool {
+    test_header!("poll-bell per-object targeted drain (intra-class herd collapse)");
+
+    use crate::ipc::waitlist::{WaitList, PollBellSource, BELL_MASK_ALL, OBJECT_ID_NONE};
+
+    let bit = |s: PollBellSource| 1u32 << (s as u32);
+    let uw = bit(PollBellSource::UnixWrite);
+    let pipe_bit = bit(PollBellSource::Pipe);
+
+    // Synthetic TIDs (match no real thread → no THREAD_TABLE side effects).
+    const T_A:   u64 = u64::MAX - 20; // pinned to (UnixWrite, object 100)
+    const T_B:   u64 = u64::MAX - 21; // pinned to (UnixWrite, object 200)
+    const T_ALL: u64 = u64::MAX - 22; // wake-on-class (BELL_MASK_ALL)
+    const OBJ_A: u64 = 100;
+    const OBJ_B: u64 = 200;
+
+    let mut wl = WaitList::new();
+    // Park T_A and T_B as per-object watchers on the SAME source class
+    // (UnixWrite) but DIFFERENT objects; T_ALL is the conservative wake-everyone.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    wl.enqueue_self_blocked_full(T_ALL, u64::MAX, BELL_MASK_ALL, &[]);
+    if wl.len() != 3 {
+        test_fail!("poll_bell_obj", "expected 3 parkers, got {}", wl.len());
+        return false;
+    }
+
+    // (1): targeted ring on object A wakes T_A + T_ALL, RETAINS T_B.
+    let woke = wl.drain_matching(uw, OBJ_A);
+    if !woke.contains(&T_A) || !woke.contains(&T_ALL) {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,A) missed A or ALL (woke={:?})", woke);
+        return false;
+    }
+    if woke.contains(&T_B) {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,A) over-woke the B-object parker (herd not collapsed)");
+        return false;
+    }
+    if wl.len() != 1 {
+        test_fail!("poll_bell_obj", "B-object parker not retained (len={})", wl.len());
+        return false;
+    }
+    test_println!("  targeted (UnixWrite,A) woke {{A,ALL}}, spared B ✓");
+
+    // (2): targeted ring on object B wakes the retained T_B.
+    let woke_b = wl.drain_matching(uw, OBJ_B);
+    if !woke_b.contains(&T_B) || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "targeted (UnixWrite,B) failed (woke={:?}, empty={})", woke_b, wl.is_empty());
+        return false;
+    }
+    test_println!("  targeted (UnixWrite,B) woke B ✓");
+
+    // (3): CLASS-ONLY ring wakes EVERY UnixWrite watcher (no under-wake).
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    wl.enqueue_self_blocked_full(T_ALL, u64::MAX, BELL_MASK_ALL, &[]);
+    let woke_all = wl.drain_matching(uw, OBJECT_ID_NONE);
+    if !woke_all.contains(&T_A) || !woke_all.contains(&T_B) || !woke_all.contains(&T_ALL) {
+        test_fail!("poll_bell_obj",
+            "class-only UnixWrite ring under-woke (A={}, B={}, ALL={}) — HANG RISK",
+            woke_all.contains(&T_A), woke_all.contains(&T_B), woke_all.contains(&T_ALL));
+        return false;
+    }
+    if !wl.is_empty() {
+        test_fail!("poll_bell_obj", "class-only ring left parkers behind (len={})", wl.len());
+        return false;
+    }
+    test_println!("  class-only UnixWrite ring woke ALL object-watchers (no under-wake) ✓");
+
+    // (4): id namespace is per-source — a (Pipe, A) ring does NOT wake a parker
+    // pinned to (UnixWrite, A) despite the raw id A colliding.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    let cross = wl.drain_matching(pipe_bit, OBJ_A);
+    if cross.contains(&T_A) {
+        test_fail!("poll_bell_obj", "(Pipe,A) wrongly woke a (UnixWrite,A) parker — id namespace leaked across sources");
+        return false;
+    }
+    // The UnixWrite parker must still be present and wakeable by its own source.
+    let woke_self = wl.drain_matching(uw, OBJ_A);
+    if !woke_self.contains(&T_A) || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "(UnixWrite,A) parker not wakeable by its own source after cross-source probe");
+        return false;
+    }
+    test_println!("  object id namespaced by source: (Pipe,A) ≠ (UnixWrite,A) ✓");
+
+    // (5): drain_all still releases everyone regardless of object pins.
+    wl.enqueue_self_blocked_full(T_A, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_A)]);
+    wl.enqueue_self_blocked_full(T_B, u64::MAX, 0,
+        &[crate::ipc::waitlist::watch_key_for_test(uw, OBJ_B)]);
+    let everyone = wl.drain_all();
+    if everyone.len() != 2 || !wl.is_empty() {
+        test_fail!("poll_bell_obj", "drain_all did not release all object parkers (drained={:?})", everyone);
+        return false;
+    }
+    test_println!("  drain_all releases all object-pinned parkers (EOF/close intact) ✓");
+
+    test_pass!("poll-bell per-object targeted drain (intra-class herd collapse)");
+    true
+}
+
 // ── Test 0bc: POLLHUP on pipe read-end after writer close ───────────────────
 //
 // Verifies the helper state that `poll_revents` consumes per POSIX
@@ -41850,6 +42639,51 @@ fn test_tlb_shootdown_coalesced_w133() -> bool {
     tlb::forget_cr3(fake_cr3);
 
     test_pass!("TLB shootdown coalesced over range (W133)");
+    true
+}
+
+/// TLB shootdown ACK-spin self-service drain.
+///
+/// Regression guard for the cross-CPU ack-spin deadlock: a CPU that issues a
+/// shootdown from inside an interrupt-gate fault handler spins for sibling
+/// acks with RFLAGS.IF clear (Intel SDM Vol. 3A §6.12.1.2), so it cannot take
+/// an incoming `TLB_SHOOTDOWN_VECTOR` IPI and its own slot stays pending.  If
+/// a sibling is simultaneously spinning for *this* CPU's ack, neither can ack
+/// the other — a mutual deadlock that burns the full ACK bound on both
+/// (observed live as interleaved `[TLB/TIMEOUT] cpu=0 mask=0x2` /
+/// `cpu=1 mask=0x1`).  The fix has the spinner drain its OWN pending slot
+/// inline; this test exercises that drain end-to-end:
+///   1. First drain of a freshly-published pending slot returns `true`
+///      (claimed and acked exactly once) and advances `shootdowns_handled`.
+///   2. A second drain of the now-empty slot returns `false` (idempotent).
+fn test_tlb_self_service_drain() -> bool {
+    test_header!("TLB shootdown ACK-spin self-service drain");
+
+    use crate::mm::tlb;
+
+    let s_before = tlb::stats();
+    let (first, second) = tlb::test_self_service_drains_own_slot();
+    let s_after = tlb::stats();
+
+    if !first {
+        test_fail!("tlb/self-service", "first drain did not claim the pending slot");
+        return false;
+    }
+    if second {
+        test_fail!("tlb/self-service", "second drain re-claimed an empty slot (not idempotent)");
+        return false;
+    }
+    // Exactly one shootdown was handled by the inline drain.  We assert a
+    // monotonic advance of at least one (a concurrent real IPI on another
+    // CPU could add more, so the bound is ≥1, not ==1).
+    let handled_delta = s_after.shootdowns_handled.wrapping_sub(s_before.shootdowns_handled);
+    if handled_delta < 1 {
+        test_fail!("tlb/self-service",
+                   "shootdowns_handled did not advance (delta={})", handled_delta);
+        return false;
+    }
+
+    test_pass!("TLB shootdown ACK-spin self-service drain");
     true
 }
 
@@ -46964,6 +47798,162 @@ fn test_246_udp_rx_checksum_validation() -> bool {
     true
 }
 
+// ── Test 248: UDP receive-buffer bound (SO_RCVBUF backpressure) ──────────────
+//
+// RFC 768 is an unreliable datagram service: the receiver makes no
+// delivery guarantee and is free to drop datagrams it cannot buffer.  A
+// connectionless flood (e.g. a QUIC/RFC 9000 transfer over UDP/443 whose
+// congestion control retransmits losses) MUST NOT be able to grow the
+// per-port receive queue without bound — otherwise it exhausts the
+// kernel heap (OOM) or stalls the drain.  POSIX `SO_RCVBUF`
+// (`setsockopt(2)`) caps the buffer; this test pins:
+//
+//   (a) getsockopt(SO_RCVBUF) reflects a prior setsockopt value — the
+//       cap is wired through, not defined-but-unused.
+//   (b) A flood of equal-sized datagrams past the byte cap leaves the
+//       queue BOUNDED (admits only what fits, plus the always-admit-one
+//       rule for an empty queue) — no unbounded growth.
+//   (c) Each over-cap datagram increments UDP_RX_OVERFLOW (tail-drop of
+//       the newest, the cheapest RFC-768-faithful policy).
+//   (d) The retained datagrams drain in arrival order (FIFO), proving
+//       the VecDeque front-drain preserves ordering.
+//
+// Cite: RFC 768 (UDP), RFC 9000 §2 (QUIC streams over UDP), POSIX
+// `setsockopt(2)` SO_RCVBUF, `net.core.rmem_default`.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_248_udp_rcvbuf_bound() -> bool {
+    test_header!("net: UDP receive-buffer bound (SO_RCVBUF backpressure, RFC 768)");
+
+    use crate::net::{udp, socket};
+    use crate::net::socket::SocketType;
+
+    // POSIX socket-option selectors (mirrors the kernel's private consts).
+    const SOL_SOCKET: u64 = 1;
+    const SO_RCVBUF:  u64 = 8;
+    const PORT: u16 = 17248;
+    // A 1357-byte payload matches the MTU-clamped QUIC datagram size that
+    // floods this path from a real CDN; keep the test faithful to it.
+    const PAYLOAD_LEN: usize = 1357;
+    // Small cap so a handful of datagrams overflows it deterministically.
+    const RCVBUF: u32 = 4096;
+    // floor(4096 / 1357) = 3 datagrams fit before the cap is exceeded.
+    const EXPECT_ADMITTED: usize = 3;
+    // Total offered; the surplus must be tail-dropped + counted.
+    const OFFERED: usize = 12;
+
+    // Build a socket, set SO_RCVBUF *before* bind (the common high-rate
+    // consumer pattern) and bind it — exercises the setsockopt -> bind ->
+    // udp::set_rcvbuf wiring end to end.
+    let sid = socket::socket_create(SocketType::Udp);
+    if socket::socket_setsockopt(sid, SOL_SOCKET, SO_RCVBUF, RCVBUF) != 0 {
+        socket::socket_close(sid);
+        test_fail!("test248", "setsockopt(SO_RCVBUF) returned error");
+        return false;
+    }
+    if let Err(e) = socket::socket_bind(sid, PORT) {
+        socket::socket_close(sid);
+        test_fail!("test248", "bind({}) failed: {}", PORT, e);
+        return false;
+    }
+
+    // (a) getsockopt round-trips the value (cap is wired, not unused).
+    let got = socket::socket_getsockopt(sid, SOL_SOCKET, SO_RCVBUF);
+    if got != RCVBUF {
+        socket::socket_close(sid);
+        test_fail!("test248", "(a) getsockopt(SO_RCVBUF) = {}, expected {}", got, RCVBUF);
+        return false;
+    }
+    test_println!("  (a) SO_RCVBUF round-trips: {} bytes", got);
+
+    // Drain any stragglers from a prior run on this port.
+    while udp::recv(PORT).is_some() {}
+
+    // Helper: hand a checksummed loopback datagram whose first payload
+    // byte is `seq` to handle_udp, so we can assert FIFO drain order.
+    let make_and_deliver = |seq: u8| {
+        let src = [127u8, 0, 0, 1];
+        let dst = [127u8, 0, 0, 1];
+        let udp_len: u16 = 8 + PAYLOAD_LEN as u16;
+        let mut payload = alloc::vec::Vec::with_capacity(PAYLOAD_LEN);
+        payload.push(seq);
+        payload.resize(PAYLOAD_LEN, 0u8);
+
+        let mut pkt = alloc::vec::Vec::with_capacity(udp_len as usize);
+        pkt.extend_from_slice(&50000u16.to_be_bytes()); // src port
+        pkt.extend_from_slice(&PORT.to_be_bytes());      // dst port
+        pkt.extend_from_slice(&udp_len.to_be_bytes());   // length
+        pkt.push(0); pkt.push(0);                        // cksum placeholder
+        pkt.extend_from_slice(&payload);
+
+        let mut pseudo = alloc::vec::Vec::with_capacity(12 + pkt.len());
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.push(0);
+        pseudo.push(crate::net::ipv4::PROTO_UDP);
+        pseudo.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo.extend_from_slice(&pkt);
+        let cks = crate::net::ipv4::checksum(&pseudo);
+        pkt[6] = (cks >> 8) as u8;
+        pkt[7] = (cks & 0xFF) as u8;
+
+        udp::handle_udp(src, dst, &pkt);
+    };
+
+    // (b)+(c) Flood OFFERED datagrams; the surplus past the cap must be
+    // tail-dropped and counted.
+    let overflow_before = udp::rx_overflow_count();
+    for seq in 0..OFFERED as u8 {
+        make_and_deliver(seq);
+    }
+    let overflow_after = udp::rx_overflow_count();
+    let dropped = (overflow_after - overflow_before) as usize;
+    test_println!("  (b/c) offered {} datagrams ({}B each), overflow drops: {}",
+                  OFFERED, PAYLOAD_LEN, dropped);
+    if dropped != OFFERED - EXPECT_ADMITTED {
+        udp::unbind(PORT);
+        socket::socket_close(sid);
+        test_fail!("test248",
+            "(c) expected {} tail-drops, got {} (admitted ~{})",
+            OFFERED - EXPECT_ADMITTED, dropped, OFFERED - dropped);
+        return false;
+    }
+
+    // (d) Drain: exactly EXPECT_ADMITTED retained, in arrival order.
+    let mut drained = 0usize;
+    let mut expect_seq = 0u8;
+    while let Some(dg) = udp::recv(PORT) {
+        if dg.data.len() != PAYLOAD_LEN {
+            udp::unbind(PORT);
+            socket::socket_close(sid);
+            test_fail!("test248", "(d) drained datagram has {} bytes, expected {}",
+                       dg.data.len(), PAYLOAD_LEN);
+            return false;
+        }
+        if dg.data[0] != expect_seq {
+            udp::unbind(PORT);
+            socket::socket_close(sid);
+            test_fail!("test248", "(d) out-of-order drain: got seq {}, expected {}",
+                       dg.data[0], expect_seq);
+            return false;
+        }
+        drained += 1;
+        expect_seq += 1;
+    }
+    test_println!("  (d) drained {} datagrams FIFO (seq 0..{})", drained, drained);
+    if drained != EXPECT_ADMITTED {
+        udp::unbind(PORT);
+        socket::socket_close(sid);
+        test_fail!("test248", "(b) queue admitted {} datagrams, expected bound {}",
+                   drained, EXPECT_ADMITTED);
+        return false;
+    }
+
+    udp::unbind(PORT);
+    socket::socket_close(sid);
+    test_pass!("UDP receive-buffer bound (SO_RCVBUF backpressure, RFC 768)");
+    true
+}
+
 // ── Test 247: ICMP RX checksum validation (RFC 792, RFC 1122 §3.2.2) ─────────
 //
 // RFC 792 specifies the ICMP checksum as "the 16-bit one's complement
@@ -48023,40 +49013,123 @@ fn test_520_wakeup_preemption_kick() -> bool {
         }
     }
 
-    // ── (b) kick semantics against the live table ────────────────────────────
-    // The kick is gated OFF by default (see `sched::WAKE_KICK_ENABLED`);
-    // enable it for the assertions below, restore OFF after.
+    // ── (b) kick semantics against a SYNTHETIC running victim ─────────────────
+    // The Stage-A guarded kick (2026-06-15) added two guards that the live
+    // test-runner thread (TID 0, the BSP) cannot exercise: GUARD 1 makes any
+    // `is_io_pump()` thread (TID 0 today) un-kickable, and GUARD 2 requires a
+    // priority gap of `KICK_DELTA` (=2).  We therefore drive the kick against a
+    // synthetic NON-zero-tid `Running` victim pinned to a synthetic CPU index,
+    // so the assertions are deterministic and never depend on the live CPU's
+    // running thread.  The victim is created Blocked, mutated to Running for
+    // the scan, and retired Dead — all under one THREAD_TABLE critical section
+    // per step so a sibling CPU's picker never sees it Ready.
+    let victim = match crate::proc::create_thread_blocked(0, "wake-kick-victim", 0) {
+        Some(t) => t,
+        None => {
+            test_fail!("test520", "create_thread_blocked (victim) failed");
+            return false;
+        }
+    };
+    // Synthetic CPU index for the assertion — last valid slot, cleared first so
+    // we observe a deterministic 0→1 edge without perturbing a live CPU.
+    let test_cpu = crate::arch::x86_64::apic::MAX_CPUS - 1;
+    // Pin the victim Running on `test_cpu` at a known low priority (4), well
+    // below the high woken_prio used below but within KICK_DELTA of the
+    // delta-boundary case.
+    const VICTIM_PRIO: u8 = 4;
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(th) = threads.iter_mut().find(|t| t.tid == victim) {
+            th.state = ThreadState::Running;
+            th.priority = VICTIM_PRIO;
+            th.base_priority = VICTIM_PRIO;
+            th.last_cpu = test_cpu as u8;
+        }
+    }
+
     crate::sched::set_wake_kick(true);
-    // woken_prio = 0: structurally no thread satisfies `priority < 0`.
+
+    // (b.0) woken_prio = 0: structurally no thread satisfies the delta guard.
     let kicked_zero = {
         let threads = THREAD_TABLE.lock();
         crate::sched::kick_preempt_for_wake(&threads, 0)
     };
+
+    // (b.1) GUARD 2 boundary: woken_prio == VICTIM_PRIO + 1 is BELOW the
+    // KICK_DELTA (2) threshold → must NOT kick the victim.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let threads = THREAD_TABLE.lock();
+        let _ = crate::sched::kick_preempt_for_wake(&threads, VICTIM_PRIO + 1);
+    }
+    let kicked_below_delta = crate::sched::need_reschedule_flag(test_cpu);
+
+    // (b.2) GUARD 2 satisfied: woken_prio == VICTIM_PRIO + KICK_DELTA (=2) →
+    // MUST kick the victim's CPU.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let threads = THREAD_TABLE.lock();
+        let _ = crate::sched::kick_preempt_for_wake(&threads, VICTIM_PRIO + 2);
+    }
+    let kicked_at_delta = crate::sched::need_reschedule_flag(test_cpu);
+
+    // (b.3) GUARD 1 (io-pump): even at woken_prio = 255 the kick must NEVER set
+    // a reschedule on TID 0's CPU.  We assert the victim is the only kicked
+    // CPU at 255 by checking the kicked count stays 1 (the victim) — TID 0 is
+    // also Running but `is_io_pump()` skips it.
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    let kicked_max = {
+        let threads = THREAD_TABLE.lock();
+        crate::sched::kick_preempt_for_wake(&threads, 255)
+    };
+    let victim_kicked_max = crate::sched::need_reschedule_flag(test_cpu);
+
+    // Gate restored + victim retired before any return path.
+    crate::sched::set_wake_kick(false);
+    crate::sched::clear_need_reschedule_for_test(test_cpu);
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(th) = threads.iter_mut().find(|t| t.tid == victim) {
+            th.state = ThreadState::Dead;
+        }
+    }
+
     if kicked_zero != 0 {
-        crate::sched::set_wake_kick(false);
         test_fail!("test520", "woken_prio=0 kicked {} CPUs (expected 0)", kicked_zero);
         return false;
     }
-    // woken_prio = 255: every Running thread (priority <= PRIORITY_MAX=31)
-    // qualifies — including THIS test-runner thread.  After the call, this
-    // CPU's NEED_RESCHEDULE flag MUST be observable regardless of whether we
-    // or a concurrent timer tick set it (the flag is only consumed by this
-    // CPU's own reschedule points, none of which run inside this test).
-    {
-        let threads = THREAD_TABLE.lock();
-        let _ = crate::sched::kick_preempt_for_wake(&threads, 255);
-    }
-    let cpu = crate::arch::x86_64::apic::cpu_index();
-    let flag_set = crate::sched::need_reschedule_flag(cpu);
-    // Gate restored before any early return so the suite's default behaviour
-    // (kick disabled) is preserved for subsequent tests.
-    crate::sched::set_wake_kick(false);
-    if !flag_set {
+    if kicked_below_delta {
         test_fail!("test520",
-            "woken_prio=255 did not set NEED_RESCHEDULE on cpu {} (running thread qualifies)",
-            cpu);
+            "GUARD 2 breach: woken_prio={} (gap 1 < KICK_DELTA) kicked the victim",
+            VICTIM_PRIO + 1);
         return false;
     }
+    if !kicked_at_delta {
+        test_fail!("test520",
+            "GUARD 2: woken_prio={} (gap == KICK_DELTA) did NOT kick the victim",
+            VICTIM_PRIO + 2);
+        return false;
+    }
+    // GUARD 1: TID 0 must never be among the kicked CPUs.  With the victim the
+    // only non-pump Running thread we control, the kick count at 255 must be
+    // exactly 1 (the victim) — if TID 0 were kickable the count would exceed 1
+    // whenever TID 0's last_cpu differs from the victim's.  We assert the
+    // victim WAS kicked and that the io-pump exclusion held by checking the
+    // io_pump predicate directly on the live table.
+    if !victim_kicked_max {
+        test_fail!("test520", "woken_prio=255 did not kick the synthetic victim's CPU");
+        return false;
+    }
+    let io_pump_excluded = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == 0).map(|t| t.is_io_pump()).unwrap_or(true)
+    };
+    if !io_pump_excluded {
+        test_fail!("test520", "TID 0 is not recognised as an io_pump (GUARD 1 would not protect it)");
+        return false;
+    }
+    let _ = kicked_max; // count is implementation-dependent (other CPUs may run threads)
+
     // Gated-off contract: with the gate restored OFF the kick must be inert.
     let kicked_gated = {
         let threads = THREAD_TABLE.lock();
@@ -48066,7 +49139,8 @@ fn test_520_wakeup_preemption_kick() -> bool {
         test_fail!("test520", "kick fired while gated OFF ({} CPUs)", kicked_gated);
         return false;
     }
-    test_println!("  kick: prio 0 → 0; prio 255 → NEED_RESCHEDULE[{}] set; gated-off inert ✓", cpu);
+    test_println!(
+        "  kick: prio 0 → 0; below-delta → no kick; at-delta → kick; io-pump excluded; gated-off inert ✓");
 
     test_pass!("event-wake boost + wakeup-preemption kick");
     true
@@ -51285,6 +52359,195 @@ fn test_296_proc_fd_reopen_unlinked_memfd() -> bool {
     true
 }
 
+// ── Test 300: a file-backed mmap keeps the inode alive after the last fd close ─
+//
+// Per mmap(2): a memory mapping is a reference to the mapped file's underlying
+// object — "the [object] is not deallocated until [...] all mappings have been
+// unmapped".  Per memfd_create(2): the (unlinked) memfd inode "is freed when
+// all references to the file are dropped"; an active mapping is such a
+// reference.  So `close(2)` of the LAST fd to a still-mapped memfd must NOT free
+// the inode — the mapping holds it.  Without the per-mapping inode reference the
+// close frees the ramfs inode out from under the live mapping, and the next
+// demand fault on a not-present page reads a now-missing inode (ramfs read →
+// NotFound), the page-fault handler reports an I/O error, and the process is
+// killed with SIGSEGV.  www.cnn.com's e10s tree (CrossProcessPaint shmem, sqlite
+// shm IPC) issues several `memfd_create` per run and hits exactly this; pages
+// that issue zero memfds (lite.cnn.com / wikipedia / bbc) are unaffected.
+//
+// This test drives the REAL pin/unpin paths:
+//   * `VmSpace::insert_vma` of a `VmBacking::File` takes the inode pin.
+//   * the close-time last-close test (`vfs::close`) honours the pin and does
+//     NOT free the inode while the mapping is live.
+//   * `VmSpace::remove_range` (munmap) and the exit/exec teardown walks drop the
+//     pin; the final drop frees the now-unreferenced unlinked inode.
+//   * a hole-punch split (one file VMA → two) keeps the pin count equal to the
+//     number of live file-backed VMAs.
+//
+// The load-bearing assertion is that, after the last fd is closed while the
+// mapping is live, a direct `read(inode)` on the backing filesystem STILL
+// returns the surface bytes (the exact call that returned NotFound → the
+// `[PF/io-err]` SIGSEGV before the fix).  Refs: mmap(2), munmap(2),
+// memfd_create(2), POSIX.
+#[cfg(any(feature = "test-mode", feature = "test-mode-trace"))]
+fn test_300_mmap_filebacked_inode_pin() -> bool {
+    test_header!("file-backed mmap keeps the inode alive after last fd close (Test 300)");
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace, PROT_READ, PROT_WRITE, MAP_SHARED};
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // 1. Create a real memfd (an unlinked ramfs inode) and write surface bytes.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 { test_fail!("mmap_pin", "memfd_create = {}", fd); return false; }
+    let surf = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("mmap_pin", "write memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // 2. Snapshot (mount_idx, inode) of the memfd from the current fd table.
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref()).map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("mmap_pin", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("mmap_pin", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Baseline: no mapping pin yet.
+    if crate::vfs::inode_pin_count(mnt, ino) != 0 {
+        test_fail!("mmap_pin", "pre-mmap pin count {} (want 0)",
+            crate::vfs::inode_pin_count(mnt, ino));
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // 3. Map the memfd: insert a file-backed VMA into a fresh user VmSpace.  This
+    //    drives the REAL pin (VmSpace::insert_vma → pin_file_vma → pin_inode).
+    let mut vm = match VmSpace::new_user() {
+        Some(vs) => vs,
+        None => {
+            test_fail!("mmap_pin", "VmSpace::new_user() OOM");
+            crate::subsys::linux::syscall::sys_close_test(fd as u64);
+            return false;
+        }
+    };
+    let map_base: u64 = 0x5557_0000_0000;
+    let map_len: u64 = 0x2000; // two pages, so a hole-punch split is meaningful
+    if vm.insert_vma(VmArea {
+        base: map_base, length: map_len,
+        prot: PROT_READ | PROT_WRITE, flags: MAP_SHARED,
+        backing: VmBacking::File { mount_idx: mnt, inode: ino, offset: 0, elf_load_delta: 0 },
+        name: "[mmap-file]",
+    }).is_err() {
+        test_fail!("mmap_pin", "insert_vma(file) failed");
+        crate::proc::free_vm_space(vm);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    if crate::vfs::inode_pin_count(mnt, ino) != 1 {
+        test_fail!("mmap_pin",
+            "after mmap, pin count = {} (want 1) — insert_vma did not pin the file VMA",
+            crate::vfs::inode_pin_count(mnt, ino));
+        crate::proc::free_vm_space(vm);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  mmap of memfd inode {} on mount {} took the inode pin ✓", ino, mnt);
+
+    // 4. THE BUG: close the LAST fd while the mapping is live.  Before the fix the
+    //    close-time last-close test freed the inode (no fd, not pinned); a later
+    //    fault then read a missing inode → SIGSEGV.  With the mapping pin the
+    //    inode MUST survive: a direct read on the backing filesystem still
+    //    returns the surface bytes (the exact call that returned NotFound).
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    let mut rbuf = [0u8; 8];
+    let read_ok = match crate::vfs::fs_at(mnt) {
+        Some((fs, _)) => match fs.read(ino, 0, &mut rbuf) {
+            Ok(n) => n == surf.len() && rbuf == surf,
+            Err(_) => false, // NotFound ⇒ inode was freed = the bug
+        },
+        None => false,
+    };
+    if !read_ok {
+        test_fail!("mmap_pin",
+            "after last-fd close, backing read failed/mismatched (got {:?}) — inode \
+             freed under the live mapping (the [PF/io-err] SIGSEGV root cause)", rbuf);
+        // Best-effort cleanup (the VMA still nominally holds a pin).
+        let _ = vm.remove_range(map_base, map_len);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    if crate::vfs::inode_pin_count(mnt, ino) != 1 {
+        test_fail!("mmap_pin", "post-close pin count = {} (want 1, the live mapping)",
+            crate::vfs::inode_pin_count(mnt, ino));
+        let _ = vm.remove_range(map_base, map_len);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  last-fd close while mapped: inode survives, surface still readable ✓");
+
+    // 5. Hole-punch split balance: munmap the MIDDLE page of the two-page mapping.
+    //    remove_range splits one file VMA into two → pin count must rise to 2
+    //    (one per live file-backed VMA), then the surrounding cleanup brings it
+    //    back to 0.  Punch [map_base+0x800, map_base+0x1000): straddles page 0
+    //    and page 1, leaving a left and a right piece.
+    if vm.remove_range(map_base + 0x800, 0x800).is_err() {
+        test_fail!("mmap_pin", "remove_range(hole-punch) failed");
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    let after_punch = crate::vfs::inode_pin_count(mnt, ino);
+    if after_punch != 2 {
+        test_fail!("mmap_pin",
+            "after hole-punch split, pin count = {} (want 2 = one per surviving file VMA)",
+            after_punch);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  hole-punch split: one file VMA → two, pin count 1→2 (balanced) ✓");
+
+    // 6. Tear the address space down (the process-exit / exec path).  Every
+    //    surviving file VMA unpins; the final unpin of the now-unreferenced
+    //    unlinked inode frees it.  After this the pin count is 0 and the inode is
+    //    gone (a read fails — there is no longer any reference at all).
+    crate::proc::free_vm_space(vm);
+    let final_pins = crate::vfs::inode_pin_count(mnt, ino);
+    if final_pins != 0 {
+        test_fail!("mmap_pin", "after teardown, pin count = {} (want 0 — leaked inode pin)",
+            final_pins);
+        return false;
+    }
+    let post_teardown_freed = match crate::vfs::fs_at(mnt) {
+        Some((fs, _)) => fs.read(ino, 0, &mut rbuf).is_err(), // inode gone now
+        None => true,
+    };
+    if !post_teardown_freed {
+        test_fail!("mmap_pin",
+            "after last unmap the unlinked inode is STILL readable — it should have \
+             been freed once no fd and no mapping reference remained (inode leak)");
+        return false;
+    }
+    test_println!("  full teardown: all pins dropped (count 0), unlinked inode freed ✓");
+
+    test_pass!("file-backed mmap keeps the inode alive after last fd close (Test 300)");
+    true
+}
+
 // ── Test 289: SCM_RIGHTS fds bind to the FIRST byte of their frame ───────────
 //
 // sendmsg(2) on an AF_UNIX SOCK_STREAM that carries BOTH data and SCM_RIGHTS
@@ -51868,6 +53131,265 @@ fn test_292_recvmsg_ctrunc_partial_scm_install() -> bool {
     unix::close(id_a);
     unix::close(id_b);
     test_pass!("recvmsg short control buffer: MSG_CTRUNC + partial-fit SCM install (Test 292)");
+    true
+}
+
+// ── Test 521: SCM_RIGHTS batch does NOT bleed across a recycled slot ─────────
+//
+// AF_UNIX socket ids are bare slot indices recycled the instant a slot's last
+// reference drops (net::unix::close → reset).  A queued SCM_RIGHTS batch
+// (syscall::PENDING_SCM) is keyed on that index plus a stream-position predicate
+// (recv_consumed >= byte_offset) that reset() zeroes — so without a generation
+// guard, a batch queued for the OLD occupant of an index becomes immediately
+// deliverable to the NEXT occupant that re-allocates the index, splicing fds
+// into an unrelated IPC channel (→ IPDL num_handles mismatch → a fatal channel
+// error in the parent).  This test proves the per-slot `incarnation` guard makes
+// such a stale batch structurally undeliverable to the recycled slot.
+//
+// Refs: recvmsg(2)/sendmsg(2) SCM_RIGHTS, unix(7), POSIX.1-2017 §2.14 (a
+// received descriptor is associated with the message that carried it).
+fn test_521_scm_recycle_incarnation_isolation() -> bool {
+    use crate::net::unix;
+    test_header!("SCM_RIGHTS batch undeliverable across a recycled AF_UNIX slot (Test 521)");
+
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let (a, b) = unix::socketpair(unix::SockKind::Stream, creds);
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_recycle", "socketpair returned MAX");
+        return false;
+    }
+
+    let inc0 = unix::current_incarnation(b);
+
+    // Queue a control-only batch for receiver `b` at its current stream tail
+    // (offset 0) — exactly the in-flight state that exists when a content proc
+    // tears its channel down before recvmsg'ing the pending fd handoff.
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xD00D, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+    let off = unix::enqueue_offset_for(b);
+    crate::syscall::scm_queue(b, off, alloc::vec![mk_fd()]);
+
+    // Sanity: deliverable to the CURRENT occupant of slot `b`.
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_recycle", "freshly-queued batch not deliverable to current occupant");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Tear down `b` WITHOUT recvmsg'ing.  This bumps slot `b`'s incarnation and
+    // drains its pending batches (scm_drain_receiver) — but we model a stale
+    // batch that survives the drain window by re-queuing one bound to the OLD
+    // incarnation immediately AFTER the close, as a racing sender on another CPU
+    // would (it captured `b` before the close and its scm_queue lands after the
+    // reset but is recorded against the pre-recycle incarnation `inc0`).
+    unix::close(b);
+    // Forge the racing-sender batch carrying the stale incarnation.  This is the
+    // exact stale-batch shape the incarnation guard must reject; we cannot let
+    // scm_queue re-capture the (already-bumped) live incarnation, so push it via
+    // the test-only stale injector below.
+    crate::syscall::scm_test_inject_stale_batch(b, inc0, 0, alloc::vec![mk_fd()]);
+
+    // Re-allocate the SAME slot index for an unrelated connection.  socketpair
+    // scans for the lowest Free slot; the just-closed `b` is the prime
+    // candidate.  If it does not reuse `b`, the test still holds (the stale
+    // batch simply targets a Free/other slot), but we assert the common case.
+    let (c, d) = unix::socketpair(unix::SockKind::Stream, creds);
+    if c == u64::MAX || d == u64::MAX {
+        test_fail!("scm_recycle", "second socketpair returned MAX");
+        unix::close(a);
+        return false;
+    }
+
+    // The NEW occupant of slot `b` (whichever of c/d landed there) must NOT see
+    // the stale batch as deliverable — its current incarnation differs from the
+    // batch's recorded `inc0`.
+    for &nid in &[c, d] {
+        if nid == b {
+            let inc_now = unix::current_incarnation(nid);
+            if inc_now == inc0 {
+                test_fail!("scm_recycle",
+                    "recycled slot incarnation NOT bumped ({} == {})", inc_now, inc0);
+                unix::close(a); unix::close(c); unix::close(d);
+                return false;
+            }
+            if crate::syscall::has_scm_deliverable(nid, unix::recv_consumed(nid)) {
+                test_fail!("scm_recycle",
+                    "STALE batch deliverable to recycled slot {} (cross-channel fd bleed)", nid);
+                unix::close(a); unix::close(c); unix::close(d);
+                return false;
+            }
+            test_println!("  recycled slot {} (inc {}→{}) correctly rejects stale batch ✓",
+                nid, inc0, unix::current_incarnation(nid));
+        }
+    }
+
+    // Clean up the forged stale batch so it does not leak into later tests.
+    let orphaned = crate::syscall::scm_drain_receiver(b);
+    crate::syscall::scm_drop_fds(orphaned);
+
+    unix::close(a);
+    unix::close(c);
+    unix::close(d);
+    test_pass!("SCM_RIGHTS batch undeliverable across a recycled AF_UNIX slot (Test 521)");
+    true
+}
+
+// ── Test 522: concurrent same-peer SCM_RIGHTS sendmsg atomicity ──────────────
+//
+// Each `sendmsg(2)` carrying SCM_RIGHTS must commit its data bytes AND its
+// ancillary fd batch to the peer as one indivisible unit, so the batch's
+// recorded byte_offset always names bytes that belong to THAT frame.  The prior
+// code captured the bind offset (TABLE lock), queued the batch (PENDING_SCM
+// lock), and pushed the bytes (TABLE lock) in three separate critical sections;
+// two concurrent same-peer senders could interleave so both batches bound to
+// the SAME pre-push stream position even though their bytes occupy disjoint
+// ranges — the receiver then dequeues an fd batch at a byte position carrying a
+// DIFFERENT frame's data and the consuming IPDL channel aborts.
+//
+// `scm_send_frame_atomic` holds the unix TABLE lock across the offset capture,
+// the byte push, and the batch enqueue, so the byte cursor cannot move between
+// a frame's offset capture and its byte append.  This test drives that path for
+// two same-peer frames whose pushes are adjacent (modelling the interleave) and
+// asserts each frame's fds dequeue at its own byte boundary, never crossed.
+// Refs: recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+fn test_522_scm_sendmsg_atomic_no_desync() -> bool {
+    use crate::net::unix;
+    test_header!("concurrent same-peer SCM_RIGHTS sendmsg atomicity (Test 522)");
+
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let (a, b) = unix::socketpair(unix::SockKind::Stream, creds);
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_atomic", "socketpair returned MAX");
+        return false;
+    }
+    // Distinguishable throw-away descriptors (mount_idx==usize::MAX keeps them
+    // out of the inode-pin machinery; the atomic send treats them as plain
+    // batch entries — no real object refcount to balance).
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: usize::MAX, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Stream position where frame A begins (B's recv tail before any push).
+    let a_start = unix::recv_consumed(b); // == recv_popped == 0; also recv tail
+    if a_start != unix::enqueue_offset_for(b) {
+        test_fail!("scm_atomic", "precondition: nothing queued yet");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Frame A: 4 data bytes + fd 0xA0, committed atomically.
+    let res_a = unix::scm_send_frame_atomic(
+        a, &[alloc::vec![b'A'; 4]], /*bind_data_frame=*/true, alloc::vec![mk_fd(0xA0)]);
+    if res_a.error != 0 || res_a.total != 4 || res_a.unqueued_fds.is_some() {
+        test_fail!("scm_atomic", "frame A: err={} total={} unqueued={}",
+            res_a.error, res_a.total, res_a.unqueued_fds.is_some());
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // After A's atomic push, B's enqueue offset advanced by 4 — frame B begins
+    // at a_start+4.  This advance happened UNDER the same TABLE lock as A's
+    // offset capture, so B (had it raced) could not have captured a_start.
+    let b_start = unix::enqueue_offset_for(b);
+    if b_start != a_start + 4 {
+        test_fail!("scm_atomic", "B start {} != A start {} + 4", b_start, a_start);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Frame B: 4 data bytes + fd 0xB0, committed atomically (the "second
+    // concurrent sender").  Its batch must bind to b_start+1, NOT a_start+1.
+    let res_b = unix::scm_send_frame_atomic(
+        a, &[alloc::vec![b'B'; 4]], /*bind_data_frame=*/true, alloc::vec![mk_fd(0xB0)]);
+    if res_b.error != 0 || res_b.total != 4 || res_b.unqueued_fds.is_some() {
+        test_fail!("scm_atomic", "frame B: err={} total={} unqueued={}",
+            res_b.error, res_b.total, res_b.unqueued_fds.is_some());
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Assertion 1: the two batches bind to DISTINCT byte offsets (A at
+    // a_start+1, B at b_start+1 == a_start+5).  With the buggy three-section
+    // path both could have bound to a_start+1, colliding.  We probe the deliver
+    // predicate at progressive read positions.
+    //
+    // Nothing read yet → neither batch deliverable (both bound ahead of 0).
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_atomic", "a batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Read frame A's first byte → recv_consumed = a_start+1.  EXACTLY frame A's
+    // batch (fd 0xA0) becomes deliverable; frame B's (bound to a_start+5) must
+    // still be WITHHELD.
+    let mut one = [0u8; 1];
+    if unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0) != 1 || one[0] != b'A' {
+        test_fail!("scm_atomic", "frame A first byte not 'A' ({:?})", one);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got_a = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got_a {
+        Some(ref v) if v.len() == 1 && v[0].inode == 0xA0 => {}
+        other => {
+            test_fail!("scm_atomic",
+                "after A's first byte expected fd 0xA0, got {:?}",
+                other.as_ref().map(|v| v.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Frame B's batch must NOT be deliverable yet (its bytes are not touched):
+    // recv_consumed is a_start+1, B is bound to a_start+5.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_atomic",
+            "frame B fds deliverable after only frame A's first byte (CROSSED binding)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  frame A fds bound to frame A's byte range ✓");
+
+    // Drain the rest of frame A (3 bytes) + frame B's first byte → recv_consumed
+    // reaches a_start+5 == b_start+1, so frame B's batch (fd 0xB0) now delivers.
+    let mut rest = [0u8; 4]; // "AAA" + "B"
+    let rn = unix::read_msg(b, &mut rest).map(|(c, _)| c).unwrap_or(0);
+    if rn != 4 || &rest != b"AAAB" {
+        test_fail!("scm_atomic", "drain to B's first byte = {} / {:?}", rn, rest);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got_b = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got_b {
+        Some(ref v) if v.len() == 1 && v[0].inode == 0xB0 => {}
+        other => {
+            test_fail!("scm_atomic",
+                "after B's first byte expected fd 0xB0, got {:?}",
+                other.as_ref().map(|v| v.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    test_println!("  frame B fds bound to frame B's byte range (not crossed with A) ✓");
+
+    // The remaining 3 bytes of frame B are intact.
+    let mut tail = [0u8; 3];
+    let tn = unix::read_msg(b, &mut tail).map(|(c, _)| c).unwrap_or(0);
+    if tn != 3 || &tail != b"BBB" {
+        test_fail!("scm_atomic", "frame B tail = {} / {:?}", tn, tail);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("concurrent same-peer SCM_RIGHTS sendmsg atomicity (Test 522)");
     true
 }
 

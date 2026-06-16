@@ -3521,12 +3521,25 @@ def cmd_start(args):
     # kernel reads at boot (boot_config.rs reads `astryx.ff_url=<url>`), so a
     # site change needs no rebuild.  `ff_url` was already validated (scheme /
     # length / printable / no-comma) near the top of cmd_start.
+    # Both the URL override and the GUI-mode flag ride in the SAME
+    # opt/astryx/cmdline fw_cfg blob (fw_cfg permits one entry per name), so
+    # assemble a single space-separated token string and emit one -fw_cfg.
+    ff_gui = bool(getattr(args, "ff_gui", False))
+    cmdline_tokens = []
     if ff_url:
+        cmdline_tokens.append(f"astryx.ff_url={ff_url}")
+    if ff_gui:
+        cmdline_tokens.append("astryx.ff_gui=1")
+    if cmdline_tokens:
+        blob = " ".join(cmdline_tokens)
         extra_qemu_args += [
             "-fw_cfg",
-            f"name=opt/astryx/cmdline,string=astryx.ff_url={ff_url}",
+            f"name=opt/astryx/cmdline,string={blob}",
         ]
-        print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
+        if ff_url:
+            print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
+        if ff_gui:
+            print("[HARNESS] ff-gui mode: ON (Firefox X11/windowed)", file=sys.stderr)
 
     # When `xeyes-test` is in the feature set, the kernel boots an Alpine
     # X11 binary that needs a real framebuffer for any visible window to
@@ -3635,6 +3648,9 @@ def cmd_start(args):
         # Runtime firefox-test target URL (--ff-url), delivered via fw_cfg.
         # "" / absent when the compiled CMDLINE_* default is used.  Additive.
         "ff_url":       ff_url or "",
+        # Runtime firefox-test GUI/X11 windowed mode (--ff-gui), delivered via
+        # the same fw_cfg cmdline blob.  False = headless (compiled default).
+        "ff_gui":       bool(getattr(args, "ff_gui", False)),
         # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
         # If oracle_stub_pid is 0 the stub wasn't launched (default).
         "oracle_stub_port": oracle_stub_port,
@@ -5570,6 +5586,16 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
             elf = _get_kernel_elf()
             info = _resolve_symbol(elf, sym_name)
             if info is None:
+                # Fall back to demangled-suffix matching so a preset can name a
+                # static by its readable path (e.g.
+                # "astryx_kernel::mm::tlb::SHOOTDOWN_SLOTS") instead of the
+                # build-volatile mangled symbol — whose crate disambiguator and
+                # `.llvm.N` internal-symbol hashes change on every rebuild.
+                # Mirrors the autopsy --break suffix fallback.
+                matches = _kernel_nm_suffix_lookup(sym_name)
+                if matches:
+                    info = {"addr": hex(matches[0][0]), "size": 0, "type": "obj"}
+            if info is None:
                 return {"kind": kind, "sym": sym_name,
                         "error": "symbol not found in kernel ELF"}
             base = int(info["addr"], 16)
@@ -6178,6 +6204,18 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "pid": int(rest[0], 0),
                 "addr": f"0x{int(rest[1], 0):x}",
                 "half": half}
+    if op == "futex-key":
+        # Resolve the kernel FutexKey for (pid, uaddr) and report the backing
+        # VMA + the FUTEX_WAITERS bucket on the resolved key (across ALL pids).
+        #   kdb <sid> futex-key <pid> <uaddr>
+        # The decisive cross-process lost-wakeup discriminator: a WAIT in one
+        # process and a WAKE in another rendezvous iff their resolved keys are
+        # identical.  Requires --features kdb.
+        if len(rest) < 2:
+            raise ValueError("futex-key requires <pid> <uaddr>")
+        return {"op": "futex-key",
+                "pid": int(rest[0], 0),
+                "addr": f"0x{int(rest[1], 0):x}"}
     if op == "read-file":
         # Read a slice of a VFS file, returned base64.  Robust extraction
         # primitive — works on any live kdb session regardless of process
@@ -11179,7 +11217,16 @@ def cmd_kdb_read_png(args):
     path       = args.path
     dst        = args.dst
     timeout    = float(getattr(args, "timeout", 10.0) or 10.0)
-    max_chunks = 4096  # generous ceiling; a 16 KiB chunk × 4096 = 64 MiB cap
+    # Match the kernel READ_FILE_CHUNK (128 KiB — the measured latency knee).
+    # Each kdb request is one-shot TCP processed on the next net::poll() pump
+    # cycle, so the round-trip COUNT dominates extraction wall-time (a single
+    # request is ~0.9 s at 16 KiB, ~2.0 s at 128 KiB, but ~16 s at 256 KiB where
+    # the response overruns the TCP window). 128 KiB pulls a 2 MB file in ~16
+    # round-trips (~33 s) instead of ~128 (~2 min), finishing inside the live
+    # window before Firefox-exit teardown starves the pump. The kernel caps len
+    # at READ_FILE_CHUNK and the host loops offset += n until eof.
+    chunk_len  = 128 * 1024
+    max_chunks = 8192  # generous ceiling; 128 KiB × 8192 = 1 GiB cap
 
     chunks: list[bytes] = []
     offset = 0
@@ -11187,7 +11234,7 @@ def cmd_kdb_read_png(args):
     sig_png: Optional[bool] = None
 
     for _ in range(max_chunks):
-        req = {"op": "read-file", "path": path, "offset": offset, "len": 16384}
+        req = {"op": "read-file", "path": path, "offset": offset, "len": chunk_len}
         try:
             raw = _kdb_recv(port, req, timeout=timeout)
             resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
@@ -11589,6 +11636,20 @@ def main():
                                "fast local-render win, or --ff-url "
                                "https://bbc.com/news.  Additive: omit to keep "
                                "the compiled CMDLINE_* default.")
+    p_start.add_argument("--ff-gui", action="store_true", dest="ff_gui",
+                          help="Run Firefox in X11/GUI (windowed) mode instead "
+                               "of headless.  The harness appends "
+                               "`astryx.ff_gui=1` to the SAME opt/astryx/cmdline "
+                               "fw_cfg blob (combined with --ff-url), and the "
+                               "kernel (boot_config::ff_gui_mode) drops "
+                               "`--headless`/`--screenshot` from the Firefox "
+                               "command line and omits MOZ_HEADLESS so libxul "
+                               "calls XOpenDisplay() and paints into a real "
+                               "window on the in-kernel Xastryx server "
+                               "(DISPLAY=:0).  Capture the composited desktop "
+                               "with `screendump <sid> <out.png>`.  No rebuild "
+                               "needed (same firefox-test-core build serves "
+                               "both modes).")
     p_start.add_argument("--pcap", action="store_true", dest="pcap",
                           help="FORCE host-side packet capture ON for this "
                                "boot, even a non-FF one.  Captures ALL guest "
@@ -11835,6 +11896,10 @@ def main():
         # struct dump + parked waiters + recent wakes + holder + verdict.
         # See subsys/linux/futex_cluster.rs::recent_wakes_near + op_cond_autopsy.
         "cond-autopsy",
+        # futex-key: resolve the kernel FutexKey (private vs shared) for
+        # (pid, uaddr) + the backing VMA + the FUTEX_WAITERS bucket on that
+        # key across ALL pids.  The cross-process lost-wakeup discriminator.
+        "futex-key",
         # proc-kill: deliver a signal (default SIGKILL) to a guest process.
         "proc-kill",
         # epoll-watch: live epoll interest-set + per-fd readiness/delivered dump

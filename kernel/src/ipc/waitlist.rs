@@ -30,8 +30,134 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// All operations therefore assume exclusive access via the outer lock and
 /// do not synchronise internally.
 pub struct WaitList {
-    tids: Vec<u64>,
+    tids: Vec<BellWaiter>,
 }
+
+/// A concrete (source-class, object) the parker is watching — the exact-match
+/// key for per-object targeted wakeup.  `source_bit` is a single
+/// `1 << (PollBellSource as u32)` bit; `object_id` is that source's own object
+/// identity (pipe_id / unix socket id / eventfd slot / inet socket_id), which is
+/// what the parker's fd resolves to via the syscall-layer `get_*_id(pid, fd)`
+/// helpers and what the ring site passes to `ring_poll_bell_for_obj`.  The id
+/// namespaces are per-source (a pipe_id and a socket id may collide as raw
+/// `u64`), so a match REQUIRES both `source_bit` and `object_id` to agree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WatchKey {
+    source_bit: u32,
+    object_id: u64,
+}
+
+/// A single per-object watch key supplied by callers of the object-targeted
+/// park/enqueue API.  `source` is the readiness class; `object_id` is the
+/// concrete object the parker's fd resolves to (pipe_id / unix socket id /
+/// eventfd slot / inet socket_id), built by the syscall-layer mask builder from
+/// each watched fd.  Public counterpart to the private [`WatchKey`].
+#[derive(Clone, Copy)]
+pub struct ObjWatch {
+    pub source: PollBellSource,
+    pub object_id: u64,
+}
+
+/// Test-only constructor for an [`ObjWatch`] from a raw `source_bit` and id —
+/// lets `test_runner` build watch keys without the syscall-layer fd plumbing.
+/// `source_bit` must be a single `1 << (PollBellSource as u32)` bit.
+#[doc(hidden)]
+pub fn watch_key_for_test(source_bit: u32, object_id: u64) -> ObjWatch {
+    // Recover the source variant from its bit position.  Only used by tests.
+    let idx = source_bit.trailing_zeros() as usize;
+    let source = match idx {
+        0 => PollBellSource::Pipe,
+        1 => PollBellSource::Eventfd,
+        2 => PollBellSource::UnixWrite,
+        3 => PollBellSource::UnixShutdown,
+        4 => PollBellSource::Timerfd,
+        5 => PollBellSource::Signalfd,
+        6 => PollBellSource::Inotify,
+        7 => PollBellSource::SignalInject,
+        8 => PollBellSource::InetRx,
+        9 => PollBellSource::UnixRead,
+        _ => PollBellSource::Other,
+    };
+    ObjWatch { source, object_id }
+}
+
+/// A single parker on a `WaitList`.
+///
+/// Wakeup interest is recorded at two granularities, both honoured by
+/// [`WaitList::matches`]:
+///
+/// * `mask` — the coarse source-CLASS bitset (`bit(s) = 1 << (s as u32)`).  A bit
+///   set here means "wake me on ANY edge of this source class," used for (a) the
+///   cross-cutting always-wake classes (`Other`, `SignalInject`), (b) any fd the
+///   parker watches whose object id could not be pinned (unknown/raced/regular-
+///   file/nested-epoll fd → its source bit lands here as a conservative
+///   wake-on-class), and (c) the whole-list `BELL_MASK_ALL` sentinel for callers
+///   that do not classify at all.
+/// * `objects` — the per-OBJECT pins.  When the parker watches a concrete,
+///   resolvable pipe/socket/eventfd, the exact `(source_bit, object_id)` is
+///   recorded here and the source bit is NOT set in `mask`.  A targeted ring for
+///   `(S, id)` then wakes this parker iff `(S, id) ∈ objects` — so a write to one
+///   AF_UNIX socket no longer re-schedules every AF_UNIX poller, only the
+///   poller(s) actually watching that socket.  This is the intra-class herd
+///   collapse (the Linux per-`wait_queue_head` model: a writer wakes only the
+///   waiters registered on that object's queue, not a global scan).
+///
+/// CRITICAL (no under-wake): `mask` and `objects` are a SUPERSET of true
+/// interest.  A class-only ring (`ring_poll_bell_for`, object unknown) wakes
+/// every parker that has the source bit in `mask` OR any object of that source
+/// in `objects` — because "an edge of source S I cannot attribute" must reach
+/// all S-watchers.  Under-waking is a hang; over-waking is a redundant re-scan.
+struct BellWaiter {
+    tid: u64,
+    mask: u32,
+    objects: Vec<WatchKey>,
+}
+
+/// Sentinel `object_id` meaning "this ring is class-only — no specific object
+/// known" (e.g. timerfd fired from an ISR with no id in scope, or a legacy
+/// `ring_poll_bell()` caller).  A class-only drain wakes every parker interested
+/// in the source class (mask bit set OR any pinned object of that source),
+/// preserving the pre-per-object behaviour exactly for unconverted ring sites.
+pub const OBJECT_ID_NONE: u64 = u64::MAX;
+
+impl BellWaiter {
+    /// True if this parker must be woken by a readiness edge `(source_bit,
+    /// object_id)`.  See [`WaitList::drain_matching`] for the full predicate
+    /// rationale.  The three disjuncts are, in cheapest-first order:
+    ///   1. wake-on-CLASS: `mask` has the source bit (BELL_MASK_ALL, the
+    ///      cross-cutting classes, or an unpinnable fd of this source);
+    ///   2. targeted ring with an exact object pin: `(source_bit, object_id)`
+    ///      is in `objects`;
+    ///   3. class-only ring (`OBJECT_ID_NONE`) with any object pin of this
+    ///      source — the unattributable-edge safety net (never under-wake).
+    #[inline]
+    fn matches(&self, source_bit: u32, object_id: u64) -> bool {
+        if self.mask & source_bit != 0 {
+            return true;
+        }
+        if self.objects.is_empty() {
+            return false;
+        }
+        if object_id == OBJECT_ID_NONE {
+            // Class-only edge: wake if we pin ANY object of this source.
+            self.objects.iter().any(|k| k.source_bit == source_bit)
+        } else {
+            // Targeted edge: wake only on the exact object.
+            self.objects
+                .iter()
+                .any(|k| k.source_bit == source_bit && k.object_id == object_id)
+        }
+    }
+}
+
+/// Conservative "this waiter is interested in every readiness source" sentinel.
+/// Equal to all `N_BELL_SOURCES` low bits set; any per-source `drain_matching`
+/// bit intersects it, so a `BELL_MASK_ALL` waiter is woken by every ring — the
+/// exact semantics of the historical `drain_all`-only path.  Under-waking is a
+/// hang and strictly worse than over-waking, so any unclassifiable interest
+/// MUST fall back to this value (see `wait_poll_event` and the syscall-layer
+/// `bell_mask_for_fd`).
+pub const BELL_MASK_ALL: u32 = (1u32 << N_BELL_SOURCES) - 1;
 
 impl WaitList {
     /// Construct an empty wait list.  `const fn` so it can be used in
@@ -67,7 +193,54 @@ impl WaitList {
     /// The caller invokes `crate::sched::schedule()` after the outer lock
     /// has been dropped.
     pub fn enqueue_self_blocked(&mut self, tid: u64, wake_tick: u64) {
-        self.tids.push(tid);
+        // Shim: a caller that does not (yet) classify its interest is woken by
+        // every readiness source — identical to the historical drain_all-only
+        // behaviour.  Preserves every non-poll-bell caller (gui/terminal.rs,
+        // udp/tcp internal waiters) unchanged.
+        self.enqueue_self_blocked_full(tid, wake_tick, BELL_MASK_ALL, &[]);
+    }
+
+    /// Like [`enqueue_self_blocked`] but records the parker's readiness-source
+    /// interest `mask` so a later `drain_matching` can wake it selectively.
+    ///
+    /// CRITICAL (lost-wakeup discipline): `mask` is written to the wait list
+    /// under the SAME outer (`POLL_BELL`) lock hold as the `Running -> Blocked`
+    /// transition below — exactly as this function takes `THREAD_TABLE` while
+    /// the caller still holds the outer lock.  A `drain_matching` racing in
+    /// that window is serialized on the outer lock and therefore observes the
+    /// fully-formed `BellWaiter { tid, mask }`; no readiness edge can slip
+    /// between the mask write and the state transition.  The caller MUST pass a
+    /// SUPERSET of its true interest (`BELL_MASK_ALL` when unsure) — a too-narrow
+    /// mask is a missed wake.
+    pub fn enqueue_self_blocked_masked(&mut self, tid: u64, wake_tick: u64, mask: u32) {
+        self.enqueue_self_blocked_full(tid, wake_tick, mask, &[]);
+    }
+
+    /// Like [`enqueue_self_blocked_masked`] but additionally records the parker's
+    /// concrete per-object watch keys (`objects`) for intra-class targeted
+    /// wakeup.  `mask` carries the wake-on-CLASS sources (cross-cutting classes,
+    /// unpinnable fds, or `BELL_MASK_ALL`); `objects` carries the pinned
+    /// `(source, object_id)` keys.  A given source should appear in EITHER
+    /// `mask` (wake-on-any-edge) OR `objects` (wake-on-this-object), never both —
+    /// the syscall-layer mask builder enforces that.  Both are written under the
+    /// SAME outer (`POLL_BELL`) lock hold as the `Running -> Blocked` transition
+    /// below, so a `drain_matching` racing in that window is serialized on the
+    /// outer lock and observes the fully-formed waiter — no edge can be lost.
+    pub fn enqueue_self_blocked_full(
+        &mut self,
+        tid: u64,
+        wake_tick: u64,
+        mask: u32,
+        objects: &[ObjWatch],
+    ) {
+        let keys: Vec<WatchKey> = objects
+            .iter()
+            .map(|o| WatchKey {
+                source_bit: 1u32 << (o.source as u32),
+                object_id: o.object_id,
+            })
+            .collect();
+        self.tids.push(BellWaiter { tid, mask, objects: keys });
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             // Mirror the SMP context-switch invariant from `sleep_ticks`:
@@ -81,6 +254,45 @@ impl WaitList {
         }
     }
 
+    /// Drain every parker that matches the readiness edge `(source_bit,
+    /// object_id)`, returning their TIDs and RETAINING the non-matching waiters
+    /// in place.
+    ///
+    /// `source_bit` is a single `1 << (PollBellSource as u32)` bit.  `object_id`
+    /// is the concrete object that became ready, or [`OBJECT_ID_NONE`] for a
+    /// class-only ring (no specific object known).  A waiter matches iff:
+    ///
+    /// * its `mask` has `source_bit` set (wake-on-CLASS: a `BELL_MASK_ALL`
+    ///   waiter, the cross-cutting `Other`/`SignalInject` classes, or a source
+    ///   whose fd the parker could not pin to an object); OR
+    /// * the ring is targeted (`object_id != OBJECT_ID_NONE`) and the parker has
+    ///   the exact `(source_bit, object_id)` pinned in `objects`; OR
+    /// * the ring is class-only (`object_id == OBJECT_ID_NONE`) and the parker
+    ///   has ANY object of `source_bit` pinned — an unattributable edge of source
+    ///   S must reach every S-watcher (never under-wake).
+    ///
+    /// This is the intra-class targeted counterpart to `drain_all` (which is kept
+    /// for unconditional EOF/close/shutdown wakes where every parker must be
+    /// released regardless of interest).
+    pub fn drain_matching(&mut self, source_bit: u32, object_id: u64) -> Vec<u64> {
+        let out: Vec<u64> = self
+            .tids
+            .iter()
+            .filter(|w| w.matches(source_bit, object_id))
+            .map(|w| w.tid)
+            .collect();
+        if !out.is_empty() {
+            // Diagnostic: count parkers LEFT BEHIND by this filter (the herd the
+            // class+object filter spared from a needless re-scan).  A non-zero
+            // value proves the filter is shrinking the wake set; see
+            // `POLL_BELL_MASK_FILTERED` and kdb `sched-stats`.
+            POLL_BELL_MASK_FILTERED
+                .fetch_add((self.tids.len() - out.len()) as u64, Ordering::Relaxed);
+            self.tids.retain(|w| !w.matches(source_bit, object_id));
+        }
+        out
+    }
+
     /// Drain up to `max` parked TIDs and return them to the caller, who is
     /// expected to call `wake_tids` *after* dropping the outer wait-list
     /// lock.  Splitting drain-from-list and flip-thread-state into two
@@ -91,17 +303,20 @@ impl WaitList {
             return Vec::new();
         }
         let n = self.tids.len().min(max);
-        self.tids.drain(..n).collect()
+        self.tids.drain(..n).map(|w| w.tid).collect()
     }
 
     /// Drain every parked TID — used by close-end wakes (EOF) where every
-    /// blocked reader must be released.
+    /// blocked reader must be released regardless of interest mask.
+    /// Semantically `drain_matching(BELL_MASK_ALL)` (every waiter's mask
+    /// intersects the all-ones sentinel), kept as a distinct, intent-revealing
+    /// entry point for the unconditional EOF/close/shutdown wakes.
     pub fn drain_all(&mut self) -> Vec<u64> {
         if self.tids.is_empty() {
             return Vec::new();
         }
         let n = self.tids.len();
-        self.tids.drain(..n).collect()
+        self.tids.drain(..n).map(|w| w.tid).collect()
     }
 
     /// Remove `tid` from the list if present.  Returns `true` if the TID
@@ -111,7 +326,7 @@ impl WaitList {
     /// -> a wake removed us already, treat as success).
     pub fn remove_tid(&mut self, tid: u64) -> bool {
         let before = self.tids.len();
-        self.tids.retain(|&t| t != tid);
+        self.tids.retain(|w| w.tid != tid);
         self.tids.len() < before
     }
 }
@@ -262,6 +477,38 @@ pub static POLL_BELL_BELL_WAKES: AtomicU64 = AtomicU64::new(0);
 /// source is not wired into the bell yet — see `bell_stats()`.
 pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative number of parkers LEFT BEHIND by `drain_matching` (i.e. a
+/// per-source readiness ring fired and the class filter spared a parker whose
+/// interest mask did not include that source).  This is the direct measure of
+/// the thundering-herd collapse Stage C buys: a large value means each
+/// readiness edge wakes only the relevant class instead of every poll/epoll
+/// parker.  Surfaced via kdb `sched-stats`.  Pairs with
+/// `POLL_BELL_RESYNC_WAKES` as a correctness check: if filtering ever caused a
+/// *missed* wake the resync-wake count would rise (the waiter would only
+/// recover at the 1 s resync floor), so a stable resync ratio alongside a
+/// growing filtered count confirms the masks are a correct superset.
+pub static POLL_BELL_MASK_FILTERED: AtomicU64 = AtomicU64::new(0);
+
+/// PROFILING (intra-class herd diagnostic): cumulative number of *bell* wakes
+/// (a `ring_poll_bell_for` drained this parker, not a resync/timeout) after
+/// which the parker's own readiness re-scan reported NOT-ready — i.e. the
+/// parker was woken by a readiness edge on some OTHER object in the same source
+/// class and has nothing to do but re-park.  This is the direct measure of the
+/// intra-class thundering herd that per-object targeting eliminates: with a
+/// global source-class drain, a single AF_UNIX write wakes every AF_UNIX poller
+/// even though only one socket got data, so every poller but one lands here.
+/// A `bell_wakes`-to-`wasted_bell_wakes` ratio near 1:1 means almost every wake
+/// is wasted herd churn.  Surfaced via kdb `sched-stats` / `bell-stats`.
+pub static POLL_BELL_WASTED_BELL_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// PROFILING companion: cumulative parkers DRAINED by `drain_matching` across
+/// all rings (the raw wake-fanout numerator).  `bell_wakes` already counts the
+/// woken-parker side from `wait_poll_event`'s perspective, but this counts it at
+/// the *ring* site so the harness can compute mean fanout = drained / rings
+/// without per-parker attribution.  A mean fanout ≫ 1 with a high wasted ratio
+/// is the smoking gun for the intra-class herd.
+pub static POLL_BELL_DRAINED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Park the caller on the global poll bell.  Returns once any IPC
 /// writer has rung the bell, the bounded resync interval elapses, or
 /// the caller is woken for another reason (e.g. signal injection
@@ -315,7 +562,46 @@ pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
 /// dispatcher, and the pipe/eventfd/unix wake paths), so the reverse
 /// edge `PROCESS_TABLE → POLL_BELL` does not exist and the addition is
 /// inversion-free.  `POLL_BELL` is never held across `schedule()`.
-pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool) -> bool {
+pub fn wait_poll_event(caller_deadline: u64, ready_now: impl FnMut() -> bool) -> bool {
+    // Shim for callers that do not classify their interest (gui/terminal.rs,
+    // udp/tcp internal waiters): park interested in every readiness source,
+    // identical to the historical drain_all-only behaviour.
+    wait_poll_event_masked(caller_deadline, BELL_MASK_ALL, ready_now)
+}
+
+/// Class-filtered variant of [`wait_poll_event`].  `mask` is the set of
+/// `PollBellSource` classes (`bit(s) = 1 << (s as u32)`) the caller's watched
+/// fds can actually be made ready by; a per-source `ring_poll_bell_for(S)`
+/// wakes this parker iff `mask & (1 << S) != 0`.  Pass a SUPERSET of true
+/// interest (`BELL_MASK_ALL` for any unclassifiable fd) — under-waking is a
+/// lost wakeup / hang, over-waking is merely a redundant re-scan.  The mask is
+/// recorded under the same `POLL_BELL` hold as the park (see
+/// `enqueue_self_blocked_masked`), so no racing ring can lose the edge.
+pub fn wait_poll_event_masked(
+    caller_deadline: u64,
+    mask: u32,
+    ready_now: impl FnMut() -> bool,
+) -> bool {
+    wait_poll_event_obj(caller_deadline, mask, &[], ready_now)
+}
+
+/// Object-targeted variant of [`wait_poll_event_masked`].  `class_mask` carries
+/// the wake-on-CLASS sources (cross-cutting classes, unpinnable fds, or
+/// `BELL_MASK_ALL`); `objects` carries the concrete `(source, object_id)` pins
+/// for fds that resolved to an object.  A targeted `ring_poll_bell_for_obj(S,
+/// id)` wakes this parker only if `(S, id)` is in `objects`; a class-only ring
+/// or a `class_mask` source wakes it as before.  Pass a SUPERSET of true
+/// interest — under-waking is a hang; the mask builder defaults any unpinnable
+/// fd to the class mask, so doubt always resolves to wake-on-class.  The objects
+/// are recorded under the same `POLL_BELL` hold as the park (see
+/// `enqueue_self_blocked_full`), so no racing ring can lose the edge.
+pub fn wait_poll_event_obj(
+    caller_deadline: u64,
+    class_mask: u32,
+    objects: &[ObjWatch],
+    mut ready_now: impl FnMut() -> bool,
+) -> bool {
+    let mask = class_mask;
     /// Maximum ticks to park before the outer loop rescans.  100 ticks
     /// = 1 s at `TICK_HZ=100`.  Pre-wiring this was 100 ms because the
     /// bell missed timerfd / signalfd / inotify / unix-shutdown /
@@ -347,7 +633,7 @@ pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool
         drop(bell);
         return true;
     }
-    bell.enqueue_self_blocked(tid, wake_tick);
+    bell.enqueue_self_blocked_full(tid, wake_tick, mask, objects);
     // Drop the bell AFTER enqueue but BEFORE schedule(): a wake that
     // arrives between here and schedule() finds us already on the list
     // and flips us Blocked→Ready, so the schedule() (or the scheduler
@@ -363,6 +649,15 @@ pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool
         POLL_BELL_RESYNC_WAKES.fetch_add(1, Ordering::Relaxed);
     } else {
         POLL_BELL_BELL_WAKES.fetch_add(1, Ordering::Relaxed);
+        // PROFILING (intra-class herd): a bell drained us.  Re-run the
+        // readiness probe once; if our own watched fds are STILL not ready, the
+        // wake was an unrelated same-class edge (another socket/pipe got data)
+        // and is pure herd churn.  `ready_now` is side-effect-light (it only
+        // recomputes idempotent revents bits); the caller re-checks anyway, so
+        // this adds one extra probe per bell wake — acceptable for a diagnostic.
+        if !ready_now() {
+            POLL_BELL_WASTED_BELL_WAKES.fetch_add(1, Ordering::Relaxed);
+        }
     }
     false
 }
@@ -384,8 +679,31 @@ pub fn ring_poll_bell() {
 /// of how many waiters were drained — kdb sees "this source fired N
 /// times", not "this source woke M waiters".
 pub fn ring_poll_bell_for(source: PollBellSource) {
+    ring_poll_bell_for_obj(source, OBJECT_ID_NONE);
+}
+
+/// Ring the poll bell for a SPECIFIC object of `source` — the intra-class
+/// targeted wakeup.  `object_id` is the concrete pipe/socket/eventfd id whose
+/// readiness changed (resolve via the same `get_*_id` namespace the parker's fd
+/// resolves through); only parkers that pinned that exact `(source, object_id)`
+/// — plus every wake-on-class parker of `source` — are woken.  Pass
+/// [`OBJECT_ID_NONE`] (or use [`ring_poll_bell_for`]) when the ring site has no
+/// object id in scope (e.g. an ISR-driven timerfd edge): that degrades to the
+/// class-only behaviour and wakes every parker of the class.
+///
+/// This collapses the intra-class poll-bell thundering herd: a write to ONE
+/// AF_UNIX socket no longer re-schedules every AF_UNIX poller (only the one
+/// watching that socket), mirroring the per-`wait_queue_head` wakeup model where
+/// a writer walks only the waiters registered on that object's queue.
+/// EOF/close/shutdown paths still call `drain_all` to release everyone.
+pub fn ring_poll_bell_for_obj(source: PollBellSource, object_id: u64) {
     BELL_RINGS_BY_SOURCE[source as usize].fetch_add(1, Ordering::Relaxed);
-    let drained = POLL_BELL.lock().drain_all();
+    let bit = 1u32 << (source as u32);
+    let drained = POLL_BELL.lock().drain_matching(bit, object_id);
+    // PROFILING: raw wake-fanout numerator (drained parkers per ring).
+    if !drained.is_empty() {
+        POLL_BELL_DRAINED_TOTAL.fetch_add(drained.len() as u64, Ordering::Relaxed);
+    }
     wake_tids(&drained);
 }
 
@@ -397,9 +715,11 @@ pub fn poll_bell_waiter_count() -> usize {
 
 /// Snapshot the per-source bell counters and wake-classification
 /// totals into a fixed-size array.  Returned tuple is
-/// `(per_source_counts, bell_wakes, resync_wakes)`.  Used by the kdb
-/// `bell-stats` op to render an attribution table.
-pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64) {
+/// `(per_source_counts, bell_wakes, resync_wakes, mask_filtered)`.  Used by the
+/// kdb `bell-stats` / `sched-stats` ops to render an attribution table and to
+/// prove the Stage-C class filter is shrinking the wake set
+/// (`mask_filtered` > 0) without raising the resync ratio.
+pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64, u64) {
     let mut counts = [0u64; N_BELL_SOURCES];
     for (i, c) in BELL_RINGS_BY_SOURCE.iter().enumerate() {
         counts[i] = c.load(Ordering::Relaxed);
@@ -408,5 +728,6 @@ pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64) {
         counts,
         POLL_BELL_BELL_WAKES.load(Ordering::Relaxed),
         POLL_BELL_RESYNC_WAKES.load(Ordering::Relaxed),
+        POLL_BELL_MASK_FILTERED.load(Ordering::Relaxed),
     )
 }

@@ -21,8 +21,22 @@ pub const KDB_PORT: u16 = 9999;
 
 /// Maximum request line size.  Safeguards against a misbehaving client.
 const MAX_REQ_BYTES:  usize = 16 * 1024;
-/// Maximum response size written back in one segment.
-const MAX_RESP_BYTES: usize = 32 * 1024;
+/// Maximum response size before the global truncation guard trips.
+///
+/// Raised from 32 KiB to 256 KiB so the `read-file` op can return a 128 KiB raw
+/// chunk (≈ 175 KiB base64 + envelope) in ONE round-trip.  Each kdb request is
+/// one-shot-TCP processed on the next `net::poll()` pump cycle, so the round-trip
+/// COUNT — not the byte volume — dominates extraction wall-time.  Measured cost
+/// of a single read-file request under guest load: 16 KiB ≈ 0.9 s, 128 KiB
+/// ≈ 2.0 s, but 256 KiB jumps to ≈ 16 s (the larger response overruns the TCP
+/// receive window and stalls on a retransmit timeout).  128 KiB is the knee:
+/// a 2 MB extraction is ~16 round-trips ≈ 33 s, inside the live window before
+/// Firefox-exit teardown starves the pump, and stays under the window wall.
+/// Other ops self-cap at their own local budgets (dmesg/stack walk), so the only
+/// behavioural change is that `read-file` responses up to this size pass through
+/// intact instead of being truncated mid-base64.  The host `_kdb_recv` reads
+/// until EOF and imposes its own `_KDB_RECV_MAX` ceiling.
+const MAX_RESP_BYTES: usize = 256 * 1024;
 
 // ── Dmesg ring buffer ────────────────────────────────────────────────────────
 //
@@ -422,6 +436,13 @@ pub fn dispatch(req: &str, out: &mut String) {
         // wait-addr report.  Composes the live struct dump + parked waiters +
         // recent wake targets + inferred lock holder into a single verdict.
         "cond-autopsy"   => op_cond_autopsy(req, out),
+        // futex-key: resolve the FutexKey (Private vs Shared) the kernel
+        // computes for one (pid, uaddr), report the backing VMA's
+        // flags+backing variant, and enumerate the FUTEX_WAITERS bucket on
+        // that resolved key (across all processes).  The decisive
+        // cross-process lost-wakeup discriminator: a WAIT in one process and
+        // a WAKE in another rendezvous iff their resolved keys are identical.
+        "futex-key"      => op_futex_key(req, out),
         // Deliver a signal to a guest process (default SIGKILL) — the
         // induced-verdict primitive: terminate a parked process and observe
         // what its supervisor/peer reports.
@@ -1017,9 +1038,35 @@ fn op_user_mem(req: &str, out: &mut String) {
 // begins with the 8-byte PNG signature (W3C PNG §5.2 / ISO 15948) — a cheap
 // "is this a real PNG?" check the host can read off the first chunk.
 
-/// Max raw bytes per read-file chunk.  16384 raw -> ceil(16384/3)*4 = 21848
-/// base64 chars, comfortably under the 32 KiB MAX_RESP_BYTES kdb response cap.
-const READ_FILE_CHUNK: u64 = 16384;
+/// Max raw bytes per read-file chunk.  131072 raw -> ceil(131072/3)*4 = 174764
+/// base64 chars (+ ~110-byte JSON envelope), under the 256 KiB MAX_RESP_BYTES
+/// cap.  Sized to the measured latency knee: a single read-file request costs
+/// ≈ 0.9 s at 16 KiB, ≈ 2.0 s at 128 KiB, but ≈ 16 s at 256 KiB (the response
+/// overruns the TCP receive window and stalls).  128 KiB minimises
+/// round-trips × per-trip-latency for a multi-MB pull: a 2 MB file is
+/// ~16 round-trips ≈ 33 s — inside the live window before FF-exit teardown
+/// starves the pump.  16 KiB (the previous value) was ~128 round-trips ≈ 2 min
+/// and lost the race.  The host loops `offset += n` until `eof`.
+const READ_FILE_CHUNK: u64 = 128 * 1024;
+
+/// Single-entry snapshot for the in-flight `read-file` extraction.
+///
+/// A multi-chunk extraction (e.g. a ~2 MB Firefox screenshot pulled in
+/// `ceil(N/16384)` chunks) used to call `vfs::read_file` — which returns an
+/// owned `Vec<u8>` CLONE of the whole file — on EVERY chunk request, copying
+/// the entire file once per chunk (O(file_size · chunks) ≈ hundreds of MB of
+/// memcpy to extract a 2 MB file).  This snapshot holds the bytes from the
+/// first (offset==0) chunk so subsequent offsets slice the same buffer in O(1),
+/// making an extraction O(file_size) overall.
+///
+/// Best-effort and read-only: a non-zero offset whose `(path, len)` does not
+/// match the snapshot falls back to a fresh `vfs::read_file`, so a missed/stale
+/// snapshot only costs the old per-chunk read — never wrong bytes.  The
+/// snapshot is replaced whenever a fresh offset==0 read arrives, so a re-read of
+/// the same path (or a different path) always re-snapshots.  kdb is read-only
+/// and single-threaded through the pump, so no writer can mutate the file
+/// underneath a snapshot mid-extraction.
+static READ_FILE_SNAPSHOT: Mutex<Option<(String, Vec<u8>)>> = Mutex::new(None);
 
 fn b64_append(out: &mut String, src: &[u8]) {
     const ALPHABET: &[u8; 64] =
@@ -1058,20 +1105,43 @@ fn op_read_file(req: &str, out: &mut String) {
         .unwrap_or(READ_FILE_CHUNK)
         .min(READ_FILE_CHUNK);
 
-    // Read the whole file once (ramfs/cache-backed; cheap for the small
-    // artefacts this op targets), then slice — keeps the VFS surface minimal.
-    let bytes = match crate::vfs::read_file(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            use core::fmt::Write;
-            out.push('{');
-            j_kv_str(out, "path", &path);
-            let _ = write!(out, r#""error":"read failed: {:?}","#, e);
-            j_trim_comma(out);
-            out.push('}');
-            return;
+    // Resolve the file bytes via the single-entry extraction snapshot
+    // (READ_FILE_SNAPSHOT), so a multi-chunk pull reads/clones the whole file
+    // ONCE instead of once per chunk.  Hold the snapshot lock for the whole
+    // slice+encode so the borrowed bytes stay valid.
+    let mut snap = READ_FILE_SNAPSHOT.lock();
+
+    // Decide whether the cached snapshot serves this request:
+    //  * offset==0 always re-snapshots (start of a fresh extraction, or a
+    //    re-read of a possibly-changed file).
+    //  * offset>0 reuses the snapshot only when the path matches; otherwise it
+    //    is a stale/foreign snapshot and we read fresh.
+    let reuse = offset != 0
+        && snap.as_ref().map_or(false, |(p, _)| p.as_str() == path.as_str());
+
+    if !reuse {
+        match crate::vfs::read_file(&path) {
+            Ok(b) => { *snap = Some((path.clone(), b)); }
+            Err(e) => {
+                use core::fmt::Write;
+                // On a failed read, drop any stale snapshot for this path so a
+                // later retry re-reads rather than serving stale bytes.
+                if snap.as_ref().map_or(false, |(p, _)| p.as_str() == path.as_str()) {
+                    *snap = None;
+                }
+                out.push('{');
+                j_kv_str(out, "path", &path);
+                let _ = write!(out, r#""error":"read failed: {:?}","#, e);
+                j_trim_comma(out);
+                out.push('}');
+                return;
+            }
         }
-    };
+    }
+
+    // SAFETY of unwrap: `reuse` is only true when the snapshot is Some for this
+    // path, and the !reuse branch above just populated it (or returned early).
+    let bytes: &[u8] = &snap.as_ref().unwrap().1;
 
     let file_size = bytes.len() as u64;
     let start = offset.min(file_size) as usize;
@@ -1093,6 +1163,12 @@ fn op_read_file(req: &str, out: &mut String) {
     b64_append(out, slice);
     out.push('"');
     out.push('}');
+
+    // Free the snapshot once the final chunk has been served so it does not
+    // pin a multi-MB buffer in the kdb heap after the extraction completes.
+    if eof {
+        *snap = None;
+    }
 }
 
 // ── trace-status ──────────────────────────────────────────────────────────────
@@ -1246,7 +1322,8 @@ fn op_virtio_wait_reset(out: &mut String) {
 
 fn op_bell_stats(out: &mut String) {
     use core::fmt::Write;
-    let (counts, bell_wakes, resync_wakes) = crate::ipc::waitlist::bell_stats();
+    let (counts, bell_wakes, resync_wakes, mask_filtered) =
+        crate::ipc::waitlist::bell_stats();
     let total_wakes = bell_wakes.saturating_add(resync_wakes);
     let bell_ratio_permille = if total_wakes == 0 {
         0u64
@@ -1264,10 +1341,30 @@ fn op_bell_stats(out: &mut String) {
         if i > 0 { out.push(','); }
         let _ = write!(out, r#""{}":{}"#, name, count);
     }
+    // Intra-class herd profiling: drained-fanout numerator + wasted bell wakes.
+    // mean_fanout = drained_total / sum(per-source ring counts); wasted_ratio =
+    // wasted_bell_wakes / bell_wakes.  A high fanout + high wasted ratio is the
+    // signature the per-object targeting collapses.
+    let drained_total = crate::ipc::waitlist::POLL_BELL_DRAINED_TOTAL
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let wasted_bell = crate::ipc::waitlist::POLL_BELL_WASTED_BELL_WAKES
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let total_rings: u64 = counts.iter().copied().sum();
+    let mean_fanout_permille = if total_rings == 0 {
+        0u64
+    } else {
+        drained_total.saturating_mul(1000) / total_rings
+    };
+    let wasted_ratio_permille = if bell_wakes == 0 {
+        0u64
+    } else {
+        wasted_bell.saturating_mul(1000) / bell_wakes
+    };
     let _ = write!(
         out,
-        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{}}}"#,
-        bell_wakes, resync_wakes, bell_ratio_permille
+        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{},"mask_filtered":{},"drained_total":{},"wasted_bell_wakes":{},"mean_fanout_permille":{},"wasted_ratio_permille":{}}}"#,
+        bell_wakes, resync_wakes, bell_ratio_permille, mask_filtered,
+        drained_total, wasted_bell, mean_fanout_permille, wasted_ratio_permille
     );
 }
 // ── cache-aliasing ────────────────────────────────────────────────────────────
@@ -1564,8 +1661,13 @@ fn op_sched_stats(out: &mut String) {
     let _ = write!(out, r#""ready_depth":{},"#,   crate::sched::ready_depth());
     let _ = write!(out, r#""wake_boost_enabled":{},"#,
         crate::sched::wake_boost_enabled());
-    let _ = write!(out, r#""wake_kick_enabled":{}"#,
+    let _ = write!(out, r#""wake_kick_enabled":{},"#,
         crate::sched::WAKE_KICK_ENABLED.load(core::sync::atomic::Ordering::Relaxed));
+    // Stage-C class-filter efficacy: parkers spared a needless re-scan because
+    // their interest mask did not include the firing readiness source.  A
+    // growing value means the poll-bell thundering herd is being collapsed.
+    let _ = write!(out, r#""poll_bell_mask_filtered":{}"#,
+        crate::ipc::waitlist::POLL_BELL_MASK_FILTERED.load(core::sync::atomic::Ordering::Relaxed));
     out.push('}');
 }
 
@@ -3669,6 +3771,163 @@ fn op_proc_kill(req: &str, out: &mut String) {
     let sig = extract_field(req, "sig").and_then(|s| parse_u64(&s)).unwrap_or(9).min(64) as u8;
     let ret = crate::signal::kill(pid, sig);
     let _ = write!(out, r#"{{"op":"proc-kill","pid":{},"sig":{},"ret":{}}}"#, pid, sig, ret);
+}
+
+// ── futex-key ─────────────────────────────────────────────────────────────────
+//
+// Request: {"op":"futex-key","pid":N,"addr":"0x..."}
+//
+// Resolve the [`crate::syscall::FutexKey`] the kernel computes for the futex
+// word at (pid, uaddr) — exactly as both the WAIT and WAKE syscall paths do —
+// and report:
+//   * key_kind: "private" | "shared"
+//   * for shared keys: {mount_idx, inode, byte_off}
+//   * vma: the backing VMA's {base, flags, map_shared, backing} (the raw input
+//     to the key decision)
+//   * bucket: every (pid, tid) parked on the RESOLVED key, ACROSS ALL
+//     PROCESSES — so a cross-process waiter shows up even though the
+//     virtual-address-windowed cond-autopsy (which only scans the same-pid
+//     PRIVATE cluster) cannot see it.
+//
+// Decisive use: a content/socket process WAITs on a process-shared futex and
+// the parent WAKEs the *same* underlying word at a possibly-different uaddr.
+// They rendezvous iff `futex-key` on the waiter's (pid, uaddr) and on the
+// waker's (pid, uaddr) yields the IDENTICAL key.  A `MAP_SHARED` mapping whose
+// key resolves "private" is a lost-wakeup bug (POSIX futex(2): a futex in a
+// process-shared mapping must be keyed by backing-object identity).
+fn op_futex_key(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    use crate::syscall::FutexKey;
+
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+        Some(a) => a,
+        None => { out.push_str(r#"{"error":"missing or bad 'addr'"}"#); return; }
+    };
+    if addr >= astryx_shared::KERNEL_VIRT_BASE {
+        out.push_str(r#"{"error":"addr must be a user (canonical low-half) VA"}"#);
+        return;
+    }
+
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
+    j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
+
+    // ── Raw VMA backing (the input to the key decision) ────────────────
+    // Snapshot the VMA's base/flags/backing under PROCESS_TABLE.  Mirror the
+    // foreign-VmSpace lookup futex_backing_for uses (own VmSpace authoritative;
+    // CLONE_VM children fall back to the CR3-matching parent).
+    #[derive(Clone, Copy)]
+    enum BackKind { Anonymous, File, Device, NoVma, NoSpace }
+    struct VmaInfo { base: u64, flags: u32, map_shared: bool, kind: BackKind,
+                     mount_idx: usize, inode: u64 }
+    let vinfo: VmaInfo = {
+        use crate::mm::vma::{VmBacking, MAP_SHARED};
+        let pt = match try_lock_brief(&PROCESS_TABLE) {
+            Some(g) => g,
+            None => { out.push_str(r#""error":"PROCESS_TABLE busy"}"#); return; }
+        };
+        let classify = |vma: &crate::mm::vma::VmArea| -> VmaInfo {
+            let (kind, mi, ino) = match &vma.backing {
+                VmBacking::Anonymous => (BackKind::Anonymous, 0usize, 0u64),
+                VmBacking::File { mount_idx, inode, .. } => (BackKind::File, *mount_idx, *inode),
+                VmBacking::Device { .. } => (BackKind::Device, 0, 0),
+            };
+            VmaInfo { base: vma.base, flags: vma.flags as u32,
+                      map_shared: vma.flags & MAP_SHARED != 0, kind,
+                      mount_idx: mi, inode: ino }
+        };
+        let lookup = |space: &crate::mm::vma::VmSpace| -> Option<VmaInfo> {
+            space.find_vma(addr).map(classify)
+        };
+        match pt.iter().find(|p| p.pid == pid) {
+            None => VmaInfo { base: 0, flags: 0, map_shared: false,
+                              kind: BackKind::NoSpace, mount_idx: 0, inode: 0 },
+            Some(proc) => {
+                if let Some(space) = proc.vm_space.as_ref() {
+                    lookup(space).unwrap_or(VmaInfo { base: 0, flags: 0, map_shared: false,
+                        kind: BackKind::NoVma, mount_idx: 0, inode: 0 })
+                } else if proc.cr3 != 0 && proc.parent_pid != 0 {
+                    let cr3 = proc.cr3;
+                    match pt.iter().find(|p| p.pid == proc.parent_pid)
+                        .filter(|par| par.cr3 == cr3)
+                        .and_then(|par| par.vm_space.as_ref())
+                        .and_then(lookup)
+                    {
+                        Some(v) => v,
+                        None => VmaInfo { base: 0, flags: 0, map_shared: false,
+                            kind: BackKind::NoVma, mount_idx: 0, inode: 0 },
+                    }
+                } else {
+                    VmaInfo { base: 0, flags: 0, map_shared: false,
+                        kind: BackKind::NoSpace, mount_idx: 0, inode: 0 }
+                }
+            }
+        }
+    };
+    let kind_str = match vinfo.kind {
+        BackKind::Anonymous => "anonymous",
+        BackKind::File      => "file",
+        BackKind::Device    => "device",
+        BackKind::NoVma     => "no-vma",
+        BackKind::NoSpace   => "no-space",
+    };
+    out.push_str(r#""vma":{"#);
+    j_str(out, "base"); out.push(':'); j_hex(out, vinfo.base); out.push(',');
+    let _ = write!(out, r#""flags":"{:#x}","#, vinfo.flags);
+    let _ = write!(out, r#""map_shared":{},"#, vinfo.map_shared);
+    j_kv_str(out, "backing", kind_str);
+    let _ = write!(out, r#""mount_idx":{},"inode":{}"#, vinfo.mount_idx, vinfo.inode);
+    out.push_str("},");
+
+    // ── Resolved FutexKey (the exact value WAIT/WAKE bucket on) ─────────
+    let key = crate::syscall::resolve_futex_key(pid, addr, false);
+    out.push_str(r#""key":{"#);
+    match key {
+        FutexKey::Private(p, u) => {
+            j_kv_str(out, "kind", "private");
+            let _ = write!(out, r#""pid":{},"#, p);
+            j_str(out, "uaddr"); out.push(':'); j_hex(out, u);
+        }
+        FutexKey::Shared { mount_idx, inode, byte_off } => {
+            j_kv_str(out, "kind", "shared");
+            let _ = write!(out, r#""mount_idx":{},"inode":{},"byte_off":{}"#,
+                mount_idx, inode, byte_off);
+        }
+    }
+    out.push_str("},");
+
+    // ── Bucket on the resolved key (across ALL processes) ──────────────
+    // A shared key is process-independent, so its bucket can hold waiters from
+    // several pids — exactly the cross-process rendezvous we must observe.
+    out.push_str(r#""bucket":"#);
+    // Pre-snapshot tid→pid (brief THREAD_TABLE hold) so the bucket emit below
+    // needs no nested lock while FUTEX_WAITERS is held.
+    let tid_pid: Vec<(u64, u64)> = match try_lock_brief(&crate::proc::THREAD_TABLE) {
+        Some(tt) => tt.iter().map(|t| (t.tid, t.pid)).collect(),
+        None => Vec::new(),
+    };
+    match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
+        Some(w) => {
+            out.push('[');
+            if let Some(tids) = w.get(&key) {
+                let mut first = true;
+                for &tid in tids.iter() {
+                    if !first { out.push(','); }
+                    first = false;
+                    let owner_pid = tid_pid.iter().find(|(t, _)| *t == tid)
+                        .map(|(_, p)| *p).unwrap_or(0);
+                    let _ = write!(out, r#"{{"tid":{},"pid":{}}}"#, tid, owner_pid);
+                }
+            }
+            out.push(']');
+        }
+        None => { out.push_str(r#""FUTEX_WAITERS busy""#); }
+    }
+    out.push('}');
 }
 
 fn op_cond_autopsy(req: &str, out: &mut String) {

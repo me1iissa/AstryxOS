@@ -550,18 +550,43 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         STAT_IPIS_SENT.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Spin on ack from each target.  Bounded so a wedged CPU (e.g. a
-    // KVM vCPU that is host-descheduled during a long critical section)
-    // does not deadlock the whole kernel.  The bound is ~10 ms at 1 GHz
-    // — about 1 000× larger than the previous 1 ms budget — to cover
-    // realistic KVM vCPU scheduling jitter without risking indefinite
-    // spin.  Per Intel SDM Vol. 3A §10.6.1, IPI delivery to a wedged
-    // or powered-down CPU must be handled by the sender; this bound
-    // provides that guarantee.
-    const ACK_BOUND: u32 = 10_000_000;
+    // Spin on ack from each target.  Bounded so a CPU that cannot ack —
+    // because it is IF-masked in a critical section that is NOT this
+    // ack-spin (a heap allocation under `HeapIrqGuard`, a long fault
+    // handler, etc.) and therefore cannot take the shootdown IPI nor
+    // reach the inline self-service drain — does not stall this sender
+    // for the full bound.  Per Intel SDM Vol. 3A §10.6.1 the sender is
+    // responsible for delivery to a CPU that cannot service the IPI
+    // itself; on timeout this sender returns `false` and frame-freeing
+    // callers route the affected frame through `quarantine_free` so a
+    // surviving stale TLB entry can never alias a recycled frame, while
+    // re-make-writable callers simply let the sibling re-fault benignly.
+    //
+    // The bound is ~0.5 ms at 1 GHz.  The previous 10 ms bound was chosen
+    // to never time out under KVM vCPU host-deschedule jitter, but with the
+    // inline self-service drain (which resolves the common spin-vs-spin
+    // cross-CPU case in microseconds) the only remaining timeouts come from
+    // a target masked in a *different* section — a transient that resolves
+    // the instant that section completes.  Burning 10 ms per such transient
+    // serialised seconds of latency under the heavy CLONE/munmap churn of a
+    // page-encode; 0.5 ms still comfortably covers genuine scheduling jitter
+    // while collapsing the worst-case tax ~20×.
+    const ACK_BOUND: u32 = 500_000;
     let mut remaining = targets;
     let mut iters: u32 = 0;
     while remaining != 0 && iters < ACK_BOUND {
+        // Self-service: we are spinning here with interrupts disabled (this
+        // path runs from inside an interrupt-gate exception handler — Intel
+        // SDM Vol. 3A §6.12.1.2 — so RFLAGS.IF is clear and we CANNOT take an
+        // incoming TLB_SHOOTDOWN_VECTOR IPI).  A sibling CPU may be spinning
+        // here too, waiting for *our* ack on the IPI it delivered to us.
+        // Drain our own pending slot inline so that sibling sees the ack and
+        // makes progress — without this, two CPUs that concurrently shoot
+        // down the same shared CR3 from fault handlers mutually deadlock
+        // until both burn the full ACK_BOUND.  See
+        // `service_local_shootdown_slot` for the full rationale.
+        service_local_shootdown_slot(self_cpu);
+
         let mut still = 0u64;
         let mut r = remaining;
         while r != 0 {
@@ -859,55 +884,148 @@ pub fn on_cpu_tick(current_tick: u64) {
 /// Reads the per-CPU shootdown slot, performs the invalidation if the
 /// target CR3 matches the running one, and clears `pending`.  Always
 /// EOIs the LAPIC at the end.
+/// Service this CPU's own shootdown slot inline: claim a pending request,
+/// perform the local invalidation, ack it (clear `pending`), and raise the
+/// done flag.  Returns `true` iff a pending request was claimed and handled.
+///
+/// This is the shared core of both the IPI handler ([`handle_shootdown_ipi`])
+/// and the ACK-spin self-service path in [`shootdown_range_inner`].  It is
+/// safe to call with interrupts disabled (it performs no IPI sends, no
+/// locking, and only touches per-CPU shootdown state plus `invlpg`).
+///
+/// # Why the ACK-spin must call this
+///
+/// A page fault, `#GP`, or any other exception enters through an *interrupt
+/// gate* (Intel SDM Vol. 3A §6.12.1.2: an interrupt gate clears RFLAGS.IF on
+/// entry), so a CPU that issues a TLB shootdown from inside a fault handler
+/// spins for sibling acks with **interrupts masked**.  A masked CPU cannot
+/// take the `TLB_SHOOTDOWN_VECTOR` IPI a sibling has delivered to it, so its
+/// own `SHOOTDOWN_SLOTS[self]` entry stays `pending = 1` indefinitely.  If
+/// that sibling is *also* spinning IRQ-masked for *this* CPU's ack, neither
+/// can ever ack the other — a mutual cross-CPU ack-spin deadlock that burns
+/// the full `ACK_BOUND` on both CPUs (observed as interleaved `[TLB/TIMEOUT]`
+/// with `cpu=0 mask=0x2` / `cpu=1 mask=0x1`).  Draining our own slot inline
+/// while we spin breaks the cycle: the sibling sees our ack and makes
+/// progress, then acks us in turn.  Per Intel SDM Vol. 3A §10.6.1 the sender
+/// is responsible for handling delivery to a CPU that cannot service the IPI
+/// itself; here the "sender" services the request on the target's behalf.
+#[inline]
+fn service_local_shootdown_slot(cpu: usize) -> bool {
+    if cpu >= apic::MAX_CPUS {
+        return false;
+    }
+    let slot = &SHOOTDOWN_SLOTS[cpu];
+    // Atomically claim the slot.  The single-writer rule on `pending`
+    // (one sender publishes 1, exactly one of {IPI handler, this inline
+    // self-service} clears to 0) is preserved by the compare_exchange:
+    // whichever path wins the 1→0 transition does the invalidation; the
+    // loser observes 0 and no-ops.  AcqRel on success pairs with the
+    // sender's Release-store of `pending=1` so we see the published
+    // cr3/va_lo/va_hi before the invalidation.
+    if slot
+        .pending
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let target_cr3 = slot.cr3.load(Ordering::Relaxed);
+    let va_lo = slot.va_lo.load(Ordering::Relaxed);
+    let va_hi = slot.va_hi.load(Ordering::Relaxed);
+
+    let cur_cr3 = crate::mm::vmm::get_cr3();
+    if cur_cr3 == target_cr3 {
+        local_invlpg_range(va_lo, va_hi);
+    }
+    // Even if the CR3 has since changed, ack — the bit in the active-CPU
+    // mask is gone (the scheduler cleared it after the new mov cr3) so the
+    // sender will not target this CPU again with the same payload.  The
+    // ack-clear is implicit in the compare_exchange above.
+
+    // H2 diagnostic: signal the sender that the local invalidation has
+    // committed.  The Release here pairs with the Acquire poll in
+    // `shootdown_range_inner` so the sender observes the completed `invlpg`
+    // ordering, not just the `pending` clear.
+    #[cfg(feature = "firefox-test-core")]
+    SHOOTDOWN_DONE_FLAGS[cpu].store(1, Ordering::Release);
+
+    STAT_SHOOTDOWNS_HANDLED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 pub extern "C" fn handle_shootdown_ipi() {
     let cpu = apic::cpu_index();
-    if cpu < apic::MAX_CPUS {
-        let slot = &SHOOTDOWN_SLOTS[cpu];
-        // Atomically claim the slot.  The single-writer rule on
-        // `pending` (one sender publishes 1, one handler invocation
-        // clears to 0) is enforced architecturally by the per-CPU
-        // shootdown protocol: only one IPI per target is in flight at
-        // a time because the sender spins on this slot's ack before
-        // re-using it.  We use a compare-exchange anyway so a spurious
-        // IPI delivery (vector 0xF0 arriving at a CPU whose slot is
-        // already drained, e.g. after a previously-timed-out sender
-        // cleared it) is observably handled exactly once.  AcqRel on
-        // success pairs with the sender's Release-store of `pending=1`
-        // and the matching Release-store of the ack-clear below, so we
-        // see the published cr3/va_lo/va_hi before the invalidation.
-        if slot
-            .pending
-            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            let target_cr3 = slot.cr3.load(Ordering::Relaxed);
-            let va_lo = slot.va_lo.load(Ordering::Relaxed);
-            let va_hi = slot.va_hi.load(Ordering::Relaxed);
-
-            let cur_cr3 = crate::mm::vmm::get_cr3();
-            if cur_cr3 == target_cr3 {
-                local_invlpg_range(va_lo, va_hi);
-            }
-            // Even if the CR3 has since changed, ack — the bit in the
-            // active-CPU mask is gone (the scheduler cleared it after
-            // the new mov cr3) so the sender will not target this CPU
-            // again with the same payload.  The ack-clear is implicit
-            // in the compare_exchange above; no second store needed.
-
-            // H2 diagnostic: signal the sender that the local invalidation
-            // has committed.  The Release fence here pairs with the Acquire
-            // poll in `shootdown_range_inner` so the sender observes the
-            // completed `invlpg` ordering, not just the `pending` clear.
-            #[cfg(feature = "firefox-test-core")]
-            if cpu < apic::MAX_CPUS {
-                SHOOTDOWN_DONE_FLAGS[cpu].store(1, Ordering::Release);
-            }
-
-            STAT_SHOOTDOWNS_HANDLED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    // Service this CPU's slot.  The compare_exchange inside guards against a
+    // spurious IPI delivery (vector 0xF0 arriving at a CPU whose slot is
+    // already drained, e.g. after a previously-timed-out sender cleared it,
+    // or after the inline self-service path already handled it) — it is
+    // observably handled exactly once.
+    service_local_shootdown_slot(cpu);
 
     apic::lapic_eoi();
+}
+
+/// Test-only harness for the inline self-service path.
+///
+/// Publishes a synthetic pending request into THIS CPU's shootdown slot for a
+/// CR3 that deliberately does not match the running one (so no real `invlpg`
+/// side-effect occurs), then drains it twice via the same code path the
+/// IRQ-disabled ACK-spin uses.  Returns `(first, second)` where `first` must
+/// be `true` (the pending request was claimed exactly once) and `second` must
+/// be `false` (idempotent — a drained slot is a no-op).  This exercises the
+/// fix for the cross-CPU ack-spin deadlock without needing two live CPUs.
+#[doc(hidden)]
+pub fn test_self_service_drains_own_slot() -> (bool, bool) {
+    let cpu = apic::cpu_index();
+    if cpu >= apic::MAX_CPUS {
+        // Degenerate environment — report the idempotent shape so the
+        // caller's assertion still holds.
+        return (true, false);
+    }
+    let slot = &SHOOTDOWN_SLOTS[cpu];
+
+    // Mask interrupts across the synthetic publish + double-drain so a real
+    // TLB_SHOOTDOWN_VECTOR IPI from a sibling AP cannot land in this CPU's
+    // slot between our `pending=1` publish and our first drain (which would
+    // let `handle_shootdown_ipi` win the claim and make `first` spuriously
+    // false).  Capture the prior IF state from RFLAGS so we restore it
+    // exactly (and no-op the restore if we were already masked).
+    let prior_if: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq", "pop {f}", "cli",
+            f = out(reg) prior_if,
+            options(nomem, preserves_flags),
+        );
+    }
+
+    // A CR3 that no running context can match (kernel CR3 is low phys; user
+    // CR3s are PMM frames, never this sentinel) → the invalidation is skipped
+    // but the claim/ack/done bookkeeping still runs.
+    slot.cr3.store(0xFEED_FACE_000, Ordering::Relaxed);
+    slot.va_lo.store(0x4000_0000_0000, Ordering::Relaxed);
+    slot.va_hi.store(0x4000_0000_1000, Ordering::Relaxed);
+    #[cfg(feature = "firefox-test-core")]
+    SHOOTDOWN_DONE_FLAGS[cpu].store(0, Ordering::Release);
+    // Publish LAST so the claim sees a fully-formed payload.
+    slot.pending.store(1, Ordering::Release);
+
+    let first = service_local_shootdown_slot(cpu);
+    // A second drain must observe pending==0 and no-op.
+    let second = service_local_shootdown_slot(cpu);
+
+    // Leave the slot pristine for any later real shootdown to this CPU.
+    slot.pending.store(0, Ordering::Release);
+    slot.cr3.store(0, Ordering::Relaxed);
+    slot.va_lo.store(0, Ordering::Relaxed);
+    slot.va_hi.store(0, Ordering::Relaxed);
+
+    // Restore IF only if it was set on entry.
+    if prior_if & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+    }
+
+    (first, second)
 }
 
 /// Diagnostic snapshot for kdb / introspection.

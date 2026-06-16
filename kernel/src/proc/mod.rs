@@ -321,6 +321,25 @@ impl Thread {
     pub fn is_reapable(&self) -> bool {
         self.state == ThreadState::Dead && self.tid != 0 && self.tid < 0x1000
     }
+
+    /// True for I/O-pump threads that the wakeup-preemption kick
+    /// (`sched::kick_preempt_for_wake`) must NEVER evict.
+    ///
+    /// Today only TID 0 (the BSP main loop) pumps `net::poll` / X11 / the
+    /// compositor continuously at `PRIORITY_IDLE` while holding the CPU.
+    /// Evicting it on every event wake collapsed TCP processing throughput
+    /// historically (median TLS client-Finished latency rose ~12×), so the
+    /// kick scan skips any `is_io_pump()` thread.
+    ///
+    /// FOOTGUN: this is a ROLE predicate, not a bare `tid == 0` test at the
+    /// call site, so the protection travels if a pump thread is ever added.
+    /// If a future ksoftirqd-style net-poller kernel thread is introduced
+    /// (`tid != 0`), it MUST be registered here — otherwise the kick will
+    /// evict it and re-introduce the throughput collapse.
+    #[inline]
+    pub fn is_io_pump(&self) -> bool {
+        self.tid == 0
+    }
 }
 
 // ── Priority Constants (NT-style) ────────────────────────────────────
@@ -1786,6 +1805,11 @@ pub fn free_process_memory(pid: Pid) {
     const PAGE_PRESENT: u64 = 1;
 
     for vma in &vm_space.areas {
+        // Process exit: a file-backed VMA leaves the address space, so drop the
+        // inode pin it took at mmap/fork-clone time (POSIX: the inode is freed
+        // once no fd and no mapping reference it).  No-op for anonymous/device.
+        crate::mm::vma::unpin_file_vma(vma);
+
         // Skip MMIO device VMAs — their "physical addresses" are I/O registers,
         // not PMM-tracked frames; decrementing their refcount would corrupt the
         // PMM's bookkeeping.
@@ -1814,6 +1838,14 @@ pub fn free_process_memory(pid: Pid) {
 
     // Free the private user-half page table structures.
     free_user_page_tables(cr3);
+
+    // The areas walk above dropped each file-backed VMA's inode pin via the
+    // deferred path (it ran under mm_sem.write).  Release the address-space lock,
+    // then free any inode whose last reference just went away (the unlinked
+    // memfd whose final mapping this exiting process held).  The free dance
+    // re-acquires PROCESS_TABLE, so it must run with no address-space lock held.
+    drop(_mm_write);
+    crate::vfs::drain_pending_inode_frees();
 
     crate::serial_println!("[PROC] PID {} memory freed", pid);
 }
@@ -1879,6 +1911,10 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     const PAGE_PRESENT: u64 = 1;
 
     for vma in &vm_space.areas {
+        // Exec teardown of the OLD address space: a file-backed VMA is gone, so
+        // drop its inode pin (balances the pin taken at mmap/fork-clone time).
+        crate::mm::vma::unpin_file_vma(vma);
+
         if let VmBacking::Device { .. } = &vma.backing { continue; }
 
         let mut addr = vma.base;
@@ -1900,6 +1936,13 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
 
     // Free the private user-half page table structures (PDPT / PD / PT / PML4).
     free_user_page_tables(cr3);
+
+    // Release the address-space lock, then run any deferred inode free queued by
+    // the areas walk above (a file-backed VMA of an unlinked memfd whose last
+    // mapping this old address space held).  The free re-acquires PROCESS_TABLE,
+    // so it must not run under mm_sem.write.
+    drop(_mm_write);
+    crate::vfs::drain_pending_inode_frees();
 
     crate::serial_println!("[PROC] old VmSpace (cr3={:#x}) freed", cr3);
 }
@@ -3668,6 +3711,10 @@ pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
             }
         }
     }
+    // The vfork isolated stack is anonymous, so remove_range queues no inode
+    // free here; drain anyway to keep "every under-lock unpin pairs a drain"
+    // uniform (a no-op early-return when the queue is empty).
+    crate::vfs::drain_pending_inode_frees();
 
     crate::serial_println!(
         "[VFORK-STACK] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
@@ -3826,12 +3873,17 @@ pub fn alloc_vfork_child_tls(parent_pid: Pid) -> Option<u64> {
     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
     if !crate::mm::vmm::map_page_in(parent_cr3, base, frame, flags) {
         crate::mm::pmm::free_page(frame);
-        let mut procs = PROCESS_TABLE.lock();
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
-            if let Some(space) = p.vm_space.as_mut() {
-                let _ = space.remove_range(base, length);
+        {
+            let mut procs = PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+                if let Some(space) = p.vm_space.as_mut() {
+                    let _ = space.remove_range(base, length);
+                }
             }
         }
+        // Rollback of an anonymous TLS VMA — queues no inode free; drain for
+        // uniformity (no-op when empty).
+        crate::vfs::drain_pending_inode_frees();
         return None;
     }
     crate::mm::refcount::page_ref_inc(frame);
@@ -3865,6 +3917,8 @@ pub fn vfork_isolated_tls_cleanup(parent_pid: Pid, base: u64, length: u64) {
             }
         }
     }
+    // Anonymous TLS VMA — queues no inode free; drain for uniformity.
+    crate::vfs::drain_pending_inode_frees();
 
     crate::serial_println!(
         "[VFORK-TLS] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",

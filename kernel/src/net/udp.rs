@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -18,9 +19,34 @@ use super::ipv4;
 /// counter has no synchronisation duty.
 static UDP_RX_BAD_CSUM: AtomicU64 = AtomicU64::new(0);
 
+/// Count of UDP datagrams discarded on receive because the bound port's
+/// receive buffer was full.  UDP is an unreliable datagram service
+/// (RFC 768) — when the application cannot drain fast enough, the
+/// receiver sheds load by dropping rather than growing without bound.
+/// The cap mirrors the POSIX `SO_RCVBUF` limit (`setsockopt(2)`); the
+/// Linux `net.core.rmem_default` sysctl documents the conventional
+/// default we adopt (see `DEFAULT_RCVBUF_BYTES`).  An unbounded queue
+/// is a denial-of-service vector: a QUIC (RFC 9000) flood over UDP/443
+/// would otherwise grow the kernel heap until OOM, or stall the drain.
+/// Relaxed — the counter has no synchronisation duty.
+static UDP_RX_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Default per-binding receive-buffer byte cap, applied when no
+/// `SO_RCVBUF` has been set on the owning socket.  212992 bytes matches
+/// the conventional `net.core.rmem_default` value so resolvers and QUIC
+/// stacks observe the same backpressure point they would on a stock
+/// Unix host.  The cap accounts queued payload bytes only.
+pub const DEFAULT_RCVBUF_BYTES: usize = 212_992;
+
 /// Read the running count of UDP RX checksum drops.
 pub fn rx_bad_csum_count() -> u64 {
     UDP_RX_BAD_CSUM.load(Ordering::Relaxed)
+}
+
+/// Read the running count of UDP RX drops caused by a full receive
+/// buffer (`SO_RCVBUF` / `net.core.rmem_default` overflow).
+pub fn rx_overflow_count() -> u64 {
+    UDP_RX_OVERFLOW.load(Ordering::Relaxed)
 }
 
 /// A UDP header (parsed).
@@ -51,9 +77,23 @@ pub struct UdpDatagram {
 }
 
 /// Per-port receive buffer.
+///
+/// `queue` is a `VecDeque` so the consumer drains from the front in O(1)
+/// (`pop_front`) — a plain `Vec` with `remove(0)` is O(n) per dequeue,
+/// which degrades to O(n²) drain under a sustained datagram flood and
+/// lets the fill rate outrun the consumer.  `queued_bytes` tracks the
+/// total payload bytes currently queued so the `rcvbuf_bytes` cap can be
+/// enforced in O(1) on every `handle_udp` push, per RFC 768's
+/// unreliable-delivery contract (tail-drop on overflow).
 struct UdpBinding {
     port: u16,
-    queue: Vec<UdpDatagram>,
+    queue: VecDeque<UdpDatagram>,
+    /// Sum of `data.len()` over all queued datagrams.
+    queued_bytes: usize,
+    /// Receive-buffer byte cap for this binding.  Set from the owning
+    /// socket's `SO_RCVBUF` (`set_rcvbuf`); defaults to
+    /// `DEFAULT_RCVBUF_BYTES`.
+    rcvbuf_bytes: usize,
 }
 
 /// Bound UDP ports.
@@ -97,14 +137,34 @@ pub fn handle_udp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         header.dst_port, payload.len());
 
     // Deliver to bound port.
+    //
+    // RFC 768 makes no delivery guarantee: when the bound port's receive
+    // buffer is full we DROP the datagram rather than grow the queue
+    // without bound.  We tail-drop (discard the just-arrived datagram,
+    // the newest) because it is the cheapest RFC-768-faithful choice and
+    // preserves the in-order datagrams already queued for the consumer.
+    // A connectionless flood — e.g. a QUIC (RFC 9000) transfer over
+    // UDP/443 whose congestion control will retransmit the lost
+    // datagrams — must never be able to exhaust the kernel heap.  We
+    // always admit at least one datagram into an empty queue so a
+    // pathologically small `SO_RCVBUF` cannot wedge the socket entirely.
     let mut bindings = UDP_BINDINGS.lock();
     let delivered = if let Some(binding) = bindings.iter_mut().find(|b| b.port == header.dst_port) {
-        binding.queue.push(UdpDatagram {
-            src_ip,
-            src_port: header.src_port,
-            data: Vec::from(payload),
-        });
-        true
+        let incoming = payload.len();
+        let would_be = binding.queued_bytes.saturating_add(incoming);
+        if would_be > binding.rcvbuf_bytes && !binding.queue.is_empty() {
+            // Receive buffer full — shed load (tail-drop newest).
+            UDP_RX_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            binding.queue.push_back(UdpDatagram {
+                src_ip,
+                src_port: header.src_port,
+                data: Vec::from(payload),
+            });
+            binding.queued_bytes = would_be;
+            true
+        }
     } else {
         false
     };
@@ -146,17 +206,34 @@ pub fn bind(port: u16) -> Result<(), &'static str> {
     }
     bindings.push(UdpBinding {
         port,
-        queue: Vec::new(),
+        queue: VecDeque::new(),
+        queued_bytes: 0,
+        rcvbuf_bytes: DEFAULT_RCVBUF_BYTES,
     });
     Ok(())
+}
+
+/// Set the receive-buffer byte cap for a bound port from its owning
+/// socket's `SO_RCVBUF` (`setsockopt(2)`).  A zero argument restores the
+/// `net.core.rmem_default` baseline; the cap is clamped to at least one
+/// MTU-sized datagram so a tiny request cannot make the socket undeliverable.
+/// No-op when the port is not (yet) bound.
+pub fn set_rcvbuf(port: u16, bytes: usize) {
+    let effective = if bytes == 0 { DEFAULT_RCVBUF_BYTES } else { bytes };
+    let effective = effective.max(2048);
+    let mut bindings = UDP_BINDINGS.lock();
+    if let Some(binding) = bindings.iter_mut().find(|b| b.port == port) {
+        binding.rcvbuf_bytes = effective;
+    }
 }
 
 /// Receive a datagram from a bound port (non-blocking).
 pub fn recv(port: u16) -> Option<UdpDatagram> {
     let mut bindings = UDP_BINDINGS.lock();
     if let Some(binding) = bindings.iter_mut().find(|b| b.port == port) {
-        if !binding.queue.is_empty() {
-            return Some(binding.queue.remove(0));
+        if let Some(dg) = binding.queue.pop_front() {
+            binding.queued_bytes = binding.queued_bytes.saturating_sub(dg.data.len());
+            return Some(dg);
         }
     }
     None

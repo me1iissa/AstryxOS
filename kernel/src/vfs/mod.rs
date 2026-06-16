@@ -168,6 +168,18 @@ static DELETED_INODES: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// [`unpin_inode`]).
 static PINNED_INODES: Mutex<Vec<(usize, u64, u32)>> = Mutex::new(Vec::new());
 
+/// Inodes whose last pin was dropped while the caller could not safely run the
+/// inode-free dance (which acquires `PROCESS_TABLE` / `DELETED_INODES` / the
+/// filesystem inode lock).  The mmap pin/unpin sites
+/// (`VmSpace::remove_range`, `mprotect`, the exit/exec teardown walks) run with
+/// `PROCESS_TABLE` or the address-space `mm_sem` held, so `unpin_inode`'s
+/// `PROCESS_TABLE` re-acquisition there would self-deadlock (`spin::Mutex` is
+/// not reentrant).  Those sites call [`unpin_inode_deferred`] instead, which
+/// only touches `PINNED_INODES` and queues a now-zero-pin inode here; the free
+/// is performed later by [`drain_pending_inode_frees`], called once the caller
+/// has released every address-space lock.
+static PENDING_INODE_FREES: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
 /// Add one kernel pin on `(mount_idx, inode)` so [`close`] will not free it
 /// even when no process fd table references it (e.g. an SCM_RIGHTS descriptor
 /// queued for delivery).  Balance every call with exactly one [`unpin_inode`].
@@ -187,23 +199,35 @@ pub fn pin_inode(mount_idx: usize, inode: u64) {
 /// if the inode was actually freed by this call.
 pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
     if mount_idx == usize::MAX { return false; }
-    let now_unpinned = {
-        let mut p = PINNED_INODES.lock();
-        if let Some(idx) = p.iter().position(|(m, n, _)| *m == mount_idx && *n == inode) {
-            if p[idx].2 > 1 {
-                p[idx].2 -= 1;
-                false
-            } else {
-                p.remove(idx);
-                true
-            }
-        } else {
+    if !dec_pin_reached_zero(mount_idx, inode) { return false; }
+    free_unpinned_inode_if_orphaned(mount_idx, inode)
+}
+
+/// Decrement one pin on `(mount_idx, inode)`, returning true iff that dropped
+/// the LAST pin.  Touches only `PINNED_INODES`, so it is safe to call with
+/// `PROCESS_TABLE` or an address-space `mm_sem` held.
+fn dec_pin_reached_zero(mount_idx: usize, inode: u64) -> bool {
+    let mut p = PINNED_INODES.lock();
+    if let Some(idx) = p.iter().position(|(m, n, _)| *m == mount_idx && *n == inode) {
+        if p[idx].2 > 1 {
+            p[idx].2 -= 1;
             false
+        } else {
+            p.remove(idx);
+            true
         }
-    };
-    if !now_unpinned { return false; }
-    // Last pin gone — free the inode iff it was deferred-deleted and no process
-    // fd table still references it.  Mirrors the close()-time last-close test.
+    } else {
+        false
+    }
+}
+
+/// Free `(mount_idx, inode)` iff it was deferred-deleted (unlinked) and now has
+/// no open fd and no remaining pin.  Mirrors the `close()`-time last-close test.
+/// Acquires `PROCESS_TABLE`, `DELETED_INODES`, and the filesystem inode lock, so
+/// the caller MUST NOT hold any of those (nor an address-space lock that is
+/// itself acquired beneath `PROCESS_TABLE`).  Returns true if the inode was
+/// freed by this call.
+fn free_unpinned_inode_if_orphaned(mount_idx: usize, inode: u64) -> bool {
     let still_open = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
@@ -212,6 +236,9 @@ pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
         }))
     };
     if still_open { return false; }
+    // A pin re-taken after our decrement (a concurrent mmap of the same inode)
+    // must veto the free — re-check under the lock-free PINNED query.
+    if inode_is_pinned(mount_idx, inode) { return false; }
     let was_deleted = {
         let mut dl = DELETED_INODES.lock();
         let before = dl.len();
@@ -227,10 +254,51 @@ pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
     false
 }
 
+/// Drop one pin on `(mount_idx, inode)` from a context that holds an
+/// address-space lock (`PROCESS_TABLE` / `mm_sem`).  Decrements the pin count
+/// immediately (cheap, `PINNED_INODES`-only) and, if that was the last pin,
+/// QUEUES the inode for a deferred free instead of freeing it inline — because
+/// the free dance re-acquires `PROCESS_TABLE`, which is non-reentrant.  The
+/// caller MUST call [`drain_pending_inode_frees`] after releasing its
+/// address-space locks (the mmap/munmap/mprotect/fork/exit paths do).
+pub fn unpin_inode_deferred(mount_idx: usize, inode: u64) {
+    if mount_idx == usize::MAX { return; }
+    if dec_pin_reached_zero(mount_idx, inode) {
+        PENDING_INODE_FREES.lock().push((mount_idx, inode));
+    }
+}
+
+/// Perform any inode frees queued by [`unpin_inode_deferred`].  Call with NO
+/// address-space lock held (`PROCESS_TABLE` / `mm_sem` / `DELETED_INODES`).
+/// Idempotent and cheap when the queue is empty (the common case).
+pub fn drain_pending_inode_frees() {
+    // Swap the queue out under its own lock, then free without holding it so a
+    // concurrent unpin can keep enqueuing.
+    let pending = {
+        let mut q = PENDING_INODE_FREES.lock();
+        if q.is_empty() { return; }
+        core::mem::take(&mut *q)
+    };
+    for (mount_idx, inode) in pending {
+        let _ = free_unpinned_inode_if_orphaned(mount_idx, inode);
+    }
+}
+
 /// True if `(mount_idx, inode)` currently has at least one kernel pin
 /// (see [`pin_inode`]).
 fn inode_is_pinned(mount_idx: usize, inode: u64) -> bool {
     PINNED_INODES.lock().iter().any(|(m, n, c)| *m == mount_idx && *n == inode && *c > 0)
+}
+
+/// Current kernel-pin count on `(mount_idx, inode)` (0 if unpinned).  Exposed
+/// for in-kernel regression tests that assert pin/unpin balance across the
+/// mmap / fork / split / teardown paths; not used on any production hot path.
+#[cfg(any(feature = "test-mode", feature = "test-mode-trace"))]
+pub fn inode_pin_count(mount_idx: usize, inode: u64) -> u32 {
+    PINNED_INODES.lock().iter()
+        .find(|(m, n, _)| *m == mount_idx && *n == inode)
+        .map(|(_, _, c)| *c)
+        .unwrap_or(0)
 }
 
 // ───── firefox-test screenshot-write gate ───────────────────────────────────
