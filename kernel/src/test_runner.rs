@@ -366,6 +366,15 @@ pub fn run() -> ! {
         if test_dns_resolution() { passed += 1; }
     }
 
+    // ── Test 6b: DNS cyclic compression-pointer guard (CWE-835) ─────
+    //
+    // Pure parser unit test (no network): proves the in-kernel resolver
+    // cannot be hung by a self-referential / chained DNS compression
+    // pointer (RFC 1035 §4.1.4).  Runs unconditionally — a hang here would
+    // wedge the whole test boot, which is itself the regression signal.
+    total += 1;
+    if test_dns_cyclic_pointer_guard() { passed += 1; }
+
     // ── Test 7: Object Manager Namespace ────────────────────────────
 
     total += 1;
@@ -3389,6 +3398,69 @@ fn test_dns_resolution() -> bool {
             true
         }
     }
+}
+
+/// DNS name-decompression cyclic-pointer guard (RFC 1035 §4.1.4, CWE-835).
+///
+/// A response whose name field is a self-referential compression pointer
+/// (`0xC0 0x0C` at offset 12 → ptr 12) must terminate the parser with `None`,
+/// never loop forever: the offset stays in-bounds so the `offset >= len`
+/// bound can never fire, and without a hop cap the in-kernel resolver thread
+/// (shell `ping`/`nslookup`, the test runner) hangs.  A malicious or spoofed
+/// nameserver controls every byte of the reply, so this is a remote DoS.
+/// The test runs the real private parser via `dns::test_skip_dns_name` and
+/// asserts: (a) the cyclic pointer returns `None` (and, implicitly, returns
+/// at all — a hang would wedge the whole test boot); (b) a chained-pointer
+/// loop also returns `None`; (c) a well-formed compressed name still parses.
+fn test_dns_cyclic_pointer_guard() -> bool {
+    test_header!("DNS cyclic compression-pointer guard (RFC 1035 §4.1.4, CWE-835)");
+    use crate::net::dns;
+
+    // (a) Self-referential pointer: a 2-byte name at offset 0 that points to
+    //     itself.  0xC0 0x00 → label-type 0b11 (pointer), offset bits = 0.
+    //     Pre-#fix this looped forever; the guard must return None.
+    let cyclic_self: [u8; 2] = [0xC0, 0x00];
+    if dns::test_skip_dns_name(&cyclic_self, 0).is_some() {
+        test_fail!("dns_cyclic", "self-referential pointer did not return None");
+        return false;
+    }
+    test_println!("  self-referential 0xC0 0x00 → None ✓ (did not hang)");
+
+    // (b) Two-pointer cycle: offset 0 → 2, offset 2 → 0.  Mutually-referential
+    //     pointers must also be caught by the hop cap.
+    let cyclic_pair: [u8; 4] = [0xC0, 0x02, 0xC0, 0x00];
+    if dns::test_skip_dns_name(&cyclic_pair, 0).is_some() {
+        test_fail!("dns_cyclic", "two-pointer cycle did not return None");
+        return false;
+    }
+    test_println!("  two-pointer cycle → None ✓");
+
+    // (c) Well-formed name with a single legal back-pointer must still parse.
+    //     Layout: [0]=3 'w' 'w' 'w' [4]=0 (root)  then at [5] a pointer to
+    //     offset 0.  Skipping the name at offset 5 must succeed and return the
+    //     offset just past the 2-byte pointer (7).
+    let mut wire: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    wire.extend_from_slice(&[3, b'w', b'w', b'w', 0]); // "www." at offset 0
+    wire.extend_from_slice(&[0xC0, 0x00]);             // pointer→0 at offset 5
+    match dns::test_skip_dns_name(&wire, 5) {
+        Some(7) => test_println!("  well-formed back-pointer at off 5 → 7 ✓"),
+        other => {
+            test_fail!("dns_cyclic", "well-formed name parse: expected Some(7), got {:?}", other);
+            return false;
+        }
+    }
+
+    // (d) Uncompressed name parses to the byte past the root label.
+    match dns::test_skip_dns_name(&[3, b'w', b'w', b'w', 0], 0) {
+        Some(5) => test_println!("  uncompressed name → 5 ✓"),
+        other => {
+            test_fail!("dns_cyclic", "uncompressed parse: expected Some(5), got {:?}", other);
+            return false;
+        }
+    }
+
+    test_pass!("DNS cyclic compression-pointer guard");
+    true
 }
 
 /// Test IPv6 DNS resolution (AAAA record) for the anycast service.
