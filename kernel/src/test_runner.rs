@@ -2513,6 +2513,14 @@ pub fn run() -> ! {
 
         total += 1;
         if test_247_icmp_rx_checksum_validation() { passed += 1; }
+
+        // ── Test 248: UDP receive-buffer bound (SO_RCVBUF backpressure) ──
+        // RFC 768 unreliable-delivery + POSIX SO_RCVBUF: a UDP flood past
+        // the per-port receive buffer must be tail-dropped (queue stays
+        // bounded, UDP_RX_OVERFLOW advances) while the retained datagrams
+        // drain in order; getsockopt(SO_RCVBUF) reflects a setsockopt value.
+        total += 1;
+        if test_248_udp_rcvbuf_bound() { passed += 1; }
     }
 
     // ── Tests 251-256: X11 protocol conformance ─────────────────────────
@@ -47380,6 +47388,162 @@ fn test_246_udp_rx_checksum_validation() -> bool {
 
     udp::unbind(PORT);
     test_pass!("UDP RX checksum validation (RFC 768, RFC 1122 §4.1.3.4)");
+    true
+}
+
+// ── Test 248: UDP receive-buffer bound (SO_RCVBUF backpressure) ──────────────
+//
+// RFC 768 is an unreliable datagram service: the receiver makes no
+// delivery guarantee and is free to drop datagrams it cannot buffer.  A
+// connectionless flood (e.g. a QUIC/RFC 9000 transfer over UDP/443 whose
+// congestion control retransmits losses) MUST NOT be able to grow the
+// per-port receive queue without bound — otherwise it exhausts the
+// kernel heap (OOM) or stalls the drain.  POSIX `SO_RCVBUF`
+// (`setsockopt(2)`) caps the buffer; this test pins:
+//
+//   (a) getsockopt(SO_RCVBUF) reflects a prior setsockopt value — the
+//       cap is wired through, not defined-but-unused.
+//   (b) A flood of equal-sized datagrams past the byte cap leaves the
+//       queue BOUNDED (admits only what fits, plus the always-admit-one
+//       rule for an empty queue) — no unbounded growth.
+//   (c) Each over-cap datagram increments UDP_RX_OVERFLOW (tail-drop of
+//       the newest, the cheapest RFC-768-faithful policy).
+//   (d) The retained datagrams drain in arrival order (FIFO), proving
+//       the VecDeque front-drain preserves ordering.
+//
+// Cite: RFC 768 (UDP), RFC 9000 §2 (QUIC streams over UDP), POSIX
+// `setsockopt(2)` SO_RCVBUF, `net.core.rmem_default`.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_248_udp_rcvbuf_bound() -> bool {
+    test_header!("net: UDP receive-buffer bound (SO_RCVBUF backpressure, RFC 768)");
+
+    use crate::net::{udp, socket};
+    use crate::net::socket::SocketType;
+
+    // POSIX socket-option selectors (mirrors the kernel's private consts).
+    const SOL_SOCKET: u64 = 1;
+    const SO_RCVBUF:  u64 = 8;
+    const PORT: u16 = 17248;
+    // A 1357-byte payload matches the MTU-clamped QUIC datagram size that
+    // floods this path from a real CDN; keep the test faithful to it.
+    const PAYLOAD_LEN: usize = 1357;
+    // Small cap so a handful of datagrams overflows it deterministically.
+    const RCVBUF: u32 = 4096;
+    // floor(4096 / 1357) = 3 datagrams fit before the cap is exceeded.
+    const EXPECT_ADMITTED: usize = 3;
+    // Total offered; the surplus must be tail-dropped + counted.
+    const OFFERED: usize = 12;
+
+    // Build a socket, set SO_RCVBUF *before* bind (the common high-rate
+    // consumer pattern) and bind it — exercises the setsockopt -> bind ->
+    // udp::set_rcvbuf wiring end to end.
+    let sid = socket::socket_create(SocketType::Udp);
+    if socket::socket_setsockopt(sid, SOL_SOCKET, SO_RCVBUF, RCVBUF) != 0 {
+        socket::socket_close(sid);
+        test_fail!("test248", "setsockopt(SO_RCVBUF) returned error");
+        return false;
+    }
+    if let Err(e) = socket::socket_bind(sid, PORT) {
+        socket::socket_close(sid);
+        test_fail!("test248", "bind({}) failed: {}", PORT, e);
+        return false;
+    }
+
+    // (a) getsockopt round-trips the value (cap is wired, not unused).
+    let got = socket::socket_getsockopt(sid, SOL_SOCKET, SO_RCVBUF);
+    if got != RCVBUF {
+        socket::socket_close(sid);
+        test_fail!("test248", "(a) getsockopt(SO_RCVBUF) = {}, expected {}", got, RCVBUF);
+        return false;
+    }
+    test_println!("  (a) SO_RCVBUF round-trips: {} bytes", got);
+
+    // Drain any stragglers from a prior run on this port.
+    while udp::recv(PORT).is_some() {}
+
+    // Helper: hand a checksummed loopback datagram whose first payload
+    // byte is `seq` to handle_udp, so we can assert FIFO drain order.
+    let make_and_deliver = |seq: u8| {
+        let src = [127u8, 0, 0, 1];
+        let dst = [127u8, 0, 0, 1];
+        let udp_len: u16 = 8 + PAYLOAD_LEN as u16;
+        let mut payload = alloc::vec::Vec::with_capacity(PAYLOAD_LEN);
+        payload.push(seq);
+        payload.resize(PAYLOAD_LEN, 0u8);
+
+        let mut pkt = alloc::vec::Vec::with_capacity(udp_len as usize);
+        pkt.extend_from_slice(&50000u16.to_be_bytes()); // src port
+        pkt.extend_from_slice(&PORT.to_be_bytes());      // dst port
+        pkt.extend_from_slice(&udp_len.to_be_bytes());   // length
+        pkt.push(0); pkt.push(0);                        // cksum placeholder
+        pkt.extend_from_slice(&payload);
+
+        let mut pseudo = alloc::vec::Vec::with_capacity(12 + pkt.len());
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.push(0);
+        pseudo.push(crate::net::ipv4::PROTO_UDP);
+        pseudo.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo.extend_from_slice(&pkt);
+        let cks = crate::net::ipv4::checksum(&pseudo);
+        pkt[6] = (cks >> 8) as u8;
+        pkt[7] = (cks & 0xFF) as u8;
+
+        udp::handle_udp(src, dst, &pkt);
+    };
+
+    // (b)+(c) Flood OFFERED datagrams; the surplus past the cap must be
+    // tail-dropped and counted.
+    let overflow_before = udp::rx_overflow_count();
+    for seq in 0..OFFERED as u8 {
+        make_and_deliver(seq);
+    }
+    let overflow_after = udp::rx_overflow_count();
+    let dropped = (overflow_after - overflow_before) as usize;
+    test_println!("  (b/c) offered {} datagrams ({}B each), overflow drops: {}",
+                  OFFERED, PAYLOAD_LEN, dropped);
+    if dropped != OFFERED - EXPECT_ADMITTED {
+        udp::unbind(PORT);
+        socket::socket_close(sid);
+        test_fail!("test248",
+            "(c) expected {} tail-drops, got {} (admitted ~{})",
+            OFFERED - EXPECT_ADMITTED, dropped, OFFERED - dropped);
+        return false;
+    }
+
+    // (d) Drain: exactly EXPECT_ADMITTED retained, in arrival order.
+    let mut drained = 0usize;
+    let mut expect_seq = 0u8;
+    while let Some(dg) = udp::recv(PORT) {
+        if dg.data.len() != PAYLOAD_LEN {
+            udp::unbind(PORT);
+            socket::socket_close(sid);
+            test_fail!("test248", "(d) drained datagram has {} bytes, expected {}",
+                       dg.data.len(), PAYLOAD_LEN);
+            return false;
+        }
+        if dg.data[0] != expect_seq {
+            udp::unbind(PORT);
+            socket::socket_close(sid);
+            test_fail!("test248", "(d) out-of-order drain: got seq {}, expected {}",
+                       dg.data[0], expect_seq);
+            return false;
+        }
+        drained += 1;
+        expect_seq += 1;
+    }
+    test_println!("  (d) drained {} datagrams FIFO (seq 0..{})", drained, drained);
+    if drained != EXPECT_ADMITTED {
+        udp::unbind(PORT);
+        socket::socket_close(sid);
+        test_fail!("test248", "(b) queue admitted {} datagrams, expected bound {}",
+                   drained, EXPECT_ADMITTED);
+        return false;
+    }
+
+    udp::unbind(PORT);
+    socket::socket_close(sid);
+    test_pass!("UDP receive-buffer bound (SO_RCVBUF backpressure, RFC 768)");
     true
 }
 
