@@ -63,6 +63,22 @@ const MAX_TCP_CONNECTIONS: usize = 1024;
 /// permits dropping a segment that cannot be buffered.
 const OOO_MAX_BYTES: usize = 256 * 1024;
 
+/// Upper bound on the NUMBER of distinct out-of-order entries retained in a
+/// single connection's reassembly queue, independent of `OOO_MAX_BYTES`.
+///
+/// A byte cap alone does not bound entry count: a peer sending 1 data byte at
+/// each of many distinct, non-adjacent sequence numbers could admit hundreds
+/// of thousands of tiny entries while staying under the byte cap, turning
+/// every insert/scan into a multi-hundred-thousand-element walk under the
+/// non-preemptible `TCP_CONNECTIONS` lock and stalling the machine — the
+/// SegmentSmack pattern (CVE-2018-5390).  Adjacent segments are coalesced on
+/// insert so a contiguous reorder collapses to one entry; this cap stops a
+/// deliberately *non*-adjacent flood from exploding the entry count.  1024
+/// entries comfortably exceeds the reorder fan-out of any well-behaved peer
+/// at the in-kernel demo's window sizes.  Inserts past the cap are dropped
+/// (the peer retransmits — RFC 9293 §3.10.7.4).
+const OOO_MAX_ENTRIES: usize = 1024;
+
 /// Grace period before a `Closed` connection is eligible for GC.
 ///
 /// Connections enter `Closed` either via TIME_WAIT expiry, a peer RST,
@@ -147,13 +163,28 @@ pub struct TcpConnection {
     /// other than `seq == recv_next`, so the rest of the response could
     /// never be delivered even after the peer retransmits.
     ///
-    /// Invariants: entries are kept sorted ascending by `seq`, carry only
-    /// data strictly ahead of `recv_next` at insert time, never overlap
-    /// (overlaps are trimmed on insert), and are bounded by
-    /// `OOO_MAX_BYTES` so a malicious or pathological peer cannot grow the
-    /// queue without bound.  Drained in order by `drain_ooo` once the gap
-    /// at `recv_next` is filled.
-    ooo_segments: Vec<(u32, Vec<u8>)>,
+    /// Invariants: entries carry only data strictly ahead of `recv_next` at
+    /// insert time, never overlap (overlaps are trimmed and adjacent entries
+    /// coalesced on insert), and are bounded by BOTH `OOO_MAX_BYTES` and
+    /// `OOO_MAX_ENTRIES` so a malicious or pathological peer cannot grow the
+    /// queue without bound.  Drained in order by `drain_ooo` once the gap at
+    /// `recv_next` is filled.
+    ///
+    /// Backed by a `BTreeMap` keyed by each segment's start sequence number,
+    /// giving O(log n) insert/erase/range and naturally-ordered iteration —
+    /// replacing the former `Vec` whose `insert`/`remove` shifted O(n)
+    /// elements per operation (O(n²) under a sustained reorder/1-byte flood,
+    /// the SegmentSmack stall, CVE-2018-5390).  The map key is the raw start
+    /// seq; the OOO window is bounded to `OOO_MAX_BYTES` (≪ 2³¹), so all keys
+    /// sit in a contiguous window above `recv_next` and the map's natural u32
+    /// ordering matches RFC 1982 serial order across that window.
+    ooo_segments: alloc::collections::BTreeMap<u32, Vec<u8>>,
+
+    /// Running total of bytes held across `ooo_segments`, maintained
+    /// incrementally so the `OOO_MAX_BYTES` budget check is O(1) instead of
+    /// re-summing the whole map on every insert.  Mirrors the reference
+    /// `sk_rmem_alloc` accounting.
+    ooo_total_bytes: usize,
 
     // Retransmit queue
     retransmit_queue: VecDeque<RetransmitEntry>,
@@ -363,18 +394,19 @@ fn seq_lt(a: u32, b: u32) -> bool {
 
 // ── Out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──────────────────────
 
-/// Total bytes currently held across all out-of-order segments.
-fn ooo_bytes(conn: &TcpConnection) -> usize {
-    conn.ooo_segments.iter().map(|(_, d)| d.len()).sum()
-}
-
 /// Buffer one in-window segment whose data starts at `seg_seq`, strictly
 /// ahead of `recv_next` (the caller has already established this is not the
-/// in-order segment).  Trims any portion that overlaps already-buffered or
-/// already-delivered bytes so the queue carries each octet exactly once, and
-/// keeps the queue sorted ascending by sequence number.  Drops the segment
-/// (without recording it) once the per-connection byte budget would be
-/// exceeded — the peer will retransmit, RFC 9293 §3.10.7.4.
+/// in-order segment).  Trims any portion that overlaps already-delivered
+/// bytes, coalesces with the segment immediately preceding it when the two
+/// abut, and keeps the queue ordered by start sequence in the `BTreeMap`.
+/// Drops the segment (without recording it) once EITHER the per-connection
+/// byte budget (`OOO_MAX_BYTES`) or the entry-count cap (`OOO_MAX_ENTRIES`,
+/// the SegmentSmack 1-byte-flood guard, CVE-2018-5390) would be exceeded —
+/// the peer retransmits, RFC 9293 §3.10.7.4.
+///
+/// All map operations are O(log n); coalescing a contiguous reorder into the
+/// preceding entry keeps a well-behaved multi-segment response collapsed to a
+/// single entry, so the common case never approaches the count cap.
 fn insert_ooo(conn: &mut TcpConnection, seg_seq: u32, payload: &[u8]) {
     // Clamp the left edge to recv_next: never re-buffer bytes we have
     // already delivered in order.
@@ -387,61 +419,79 @@ fn insert_ooo(conn: &mut TcpConnection, seg_seq: u32, payload: &[u8]) {
         start = conn.recv_next;
     }
     if data.is_empty() { return; }
+    let new_end = start.wrapping_add(data.len() as u32);
 
-    // If a previously-buffered segment already covers this start, and
-    // extends at least as far, the new segment adds nothing.
-    for (s, d) in conn.ooo_segments.iter() {
-        let end = s.wrapping_add(d.len() as u32);
-        if seq_le(*s, start) && seq_le(start.wrapping_add(data.len() as u32), end) {
-            return; // fully covered by an existing entry
+    // If the entry whose start is ≤ `start` already extends past `new_end`,
+    // the new segment adds nothing — O(log n) predecessor lookup via a range
+    // query, not an O(n) scan.  (Keys sit in a contiguous window above
+    // recv_next, so raw-u32 range order matches serial order here.)
+    if let Some((&ps, pd)) = conn.ooo_segments.range(..=start).next_back() {
+        let pend = ps.wrapping_add(pd.len() as u32);
+        if seq_le(start, pend) && seq_le(new_end, pend) {
+            return; // fully covered by the predecessor entry
         }
     }
 
-    // Budget guard: drop rather than grow unbounded.
-    if ooo_bytes(conn).saturating_add(data.len()) > OOO_MAX_BYTES {
+    // Bounds: drop rather than grow unbounded — by BYTES and by ENTRY COUNT.
+    // The count cap is what stops a 1-byte-per-distinct-seq flood
+    // (CVE-2018-5390) from admitting hundreds of thousands of tiny entries.
+    if conn.ooo_total_bytes.saturating_add(data.len()) > OOO_MAX_BYTES {
+        return;
+    }
+    if conn.ooo_segments.len() >= OOO_MAX_ENTRIES
+        // Coalescing into an abutting predecessor adds no NEW entry, so the
+        // count cap only blocks inserts that would create a fresh key.
+        && !matches!(conn.ooo_segments.range(..=start).next_back(),
+                     Some((&ps, pd)) if ps.wrapping_add(pd.len() as u32) == start)
+    {
         return;
     }
 
-    // Insert sorted by sequence number.  We keep overlapping entries simple:
-    // the drain step (`drain_ooo`) trims any residual overlap against
-    // recv_next as it consumes, so exact dedup here is a best-effort
-    // optimisation, not a correctness requirement.
-    let entry = (start, data.to_vec());
-    let pos = conn.ooo_segments
-        .iter()
-        .position(|(s, _)| seq_gt(*s, start))
-        .unwrap_or(conn.ooo_segments.len());
-    conn.ooo_segments.insert(pos, entry);
+    // Coalesce with an immediately-preceding entry that abuts `start`
+    // (its end == start): extend it in place rather than adding a new key,
+    // collapsing a contiguous reorder to one entry.
+    if let Some((&ps, _)) = conn.ooo_segments.range(..start).next_back() {
+        let pend = {
+            let pd = &conn.ooo_segments[&ps];
+            ps.wrapping_add(pd.len() as u32)
+        };
+        if pend == start {
+            conn.ooo_segments.get_mut(&ps).unwrap().extend_from_slice(data);
+            conn.ooo_total_bytes += data.len();
+            return;
+        }
+    }
+
+    conn.ooo_segments.insert(start, data.to_vec());
+    conn.ooo_total_bytes += data.len();
 }
 
 /// After `recv_next` advances, deliver any buffered out-of-order segments
 /// that are now contiguous, advancing `recv_next` past each.  Returns true
 /// if at least one buffered segment was delivered (so the caller knows the
 /// cumulative ACK must reflect the new recv_next).
+///
+/// Pops from the front of the `BTreeMap` (lowest start seq) in O(log n) per
+/// step — replacing the former `Vec::remove(i)` that shifted O(n) tail
+/// elements on every pop (O(n²) total drain, the stall this fix removes).
 fn drain_ooo(conn: &mut TcpConnection) -> bool {
     let mut delivered = false;
     loop {
-        // Find a buffered segment that begins at or before recv_next and
-        // extends past it (i.e. it fills, or partially fills, the gap).
-        let mut take: Option<usize> = None;
-        for (i, (s, d)) in conn.ooo_segments.iter().enumerate() {
-            let end = s.wrapping_add(d.len() as u32);
-            if seq_le(*s, conn.recv_next) && seq_gt(end, conn.recv_next) {
-                take = Some(i);
-                break;
-            }
-            // Drop any segment now wholly behind recv_next (already
-            // delivered by an overlapping in-order arrival).
-            if seq_le(end, conn.recv_next) {
-                take = Some(i);
-                break;
-            }
-        }
-        let Some(i) = take else { break };
-        let (s, d) = conn.ooo_segments.remove(i);
-        let end = s.wrapping_add(d.len() as u32);
+        // Peek the lowest-keyed entry; it is the only candidate that can
+        // fill (or be wholly behind) the gap at recv_next.
+        let Some((&s, _)) = conn.ooo_segments.iter().next() else { break };
+        let d_len = conn.ooo_segments[&s].len();
+        let end = s.wrapping_add(d_len as u32);
+
+        // Not yet contiguous with recv_next → a gap remains; stop draining.
+        if seq_gt(s, conn.recv_next) { break; }
+
+        let d = conn.ooo_segments.remove(&s).unwrap();
+        conn.ooo_total_bytes = conn.ooo_total_bytes.saturating_sub(d.len());
+
         if seq_le(end, conn.recv_next) {
-            // Wholly stale — discard, keep scanning.
+            // Wholly stale — already delivered by an overlapping in-order
+            // arrival.  Discard and keep scanning.
             continue;
         }
         // Append only the portion ahead of recv_next.
@@ -683,7 +733,8 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 recv_next:   rcv_nxt,
                 recv_buffer: Vec::new(),
                 send_buffer: Vec::new(),
-                ooo_segments: Vec::new(),
+                ooo_segments: alloc::collections::BTreeMap::new(),
+                ooo_total_bytes: 0,
                 retransmit_queue: VecDeque::new(),
                 rto:         RTO_INITIAL,
                 srtt:        RTO_INITIAL / 2,
@@ -1400,7 +1451,8 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         recv_next:   1,
         recv_buffer: recv_data.to_vec(),
         send_buffer: Vec::new(),
-        ooo_segments: Vec::new(),
+        ooo_segments: alloc::collections::BTreeMap::new(),
+        ooo_total_bytes: 0,
         retransmit_queue: VecDeque::new(),
         rto:         RTO_INITIAL,
         srtt:        RTO_INITIAL / 2,
@@ -1462,7 +1514,8 @@ pub fn test_inject_syn_received(local_port: u16, remote_ip: Ipv4Address,
         recv_next:   1,
         recv_buffer: Vec::new(),
         send_buffer: Vec::new(),
-        ooo_segments: Vec::new(),
+        ooo_segments: alloc::collections::BTreeMap::new(),
+        ooo_total_bytes: 0,
         retransmit_queue: VecDeque::new(), // EMPTY — the bug's whole point
         rto:         RTO_INITIAL,
         srtt:        RTO_INITIAL / 2,
@@ -1503,6 +1556,88 @@ pub fn live_conn_count_on_port(local_port: u16) -> usize {
     let conns = TCP_CONNECTIONS.lock();
     conns.iter().filter(|c|
         c.local_port == local_port && c.state != TcpState::Closed).count()
+}
+
+/// Test-only (test-mode + friends): synthesise an Established TCB with
+/// `recv_next == 1`, an empty receive buffer, and an empty OOO queue.  A
+/// broad-gated twin of the `kdb`-only `test_inject_established`, so the OOO
+/// reassembly-bounding regression test can run under CI's `test-mode` build.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn test_inject_established_tm(local_port: u16, remote_ip: Ipv4Address,
+                                  remote_port: u16) -> Result<(), &'static str> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    if conns.iter().any(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        return Err("duplicate 4-tuple");
+    }
+    let isn = new_isn();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if conns.len() >= MAX_TCP_CONNECTIONS {
+        gc_closed_in(&mut conns, now);
+        if conns.len() >= MAX_TCP_CONNECTIONS {
+            return Err("TCP_CONNECTIONS cap reached");
+        }
+    }
+    conns.push(TcpConnection {
+        local_ip:    super::our_ip(),
+        local_port,
+        remote_ip,
+        remote_port,
+        state:       TcpState::Established,
+        send_next:   isn.wrapping_add(1),
+        send_unack:  isn,
+        recv_next:   1,
+        recv_buffer: Vec::new(),
+        send_buffer: Vec::new(),
+        ooo_segments: alloc::collections::BTreeMap::new(),
+        ooo_total_bytes: 0,
+        retransmit_queue: VecDeque::new(),
+        rto:         RTO_INITIAL,
+        srtt:        RTO_INITIAL / 2,
+        cwnd:        MSS,
+        ssthresh:    65535,
+        dup_acks:    0,
+        peer_window: 65535,
+        reuseaddr:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        timewait_start: 0,
+        closed_tick: 0,
+        accepted:    false,
+        created_tick: now,
+    });
+    Ok(())
+}
+
+/// Test-only: feed a single in-window OOO data segment to the Established TCB
+/// on `(local_port, remote_ip, remote_port)` via the real `insert_ooo`/
+/// `drain_ooo` path, then report `(ooo_entry_count, ooo_buffered_bytes,
+/// recv_buffer_len)`.  Lets the SegmentSmack-bounding regression test
+/// (CVE-2018-5390) drive a 1-byte-per-distinct-seq flood and observe that the
+/// entry count stays bounded while in-order data still drains correctly.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn test_feed_ooo(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
+                     seq: u32, payload: &[u8]) -> Option<(usize, usize, usize)> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)?;
+    if seq == conn.recv_next {
+        // In-order: append + drain (mirrors receive_segment_data).
+        conn.recv_buffer.extend_from_slice(payload);
+        conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+        drain_ooo(conn);
+    } else if seq_gt(seq.wrapping_add(payload.len() as u32), conn.recv_next) {
+        insert_ooo(conn, seq, payload);
+    }
+    Some((conn.ooo_segments.len(), conn.ooo_total_bytes, conn.recv_buffer.len()))
 }
 
 /// Test-only: force the state of the TCB matching the given 4-tuple,
@@ -1696,7 +1831,8 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         recv_next:   0,
         recv_buffer: Vec::new(),
         send_buffer: Vec::new(),
-        ooo_segments: Vec::new(),
+        ooo_segments: alloc::collections::BTreeMap::new(),
+        ooo_total_bytes: 0,
         retransmit_queue: VecDeque::new(),
         rto:         RTO_INITIAL,
         srtt:        RTO_INITIAL / 2,
@@ -1743,7 +1879,8 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             recv_next:   0,
             recv_buffer: Vec::new(),
             send_buffer: Vec::new(),
-            ooo_segments: Vec::new(),
+            ooo_segments: alloc::collections::BTreeMap::new(),
+            ooo_total_bytes: 0,
             retransmit_queue: VecDeque::new(),
             rto:         RTO_INITIAL,
             srtt:        RTO_INITIAL / 2,

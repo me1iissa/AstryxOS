@@ -1107,7 +1107,9 @@ pub fn run() -> ! {
     total += 1;
     if test_tcp_syn_flood_reaper() { passed += 1; }
 
-
+    // ── Test 89d: OOO reassembly bounded + ordered drain (CVE-2018-5390) ──
+    total += 1;
+    if test_tcp_ooo_bounded_drain() { passed += 1; }
 
     // ── Test 90: TCP congestion control (slow start + cwnd growth) ────────
 
@@ -22779,6 +22781,121 @@ fn test_tcp_syn_flood_reaper() -> bool {
     let _ = tcp::abort(PORT2);
 
     test_pass!("TCP SYN-flood half-open reaper (RFC 4987)");
+    true
+}
+
+// ── Test 89d: TCP OOO reassembly bounded + O(n log n) drain (SegmentSmack) ───
+//
+// RFC 9293 §3.10.7.4, CVE-2018-5390 (SegmentSmack).  The out-of-order
+// reassembly queue must bound BOTH bytes and ENTRY COUNT, and drain in order
+// efficiently.  Pre-fix the queue was a `Vec` with O(n) insert/remove (O(n²)
+// under a flood) and an entry count capped only implicitly by the byte cap,
+// so a 1-byte-per-distinct-seq flood could admit ~262k tiny entries and pin a
+// core under the non-preemptible TCP lock.  This test floods the OOO queue
+// with many 1-byte non-adjacent segments and asserts:
+//   (1) the entry count stays bounded (≤ OOO_MAX_ENTRIES = 1024);
+//   (2) once the gap at recv_next is filled, buffered data drains IN ORDER;
+//   (3) a contiguous reorder coalesces (does not consume an entry each).
+fn test_tcp_ooo_bounded_drain() -> bool {
+    test_header!("TCP OOO reassembly bounded + ordered drain (CVE-2018-5390)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8097;
+    let rip: [u8; 4] = [203, 0, 113, 9];
+    if let Err(e) = tcp::test_inject_established_tm(PORT, rip, 50000) {
+        test_fail!("ooo_bound", "inject Established failed: {}", e);
+        return false;
+    }
+    // recv_next == 1.  Feed 1-byte segments at NON-ADJACENT seqs, leaving the
+    // gap at seq 1 unfilled so nothing drains.  Use a stride of 2 so no two
+    // segments abut (each stays a distinct entry, the worst case).  Flood
+    // FLOOD segments — comfortably more than OOO_MAX_ENTRIES (1024) — and
+    // assert the entry count never exceeds the cap.
+    const FLOOD: u32 = 4000;
+    let mut max_entries = 0usize;
+    for k in 0..FLOOD {
+        let seq = 3u32.wrapping_add(k * 2); // 3,5,7,... (gap at 1,2 stays open)
+        match tcp::test_feed_ooo(PORT, rip, 50000, seq, b"X") {
+            Some((entries, _bytes, _rb)) => { max_entries = max_entries.max(entries); }
+            None => { test_fail!("ooo_bound", "test_feed_ooo returned None at k={}", k); return false; }
+        }
+    }
+    test_println!("  fed {} 1-byte non-adjacent OOO segments; peak entries={}",
+                  FLOOD, max_entries);
+    if max_entries > 1024 {
+        test_fail!("ooo_bound",
+            "OOO entry count {} exceeded cap 1024 — SegmentSmack guard absent",
+            max_entries);
+        return false;
+    }
+    test_println!("  entry count stayed ≤ 1024 ✓ (CVE-2018-5390 bounded)");
+
+    // Tear down and rebuild a clean TCB for the ordered-drain + coalesce check
+    // (the flooded one has a sparse 1024-entry tail we don't need).
+    let _ = tcp::abort(PORT);
+    tcp::tcp_timer_tick(); // RST + mark_closed
+    // Give GC a window, then a tick to reap so the 4-tuple is reusable.
+    let start = crate::arch::x86_64::irq::get_ticks();
+    while crate::arch::x86_64::irq::get_ticks().wrapping_sub(start) < 60 {
+        core::hint::spin_loop();
+    }
+    tcp::tcp_timer_tick();
+
+    const PORT2: u16 = 8096;
+    if let Err(e) = tcp::test_inject_established_tm(PORT2, rip, 50001) {
+        test_fail!("ooo_bound", "inject Established #2 failed: {}", e);
+        return false;
+    }
+    // recv_next == 1.  Bytes at seq 1='A', 2='B', 3='C', 4='D', 5='E'.
+    // Buffer the OOO tail AHEAD of the gap at seq 1, feeding the two ABUTTING
+    // segments in ascending order so forward-coalesce fires:
+    //   seq 2 "BC" (covers 2,3)  → new entry [2..4)
+    //   seq 4 "DE" (covers 4,5)  → abuts [2..4) at 4 → coalesced into [2..6)
+    let first = tcp::test_feed_ooo(PORT2, rip, 50001, 2, b"BC");
+    if let Some((entries, _, _)) = first {
+        if entries != 1 {
+            test_fail!("ooo_bound", "after first OOO seg expected 1 entry, got {}", entries);
+            return false;
+        }
+    }
+    let after_ooo = tcp::test_feed_ooo(PORT2, rip, 50001, 4, b"DE"); // abuts → coalesce
+    if let Some((entries, bytes, _rb)) = after_ooo {
+        if entries != 1 {
+            test_fail!("ooo_bound",
+                "expected coalesced single OOO entry [2..6), got {} entries", entries);
+            return false;
+        }
+        if bytes != 4 {
+            test_fail!("ooo_bound", "expected 4 buffered OOO bytes (BCDE), got {}", bytes);
+            return false;
+        }
+        test_println!("  abutting OOO segments coalesced to 1 entry [2..6) ✓");
+    }
+    // Now deliver the in-order gap-filler seq 1 = "A": recv_next advances to 2,
+    // then the buffered [2..6)="BCDE" drains, recv_next → 6, recv_buffer="ABCDE".
+    match tcp::test_feed_ooo(PORT2, rip, 50001, 1, b"A") {
+        Some((entries, _b, rb_len)) => {
+            if entries != 0 {
+                test_fail!("ooo_bound", "after gap-fill, expected 0 OOO entries, got {}", entries);
+                return false;
+            }
+            if rb_len != 5 {
+                test_fail!("ooo_bound", "after drain expected 5 recv bytes (ABCDE), got {}", rb_len);
+                return false;
+            }
+        }
+        None => { test_fail!("ooo_bound", "gap-fill feed returned None"); return false; }
+    }
+    // Verify the actual byte ORDER is ABCDE (in-order delivery, not jumbled).
+    let drained = tcp::read_from(PORT2, rip, 50001);
+    if drained != b"ABCDE" {
+        test_fail!("ooo_bound", "drain order wrong: got {:?}, expected b\"ABCDE\"", drained);
+        return false;
+    }
+    test_println!("  gap-fill drained buffered tail IN ORDER → \"ABCDE\" ✓");
+
+    let _ = tcp::abort(PORT2);
+    test_pass!("TCP OOO reassembly bounded + ordered drain (CVE-2018-5390)");
     true
 }
 
