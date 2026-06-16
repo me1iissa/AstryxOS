@@ -2828,6 +2828,26 @@ pub fn run() -> ! {
         if test_276_tcp_send_buffer_drain() { passed += 1; }
     }
 
+    // ── Test 281: TCP graceful close — close() must not orphan send_buffer ─
+    // Regression gate for the WebXO `Connection: close` multi-segment
+    // truncation: a server that send()s a >1-MSS body then immediately
+    // close()s used to emit FIN at the snapshot of send_next (after only the
+    // first window's worth of data), assigning every buffered byte a sequence
+    // ABOVE the FIN — so the peer, having seen end-of-stream, discarded the
+    // ~9 KB tail and received only ~1 segment.  The fix defers the FIN until
+    // send_buffer drains (RFC 9293 §3.5).  This test drives the exact
+    // close-before-drain race and asserts the full body arrives intact and
+    // the peer's FIN observation follows (never precedes) the last data byte.
+    //
+    // Refs: RFC 9293 §3.5 (graceful close), §3.7 (data transfer), RFC 5681
+    // §3.1 (slow start), IEEE Std 1003.1-2017 §close.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core",
+              feature = "oracle-test", feature = "oracle-daemon-test"))]
+    {
+        total += 1;
+        if test_281_tcp_graceful_close_no_truncation() { passed += 1; }
+    }
+
     // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
     // Exercises the three socket-layer fixes that unblock outbound DNS
     // for any glibc/musl-linked Linux client:
@@ -34039,6 +34059,202 @@ fn test_276_tcp_send_buffer_drain() -> bool {
     let _ = tcp::abort(client_port);
     let _ = tcp::abort(SERVER_PORT);
     test_pass!("TCP send_buffer drain — multi-MSS payload fully delivered (loopback)");
+    true
+}
+
+/// Test 281: graceful close (RFC 9293 §3.5) — `close()` with a non-empty
+/// `send_buffer` must NOT orphan the buffered tail.
+///
+/// This is the WebXO `Connection: close` truncation regression.  A server
+/// that `send()`s a multi-segment body then immediately `close()`s exhibited
+/// the bug: the initial congestion window (1 MSS) let only the first segment
+/// onto the wire, the remaining bytes were queued in `send_buffer`, and the
+/// old `close()` emitted FIN at the snapshot of `send_next` — i.e. right after
+/// the first segment.  The FIN consumes the next sequence number, so every
+/// byte still in `send_buffer` was assigned a sequence *above* the FIN and was
+/// discarded by the peer (which had already observed end-of-stream).  The
+/// client therefore received only ~1 segment of a ~2 KB body.
+///
+/// The fix defers the FIN: `close()` on a connection with unsent data sets
+/// `close_pending`, keeps the TCB in ESTABLISHED/CLOSE-WAIT, and lets the
+/// `tcp_timer_tick` drain loop flush `send_buffer` as the window opens, then
+/// emit the FIN at the true end of the byte stream (ESTABLISHED → FIN-WAIT-1).
+///
+/// The test drives the close-before-drain race exactly as WebXO does and
+/// asserts (a) every byte of a >1-MSS payload arrives intact at the peer and
+/// (b) the peer observes the FIN only *after* the full payload (its TCB leaves
+/// ESTABLISHED for CLOSE-WAIT or beyond), proving the FIN did not precede the
+/// tail.  Self-contained over the loopback short-circuit.
+///
+/// Refs: RFC 9293 §3.5 (graceful close — "queue this until all preceding SENDs
+/// have been segmentized, then form a FIN segment and send it"), RFC 9293
+/// §3.7 (data transfer), RFC 5681 §3.1 (slow start), IEEE Std 1003.1-2017
+/// §close / §shutdown.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "oracle-daemon-test"))]
+fn test_281_tcp_graceful_close_no_truncation() -> bool {
+    test_header!("TCP graceful close — close() with pending send_buffer delivers full body (loopback)");
+
+    use crate::net::tcp;
+
+    const SERVER_PORT: u16 = 17381;
+    const LB_IP: [u8; 4] = [127, 0, 0, 1];
+    // A multi-segment body (>1 MSS) so the first send buffers a tail behind
+    // the initial 1-MSS congestion window — the WebXO ~10 KB landing-page
+    // shape, scaled down to a few segments for a fast self-contained test.
+    const PAYLOAD_LEN: usize = (tcp::MSS as usize) * 3 + 271;
+
+    let mut payload = alloc::vec![0u8; PAYLOAD_LEN];
+    for i in 0..PAYLOAD_LEN {
+        payload[i] = ((i * 31 + 7) % 256) as u8;
+    }
+
+    if let Err(e) = tcp::listen(SERVER_PORT) {
+        test_fail!("tcp_graceful_close", "listen({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let client_port = match tcp::connect(LB_IP, SERVER_PORT) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("tcp_graceful_close", "connect failed: {}", e);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    };
+
+    // Drive the 3-way handshake to Established on both sides.
+    for _ in 0..8 { crate::net::poll(); }
+
+    let snap = tcp::snapshot_connections();
+    let server_child = snap.iter().find(|c|
+        c.local_port == SERVER_PORT
+        && c.remote_ip[0] == 127
+        && c.remote_port == client_port
+        && c.state == tcp::TcpState::Established).copied();
+    let client_ok = snap.iter().any(|c|
+        c.local_port == client_port
+        && c.remote_port == SERVER_PORT
+        && c.state == tcp::TcpState::Established);
+
+    let server_child = match (client_ok, server_child) {
+        (true, Some(c)) => c,
+        _ => {
+            test_fail!("tcp_graceful_close", "3WHS did not reach Established on both sides");
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    };
+    test_println!("  3WHS complete: client_port={} server_port={} ✓",
+        client_port, SERVER_PORT);
+
+    // Send the multi-segment body.  Only the first MSS fits the initial cwnd;
+    // the rest is queued in send_buffer.
+    match tcp::send_data_to(client_port, LB_IP, SERVER_PORT, &payload) {
+        Ok(n) if n == PAYLOAD_LEN => {}
+        Ok(n) => {
+            test_fail!("tcp_graceful_close",
+                "send_data_to accepted {} (expected {})", n, PAYLOAD_LEN);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("tcp_graceful_close", "send_data_to failed: {}", e);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    }
+
+    // CLOSE IMMEDIATELY — the WebXO `Connection: close` race: close() is
+    // called while ~2/3 of the body is still sitting in send_buffer.  The
+    // pre-fix bug emitted FIN here and orphaned that tail.  Post-fix the FIN
+    // is deferred until the buffer drains.
+    if let Err(e) = tcp::close_connection(client_port, LB_IP, SERVER_PORT) {
+        test_fail!("tcp_graceful_close", "close_connection failed: {}", e);
+        let _ = tcp::abort(client_port);
+        let _ = tcp::abort(SERVER_PORT);
+        return false;
+    }
+
+    // The client must NOT have jumped straight to FIN-WAIT-1 with an orphaned
+    // tail: with data still buffered, close() defers the FIN and keeps the TCB
+    // in ESTABLISHED until the drain loop flushes it (RFC 9293 §3.5).
+    let post_close = tcp::snapshot_connections();
+    if let Some(c) = post_close.iter().find(|c|
+        c.local_port == client_port && c.remote_port == SERVER_PORT)
+    {
+        if c.state != tcp::TcpState::Established {
+            test_fail!("tcp_graceful_close",
+                "client left ESTABLISHED ({:?}) with data still buffered — FIN not deferred",
+                c.state);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    }
+    test_println!("  close() deferred FIN (client still ESTABLISHED, tail buffered) ✓");
+
+    // Drive ACK round-trips + timer-driven drain.  Each poll tick services the
+    // loopback path and tcp_timer_tick; the buffer empties one MSS per tick as
+    // cwnd grows, then the deferred FIN fires.  Allow generous ticks for the
+    // 3+ segments plus the FIN handshake.
+    for _ in 0..48 { crate::net::poll(); }
+
+    // (a) Full body must have arrived intact — no truncation.
+    let received = tcp::read_from(SERVER_PORT, server_child.remote_ip, client_port);
+    if received.len() != PAYLOAD_LEN {
+        test_fail!("tcp_graceful_close",
+            "received {} B (expected {} — close orphaned the buffered tail)",
+            received.len(), PAYLOAD_LEN);
+        let _ = tcp::abort(client_port);
+        let _ = tcp::abort(SERVER_PORT);
+        return false;
+    }
+    for i in 0..PAYLOAD_LEN {
+        if received[i] != payload[i] {
+            test_fail!("tcp_graceful_close",
+                "byte mismatch at offset {} — got {:#04x} expected {:#04x}",
+                i, received[i], payload[i]);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    }
+    test_println!("  full {} B body delivered intact after close ✓", PAYLOAD_LEN);
+
+    // (b) The server child must have observed our FIN — and only after the
+    // whole body (recv_next advanced past every payload byte before the FIN
+    // consumed its sequence).  A peer FIN moves an ESTABLISHED TCB to
+    // CLOSE-WAIT (or it has already progressed further / been reaped).  If the
+    // FIN had preceded the tail, the server would have closed early and the
+    // length check above would already have failed; this asserts the FIN
+    // genuinely arrived (the close completed), not that the data simply
+    // dribbled in without a terminating FIN.
+    let final_snap = tcp::snapshot_connections();
+    let server_state = final_snap.iter().find(|c|
+        c.local_port == SERVER_PORT
+        && c.remote_port == client_port).map(|c| c.state);
+    match server_state {
+        // Saw the FIN and moved on, or the closed TCB was already reaped.
+        Some(tcp::TcpState::CloseWait) | Some(tcp::TcpState::LastAck)
+        | Some(tcp::TcpState::Closed)  | Some(tcp::TcpState::TimeWait) | None => {
+            test_println!("  server observed FIN after full body (state={:?}) ✓", server_state);
+        }
+        Some(other) => {
+            test_fail!("tcp_graceful_close",
+                "server child still in {:?} — deferred FIN never arrived", other);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    }
+
+    let _ = tcp::abort(client_port);
+    let _ = tcp::abort(SERVER_PORT);
+    test_pass!("TCP graceful close — close() with pending send_buffer delivers full body (loopback)");
     true
 }
 
