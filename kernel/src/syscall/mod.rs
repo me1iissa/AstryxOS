@@ -1851,6 +1851,15 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                             crate::net::unix::close(f.inode);
                         } else if f.mount_idx == usize::MAX
                             && f.flags & 0x4000_0000 != 0
+                            && f.flags & crate::syscall::NETLINK_SOCKET_FLAG != 0
+                        {
+                            // CLOEXEC-marked AF_NETLINK socket: drop one ref so
+                            // the post-execve image releasing it does not destroy
+                            // a socket the forking parent still holds (last-close
+                            // semantics, parallel to the AF_UNIX arm above).
+                            crate::net::netlink::close(f.inode);
+                        } else if f.mount_idx == usize::MAX
+                            && f.flags & 0x4000_0000 != 0
                             && f.flags & crate::syscall::UNIX_SOCKET_FLAG == 0
                         {
                             // CLOEXEC-marked AF_INET socket: drop one ref so the
@@ -4554,6 +4563,14 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
         crate::net::unix::inc_ref(fd_clone.inode);
     } else if fd_clone.mount_idx == usize::MAX
         && fd_clone.flags & 0x4000_0000 != 0
+        && fd_clone.flags & NETLINK_SOCKET_FLAG != 0
+    {
+        // AF_NETLINK socket: the duplicate is one more reference to the same
+        // open file description; close(2) on either fd must not destroy the
+        // shared socket until the last reference drops.
+        crate::net::netlink::inc_ref(fd_clone.inode);
+    } else if fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x4000_0000 != 0
         && fd_clone.flags & UNIX_SOCKET_FLAG == 0
     {
         // AF_INET socket: the duplicate is one more reference to the same open
@@ -4640,6 +4657,13 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
         crate::net::unix::inc_ref(fd_clone.inode);
     } else if fd_clone.mount_idx == usize::MAX
         && fd_clone.flags & 0x4000_0000 != 0
+        && fd_clone.flags & NETLINK_SOCKET_FLAG != 0
+    {
+        // AF_NETLINK socket: the duplicate is one more open-file-description
+        // reference.  Balanced by the close on either fd.
+        crate::net::netlink::inc_ref(fd_clone.inode);
+    } else if fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x4000_0000 != 0
         && fd_clone.flags & UNIX_SOCKET_FLAG == 0
     {
         // AF_INET socket: the duplicate is one more open-file-description
@@ -4687,6 +4711,12 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
             && prev.flags & UNIX_SOCKET_FLAG != 0
         {
             crate::net::unix::close(prev.inode);
+        } else if prev.mount_idx == usize::MAX
+            && prev.flags & 0x4000_0000 != 0
+            && prev.flags & NETLINK_SOCKET_FLAG != 0
+        {
+            // Displaced AF_NETLINK socket fd loses one open-file-description ref.
+            crate::net::netlink::close(prev.inode);
         } else if prev.mount_idx == usize::MAX
             && prev.flags & 0x4000_0000 != 0
             && prev.flags & UNIX_SOCKET_FLAG == 0
@@ -4829,7 +4859,13 @@ pub(crate) fn is_socket_fd(pid: u64, fd_num: usize) -> bool {
     procs.iter().find(|p| p.pid == pid)
         .and_then(|p| p.file_descriptors.get(fd_num))
         .and_then(|f| f.as_ref())
-        .map(|f| f.mount_idx == usize::MAX && f.flags & 0x4000_0000 != 0)
+        // The AF_INET/AF_INET6 path is the SOCKET_FD marker WITHOUT the
+        // AF_NETLINK subtype bit (the AF_UNIX bit lives in a separate slot,
+        // and the unix dispatch arms are checked first; netlink fds set bit
+        // 22 and must NOT be treated as AF_INET sockets here).
+        .map(|f| f.mount_idx == usize::MAX
+              && f.flags & 0x4000_0000 != 0
+              && f.flags & NETLINK_SOCKET_FLAG == 0)
         .unwrap_or(false)
 }
 
@@ -5007,6 +5043,15 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     }
     if is_eventfd_fd(pid, fd) {
         if crate::ipc::eventfd::is_readable(get_eventfd_id(pid, fd)) { events & POLLIN } else { 0 }
+    } else if is_netlink_socket_fd(pid, fd) {
+        // AF_NETLINK readiness: POLLIN iff a reply is queued; POLLOUT always
+        // (the send path is synchronous and never blocks) — netlink(7),
+        // poll(2).  No POLLHUP/POLLRDHUP concept (netlink is connectionless).
+        let nid = get_netlink_socket_id(pid, fd);
+        let mut rev = 0u16;
+        if crate::net::netlink::has_data(nid) { rev |= events & POLLIN; }
+        if crate::net::netlink::writable(nid) { rev |= events & POLLOUT; }
+        rev
     } else if is_unix_socket_fd(pid, fd) {
         let uid = get_unix_socket_id(pid, fd);
         let has_d = crate::net::unix::has_data(uid);
@@ -5234,6 +5279,74 @@ pub(crate) fn alloc_unix_socket_fd(pid: u64, unix_id: u64, cloexec: bool, nonblo
     let fd = crate::vfs::FileDescriptor {
         mount_idx: usize::MAX,
         inode: unix_id,
+        offset: 0,
+        flags: flag_bits,
+        is_console: false,
+        cloexec,
+        file_type: crate::vfs::FileType::Socket,
+        open_path: alloc::string::String::new(),
+    };
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
+    };
+    for i in 0..proc.file_descriptors.len() {
+        if proc.file_descriptors[i].is_none() {
+            proc.file_descriptors[i] = Some(fd);
+            return i as i64;
+        }
+    }
+    if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let idx = proc.file_descriptors.len();
+        proc.file_descriptors.push(Some(fd));
+        idx as i64
+    } else {
+        -24 // EMFILE
+    }
+}
+
+// ── AF_NETLINK socket helpers ──────────────────────────────────────────────────
+
+/// Bit 22 of the fd flags word: this socket fd is an AF_NETLINK socket.  It
+/// shares the generic SOCKET_FD marker (0x4000_0000) with AF_UNIX/AF_INET but
+/// carries this subtype bit so the dispatch arms route it to `net::netlink`
+/// rather than the AF_INET socket path.  Distinct from `UNIX_SOCKET_FLAG`
+/// (bit 23), so the three families are mutually exclusive.
+pub(crate) const NETLINK_SOCKET_FLAG: u32 = 0x0040_0000;
+
+/// Check if a file descriptor is an AF_NETLINK socket.
+pub(crate) fn is_netlink_socket_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.mount_idx == usize::MAX
+              && f.flags & 0x4000_0000 != 0
+              && f.flags & NETLINK_SOCKET_FLAG != 0)
+        .unwrap_or(false)
+}
+
+/// Get the netlink socket id for a file descriptor.
+pub(crate) fn get_netlink_socket_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+/// Allocate a new AF_NETLINK socket fd, returning the fd number or negative
+/// errno.  `cloexec` sets FD_CLOEXEC; `nonblock` sets O_NONBLOCK in the fd's
+/// status flags so subsequent recv calls return -EAGAIN instead of blocking
+/// (socket(2) SOCK_CLOEXEC / SOCK_NONBLOCK).
+pub(crate) fn alloc_netlink_socket_fd(pid: u64, netlink_id: u64, cloexec: bool, nonblock: bool) -> i64 {
+    let mut flag_bits: u32 = 0x4000_0000 | NETLINK_SOCKET_FLAG; // SOCKET_FD | NETLINK
+    if nonblock { flag_bits |= 0x0800; }
+    let fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode: netlink_id,
         offset: 0,
         flags: flag_bits,
         is_console: false,

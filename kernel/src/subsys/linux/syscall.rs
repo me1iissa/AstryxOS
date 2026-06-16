@@ -1367,6 +1367,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 crate::net::unix::close(unix_id);
+            // If it's an AF_NETLINK socket fd, close the underlying netlink socket.
+            } else if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                crate::net::netlink::close(nl_id);
             // If it's an AF_INET socket fd, close the underlying socket.
             } else if crate::syscall::is_socket_fd(pid, fd) {
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
@@ -1753,7 +1757,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let cloexec  = (arg2 & 0x80000) != 0;
             let nonblock = (arg2 & 0x00800) != 0;
             let pid = crate::proc::current_pid_lockless();
-            if domain == 1 {
+            if domain == 16 {
+                // AF_NETLINK: routing/device introspection socket (NETLINK_ROUTE).
+                // `type` is SOCK_RAW (3) or SOCK_DGRAM (2) — netlink ignores the
+                // distinction (netlink(7)).  `protocol` (arg3) selects the netlink
+                // family; we only implement NETLINK_ROUTE (0).  Any other protocol
+                // is EPROTONOSUPPORT per socket(2).
+                let protocol = arg3 as u32;
+                if protocol != crate::net::netlink::NETLINK_ROUTE {
+                    return -93; // EPROTONOSUPPORT
+                }
+                if sock_type != 3 && sock_type != 2 {
+                    return -93; // EPROTONOSUPPORT — only SOCK_RAW/SOCK_DGRAM
+                }
+                let nl_id = crate::net::netlink::create(protocol);
+                if nl_id == u64::MAX { return -24; } // EMFILE
+                crate::syscall::alloc_netlink_socket_fd(pid, nl_id, cloexec, nonblock)
+            } else if domain == 1 {
                 // AF_UNIX: use net::unix module.
                 // SOCK_STREAM=1, SOCK_DGRAM=2, SOCK_SEQPACKET=5.
                 let kind = match sock_type {
@@ -2090,7 +2110,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 unsafe { core::slice::from_raw_parts(buf_ptr, len) }.to_vec()
             };
             let data: &[u8] = &data_owned;
-            if crate::syscall::is_unix_socket_fd(pid, fd) {
+            if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                // AF_NETLINK sendto/send: the request payload is one or more
+                // nlmsghdr-framed messages; the destination sockaddr_nl is
+                // ignored (rtnetlink requests target the kernel, nl_pid 0).
+                // The reply is built synchronously and queued for recv.
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                crate::net::netlink::send_request(nl_id, data, pid as u32)
+            } else if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 crate::net::unix::write(unix_id, data)
             } else {
@@ -2166,6 +2193,50 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let msg_dontwait = (flags & 0x40) != 0;
             let addr_ptr     = arg5;
             let addrlen_ptr  = arg6 as *mut u32;
+            if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                // AF_NETLINK recvfrom/recv: dequeue one queued reply (a
+                // multipart run of nlmsghdr-framed messages ending in
+                // NLMSG_DONE).  A blocking recv parks until a reply is queued;
+                // since our dump is produced synchronously on the send path,
+                // the reply is normally already present.  If the caller
+                // supplied a sockaddr, fill a sockaddr_nl whose nl_pid is 0
+                // (the message came from the kernel — sockaddr_nl(7)).
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if blocking {
+                    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
+                    while !crate::net::netlink::has_data(nl_id) {
+                        if signal_pending(pid) { return -4; } // EINTR
+                        crate::net::poll();
+                        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                            return -11; // EAGAIN
+                        }
+                        crate::sched::yield_cpu();
+                    }
+                }
+                let (n, _trunc) = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                    crate::net::netlink::recv(nl_id, buf)
+                };
+                if n == 0 { return -11; } // EAGAIN — empty queue, non-blocking
+                // Fill the source sockaddr_nl (nl_pid = 0 = kernel) if asked.
+                if addr_ptr != 0 && !addrlen_ptr.is_null() {
+                    let cap = unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::read(addrlen_ptr)
+                    } as usize;
+                    let mut sa = [0u8; 12];
+                    sa[0] = 16; // AF_NETLINK
+                    let w = cap.min(12);
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(sa.as_ptr(), addr_ptr as *mut u8, w);
+                        core::ptr::write_unaligned(addrlen_ptr, 12u32);
+                    }
+                }
+                return n as i64;
+            }
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 // Per recvfrom(2) / unix(7): a recv on a socket without
@@ -2563,6 +2634,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
                 return total as i64;
             }
+            // AF_NETLINK sendmsg: gather all iovecs into one request buffer and
+            // process it as a single rtnetlink request batch.  A netlink message
+            // is self-framed by its nlmsghdr.nlmsg_len, so concatenation across
+            // iovecs is well-defined (netlink(7)).  The destination sockaddr_nl
+            // (msg_name) is ignored — rtnetlink requests target the kernel.
+            if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                for iov in &iovecs_owned {
+                    let base = iov[0] as *const u8;
+                    let slen = iov[1] as usize;
+                    if slen == 0 { continue; }
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    req.extend_from_slice(unsafe { core::slice::from_raw_parts(base, slen) });
+                }
+                return crate::net::netlink::send_request(nl_id, &req, pid as u32);
+            }
+
             // Non-SCM fast path (AF_UNIX frame with no ancillary fds, or AF_INET):
             // push the frame's data bytes per-iovec.  An SCM_RIGHTS AF_UNIX frame
             // was already committed atomically above and returned; reaching here
@@ -2650,6 +2739,66 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 (iov[0][0] as *mut u8, iov[0][1] as usize)
             };
             let bytes_read: i64;
+            if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                // AF_NETLINK recvmsg: drain one queued reply into iov[0].
+                // Each reply is a self-contained multipart run of nlmsghdr
+                // messages ending in NLMSG_DONE (netlink(7)).  Blocking recv
+                // parks until a reply is queued; the dump is produced
+                // synchronously on the send path so it is normally present.
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                let msg_dontwait = (arg3 & 0x40) != 0;
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if blocking {
+                    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
+                    while !crate::net::netlink::has_data(nl_id) {
+                        if signal_pending(pid) { return -4; } // EINTR
+                        crate::net::poll();
+                        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                            return -11; // EAGAIN
+                        }
+                        crate::sched::yield_cpu();
+                    }
+                }
+                let (n, trunc) = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+                    crate::net::netlink::recv(nl_id, buf)
+                };
+                if n == 0 {
+                    return -11; // EAGAIN — empty queue (non-blocking)
+                }
+                // Marshal the source sockaddr_nl (nl_pid = 0 = kernel) into
+                // msg_name when the caller supplied a buffer; set msg_namelen.
+                let (name_ptr, name_cap) = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    (core::ptr::read_unaligned(msghdr_ptr.add(0)),
+                     core::ptr::read_unaligned(msghdr_ptr.add(1)) as u32 as usize)
+                };
+                if name_ptr != 0 {
+                    let mut sa = [0u8; 12];
+                    sa[0] = 16; // AF_NETLINK
+                    let w = name_cap.min(12);
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(sa.as_ptr(), name_ptr as *mut u8, w);
+                        // msg_namelen is the socklen_t at byte offset 8.
+                        core::ptr::write_unaligned((arg2 + 8) as *mut u32, 12u32);
+                    }
+                }
+                // msg_flags (offset 48): set MSG_TRUNC (0x20) when the reply
+                // did not fit the supplied buffer (recvmsg(2)); else 0.
+                // msg_controllen (word5) = 0 — netlink carries no ancillary data.
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    let flags_val: u32 = if trunc { 0x20 } else { 0 };
+                    core::ptr::write_unaligned(msghdr_ptr.add(6) as *mut u32, flags_val);
+                    let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
+                    if ctrl_ptr != 0 {
+                        core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
+                    }
+                }
+                return n as i64;
+            }
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 // Per recvmsg(2) / unix(7): a recv on a socket that is not in
@@ -3016,7 +3165,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::read_unaligned(addr_ptr as *const u16)
             };
-            if family == 1 {
+            if family == 16 {
+                // AF_NETLINK — sockaddr_nl { u16 nl_family; u16 nl_pad;
+                // u32 nl_pid; u32 nl_groups } (sockaddr_nl(7)).  nl_pid==0
+                // requests a kernel-assigned port id; any non-zero value is
+                // accepted verbatim.  groups are accepted but unused (we deliver
+                // no multicast).
+                if !crate::syscall::is_netlink_socket_fd(pid, fd) { return -9; }
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                let (nl_pid, nl_groups) = if addrlen >= 12 {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let pid_v = unsafe {
+                        core::ptr::read_unaligned((addr_ptr + 4) as *const u32)
+                    };
+                    let grp_v = unsafe {
+                        core::ptr::read_unaligned((addr_ptr + 8) as *const u32)
+                    };
+                    (pid_v, grp_v)
+                } else {
+                    (0u32, 0u32)
+                };
+                crate::net::netlink::bind(nl_id, nl_pid, nl_groups, pid as u32) as i64
+            } else if family == 1 {
                 // AF_UNIX — sockaddr_un
                 if !crate::syscall::is_unix_socket_fd(pid, fd) { return -9; }
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
@@ -3103,6 +3273,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 core::ptr::read(addrlen_ptr)
             } as usize;
 
+            if crate::syscall::is_netlink_socket_fd(pid, fd) {
+                // AF_NETLINK getsockname — sockaddr_nl { u16 nl_family;
+                // u16 nl_pad; u32 nl_pid; u32 nl_groups } (sockaddr_nl(7)).
+                // Reports the bound port id in nl_pid; groups is 0 (we join
+                // no multicast groups).  A never-bound socket reports nl_pid=0.
+                let nl_id = crate::syscall::get_netlink_socket_id(pid, fd);
+                let nl_pid = crate::net::netlink::local_pid(nl_id).unwrap_or(0);
+                let want = 12usize; // sizeof(struct sockaddr_nl)
+                let mut tmp = [0u8; 12];
+                tmp[0] = 16; // nl_family = AF_NETLINK (lo)
+                tmp[1] = 0;  // AF_NETLINK hi
+                // nl_pad (offset 2) stays 0.
+                tmp[4..8].copy_from_slice(&nl_pid.to_ne_bytes()); // nl_pid
+                // nl_groups (offset 8) stays 0.
+                let n = cap.min(want);
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(tmp.as_ptr(), addr_ptr as *mut u8, n);
+                    core::ptr::write(addrlen_ptr, want as u32);
+                }
+                return 0;
+            }
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 // AF_UNIX sockaddr_un — minimal: family=1, empty path.
                 // Suffices for socketpair() peers and unnamed sockets;
@@ -6704,6 +6896,28 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
             }
         }
+    } else if crate::syscall::is_netlink_socket_fd(pid, fd as usize) {
+        // read(2) on an AF_NETLINK socket drains one queued reply, same as
+        // recv (netlink(7)).  Blocking read parks until a reply is queued.
+        let nl_id = crate::syscall::get_netlink_socket_id(pid, fd as usize);
+        let blocking = !fd_is_nonblocking(pid, fd as usize);
+        if blocking {
+            let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
+            while !crate::net::netlink::has_data(nl_id) {
+                if signal_pending(pid) { return -4; } // EINTR
+                crate::net::poll();
+                if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                    return -11; // EAGAIN
+                }
+                crate::sched::yield_cpu();
+            }
+        }
+        let (n, _trunc) = {
+            let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+            let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+            crate::net::netlink::recv(nl_id, buf_sl)
+        };
+        return if n == 0 { -11 } else { n as i64 };
     } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
         let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
         // Per read(2) / unix(7): read on a blocking AF_UNIX socket (no
@@ -7252,13 +7466,14 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // The VFS fd_write path below threads the raw user pointer through into
     // its own STAC/CLAC-bracketed copy helpers, so we don't need to snapshot
     // for that case — keeping the zero-copy fast path intact.
-    let is_pipe   = crate::syscall::is_pipe_fd(pid, fd as usize);
-    let is_unix   = !is_pipe && crate::syscall::is_unix_socket_fd(pid, fd as usize);
-    let is_inet   = !is_pipe && !is_unix && crate::syscall::is_socket_fd(pid, fd as usize);
-    let is_evfd   = !is_pipe && !is_unix && !is_inet
+    let is_pipe    = crate::syscall::is_pipe_fd(pid, fd as usize);
+    let is_unix    = !is_pipe && crate::syscall::is_unix_socket_fd(pid, fd as usize);
+    let is_netlink = !is_pipe && !is_unix && crate::syscall::is_netlink_socket_fd(pid, fd as usize);
+    let is_inet    = !is_pipe && !is_unix && !is_netlink && crate::syscall::is_socket_fd(pid, fd as usize);
+    let is_evfd    = !is_pipe && !is_unix && !is_netlink && !is_inet
                     && crate::syscall::is_eventfd_fd(pid, fd as usize);
 
-    if is_pipe || is_unix || is_inet || is_evfd {
+    if is_pipe || is_unix || is_netlink || is_inet || is_evfd {
         // User-pointer check: required for real user-space callers to prevent
         // ring-0 from writing kernel memory on behalf of a user process (CWE-823).
         // Bypassed when called from dispatch_linux_kernel (KernelDispatchGuard),
@@ -7288,6 +7503,13 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         if is_unix {
             let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
             return crate::net::unix::write(unix_id, data);
+        }
+        if is_netlink {
+            // write(2) on an AF_NETLINK socket is equivalent to a send of the
+            // request payload (netlink(7)): process the rtnetlink request and
+            // queue the reply.
+            let nl_id = crate::syscall::get_netlink_socket_id(pid, fd as usize);
+            return crate::net::netlink::send_request(nl_id, data, pid as u32);
         }
         if is_inet {
             let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
@@ -11327,10 +11549,11 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
         })
     };
 
-    const SOCKET_FD_BIT:  u32 = 0x4000_0000;
-    const UNIX_SOCK_BIT:  u32 = 0x0080_0000;
-    const PIPE_FD_BIT:    u32 = 0x8000_0000;
-    const O_WRONLY_BIT:   u32 = 0x01;
+    const SOCKET_FD_BIT:   u32 = 0x4000_0000;
+    const UNIX_SOCK_BIT:   u32 = 0x0080_0000;
+    const NETLINK_SOCK_BIT: u32 = 0x0040_0000;
+    const PIPE_FD_BIT:     u32 = 0x8000_0000;
+    const O_WRONLY_BIT:    u32 = 0x01;
 
     match info {
         None => match fd { 0 => 0, 1 | 2 => EPOLLOUT, _ => EPOLLERR },
@@ -11389,7 +11612,14 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                 //
                 // AF_INET goes through the protocol's `socket_has_data`
                 // — same shape, distinct backend.
-                if flags & UNIX_SOCK_BIT != 0 {
+                if flags & NETLINK_SOCK_BIT != 0 {
+                    // AF_NETLINK: EPOLLIN iff a reply is queued; EPOLLOUT
+                    // always (synchronous send never blocks) — netlink(7),
+                    // epoll(7).  No EPOLLHUP/EPOLLRDHUP (connectionless).
+                    let mut ev = EPOLLOUT;
+                    if crate::net::netlink::has_data(inode) { ev |= EPOLLIN; }
+                    ev
+                } else if flags & UNIX_SOCK_BIT != 0 {
                     // EPOLLOUT only when a `write()` would make progress — the
                     // peer's recv ring has room, or the write side can no
                     // longer block (SHUT_WR / peer-gone / not-connected, where

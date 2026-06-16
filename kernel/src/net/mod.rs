@@ -25,6 +25,7 @@ pub mod socket;
 pub mod dns;
 pub mod dhcp;
 pub mod unix;
+pub mod netlink;
 pub mod loopback;
 pub mod ipver;
 
