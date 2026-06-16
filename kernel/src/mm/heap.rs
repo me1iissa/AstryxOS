@@ -27,8 +27,20 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Kernel heap size: 128 MiB (sufficient for 1920×1080 GUI with multiple window surfaces).
-pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
+/// Kernel heap size: 384 MiB.
+///
+/// 128 MiB sufficed for a 1920×1080 GUI with a few window surfaces, but a
+/// heavy real-world web page exhausts it: anonymous in-memory files
+/// (memfd_create(2)/tmpfs) back their data in a `Vec<u8>` on this heap, so a
+/// large shared image surface lands here in one allocation.  A 4K hero image
+/// decoded RGBA is 3840×2400×4 = 36 MiB in a single `Vec` resize; combined
+/// with the page's many cached subresources that single allocation tipped a
+/// near-full 128 MiB heap over (observed: 119 MiB allocated / 9 MiB free at
+/// the failure, so the 36 MiB request could not fit).  384 MiB gives ample
+/// room for such surfaces while staying far below the bootloader's 1 GiB
+/// higher-half huge-page map limit (heap base ~10 MiB phys + 384 MiB ends at
+/// ~394 MiB, well under 1 GiB) and using only a fraction of guest RAM.
+pub const HEAP_SIZE: usize = 384 * 1024 * 1024;
 
 /// Minimum heap base virtual address — phys 8 MiB in the higher-half map.
 ///

@@ -550,15 +550,28 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         STAT_IPIS_SENT.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Spin on ack from each target.  Bounded so a wedged CPU (e.g. a
-    // KVM vCPU that is host-descheduled during a long critical section)
-    // does not deadlock the whole kernel.  The bound is ~10 ms at 1 GHz
-    // — about 1 000× larger than the previous 1 ms budget — to cover
-    // realistic KVM vCPU scheduling jitter without risking indefinite
-    // spin.  Per Intel SDM Vol. 3A §10.6.1, IPI delivery to a wedged
-    // or powered-down CPU must be handled by the sender; this bound
-    // provides that guarantee.
-    const ACK_BOUND: u32 = 10_000_000;
+    // Spin on ack from each target.  Bounded so a CPU that cannot ack —
+    // because it is IF-masked in a critical section that is NOT this
+    // ack-spin (a heap allocation under `HeapIrqGuard`, a long fault
+    // handler, etc.) and therefore cannot take the shootdown IPI nor
+    // reach the inline self-service drain — does not stall this sender
+    // for the full bound.  Per Intel SDM Vol. 3A §10.6.1 the sender is
+    // responsible for delivery to a CPU that cannot service the IPI
+    // itself; on timeout this sender returns `false` and frame-freeing
+    // callers route the affected frame through `quarantine_free` so a
+    // surviving stale TLB entry can never alias a recycled frame, while
+    // re-make-writable callers simply let the sibling re-fault benignly.
+    //
+    // The bound is ~0.5 ms at 1 GHz.  The previous 10 ms bound was chosen
+    // to never time out under KVM vCPU host-deschedule jitter, but with the
+    // inline self-service drain (which resolves the common spin-vs-spin
+    // cross-CPU case in microseconds) the only remaining timeouts come from
+    // a target masked in a *different* section — a transient that resolves
+    // the instant that section completes.  Burning 10 ms per such transient
+    // serialised seconds of latency under the heavy CLONE/munmap churn of a
+    // page-encode; 0.5 ms still comfortably covers genuine scheduling jitter
+    // while collapsing the worst-case tax ~20×.
+    const ACK_BOUND: u32 = 500_000;
     let mut remaining = targets;
     let mut iters: u32 = 0;
     while remaining != 0 && iters < ACK_BOUND {
