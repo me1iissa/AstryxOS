@@ -2868,7 +2868,42 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         offset
     };
 
-    let n = fs.write(inode, write_offset, data)?;
+    // Bounce the write through a kernel-heap buffer for the same reason the
+    // read path does (see `fd_read`): a block-backed filesystem (ext2) services
+    // an aligned whole-block write by handing the source slice straight to the
+    // block device, which DMAs *from* it.  The virtio-blk descriptor's address
+    // field is a physical address derived from the buffer's virtual address by
+    // a fixed offset with no page-table walk, so a user virtual address gets
+    // written into the descriptor verbatim and the device reads from a bogus
+    // physical address — halting the virtqueue exactly as the read bug did.
+    // Copy each chunk of user bytes into a kernel-heap (physically-contiguous)
+    // buffer, then hand THAT to the filesystem.  Bounded to 256 KiB chunks so a
+    // huge write never allocates a count-sized kernel buffer.  In-memory
+    // filesystems (ramfs/tmpfs) memcpy and are unaffected; fat32 already
+    // bounces through its sector cache, and the ext2 partial-block tail RMWs
+    // through a kernel buffer — only the ext2 whole-block fast path leaked the
+    // user pointer, which this closes for every backing-store write.
+    let n = {
+        const BOUNCE_CHUNK: usize = 256 * 1024;
+        let chunk_cap = count.min(BOUNCE_CHUNK);
+        let mut bounce = alloc::vec![0u8; chunk_cap];
+        let mut done = 0usize;
+        loop {
+            if done >= count {
+                break;
+            }
+            let want = (count - done).min(chunk_cap);
+            // Copy the user bytes into the kernel bounce buffer (the read of
+            // `data` may fault the user pages in — MOUNTS already dropped).
+            bounce[..want].copy_from_slice(&data[done..done + want]);
+            let put = fs.write(inode, write_offset + done as u64, &bounce[..want])?;
+            done += put;
+            if put < want {
+                break; // short write — the backing store accepted no more.
+            }
+        }
+        done
+    };
 
     // Page-cache coherency: any process that previously mmap'd this file
     // has a cache-page-backed PTE that points at the pre-write bytes.
