@@ -3087,6 +3087,13 @@ pub fn run() -> ! {
     total += 1;
     if test_299_mmap_placement_race_repick() { passed += 1; }
 
+    // ── Test 300: syslog(2)/klogctl reads the kernel log ring ──────────────
+    // `dmesg` reads the kernel log via syslog(2) READ_ALL.  Verifies the
+    // action surface (READ_ALL/READ_CLEAR/CLEAR/SIZE_BUFFER/SIZE_UNREAD) and
+    // the EINVAL gates.  Refs: syslog(2)/klogctl man page; published klog ABI.
+    total += 1;
+    if test_300_syslog_klogctl_reads_log_ring() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -54879,6 +54886,186 @@ fn test_299_mmap_placement_race_repick() -> bool {
         test_pass!("mmap re-picks a fresh base on lost placement race (Test 299)");
     }
     ok
+}
+
+// ── Test 300: syslog(2)/klogctl reads the kernel log ring ────────────────────
+//
+// `dmesg` (busybox/util-linux) reads the kernel log via syslog(2) with
+// SYSLOG_ACTION_READ_ALL (type 3): copy the LAST `len` bytes currently in the
+// ring buffer into the user buffer, non-destructively.  This test writes a
+// known marker into the ring, then exercises the action surface:
+//
+//   - SYSLOG_ACTION_SIZE_BUFFER (10)  → total ring capacity (DMESG_CAP)
+//   - SYSLOG_ACTION_READ_ALL  (3)     → marker present in the returned tail
+//   - SYSLOG_ACTION_READ_CLEAR(4)     → marker present, then ring cleared
+//   - SYSLOG_ACTION_CLEAR (5) + SIZE_UNREAD (9) → empty after clear
+//   - unknown action → -EINVAL
+//
+// The handler validates the user buffer via `validate_user_ptr` + the SMAP
+// `UserGuard` bracket.  This test runs in kernel context with a kernel-VA
+// stack buffer, so the calls are wrapped in `KernelDispatchGuard` to set the
+// per-CPU user-pointer-check bypass — the same pattern as the other in-kernel
+// copy-to-user syscall tests.  Refs: syslog(2)/klogctl man page; published
+// klog ABI (`<sys/klog.h>` SYSLOG_ACTION_*).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_300_syslog_klogctl_reads_log_ring() -> bool {
+    test_header!("syslog(2)/klogctl reads the kernel log ring (Test 300)");
+    let mut ok = true;
+
+    const READ:       u64 = 2;
+    const READ_ALL:   u64 = 3;
+    const READ_CLEAR: u64 = 4;
+    const CLEAR:      u64 = 5;
+    const SIZE_UNREAD: u64 = 9;
+    const SIZE_BUFFER: u64 = 10;
+
+    // Seed a unique marker into the ring directly (the same ring the serial
+    // tee feeds).  Use a needle that won't collide with normal boot output.
+    const MARKER: &str = "[TEST300-DMESG-MARKER] kernel log ring needle\n";
+    crate::util::dmesg::DMESG.lock().clear();
+    crate::util::dmesg::write_str(MARKER);
+
+    // SIZE_BUFFER → capacity.  buf/len ignored for this action.
+    {
+        let cap = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(SIZE_BUFFER, 0, 0)
+        };
+        test_println!("  SIZE_BUFFER → {}", cap);
+        if cap != crate::util::dmesg::DMESG_CAP as i64 {
+            test_fail!("syslog", "SIZE_BUFFER returned {} (want {})",
+                cap, crate::util::dmesg::DMESG_CAP);
+            ok = false;
+        }
+    }
+
+    // SIZE_UNREAD reflects the seeded marker (consuming-read accounting).
+    {
+        let unread = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(SIZE_UNREAD, 0, 0)
+        };
+        test_println!("  SIZE_UNREAD → {}", unread);
+        if unread < MARKER.len() as i64 {
+            test_fail!("syslog", "SIZE_UNREAD {} < marker len {}", unread, MARKER.len());
+            ok = false;
+        }
+    }
+
+    // READ_ALL → the marker must appear in the returned tail.
+    {
+        let mut buf = [0u8; 1024];
+        let n = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(READ_ALL, buf.as_mut_ptr() as u64, buf.len() as u64)
+        };
+        test_println!("  READ_ALL → {} bytes", n);
+        if n < 0 {
+            test_fail!("syslog", "READ_ALL returned errno {}", n);
+            ok = false;
+        } else {
+            let got = &buf[..n as usize];
+            if find_subslice(got, MARKER.as_bytes()).is_none() {
+                test_fail!("syslog", "READ_ALL did not contain the marker");
+                ok = false;
+            } else {
+                test_println!("  READ_ALL contains the marker (OK)");
+            }
+        }
+    }
+
+    // EINVAL surface: null buffer + non-zero len, negative len, unknown action.
+    {
+        let einval_cases: &[(u64, u64, u64, &str)] = &[
+            (READ_ALL, 0, 64, "READ_ALL null-buf"),
+            (READ, 0, 64, "READ null-buf"),
+            (READ_ALL, 0x1000, u64::MAX, "READ_ALL negative-len"),
+            (9999, 0, 0, "unknown-action"),
+        ];
+        for &(act, b, l, label) in einval_cases {
+            let r = unsafe {
+                let _g = crate::syscall::KernelDispatchGuard::new();
+                crate::syscall::sys_syslog(act, b, l)
+            };
+            if r != -22 {
+                test_fail!("syslog", "{} returned {} (want -22 EINVAL)", label, r);
+                ok = false;
+            } else {
+                test_println!("  {} → -EINVAL (OK)", label);
+            }
+        }
+    }
+
+    // READ_CLEAR → marker present, then ring emptied.
+    {
+        let mut buf = [0u8; 1024];
+        let n = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(READ_CLEAR, buf.as_mut_ptr() as u64, buf.len() as u64)
+        };
+        if n < 0 || find_subslice(&buf[..n.max(0) as usize], MARKER.as_bytes()).is_none() {
+            test_fail!("syslog", "READ_CLEAR did not return the marker (n={})", n);
+            ok = false;
+        }
+        // After READ_CLEAR the ring is cleared.  Assert the unique marker is
+        // GONE rather than the ring being byte-empty: concurrent kernel/serial
+        // logging on another CPU may append fresh bytes between the internal
+        // clear and this follow-up read, but the unique marker can never
+        // reappear once cleared.
+        let after = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(READ_ALL, buf.as_mut_ptr() as u64, buf.len() as u64)
+        };
+        test_println!("  READ_CLEAR then READ_ALL → {} bytes", after);
+        if after > 0
+            && find_subslice(&buf[..after as usize], MARKER.as_bytes()).is_some()
+        {
+            test_fail!("syslog", "marker still present after READ_CLEAR (READ_ALL={})", after);
+            ok = false;
+        }
+    }
+
+    // CLEAR explicit: seed again, CLEAR, then the marker is gone.  CLEAR
+    // returns 0 unconditionally; we assert the unique marker disappears
+    // rather than SIZE_UNREAD being byte-zero, since concurrent serial
+    // logging on another CPU may append fresh bytes right after the clear.
+    {
+        crate::util::dmesg::write_str(MARKER);
+        let cleared = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(CLEAR, 0, 0)
+        };
+        let unread = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(SIZE_UNREAD, 0, 0)
+        };
+        test_println!("  CLEAR → {}, SIZE_UNREAD → {}", cleared, unread);
+        let mut buf = [0u8; 1024];
+        let after = unsafe {
+            let _g = crate::syscall::KernelDispatchGuard::new();
+            crate::syscall::sys_syslog(READ_ALL, buf.as_mut_ptr() as u64, buf.len() as u64)
+        };
+        let marker_gone = after <= 0
+            || find_subslice(&buf[..after as usize], MARKER.as_bytes()).is_none();
+        if cleared != 0 || !marker_gone {
+            test_fail!("syslog", "CLEAR ret={} marker_gone={}", cleared, marker_gone);
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("syslog(2)/klogctl: READ_ALL/READ_CLEAR/CLEAR/SIZE_* + EINVAL (Test 300)");
+    }
+    ok
+}
+
+/// Find the first occurrence of `needle` in `hay`; returns the start index.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 // ── Test 295: cross-process SHARED futex keying (memfd MAP_SHARED) ───────────

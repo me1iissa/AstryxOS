@@ -40,44 +40,11 @@ const MAX_RESP_BYTES: usize = 256 * 1024;
 
 // ── Dmesg ring buffer ────────────────────────────────────────────────────────
 //
-// 64 KiB byte ring.  Intended to mirror COM1 output; currently populated
-// only by explicit `dmesg_write_str()` callers.  Wiring a mirror hook
-// into `drivers::serial::_serial_print` is a follow-up.
+// The log ring lives in `crate::util::dmesg` (always compiled, so the
+// `syslog(2)` handler can read it in non-kdb builds).  kdb's `dmesg` op reads
+// the same ring via the re-export below.
 
-const DMESG_CAP: usize = 64 * 1024;
-
-struct DmesgRing { buf: [u8; DMESG_CAP], head: usize, filled: bool }
-
-impl DmesgRing {
-    const fn new() -> Self { Self { buf: [0u8; DMESG_CAP], head: 0, filled: false } }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.buf[self.head] = b;
-            self.head += 1;
-            if self.head == DMESG_CAP { self.head = 0; self.filled = true; }
-        }
-    }
-    fn snapshot(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(if self.filled { DMESG_CAP } else { self.head });
-        if self.filled {
-            out.extend_from_slice(&self.buf[self.head..]);
-            out.extend_from_slice(&self.buf[..self.head]);
-        } else {
-            out.extend_from_slice(&self.buf[..self.head]);
-        }
-        out
-    }
-}
-
-pub(crate) static DMESG: Mutex<DmesgRing> = Mutex::new(DmesgRing::new());
-
-/// Feed bytes into the in-kernel log ring.  Tiny / no alloc.
-/// Currently only callable from within this crate; kept public so a
-/// future serial-mirror hook can forward into it without refactoring.
-#[allow(dead_code)]
-pub fn dmesg_write_str(s: &str) {
-    if let Some(mut r) = DMESG.try_lock() { r.write(s.as_bytes()); }
-}
+use crate::util::dmesg::DMESG;
 
 // ── Listener state machine ───────────────────────────────────────────────────
 

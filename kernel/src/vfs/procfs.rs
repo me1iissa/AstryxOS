@@ -64,6 +64,7 @@ const INO_UPTIME:            u64 = 2003;
 const INO_VERSION:           u64 = 2004;
 const INO_MOUNTS:            u64 = 2005;
 const INO_CMDLINE:           u64 = 2006;
+const INO_KMSG:              u64 = 2008; // /proc/kmsg — kernel log ring snapshot
 const INO_SELF_DIR:          u64 = 2010;
 const INO_SELF_MAPS:         u64 = 2011;
 const INO_SELF_STATUS:       u64 = 2012;
@@ -148,6 +149,7 @@ impl ProcFs {
             | INO_VERSION
             | INO_MOUNTS
             | INO_CMDLINE
+            | INO_KMSG
             | INO_STAT
             | INO_SELF_MAPS
             | INO_SELF_STATUS
@@ -193,6 +195,11 @@ impl ProcFs {
             INO_MOUNTS  => Some(generate_mounts()),
             INO_STAT    => Some(generate_stat()),
             INO_CMDLINE => Some(b"astryx_kernel root=/dev/ramdisk0 console=fb0\n".to_vec()),
+            // /proc/kmsg — snapshot of the kernel log ring (the same ring
+            // syslog(2)/klogctl reads).  A non-streaming snapshot read: each
+            // open returns the current ring contents.  Backed by the shared
+            // ring in `crate::util::dmesg`.
+            INO_KMSG => Some(crate::util::dmesg::snapshot()),
             // /proc/self/maps — real content from the calling process's VMA table.
             // fd_read() intercepts this path first (see vfs/mod.rs) and delegates
             // to generate_proc_maps() with the caller's PID.  This arm is the
@@ -262,6 +269,7 @@ impl FileSystemOps for ProcFs {
             (INO_ROOT, "version")           => Ok(INO_VERSION),
             (INO_ROOT, "mounts")            => Ok(INO_MOUNTS),
             (INO_ROOT, "cmdline")           => Ok(INO_CMDLINE),
+            (INO_ROOT, "kmsg")              => Ok(INO_KMSG),
             (INO_ROOT, "stat")              => Ok(INO_STAT),
             (INO_ROOT, "self")              => Ok(INO_SELF_DIR),
             (INO_ROOT, "sys")               => Ok(INO_SYS_DIR),
@@ -406,6 +414,7 @@ impl FileSystemOps for ProcFs {
                 f!("version",  INO_VERSION),
                 f!("mounts",   INO_MOUNTS),
                 f!("cmdline",  INO_CMDLINE),
+                f!("kmsg",     INO_KMSG),
                 f!("stat",     INO_STAT),
                 d!("self",     INO_SELF_DIR),
                 d!("sys",      INO_SYS_DIR),

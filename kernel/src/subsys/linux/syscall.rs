@@ -4330,6 +4330,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 102: getuid
         102 => crate::syscall::sys_getuid(),
+        // 103: syslog(type, bufp, len) — read/clear the kernel log ring.
+        // The user buffer is validated per-action inside the handler (only
+        // the READ family dereferences it), so no blanket pre-check here.
+        103 => crate::syscall::sys_syslog(arg1, arg2, arg3),
         // 104: getgid
         104 => crate::syscall::sys_getgid(),
         // 107: geteuid
