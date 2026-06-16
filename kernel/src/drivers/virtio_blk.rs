@@ -608,6 +608,24 @@ fn acquire_slot() -> Option<usize> {
     None
 }
 
+/// Count how many of the `MAX_INFLIGHT` slots are currently quarantined
+/// (timed-out, device-owned, awaiting reclaim).  Used by `do_io`'s
+/// acquire-slot deadline path to distinguish a self-inflicted slot-exhaustion
+/// wedge (every slot pinned by a leaked quarantine) from a genuinely
+/// busy-but-healthy 32-deep queue: in the former the device's used ring has
+/// nothing left to retire, so its `used.idx` legitimately freezes and the
+/// quarantined slots can NEVER be reclaimed by `drain_used_ring` — a permanent
+/// wedge that only a device reset can recover (VIRTIO 1.2 §2.7).
+fn quarantined_count() -> usize {
+    let mut n = 0;
+    for i in 0..MAX_INFLIGHT {
+        if COMPLETIONS[i].quarantined.load(Ordering::Acquire) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Release a slot for reuse.  Must be called by the same waiter that
 /// acquired it, after the wait has consumed `done` + `status` — i.e. only
 /// once the device has retired this slot's descriptor chain (or the request
@@ -1919,8 +1937,33 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
             deadline = now.saturating_add(NO_PROGRESS_TICKS);
         }
         if now >= deadline {
+            // FINAL-DRAIN re-check before quarantining (closes the spurious-
+            // quarantine TOCTOU that leaks slots under load).  Between the last
+            // `drain_used_ring` at the top of this loop and the deadline test,
+            // the device may have retired THIS slot's chain — advancing its own
+            // `used.idx` for our entry — but the global `used.idx` re-arm above
+            // only sees aggregate progress, so our slot's completion can be
+            // missed and the slot needlessly quarantined.  A quarantined slot is
+            // reclaimed ONLY when a future used-ring entry appears for it; once
+            // the device's queue empties (every other slot is also pinned) that
+            // entry never comes and the slot leaks, exhausting MAX_INFLIGHT and
+            // wedging all further I/O.  This is the GUI fork-storm cascade: the
+            // device retires requests in <2 ms (per the wait-amplification
+            // histogram) yet slots accumulate as quarantined-and-leaked.  So
+            // before giving up, walk the ring one last time and re-test `done`:
+            // if our completion has in fact landed, release the slot normally
+            // instead of leaking it via quarantine.  Per VIRTIO 1.2 §2.7.13 the
+            // device retires a chain by appending it to the used ring; this
+            // re-drain consumes exactly that.
+            if qs != 0 && vq_virt != 0 {
+                drain_used_ring(qs, vq_virt);
+            }
+            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                return Ok(yields);
+            }
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            // The request may still be owned by the device (it is in the avail
+            // The request really is still owned by the device (it is in the avail
             // ring but the device has not retired it).  Quarantine — do NOT
             // release — so its descriptor chain and data buffer are not recycled
             // under the device.  Releasing here is the bug that let in-flight
@@ -1984,8 +2027,20 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
             deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
         }
         if now >= deadline {
+            // FINAL-DRAIN re-check before quarantining — see the matching
+            // comment in `wait_adaptive`.  The device may have retired our chain
+            // since the last ring walk; re-draining and re-testing `done` here
+            // avoids needlessly quarantining (and leaking) a slot whose
+            // completion has already landed.  VIRTIO 1.2 §2.7.13.
+            if qs != 0 && vq_virt != 0 {
+                drain_used_ring(qs, vq_virt);
+            }
+            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                return Ok(yields);
+            }
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            // Quarantine, not release — the request may still be device-owned.
+            // Quarantine, not release — the request really is still device-owned.
             quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
@@ -2178,6 +2233,26 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         let mut acq_last_used = device_used_idx(acq_qs, acq_vq);
         let mut acq_deadline = crate::arch::x86_64::irq::get_ticks()
             .saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+        // One-shot device-reset recovery for self-inflicted slot exhaustion.
+        // Under a heavy fork/teardown storm (the GTK/X11 GUI-launch path) the
+        // per-request no-progress deadline can fire on a burst of in-flight
+        // requests, quarantining their slots.  A quarantined slot is reclaimed
+        // ONLY when the device produces a used-ring entry for it; once EVERY
+        // slot is quarantined the device's queue is empty, its `used.idx`
+        // freezes for lack of anything to retire, and the quarantined slots can
+        // never be reclaimed — a permanent wedge that starves all further I/O
+        // and, downstream, fails the demand-fault read of a shared-library code
+        // page (delivering a fatal SIGSEGV to the faulting process).  The
+        // device itself is healthy (it retired thousands of prior requests); the
+        // queue is wedged purely by our own leaked quarantines.  When the
+        // acquire deadline fires on this signature, a single device reset drops
+        // all (now-meaningless) in-flight chains and releases every slot — the
+        // spec-sanctioned way to abandon device-owned buffers (VIRTIO 1.2 §2.7)
+        // — converting the permanent wedge into a transient hiccup.  Gated to
+        // fire at most once per `do_io` call and only on the exhaustion
+        // signature, so a genuinely-busy 32-deep queue (no quarantines) never
+        // triggers it and a truly dead device still fails after the reset.
+        let mut reset_recovered = false;
         let slot = loop {
             if let Some(s) = acquire_slot() {
                 break s;
@@ -2193,9 +2268,35 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
                 acq_last_used = cur_used;
                 acq_deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
             } else if crate::sched::is_active() && now >= acq_deadline {
-                // No slot freed and no device progress for the whole window —
-                // the device is wedged.  Fail-fast (matches the wait-completion
-                // deadline contract) instead of hanging the caller forever.
+                // No slot freed and no device progress for the whole window.
+                // Distinguish self-inflicted slot exhaustion (every slot pinned
+                // by a leaked quarantine) from a genuinely dead device.  A high
+                // quarantine count with zero free slots is the exhaustion
+                // signature: reset the device once to recover the queue, then
+                // give the acquire one more full window.
+                if !reset_recovered
+                    && quarantined_count() >= MAX_INFLIGHT / 2
+                {
+                    crate::serial_println!(
+                        "[VIRTIO-BLK] slot exhaustion ({}/{} quarantined) — \
+                         resetting device to recover the queue",
+                        quarantined_count(), MAX_INFLIGHT);
+                    // `restart_device` takes VIRTIO_BLK.lock() (not held here)
+                    // and releases ALL slots after the reset.  Re-snapshot the
+                    // ISR virtqueue handles afterwards: the reset zeroes the
+                    // used ring and resets `used.idx`, so our cached cursor must
+                    // restart too.
+                    if restart_device() {
+                        reset_recovered = true;
+                        acq_last_used = device_used_idx(acq_qs, acq_vq);
+                        acq_deadline =
+                            now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+                        continue;
+                    }
+                }
+                // Reset already attempted (or refused) and still no slot — the
+                // device is genuinely wedged.  Fail-fast (matches the
+                // wait-completion deadline contract) instead of hanging forever.
                 return Err(BlockError::IoError);
             }
             if crate::sched::is_active() {
