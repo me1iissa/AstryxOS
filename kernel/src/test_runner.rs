@@ -2919,6 +2919,18 @@ pub fn run() -> ! {
     total += 1;
     if test_521_scm_recycle_incarnation_isolation() { passed += 1; }
 
+    // ── Test 522: concurrent same-peer SCM_RIGHTS sendmsg atomicity ───────
+    // Two SCM_RIGHTS-bearing frames sent to the SAME peer must each bind their
+    // fd batch to their OWN byte range: frame A's fds deliver at A's byte
+    // boundary, frame B's at B's, never crossed.  The atomic send commits the
+    // bind-offset capture, the byte push, and the batch enqueue under ONE unix
+    // TABLE lock, so no concurrent sender can advance the peer's recv stream
+    // between A's offset capture and A's byte append (the desync that aborts an
+    // IPDL channel with "actor not managed" / deserialization failure).  Refs:
+    // recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+    total += 1;
+    if test_522_scm_sendmsg_atomic_no_desync() { passed += 1; }
+
     // ── Test 293: epoll EPOLLIN parity on a listening AF_UNIX socket ───────
     // A listening AF_UNIX socket with a queued connection is read-ready;
     // epoll_wait(2) must report EPOLLIN for it just as poll(2)/select(2) do
@@ -52890,6 +52902,161 @@ fn test_521_scm_recycle_incarnation_isolation() -> bool {
     unix::close(c);
     unix::close(d);
     test_pass!("SCM_RIGHTS batch undeliverable across a recycled AF_UNIX slot (Test 521)");
+    true
+}
+
+// ── Test 522: concurrent same-peer SCM_RIGHTS sendmsg atomicity ──────────────
+//
+// Each `sendmsg(2)` carrying SCM_RIGHTS must commit its data bytes AND its
+// ancillary fd batch to the peer as one indivisible unit, so the batch's
+// recorded byte_offset always names bytes that belong to THAT frame.  The prior
+// code captured the bind offset (TABLE lock), queued the batch (PENDING_SCM
+// lock), and pushed the bytes (TABLE lock) in three separate critical sections;
+// two concurrent same-peer senders could interleave so both batches bound to
+// the SAME pre-push stream position even though their bytes occupy disjoint
+// ranges — the receiver then dequeues an fd batch at a byte position carrying a
+// DIFFERENT frame's data and the consuming IPDL channel aborts.
+//
+// `scm_send_frame_atomic` holds the unix TABLE lock across the offset capture,
+// the byte push, and the batch enqueue, so the byte cursor cannot move between
+// a frame's offset capture and its byte append.  This test drives that path for
+// two same-peer frames whose pushes are adjacent (modelling the interleave) and
+// asserts each frame's fds dequeue at its own byte boundary, never crossed.
+// Refs: recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+fn test_522_scm_sendmsg_atomic_no_desync() -> bool {
+    use crate::net::unix;
+    test_header!("concurrent same-peer SCM_RIGHTS sendmsg atomicity (Test 522)");
+
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let (a, b) = unix::socketpair(unix::SockKind::Stream, creds);
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_atomic", "socketpair returned MAX");
+        return false;
+    }
+    // Distinguishable throw-away descriptors (mount_idx==usize::MAX keeps them
+    // out of the inode-pin machinery; the atomic send treats them as plain
+    // batch entries — no real object refcount to balance).
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: usize::MAX, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Stream position where frame A begins (B's recv tail before any push).
+    let a_start = unix::recv_consumed(b); // == recv_popped == 0; also recv tail
+    if a_start != unix::enqueue_offset_for(b) {
+        test_fail!("scm_atomic", "precondition: nothing queued yet");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Frame A: 4 data bytes + fd 0xA0, committed atomically.
+    let res_a = unix::scm_send_frame_atomic(
+        a, &[alloc::vec![b'A'; 4]], /*bind_data_frame=*/true, alloc::vec![mk_fd(0xA0)]);
+    if res_a.error != 0 || res_a.total != 4 || res_a.unqueued_fds.is_some() {
+        test_fail!("scm_atomic", "frame A: err={} total={} unqueued={}",
+            res_a.error, res_a.total, res_a.unqueued_fds.is_some());
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // After A's atomic push, B's enqueue offset advanced by 4 — frame B begins
+    // at a_start+4.  This advance happened UNDER the same TABLE lock as A's
+    // offset capture, so B (had it raced) could not have captured a_start.
+    let b_start = unix::enqueue_offset_for(b);
+    if b_start != a_start + 4 {
+        test_fail!("scm_atomic", "B start {} != A start {} + 4", b_start, a_start);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Frame B: 4 data bytes + fd 0xB0, committed atomically (the "second
+    // concurrent sender").  Its batch must bind to b_start+1, NOT a_start+1.
+    let res_b = unix::scm_send_frame_atomic(
+        a, &[alloc::vec![b'B'; 4]], /*bind_data_frame=*/true, alloc::vec![mk_fd(0xB0)]);
+    if res_b.error != 0 || res_b.total != 4 || res_b.unqueued_fds.is_some() {
+        test_fail!("scm_atomic", "frame B: err={} total={} unqueued={}",
+            res_b.error, res_b.total, res_b.unqueued_fds.is_some());
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // ── Assertion 1: the two batches bind to DISTINCT byte offsets (A at
+    // a_start+1, B at b_start+1 == a_start+5).  With the buggy three-section
+    // path both could have bound to a_start+1, colliding.  We probe the deliver
+    // predicate at progressive read positions.
+    //
+    // Nothing read yet → neither batch deliverable (both bound ahead of 0).
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_atomic", "a batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Read frame A's first byte → recv_consumed = a_start+1.  EXACTLY frame A's
+    // batch (fd 0xA0) becomes deliverable; frame B's (bound to a_start+5) must
+    // still be WITHHELD.
+    let mut one = [0u8; 1];
+    if unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0) != 1 || one[0] != b'A' {
+        test_fail!("scm_atomic", "frame A first byte not 'A' ({:?})", one);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got_a = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got_a {
+        Some(ref v) if v.len() == 1 && v[0].inode == 0xA0 => {}
+        other => {
+            test_fail!("scm_atomic",
+                "after A's first byte expected fd 0xA0, got {:?}",
+                other.as_ref().map(|v| v.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Frame B's batch must NOT be deliverable yet (its bytes are not touched):
+    // recv_consumed is a_start+1, B is bound to a_start+5.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_atomic",
+            "frame B fds deliverable after only frame A's first byte (CROSSED binding)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  frame A fds bound to frame A's byte range ✓");
+
+    // Drain the rest of frame A (3 bytes) + frame B's first byte → recv_consumed
+    // reaches a_start+5 == b_start+1, so frame B's batch (fd 0xB0) now delivers.
+    let mut rest = [0u8; 4]; // "AAA" + "B"
+    let rn = unix::read_msg(b, &mut rest).map(|(c, _)| c).unwrap_or(0);
+    if rn != 4 || &rest != b"AAAB" {
+        test_fail!("scm_atomic", "drain to B's first byte = {} / {:?}", rn, rest);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got_b = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got_b {
+        Some(ref v) if v.len() == 1 && v[0].inode == 0xB0 => {}
+        other => {
+            test_fail!("scm_atomic",
+                "after B's first byte expected fd 0xB0, got {:?}",
+                other.as_ref().map(|v| v.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    test_println!("  frame B fds bound to frame B's byte range (not crossed with A) ✓");
+
+    // The remaining 3 bytes of frame B are intact.
+    let mut tail = [0u8; 3];
+    let tn = unix::read_msg(b, &mut tail).map(|(c, _)| c).unwrap_or(0);
+    if tn != 3 || &tail != b"BBB" {
+        test_fail!("scm_atomic", "frame B tail = {} / {:?}", tn, tail);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("concurrent same-peer SCM_RIGHTS sendmsg atomicity (Test 522)");
     true
 }
 
