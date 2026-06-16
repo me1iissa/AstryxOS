@@ -5570,6 +5570,16 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
             elf = _get_kernel_elf()
             info = _resolve_symbol(elf, sym_name)
             if info is None:
+                # Fall back to demangled-suffix matching so a preset can name a
+                # static by its readable path (e.g.
+                # "astryx_kernel::mm::tlb::SHOOTDOWN_SLOTS") instead of the
+                # build-volatile mangled symbol — whose crate disambiguator and
+                # `.llvm.N` internal-symbol hashes change on every rebuild.
+                # Mirrors the autopsy --break suffix fallback.
+                matches = _kernel_nm_suffix_lookup(sym_name)
+                if matches:
+                    info = {"addr": hex(matches[0][0]), "size": 0, "type": "obj"}
+            if info is None:
                 return {"kind": kind, "sym": sym_name,
                         "error": "symbol not found in kernel ELF"}
             base = int(info["addr"], 16)

@@ -400,6 +400,9 @@ presets:
         kind: regs
       - name: shootdown_slots
         kind: sym_window
-        sym: _RNvNtNtCs7Jo0tKRTyaU_13astryx_kernel2mm3tlb15SHOOTDOWN_SLOTS.llvm.5193700054269298329
+        # Readable, rebuild-stable name: the sym_window resolver falls back to
+        # demangled-suffix matching when the exact symbol is absent, so this
+        # survives the crate-disambiguator / .llvm.N hash churn of each build.
+        sym: astryx_kernel::mm::tlb::SHOOTDOWN_SLOTS
         offset: 0
         len: 512

@@ -983,6 +983,22 @@ pub fn test_self_service_drains_own_slot() -> (bool, bool) {
         return (true, false);
     }
     let slot = &SHOOTDOWN_SLOTS[cpu];
+
+    // Mask interrupts across the synthetic publish + double-drain so a real
+    // TLB_SHOOTDOWN_VECTOR IPI from a sibling AP cannot land in this CPU's
+    // slot between our `pending=1` publish and our first drain (which would
+    // let `handle_shootdown_ipi` win the claim and make `first` spuriously
+    // false).  Capture the prior IF state from RFLAGS so we restore it
+    // exactly (and no-op the restore if we were already masked).
+    let prior_if: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq", "pop {f}", "cli",
+            f = out(reg) prior_if,
+            options(nomem, preserves_flags),
+        );
+    }
+
     // A CR3 that no running context can match (kernel CR3 is low phys; user
     // CR3s are PMM frames, never this sentinel) → the invalidation is skipped
     // but the claim/ack/done bookkeeping still runs.
@@ -1003,6 +1019,11 @@ pub fn test_self_service_drains_own_slot() -> (bool, bool) {
     slot.cr3.store(0, Ordering::Relaxed);
     slot.va_lo.store(0, Ordering::Relaxed);
     slot.va_hi.store(0, Ordering::Relaxed);
+
+    // Restore IF only if it was set on entry.
+    if prior_if & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+    }
 
     (first, second)
 }
