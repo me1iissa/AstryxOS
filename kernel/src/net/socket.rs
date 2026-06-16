@@ -38,6 +38,17 @@ pub struct Socket {
     // connection-mode sockets, signals end-of-stream to the peer (TCP FIN).
     pub shut_rd:   bool,
     pub shut_wr:   bool,
+    // Open-file-description reference count.  One AF_INET `Socket` entry is the
+    // shared "open file description" (POSIX.1-2017 §2.14) behind potentially
+    // many fds — fork/vfork duplicates the fd table, dup(2) clones an fd, and
+    // SCM_RIGHTS could pass one.  Each such duplicate adds a reference; the
+    // socket (and its TCP/UDP TCB) is torn down only when the LAST reference is
+    // closed.  Without this, the FIRST `close(2)` in any process destroys the
+    // socket for every other holder — the bug that left a forked dropbear
+    // session child's accepted-connection fd dangling (getpeername → ENOTCONN
+    // → "Socket not connected" early exit).  Mirrors the AF_UNIX `ref_count`
+    // model.  Initialised to 1 by every constructor (the fd that created it).
+    pub ref_count: u32,
 }
 
 /// Socket table.
@@ -65,6 +76,7 @@ pub fn socket_create(socket_type: SocketType) -> u64 {
         so_error:    0,
         shut_rd:     false,
         shut_wr:     false,
+        ref_count:   1, // the fd returned by socket(2)
     });
     id
 }
@@ -107,6 +119,7 @@ pub fn socket_create_accepted(local_port: u16,
         so_error:    0,
         shut_rd:     false,
         shut_wr:     false,
+        ref_count:   1, // the fd returned by accept(2)
     });
     id
 }
@@ -967,6 +980,16 @@ pub fn socket_fully_hung_up(id: u64) -> bool {
 pub fn socket_close(id: u64) {
     let mut sockets = SOCKETS.lock();
     if let Some(idx) = sockets.iter().position(|s| s.id == id) {
+        // Drop ONE open-file-description reference.  A socket inherited across
+        // fork(2) / duplicated via dup(2) is one shared object held by several
+        // fds; only the LAST close tears down the TCB and frees the entry.  An
+        // earlier close just decrements so the surviving holder's fd keeps
+        // resolving to a live, connected socket (POSIX.1-2017 §close: the open
+        // file description is released only when the reference count reaches 0).
+        if sockets[idx].ref_count > 1 {
+            sockets[idx].ref_count -= 1;
+            return;
+        }
         let sock = &sockets[idx];
         let socket_type = sock.socket_type;
         let local_port = sock.local_port;
@@ -1002,6 +1025,18 @@ pub fn socket_close(id: u64) {
             }
         }
         sockets.remove(idx);
+    }
+}
+
+/// Add one open-file-description reference to AF_INET socket `id`.  Called when
+/// an fd referring to this socket is duplicated — fork(2)/vfork(2) copying the
+/// fd table, dup(2)/dup2(2), or an SCM_RIGHTS pass.  Balances a later
+/// [`socket_close`].  No-op if `id` is not (or no longer) in the table — a
+/// caller racing teardown simply finds nothing to bump (it had no live fd).
+pub fn inc_ref(id: u64) {
+    let mut sockets = SOCKETS.lock();
+    if let Some(s) = sockets.iter_mut().find(|s| s.id == id) {
+        s.ref_count = s.ref_count.saturating_add(1);
     }
 }
 

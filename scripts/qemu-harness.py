@@ -1249,6 +1249,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           smp: int = 2,
                           cpu_model: Optional[str] = None,
                           esp_dir_override: Optional[str] = None,
+                          data_img_override: Optional[str] = None,
                           qga_sock: str = "",
                           extra_qemu_args: Optional[list[str]] = None,
                           snapshottable: bool = False,
@@ -1277,11 +1278,17 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         `build/esp`. Used by cmd_start to point at the session-scoped frozen
         copy under `~/.astryx-harness/<sid>.esp/`, isolating the running QEMU
         from concurrent rebuilds in the in-tree ESP.
+    data_img_override: if set, use this ext2 data image as the virtio-blk
+        data disk instead of the in-tree `build/data.img`. Lets a session
+        boot against a purpose-built side image (e.g. an sshd-staged disk at
+        `/tmp/astryx-sshd/data.img`) WITHOUT touching the shared in-tree
+        image that concurrent sessions are using. Staleness check + restage
+        are skipped for an overridden image (caller owns its contents).
     """
     wt = _get_watch_test()
     ROOT     = wt.ROOT
     ESP_DIR  = Path(esp_dir_override) if esp_dir_override else wt.ESP_DIR
-    DATA_IMG = wt.DATA_IMG
+    DATA_IMG = Path(data_img_override) if data_img_override else wt.DATA_IMG
     OVMF_CODE     = wt.OVMF_CODE
     OVMF_VARS_SRC = wt.OVMF_VARS_SRC
 
@@ -3133,9 +3140,28 @@ def cmd_start(args):
     # causing verifiers to mis-attribute the stall to the PR under review.
     # Fix: (1) auto-symlink from the source-of-truth if reachable, (2) emit a
     # visible banner regardless so the operator always knows the state.
+    # --data-img override: a caller-owned side image (e.g. an sshd-staged
+    # ext2 disk at /tmp/astryx-sshd/data.img). When set, point the data disk
+    # at it and skip the auto-symlink / staleness / restage machinery below —
+    # those only manage the shared in-tree build/data.img, and touching it
+    # would disturb concurrent sessions. The caller is responsible for having
+    # staged the override image's contents.
+    _data_img_override = getattr(args, "data_img", None)
     _data_img_path = Path(wt.DATA_IMG)
     _data_img_missing = not _data_img_path.exists()
-    if _data_img_missing:
+    if _data_img_override:
+        _data_img_path = Path(_data_img_override)
+        if not _data_img_path.exists():
+            _err(f"--data-img path does not exist: {_data_img_path}")
+        _data_img_missing = False
+        print(
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  data disk OVERRIDE (--data-img); shared image untouched      ║\n"
+            f"║  {str(_data_img_path)[:60]:<60}  ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            file=sys.stderr,
+        )
+    elif _data_img_missing:
         _CANONICAL_DATA_IMG = Path("/home/ubuntu/AstryxOS/build/data.img")
         if _CANONICAL_DATA_IMG.exists():
             _data_img_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3232,7 +3258,7 @@ def cmd_start(args):
     _disk_dir = _resolve_effective_disk_dir(Path(wt.ROOT), _data_img_path)
     _data_img_symlink = _data_img_symlink_info(_data_img_path, Path(wt.ROOT))
     _ff_variant_info["data_img_symlink"] = _data_img_symlink
-    if not _data_img_missing:
+    if not _data_img_missing and not _data_img_override:
         # Extra source directories whose compiled outputs land in build/disk/.
         # A source file newer than its compiled artifact inside build/disk/ will
         # make the artifact appear older than data.img — the normal disk_dir scan
@@ -3327,6 +3353,7 @@ def cmd_start(args):
     _staged_family = _variant_info.get("family")
     _need_variant_regen = (
         not _data_img_missing
+        and not _data_img_override     # caller-owned side image: never restage
         and not _data_img_regenerated  # avoid back-to-back regens
         and _staged_family is not None
         and _staged_family != _requested_variant
@@ -3613,6 +3640,7 @@ def cmd_start(args):
                                  smp=smp,
                                  cpu_model=cpu_model,
                                  esp_dir_override=esp_paths["session_esp_dir"],
+                                 data_img_override=_data_img_override,
                                  qga_sock=qga_sock,
                                  extra_qemu_args=extra_qemu_args,
                                  snapshottable=snapshottable,
@@ -11542,6 +11570,15 @@ def main():
                                "`ssh -p PORT root@127.0.0.1` reaches the "
                                "guest dropbear daemon.  0 = derive "
                                "deterministically from sid in 2200..2299.")
+    p_start.add_argument("--data-img", dest="data_img", type=str,
+                          default=None, metavar="PATH",
+                          help="Use PATH as the virtio-blk ext2 data disk "
+                               "instead of the in-tree build/data.img.  Lets a "
+                               "session boot a purpose-built side image (e.g. an "
+                               "sshd-staged disk) WITHOUT touching the shared "
+                               "in-tree image other sessions are using.  When "
+                               "set, the staleness check + auto-restage are "
+                               "skipped (caller owns the image's contents).")
     p_start.add_argument("--oracle-stub-conflux", dest="oracle_stub_conflux",
                           type=int, default=0, metavar="PORT",
                           help="When --features includes 'oracle-daemon-test' "

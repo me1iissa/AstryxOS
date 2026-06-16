@@ -1849,6 +1849,15 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                             && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                         {
                             crate::net::unix::close(f.inode);
+                        } else if f.mount_idx == usize::MAX
+                            && f.flags & 0x4000_0000 != 0
+                            && f.flags & crate::syscall::UNIX_SOCKET_FLAG == 0
+                        {
+                            // CLOEXEC-marked AF_INET socket: drop one ref so the
+                            // post-execve image releasing it does not destroy a
+                            // socket the forking parent still holds (last-close
+                            // semantics, parallel to the AF_UNIX arm above).
+                            crate::net::socket::socket_close(f.inode);
                         }
                         // Drop the eventfd open-file-description ref too —
                         // the slot is freed only on the LAST reference
@@ -4532,6 +4541,15 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
         && fd_clone.flags & UNIX_SOCKET_FLAG != 0
     {
         crate::net::unix::inc_ref(fd_clone.inode);
+    } else if fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x4000_0000 != 0
+        && fd_clone.flags & UNIX_SOCKET_FLAG == 0
+    {
+        // AF_INET socket: the duplicate is one more reference to the same open
+        // file description (a network server frequently dup()s the connection
+        // fd onto stdin/stdout); close(2) on either fd must not destroy the
+        // shared socket until the last reference drops.
+        crate::net::socket::inc_ref(fd_clone.inode);
     }
     // Same for anonymous pipe ends — the duplicate must count as an
     // independent reader/writer reference.  Without this, `close(2)` on
@@ -4597,11 +4615,18 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
 
     // Bump the underlying resource's open-file-description refcount.
     // Same rationale as sys_dup above (POSIX.1-2017 §2.14 / dup2(2)).
-    // Use UNIX_SOCKET_FLAG to exclude AF_INET sockets (W216 review).
     if fd_clone.file_type == crate::vfs::FileType::Socket
         && fd_clone.flags & UNIX_SOCKET_FLAG != 0
     {
         crate::net::unix::inc_ref(fd_clone.inode);
+    } else if fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x4000_0000 != 0
+        && fd_clone.flags & UNIX_SOCKET_FLAG == 0
+    {
+        // AF_INET socket: the duplicate is one more open-file-description
+        // reference (a server dup2()ing the connection fd onto stdin/stdout is
+        // the motivating case).  Balanced by the close on either fd.
+        crate::net::socket::inc_ref(fd_clone.inode);
     }
     // Same for anonymous pipe ends.
     if fd_clone.file_type == crate::vfs::FileType::Pipe
@@ -4635,6 +4660,12 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
             && prev.flags & UNIX_SOCKET_FLAG != 0
         {
             crate::net::unix::close(prev.inode);
+        } else if prev.mount_idx == usize::MAX
+            && prev.flags & 0x4000_0000 != 0
+            && prev.flags & UNIX_SOCKET_FLAG == 0
+        {
+            // Displaced AF_INET socket fd loses one open-file-description ref.
+            crate::net::socket::socket_close(prev.inode);
         }
         // A displaced eventfd loses one open-file-description ref too.
         if prev.file_type == crate::vfs::FileType::EventFd {

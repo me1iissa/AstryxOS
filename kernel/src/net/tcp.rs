@@ -716,8 +716,20 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         let st_after = conns[i].state;
         // CloseWait carries a peer-FIN EOF that pollers must observe as
         // POLLIN/EPOLLHUP (RFC 9293 §3.5, POSIX poll(2)).
+        //
+        // A SynReceived→Established transition completes the 3-way handshake
+        // (RFC 9293 §3.10): the child is now accept-pending on its listener's
+        // local port, which makes the LISTEN-socket fd readable for
+        // poll(2)/select(2)/epoll_wait(2) (has_pending_accept → socket_has_data
+        // → POLLIN).  Ring the bell on that edge too so a server parked on the
+        // listen fd (e.g. a select(2)-only accept loop like dropbear's) wakes
+        // promptly instead of waiting out the ~1 s wait_poll_event resync
+        // floor.  Detected here in the caller (not inside process_segment) so
+        // the ring fires AFTER drop(conns), preserving the "never hold the TCP
+        // table across a wake" discipline this site already follows.
         let became_readable = rb_after > rb_before
-            || (st_after == TcpState::CloseWait && st_before != TcpState::CloseWait);
+            || (st_after == TcpState::CloseWait && st_before != TcpState::CloseWait)
+            || (st_after == TcpState::Established && st_before == TcpState::SynReceived);
         drop(conns);
         for o in out {
             super::ipv4::send_ipv4(o.remote_ip, super::ipv4::PROTO_TCP, &o.seg);

@@ -623,10 +623,17 @@ pub fn init() {
     });
 
     // Create standard directories.
+    //
+    // NB: /bin is intentionally NOT mkdir'd here — it is created as a symlink
+    // to /disk/bin below (alongside /lib, /lib64, /usr, /opt).  A prior
+    // `mkdir("/bin")` made /bin a real (empty) directory, which then made the
+    // `symlink("/bin", "/disk/bin")` fail with EEXIST (silently, via `let _`),
+    // so /bin resolved to the empty tmpfs dir and every `/bin/foo` lookup —
+    // including the login shell `/bin/sh` that dropbear execs after SSH auth —
+    // NotFound'd.  Leaving /bin to the symlink path fixes that.
     let _ = mkdir("/dev");
     let _ = mkdir("/tmp");
     let _ = mkdir("/home");
-    let _ = mkdir("/bin");
     let _ = mkdir("/etc");
 
     // Symlinks so glibc/musl dynamic linker can find libraries on the data disk.
@@ -839,8 +846,17 @@ pub fn init() {
             b"export PATH=/bin:/usr/bin:/sbin:/usr/sbin\nexport HOME=/root\nexport TERM=linux\n");
     }
 
-    // /root home directory
-    let _ = mkdir("/root");
+    // /root home directory → /disk/root.  Symlinked (lazy target resolution,
+    // exactly like the /usr,/lib,/bin → /disk symlinks above which are also
+    // created here before the data disk is mounted) so a staged root home —
+    // e.g. /disk/root/.ssh/authorized_keys for the dropbear SSH demo — is
+    // reachable at the FHS path /root that /etc/passwd names as root's home
+    // (FHS 3.0).  Upstream daemons open $HOME/.ssh/... by absolute path from
+    // the guest root; without this redirect /root is an empty tmpfs dir and
+    // dropbear's pubkey auth finds no authorized_keys (silent "Permission
+    // denied (publickey)").  On an image with no /disk/root the link dangles
+    // harmlessly — an access just ENOENTs, the same outcome an empty dir gives.
+    let _ = symlink("/root", "/disk/root");
 
     // /etc/localtime stub — prevents TZ-related crashes in some libc builds
     if let Ok(()) = create_file("/etc/localtime") {

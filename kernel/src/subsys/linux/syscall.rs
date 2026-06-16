@@ -6053,6 +6053,28 @@ fn sys_select_linux(
         }
     }
 
+    // Snapshot the ORIGINAL interest set before any fd_set mutation.  POSIX
+    // select(2) defines the input fd_sets as the interest set for the WHOLE
+    // call; the kernel must not clear a requested bit until it has decided to
+    // return.  The blocking path below (probe_ready / do_rescan /
+    // bell_watch_for_fds) therefore reads readiness from THESE snapshots, not
+    // from the live user fd_set — otherwise the initial unready-bit clear that
+    // produces a correct returned fd_set would also erase the interest set the
+    // wait loop depends on, leaving a blocking select() waiting forever on an
+    // empty set (the dropbear accept-loop hang: select(4,{listenfd},NULL,NULL,
+    // NULL) parked on nothing, never re-checking the listen fd once it became
+    // accept-pending).
+    let req_read: alloc::vec::Vec<usize> = if readfds != 0 {
+        (0..nfds).filter(|&fd| {
+            fdset_read_bit(readfds, (fd / 8) as u64, 1u8 << (fd % 8), kernel_dispatch)
+        }).collect()
+    } else { alloc::vec::Vec::new() };
+    let req_write: alloc::vec::Vec<usize> = if writefds != 0 {
+        (0..nfds).filter(|&fd| {
+            fdset_read_bit(writefds, (fd / 8) as u64, 1u8 << (fd % 8), kernel_dispatch)
+        }).collect()
+    } else { alloc::vec::Vec::new() };
+
     for fd in 0..nfds {
         let byte_off = (fd / 8) as u64;
         let bit      = 1u8 << (fd % 8);
@@ -6119,40 +6141,64 @@ fn sys_select_linux(
     // mutating the caller's fd_set during the recheck (the authoritative
     // bit-clearing `do_rescan` runs only after we decide to return).
     let probe_ready = || -> bool {
-        for fd in 0..nfds {
-            let byte_off = (fd / 8) as u64;
-            let bit      = 1u8 << (fd % 8);
-            let r_req = readfds  != 0 && fdset_read_bit(readfds,  byte_off, bit, kernel_dispatch);
-            let w_req = writefds != 0 && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
-            if !r_req && !w_req { continue; }
-            let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
+        // Iterate the ORIGINAL interest snapshots — the live user fd_set may
+        // have had unready bits cleared by the initial scan above.
+        for &fd in req_read.iter() {
+            let revents = crate::syscall::poll_revents(pid, fd, 0x0001);
             const READABLE_MASK: u16 = 0x0001 | 0x0010;
-            if r_req && revents & READABLE_MASK != 0 { return true; }
-            if w_req && revents & 0x0004 != 0 { return true; }
+            if revents & READABLE_MASK != 0 { return true; }
+        }
+        for &fd in req_write.iter() {
+            let revents = crate::syscall::poll_revents(pid, fd, 0x0004);
+            if revents & 0x0004 != 0 { return true; }
         }
         false
     };
 
+    // Set one bit in an fd_set pointer (the initial scan may have cleared a
+    // requested bit that the blocking wait later finds ready; do_rescan must be
+    // able to re-assert it so the returned fd_set reflects the true result).
+    #[inline(always)]
+    fn fdset_set_bit(ptr: u64, byte_off: u64, bit: u8, kernel_dispatch: bool) {
+        if kernel_dispatch {
+            unsafe { *((ptr + byte_off) as *mut u8) |= bit; }
+        } else {
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *((ptr + byte_off) as *mut u8) |= bit;
+            }
+        }
+    }
+
     let do_rescan = |ready: &mut i64| {
         *ready = 0;
-        for fd in 0..nfds {
+        // Authoritative final result: iterate the ORIGINAL interest snapshots
+        // (the live user fd_set may have unready bits already cleared) and write
+        // each fd's true readiness back — SET if ready, CLEAR if not.
+        for &fd in req_read.iter() {
             let byte_off = (fd / 8) as u64;
             let bit      = 1u8 << (fd % 8);
-            let r_req = readfds  != 0 && fdset_read_bit(readfds,  byte_off, bit, kernel_dispatch);
-            let w_req = writefds != 0 && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
-            if !r_req && !w_req { continue; }
-            let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
+            let revents = crate::syscall::poll_revents(pid, fd, 0x0001);
             // Per POSIX `select(2)`: a hung-up pipe read-end is reported
             // readable so the userspace `read()` returns 0 (EOF).  POLLHUP
             // (0x0010) here therefore counts as a readable signal in
             // addition to POLLIN (0x0001).
             const READABLE_MASK: u16 = 0x0001 | 0x0010;
-            if r_req && revents & READABLE_MASK != 0 { *ready += 1; }
-            else if r_req {
+            if revents & READABLE_MASK != 0 {
+                *ready += 1;
+                fdset_set_bit(readfds, byte_off, bit, kernel_dispatch);
+            } else {
                 fdset_clear_bit(readfds, byte_off, bit, kernel_dispatch);
             }
-            if w_req && revents & 0x0004 != 0 { *ready += 1; }
-            else if w_req {
+        }
+        for &fd in req_write.iter() {
+            let byte_off = (fd / 8) as u64;
+            let bit      = 1u8 << (fd % 8);
+            let revents = crate::syscall::poll_revents(pid, fd, 0x0004);
+            if revents & 0x0004 != 0 {
+                *ready += 1;
+                fdset_set_bit(writefds, byte_off, bit, kernel_dispatch);
+            } else {
                 fdset_clear_bit(writefds, byte_off, bit, kernel_dispatch);
             }
         }
@@ -6165,6 +6211,16 @@ fn sys_select_linux(
         // applications using the canonical self-pipe-wakeup pattern to
         // busy-loop instead of blocking until the peer thread wrote.
         crate::x11::poll();
+        // Pre-wait network pump: drain any RX frames the NIC DMA'd into the
+        // ring since the initial readiness scan, and advance TCP timers, so a
+        // socket fd watched by this select(2) reflects fresh wire state before
+        // we commit to parking.  Symmetric to the identical pre-wait pump in
+        // poll(2) (nr 7) and epoll_wait(2).  Without it a select(2)-driven
+        // server (e.g. dropbear's accept loop) parked on a listen fd never
+        // sees the peer SYN/ACK that completes the 3-way handshake, because
+        // e1000 RX is poll-mode (NIC IRQs disabled) and nothing else drains
+        // the RX ring while this process owns the CPU in select.
+        crate::net::poll();
         let timeout_ms: i64 = if timeout == 0 {
             -1 // NULL → infinite
         } else if !kernel_dispatch && !crate::syscall::validate_user_ptr(timeout, 16) {
@@ -6195,22 +6251,17 @@ fn sys_select_linux(
             // Per-object interest set: every fd this select(2) call requested
             // (read OR write side) maps to its concrete readiness object, so the
             // per-object poll-bell drain wakes this caller only on edges of the
-            // exact fds it watches (intra-class herd collapse).  Computed once —
-            // the fd_set membership is fixed for the wait (do_rescan only
-            // *clears* bits on ready fds it returns, after the wait completes).
+            // exact fds it watches (intra-class herd collapse).  Built from the
+            // ORIGINAL interest snapshots — the live user fd_set may have had
+            // unready bits cleared by the initial scan, which would otherwise
+            // drop the watched fds (e.g. a listen socket that is not yet
+            // accept-pending) from the bell watch and never wake on their edge.
             // Conservative superset: an unclassifiable fd ⇒ wake-on-class.
             let (bell_mask, bell_objects) = {
                 let mut fds: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-                for fd in 0..nfds {
-                    let byte_off = (fd / 8) as u64;
-                    let bit = 1u8 << (fd % 8);
-                    let r_req = readfds != 0
-                        && fdset_read_bit(readfds, byte_off, bit, kernel_dispatch);
-                    let w_req = writefds != 0
-                        && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
-                    if r_req || w_req {
-                        fds.push(fd);
-                    }
+                fds.extend(req_read.iter().copied());
+                for &fd in req_write.iter() {
+                    if !req_read.contains(&fd) { fds.push(fd); }
                 }
                 bell_watch_for_fds(pid, fds.into_iter())
             };
@@ -6232,6 +6283,16 @@ fn sys_select_linux(
                 if !ready_in_window {
                     crate::x11::poll();
                 }
+                // Pump the NIC RX ring + TCP timers on every wakeup, mirroring
+                // the symmetric call in poll(2)/epoll_wait(2).  A socket fd
+                // watched here only becomes readable once net::poll() has run
+                // the e1000 RX → ipv4 → tcp demux that advances a SynReceived
+                // child past 3WHS (RFC 9293 §3.10) into the listener's
+                // accept-pending queue (which socket_has_data / has_pending_
+                // accept then report readable).  The poll bell is rung by
+                // pipe/eventfd writers, not by wire RX, so without this pump a
+                // select(2)-only event loop never observes incoming TCP.
+                crate::net::poll();
                 do_rescan(&mut ready);
                 if ready > 0 { break; }
                 if signal_pending(pid) { return -4; } // EINTR

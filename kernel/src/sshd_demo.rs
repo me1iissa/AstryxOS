@@ -63,7 +63,11 @@ const DROPBEAR_PATH: &str = "/disk/usr/sbin/dropbear";
 ///   3. Capture stdout + serial events
 ///
 /// 6_000 ticks = 60 s @ 100 Hz.  Bump for longer interactive soaks.
-const SSHD_SOAK_TICKS: u64 = 6_000;
+/// Raised to 24_000 (≈240 s @ 100 Hz) so a host-driven `ssh -p N` has a
+/// comfortable live window to complete the TCP 3-way handshake, the SSH-2
+/// transport/kex (RFC 4253), public-key userauth (RFC 4252) and open a
+/// session channel (RFC 4254) before the demo soak tears the daemon down.
+const SSHD_SOAK_TICKS: u64 = 24_000;
 
 /// Envp for dropbear.  Kept small + deterministic.  Notable entries:
 ///   - HOME=/root            — dropbear sets supplementary groups before

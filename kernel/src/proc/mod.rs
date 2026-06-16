@@ -2191,14 +2191,17 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // promptly.  Iterate a snapshot to avoid holding PROCESS_TABLE while calling
     // into PIPE_TABLE / unix socket TABLE (lock ordering: resource table before
     // PROCESS_TABLE).
-    let (pipe_ends, socket_ids, eventfd_ids): (
+    const SOCKET_FD_FLAG: u32 = 0x4000_0000; // bit 30: AF_UNIX or AF_INET socket fd
+    let (pipe_ends, socket_ids, inet_socket_ids, eventfd_ids): (
         alloc::vec::Vec<(u64, bool)>,
+        alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
         alloc::vec::Vec<u64>,
     ) = {
         let procs = PROCESS_TABLE.lock();
-        let (mut pipes, mut sockets, mut eventfds) =
-            (alloc::vec::Vec::new(), alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        let (mut pipes, mut sockets, mut inet_sockets, mut eventfds) =
+            (alloc::vec::Vec::new(), alloc::vec::Vec::new(),
+             alloc::vec::Vec::new(), alloc::vec::Vec::new());
         if let Some(p) = procs.iter().find(|p| p.pid == pid) {
             for f in p.file_descriptors.iter().filter_map(|f| f.as_ref()) {
                 if f.file_type == crate::vfs::FileType::Pipe
@@ -2210,12 +2213,20 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                     && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                 {
                     sockets.push(f.inode);
+                } else if f.mount_idx == usize::MAX
+                    && f.flags & SOCKET_FD_FLAG != 0
+                    && f.flags & crate::syscall::UNIX_SOCKET_FLAG == 0
+                {
+                    // AF_INET socket fd: drop one open-file-description ref so an
+                    // inherited socket the parent still holds survives this
+                    // process's exit (last-close tears the TCB down).
+                    inet_sockets.push(f.inode);
                 } else if f.file_type == crate::vfs::FileType::EventFd {
                     eventfds.push(f.inode);
                 }
             }
         }
-        (pipes, sockets, eventfds)
+        (pipes, sockets, inet_sockets, eventfds)
     };
     for (pipe_id, is_write) in pipe_ends {
         if is_write {
@@ -2228,6 +2239,10 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // close tears the slot down and notifies the peer.
     for socket_id in socket_ids {
         crate::net::unix::close(socket_id);
+    }
+    // Same last-reference discipline for inherited AF_INET sockets.
+    for socket_id in inet_socket_ids {
+        crate::net::socket::socket_close(socket_id);
     }
     // Drop the exiting process's eventfd open-file-description refs; the
     // slot is freed only when the last reference (parent's fd, in the
@@ -2851,14 +2866,28 @@ pub fn set_fork_user_regs(pid: Pid, tid: Tid, regs: ForkUserRegs) {
 /// child refer to the same open file descriptions as the corresponding
 /// descriptors in the parent."
 fn inc_socket_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
+    // SOCKET_FD flag (bit 30): set on both AF_UNIX and AF_INET socket fds.
+    // UNIX_SOCKET_FLAG (bit 23): set ONLY on AF_UNIX — used to route each kind
+    // to its own refcount table.  Both share mount_idx==usize::MAX, so the flag
+    // bits (not mount_idx) are the authoritative discriminator (mirrors
+    // `crate::syscall::is_socket_fd` / `is_unix_socket_fd`).
+    const SOCKET_FD_FLAG: u32 = 0x4000_0000;
     for fd in fds.iter().filter_map(|f| f.as_ref()) {
-        // Gate on UNIX_SOCKET_FLAG (bit 23) rather than mount_idx alone:
-        // AF_INET sockets also use mount_idx==usize::MAX but are tracked
-        // separately and must not be passed to net::unix::inc_ref.
+        // AF_UNIX socket: bump the unix-layer open-file-description count.
         if fd.file_type == crate::vfs::FileType::Socket
             && fd.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
         {
             crate::net::unix::inc_ref(fd.inode);
+        // AF_INET socket: bump the inet-layer open-file-description count.  The
+        // child inherits the same `Socket` entry behind a duplicated fd; without
+        // this bump the FIRST close in EITHER process destroys the socket for
+        // both, dangling the survivor's fd (getpeername → ENOTCONN — the forked
+        // dropbear session-child accepted-connection teardown bug).
+        } else if fd.mount_idx == usize::MAX
+            && fd.flags & SOCKET_FD_FLAG != 0
+            && fd.flags & crate::syscall::UNIX_SOCKET_FLAG == 0
+        {
+            crate::net::socket::inc_ref(fd.inode);
         }
     }
 }
