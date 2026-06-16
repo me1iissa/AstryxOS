@@ -5364,6 +5364,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Ok(s) => s,
                 Err(_) => return -22,
             };
+            // PTY slave nodes (/dev/pts/N) have no backing VFS inode, so
+            // vfs::chmod would ENOENT.  Their permissions are synthetic and
+            // fixed (see fill_linux_pty_stat), so grantpt(3)'s
+            // chmod("/dev/pts/N", 0620) — issued by an SSH server before
+            // handing the slave to the login shell — is accepted as a no-op
+            // when the pair is live, and ENOENT for a stale index (per
+            // pts(4)).
+            if let Some(n) = parse_devpts_index(path_str) {
+                return if crate::drivers::pty::is_alive(n) { 0 } else { -2 };
+            }
             match crate::vfs::chmod(path_str, arg2 as u32) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
