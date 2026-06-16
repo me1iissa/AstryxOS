@@ -411,6 +411,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "virtio-wait-spin"  => op_virtio_wait_spin(req, out),
         "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
+        "x11-present"      => op_x11_present(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
         "fault-cache-keys" => op_fault_cache_keys(out),
@@ -1366,6 +1367,20 @@ fn op_bell_stats(out: &mut String) {
         bell_wakes, resync_wakes, bell_ratio_permille, mask_filtered,
         drained_total, wasted_bell, mean_fanout_permille, wasted_ratio_permille
     );
+}
+
+// ── x11-present ───────────────────────────────────────────────────────────────
+// Cumulative Xastryx present-path opcode counts: core PutImage(72), core
+// CopyArea(62), and MIT-SHM ShmPutImage.  The discriminator for "does the X11
+// client actually paint, and via which present path?" — e.g. a windowed
+// Firefox that maps a toplevel but shows {"put_image":0,...} has not reached
+// its first frame.
+fn op_x11_present(out: &mut String) {
+    use core::fmt::Write;
+    let (put_image, copy_area, shm_put_image) = crate::x11::present_counts();
+    let _ = write!(out,
+        r#"{{"put_image":{},"copy_area":{},"shm_put_image":{}}}"#,
+        put_image, copy_area, shm_put_image);
 }
 // ── cache-aliasing ────────────────────────────────────────────────────────────
 //

@@ -5983,7 +5983,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit", "cache-aliasing",
+              "bell-stats", "x11-present", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
               "sched-stats",
@@ -11918,7 +11918,7 @@ def main():
         "unix-diag", "pipe-diag",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
-        "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
+        "bell-stats", "x11-present", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "sched-stats",
         "arm-phys",
