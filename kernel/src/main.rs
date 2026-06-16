@@ -1720,6 +1720,29 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // are unaffected.
             crate::drivers::log_ring::flush_to_serial();
 
+            // PNG extraction grace window: keep the kernel kdb/QGA-serviceable
+            // for up to ~120 s after the render so the host can copy
+            // /tmp/out.png out of the VFS over the LIVE channel (read-ff-png /
+            // kdb-read-png) rather than the slow, lossy serial B64 emit.  FF
+            // (pid 1) has exited but the kernel, drivers (e1000/SLIRP), and the
+            // kdb stub are still alive; we service the network/kdb path with the
+            // same yield+idle_tick cadence as the FFTEST poll loop so a host
+            // pull keeps draining.  Only the firefox-test-core RENDER path
+            // reaches here (the kernel-test suite is test-mode), so a render
+            // boot pausing for a clean extract is acceptable; the harness stops
+            // the session as soon as it has the file, ending the window early.
+            serial_println!("[FFTEST] png-grace-window open (<=120s for host extract)");
+            let t_grace = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_grace) < 12_000 {
+                crate::sched::yield_cpu();
+                if crate::arch::x86_64::irq::idle_tick(5) {
+                    unsafe { core::arch::asm!("hlt"); }
+                } else {
+                    core::hint::spin_loop();
+                }
+            }
+            serial_println!("[FFTEST] png-grace-window closed — exiting");
+
             // Brief pause for QMP screendump, then exit.
             let t_done = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
