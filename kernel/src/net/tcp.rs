@@ -257,6 +257,21 @@ pub struct TcpConnection {
     /// starving every listener (RFC 4987).  Set on all construction paths
     /// for consistency; only consulted while `state == SynReceived`.
     created_tick: u64,
+
+    /// A graceful close has been requested by the application while
+    /// `send_buffer` still held unsent bytes (RFC 9293 §3.5 — "Queue this
+    /// until all preceding SENDs have been segmentized, then form a FIN
+    /// segment and send it").  When set, the FIN is *not* emitted until the
+    /// send buffer drains: `tcp_timer_tick`'s send-buffer drain loop emits it
+    /// at the true end of the byte stream and performs the state transition
+    /// (ESTABLISHED → FIN-WAIT-1, CLOSE-WAIT → LAST-ACK).  Emitting the FIN at
+    /// close time — at the snapshot of `send_next` after only the first
+    /// window's worth of data — would orphan every byte still in `send_buffer`
+    /// (the FIN consumes the next sequence number, so any data given a higher
+    /// sequence arrives *after* the peer has seen end-of-stream and is
+    /// discarded).  Default `false`; a connection whose send buffer is already
+    /// empty at close time takes the immediate-FIN fast path and never sets it.
+    close_pending: bool,
 }
 
 // ── ISN generation ─────────────────────────────────────────────────────────────
@@ -827,6 +842,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 closed_tick: 0,
                 accepted:    false,
                 created_tick: now,
+                close_pending: false,
             });
             drop(conns);
             send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
@@ -1177,10 +1193,16 @@ pub fn tcp_timer_tick() {
                 continue;
             }
 
-            // Only check retransmit for states with pending unacked data.
+            // Only check retransmit / send-buffer drain for states that can
+            // still have unacked or unsent data on the wire.  `CloseWait` is
+            // included because a graceful close requested while the send
+            // buffer was non-empty (RFC 9293 §3.5) leaves the TCB in
+            // `CloseWait` with `close_pending` set and a tail still to flush
+            // before its FIN — without this it would never drain.
             if !matches!(conn.state,
                 TcpState::SynSent | TcpState::SynReceived |
-                TcpState::Established | TcpState::FinWait1 | TcpState::LastAck
+                TcpState::Established | TcpState::FinWait1 |
+                TcpState::CloseWait  | TcpState::LastAck
             ) { continue; }
 
             if let Some(e) = conn.retransmit_queue.front_mut() {
@@ -1213,29 +1235,54 @@ pub fn tcp_timer_tick() {
                 }
             }
 
-            // Drain send_buffer if window reopened.
-            if conn.send_buffer.is_empty() { continue; }
-            let in_flight  = conn.send_next.wrapping_sub(conn.send_unack);
-            let eff_window = conn.cwnd.min(conn.peer_window.max(MSS));
-            if eff_window <= in_flight { continue; }
-            let can  = (eff_window - in_flight) as usize;
-            let take = can.min(conn.send_buffer.len()).min(MSS as usize);
-            let chunk: Vec<u8> = conn.send_buffer.drain(..take).collect();
-            let seq = conn.send_next;
-            conn.retransmit_queue.push_back(RetransmitEntry {
-                seq,
-                data:       chunk.clone(),
-                sent_ticks: now,
-                rto:        conn.rto,
-                retries:    0,
-            });
-            conn.send_next = conn.send_next.wrapping_add(take as u32);
-            jobs.push(SendJob {
-                lip: conn.local_ip, lp: conn.local_port,
-                rip: conn.remote_ip, rp: conn.remote_port,
-                seq, ack: conn.recv_next, flags: PSH | ACK,
-                payload: chunk,
-            });
+            // Drain send_buffer if the window reopened.  Send at most one MSS
+            // per tick per connection; the buffer empties over successive
+            // ticks as ACKs grow cwnd (RFC 5681 slow start).
+            if !conn.send_buffer.is_empty() {
+                let in_flight  = conn.send_next.wrapping_sub(conn.send_unack);
+                let eff_window = conn.cwnd.min(conn.peer_window.max(MSS));
+                if eff_window > in_flight {
+                    let can  = (eff_window - in_flight) as usize;
+                    let take = can.min(conn.send_buffer.len()).min(MSS as usize);
+                    let chunk: Vec<u8> = conn.send_buffer.drain(..take).collect();
+                    let seq = conn.send_next;
+                    conn.retransmit_queue.push_back(RetransmitEntry {
+                        seq,
+                        data:       chunk.clone(),
+                        sent_ticks: now,
+                        rto:        conn.rto,
+                        retries:    0,
+                    });
+                    conn.send_next = conn.send_next.wrapping_add(take as u32);
+                    jobs.push(SendJob {
+                        lip: conn.local_ip, lp: conn.local_port,
+                        rip: conn.remote_ip, rp: conn.remote_port,
+                        seq, ack: conn.recv_next, flags: PSH | ACK,
+                        payload: chunk,
+                    });
+                }
+            }
+
+            // Graceful close (RFC 9293 §3.5): a close requested while the send
+            // buffer still held data deferred its FIN (`close_pending`).  Once
+            // the buffer is fully drained the FIN is formed at the true end of
+            // the byte stream — `send_next` now points past every byte the
+            // application ever queued — and the state advances (ESTABLISHED →
+            // FIN-WAIT-1, CLOSE-WAIT → LAST-ACK).  The FIN consumes the next
+            // sequence number, so it must follow, never precede, the buffered
+            // tail; emitting it at close time would have orphaned that tail.
+            if conn.close_pending && conn.send_buffer.is_empty() {
+                conn.close_pending = false;
+                let was_cw = conn.state == TcpState::CloseWait;
+                conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
+                jobs.push(SendJob {
+                    lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    seq: conn.send_next, ack: conn.recv_next,
+                    flags: FIN | ACK,
+                    payload: Vec::new(),
+                });
+            }
         }
 
         conns.retain(|c| !(c.state == TcpState::Closed && aborted.contains(&c.local_port)));
@@ -1561,6 +1608,7 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         closed_tick: 0,
         accepted:    false,
         created_tick: now,
+        close_pending: false,
     });
     Ok(())
 }
@@ -1624,6 +1672,7 @@ pub fn test_inject_syn_received(local_port: u16, remote_ip: Ipv4Address,
         closed_tick: 0,
         accepted:    false,
         created_tick: now.wrapping_sub(age_ticks),
+        close_pending: false,
     });
     Ok(())
 }
@@ -1703,6 +1752,7 @@ pub fn test_inject_established_tm(local_port: u16, remote_ip: Ipv4Address,
         closed_tick: 0,
         accepted:    false,
         created_tick: now,
+        close_pending: false,
     });
     Ok(())
 }
@@ -1968,6 +2018,7 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         closed_tick: 0,
         accepted:    false,
         created_tick: now,
+        close_pending: false,
     });
     Ok(())
 }
@@ -2016,6 +2067,7 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             closed_tick: 0,
             accepted:    false,
             created_tick: now,
+            close_pending: false,
         });
     }
     send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
@@ -2085,27 +2137,58 @@ pub fn close_listener(port: u16) {
 }
 
 pub fn close(port: u16) -> Result<(), &'static str> {
-    struct CloseInfo {
-        lip: Ipv4Address, lp: u16,
-        rip: Ipv4Address, rp: u16,
-        sn: u32, rn: u32,
-        was_close_wait: bool,
-    }
-    let info = {
+    // `Some` only when the FIN may be emitted immediately (send buffer was
+    // already empty); `None` defers the FIN to the send-buffer drain loop.
+    let info: Option<CloseInfoTcb> = {
         let mut conns = TCP_CONNECTIONS.lock();
         let conn = conns.iter_mut()
             .find(|c| c.local_port == port &&
                   matches!(c.state, TcpState::Established | TcpState::CloseWait))
             .ok_or("no connection to close")?;
+        request_close(conn)
+    };
+    if let Some(i) = info {
+        send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, FIN | ACK);
+    }
+    Ok(())
+}
+
+/// Drive the RFC 9293 §3.5 graceful-close request on a single TCB.
+///
+/// If `send_buffer` is empty all preceding SENDs have been segmentized, so the
+/// FIN is formed now: the state advances (ESTABLISHED → FIN-WAIT-1,
+/// CLOSE-WAIT → LAST-ACK) and `Some(CloseInfoTcb)` is returned for the caller to
+/// transmit the FIN once the `TCP_CONNECTIONS` lock is dropped.
+///
+/// If `send_buffer` still holds unsent bytes the FIN MUST wait — emitting it
+/// at the current `send_next` (only the first window's worth has been
+/// transmitted) would assign the FIN a sequence number *below* the buffered
+/// tail, so the peer would observe end-of-stream and discard everything that
+/// followed.  We instead set `close_pending`; `tcp_timer_tick`'s drain loop
+/// flushes the buffer as the window opens and emits the FIN at the true end of
+/// the byte stream.  Returns `None` in that case (no immediate segment).
+fn request_close(conn: &mut TcpConnection) -> Option<CloseInfoTcb> {
+    if conn.send_buffer.is_empty() {
         let was_cw = conn.state == TcpState::CloseWait;
         conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
-        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
-                    rip: conn.remote_ip, rp: conn.remote_port,
-                    sn: conn.send_next, rn: conn.recv_next,
-                    was_close_wait: was_cw }
-    };
-    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
-    Ok(())
+        Some(CloseInfoTcb {
+            lip: conn.local_ip, lp: conn.local_port,
+            rip: conn.remote_ip, rp: conn.remote_port,
+            sn: conn.send_next, rn: conn.recv_next,
+        })
+    } else {
+        // Stay in ESTABLISHED / CLOSE-WAIT; the drain loop owns the FIN.
+        conn.close_pending = true;
+        None
+    }
+}
+
+/// FIN-segment coordinates handed from `request_close` (and the drain loop)
+/// back to the lock-free transmit site.
+struct CloseInfoTcb {
+    lip: Ipv4Address, lp: u16,
+    rip: Ipv4Address, rp: u16,
+    sn: u32, rn: u32,
 }
 
 /// Close a specific connection identified by the full 4-tuple.
@@ -2119,12 +2202,9 @@ pub fn close(port: u16) -> Result<(), &'static str> {
 pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
     -> Result<(), &'static str>
 {
-    struct CloseInfo {
-        lip: Ipv4Address, lp: u16,
-        rip: Ipv4Address, rp: u16,
-        sn: u32, rn: u32,
-    }
-    let info = {
+    // `None` when the FIN is deferred to the send-buffer drain loop because
+    // `send_buffer` still holds unsent bytes (RFC 9293 §3.5 graceful close).
+    let info: Option<CloseInfoTcb> = {
         let mut conns = TCP_CONNECTIONS.lock();
         let conn = conns.iter_mut()
             .find(|c| c.local_port == local_port
@@ -2132,13 +2212,11 @@ pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u1
                    && c.remote_port == remote_port
                    && matches!(c.state, TcpState::Established | TcpState::CloseWait))
             .ok_or("no connection to close")?;
-        let was_cw = conn.state == TcpState::CloseWait;
-        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
-        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
-                    rip: conn.remote_ip, rp: conn.remote_port,
-                    sn: conn.send_next, rn: conn.recv_next }
+        request_close(conn)
     };
-    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
+    if let Some(i) = info {
+        send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, FIN | ACK);
+    }
     Ok(())
 }
 
@@ -2157,12 +2235,10 @@ pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u1
 pub fn shutdown_write(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
     -> Result<(), &'static str>
 {
-    struct CloseInfo {
-        lip: Ipv4Address, lp: u16,
-        rip: Ipv4Address, rp: u16,
-        sn: u32, rn: u32,
-    }
-    let info = {
+    // Same graceful-close semantics as `close_connection`: defer the FIN
+    // (return `None`) while `send_buffer` still holds unsent bytes so the
+    // half-closed write side flushes to completion before end-of-stream.
+    let info: Option<CloseInfoTcb> = {
         let mut conns = TCP_CONNECTIONS.lock();
         let conn = match conns.iter_mut()
             .find(|c| c.local_port == local_port
@@ -2173,13 +2249,11 @@ pub fn shutdown_write(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
             Some(c) => c,
             None    => return Ok(()),
         };
-        let was_cw = conn.state == TcpState::CloseWait;
-        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
-        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
-                    rip: conn.remote_ip, rp: conn.remote_port,
-                    sn: conn.send_next, rn: conn.recv_next }
+        request_close(conn)
     };
-    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
+    if let Some(i) = info {
+        send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, FIN | ACK);
+    }
     Ok(())
 }
 

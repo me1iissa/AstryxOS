@@ -2846,18 +2846,56 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             // handler also needs MOUNTS — same-thread recursion (#82).
             //
             // Only the tail `[offset + cached_prefix, offset + count)` that the
-            // cache did not cover is read from the backing store.  When the
-            // whole request was served from the cache the device is never
-            // touched.
+            // cache did not cover is read from the backing store; when the whole
+            // request was served from the cache the device is never touched.
+            //
+            // The tail is bounced through a kernel-heap buffer rather than letting
+            // the filesystem DMA into the user buffer directly.  A block-backed
+            // filesystem (ext2/fat32) services an aligned read by handing the
+            // destination slice to the block device.  The virtio-blk descriptor's
+            // address field is a *physical* address; the driver derives it from
+            // the buffer's kernel virtual address by the fixed direct-map offset
+            // with no page-table walk, so a *user* virtual address would be
+            // written into the descriptor verbatim — the device then targets a
+            // bogus address, the host rejects the descriptor, and the virtqueue
+            // halts (a multi-page uncached read froze used.idx, immune to doorbell
+            // re-kick and reset).  A kernel-heap `Vec` is physically contiguous
+            // with a valid address, so read into the bounce buffer then CPU-copy
+            // into the user buffer (the copy may fault the file-backed user pages
+            // in — why MOUNTS was dropped above).  In-memory filesystems memcpy
+            // and are unaffected.  256 KiB chunks bound the bounce allocation
+            // while still exceeding the device's per-request span.
             let n = if cached_prefix >= count {
                 cached_prefix
             } else {
-                let tail_n = fs.read(
-                    inode,
-                    offset + cached_prefix as u64,
-                    &mut buffer[cached_prefix..],
-                )?;
-                cached_prefix + tail_n
+                const BOUNCE_CHUNK: usize = 256 * 1024;
+                let tail = count - cached_prefix;
+                let chunk_cap = tail.min(BOUNCE_CHUNK);
+                let mut bounce = alloc::vec![0u8; chunk_cap];
+                let mut done = 0usize;
+                loop {
+                    if done >= tail {
+                        break;
+                    }
+                    let want = (tail - done).min(chunk_cap);
+                    let got = fs.read(
+                        inode,
+                        offset + (cached_prefix + done) as u64,
+                        &mut bounce[..want],
+                    )?;
+                    if got == 0 {
+                        break; // EOF / short read — stop.
+                    }
+                    // SAFETY: `buffer` has length `count`; `cached_prefix + done +
+                    // got <= count` because `want <= tail - done` and `got <= want`.
+                    let dst = cached_prefix + done;
+                    buffer[dst..dst + got].copy_from_slice(&bounce[..got]);
+                    done += got;
+                    if got < want {
+                        break; // short read — backing store has no more here.
+                    }
+                }
+                cached_prefix + done
             };
 
             // Reverse-direction page-cache coherency (closes the ramfs/tmpfs/
@@ -3322,7 +3360,42 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         offset
     };
 
-    let n = fs.write(inode, write_offset, data)?;
+    // Bounce the write through a kernel-heap buffer for the same reason the
+    // read path does (see `fd_read`): a block-backed filesystem (ext2) services
+    // an aligned whole-block write by handing the source slice straight to the
+    // block device, which DMAs *from* it.  The virtio-blk descriptor's address
+    // field is a physical address derived from the buffer's virtual address by
+    // a fixed offset with no page-table walk, so a user virtual address gets
+    // written into the descriptor verbatim and the device reads from a bogus
+    // physical address — halting the virtqueue exactly as the read bug did.
+    // Copy each chunk of user bytes into a kernel-heap (physically-contiguous)
+    // buffer, then hand THAT to the filesystem.  Bounded to 256 KiB chunks so a
+    // huge write never allocates a count-sized kernel buffer.  In-memory
+    // filesystems (ramfs/tmpfs) memcpy and are unaffected; fat32 already
+    // bounces through its sector cache, and the ext2 partial-block tail RMWs
+    // through a kernel buffer — only the ext2 whole-block fast path leaked the
+    // user pointer, which this closes for every backing-store write.
+    let n = {
+        const BOUNCE_CHUNK: usize = 256 * 1024;
+        let chunk_cap = count.min(BOUNCE_CHUNK);
+        let mut bounce = alloc::vec![0u8; chunk_cap];
+        let mut done = 0usize;
+        loop {
+            if done >= count {
+                break;
+            }
+            let want = (count - done).min(chunk_cap);
+            // Copy the user bytes into the kernel bounce buffer (the read of
+            // `data` may fault the user pages in — MOUNTS already dropped).
+            bounce[..want].copy_from_slice(&data[done..done + want]);
+            let put = fs.write(inode, write_offset + done as u64, &bounce[..want])?;
+            done += put;
+            if put < want {
+                break; // short write — the backing store accepted no more.
+            }
+        }
+        done
+    };
 
     // Page-cache coherency: any process that previously mmap'd this file
     // has a cache-page-backed PTE that points at the pre-write bytes.
