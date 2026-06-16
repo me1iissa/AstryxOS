@@ -95,11 +95,19 @@ pub fn spawn_webxo() -> Option<(u64, u64)> {
     //   --basepath=DIR  document root served for GET/HEAD.
     //   --port=N        TCP port to bind (INADDR_ANY ⇒ 0.0.0.0).
     //   --nthreads=N    worker-thread pool size; each worker blocks on
-    //                   accept(2) on the shared listen fd.  Keep modest (4)
-    //                   so the boot doesn't fork a large thread storm.
+    //                   accept(2) on the shared listen fd.
+    //
+    // We launch with a SINGLE worker thread.  WebXO's worker pool shares one
+    // HTTP/Directory object across all workers with no internal locking, so a
+    // multi-worker pool races on that shared object once threads are reused —
+    // the directory scan intermittently reads empty and the request 500s.  A
+    // single worker serialises every request through the shared object and is
+    // fully reliable.  (The kernel's directory-read path is concurrency-safe;
+    // the race is WebXO-internal, so this is the correct app-level config — a
+    // single-threaded static server is more than adequate for this docroot.)
     let basepath_arg = alloc::format!("--basepath={}", WEBXO_DOCROOT);
     let port_arg = alloc::format!("--port={}", WEBXO_PORT);
-    let argv: &[&str] = &["webxo", &basepath_arg, &port_arg, "--nthreads=4"];
+    let argv: &[&str] = &["webxo", &basepath_arg, &port_arg, "--nthreads=1"];
     let envp = default_envp();
 
     serial_println!("[WEBXO] Spawning webxo with argv={:?}", argv);
