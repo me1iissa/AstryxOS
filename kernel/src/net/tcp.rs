@@ -110,6 +110,26 @@ const MAX_SYN_BACKLOG_PER_PORT: usize = 256;
 /// until something else evicts it — i.e. forever, the permanent-wedge bug.
 const SYNACK_TIMEOUT_TICKS: u64 = 300;
 
+/// Default receive-buffer cap when a socket has not set `SO_RCVBUF`
+/// (`setsockopt(2)`), in bytes — the upper bound on `recv_buffer` for a
+/// single connection (RFC 9293 §3.8 flow control).  Without a cap, a bulk
+/// TLS/HTTP-2 response to a socket the application drains slowly grows
+/// `recv_buffer` without bound until the kernel heap OOMs.  Once the buffer
+/// reaches this cap the receiver stops accepting further in-order text (the
+/// peer retransmits, RFC 9293 §3.10.7.4) and advertises a smaller window so
+/// a well-behaved peer stops sending (flow control).  212992 matches the
+/// common `net.core.rmem_default`, the same value the connectionless UDP
+/// receive-buffer bound adopts, so TCP and UDP present a consistent default
+/// `SO_RCVBUF` to userspace.
+const DEFAULT_RCVBUF_BYTES: usize = 212_992;
+
+/// The construction-time sentinel written to `TcpConnection.rcvbuf` meaning
+/// "the application has not set `SO_RCVBUF`".  A connection left at the
+/// sentinel uses `DEFAULT_RCVBUF_BYTES`; any other value is the explicit
+/// `setsockopt(2)` request (clamped to at least one MSS so a pathologically
+/// small request cannot wedge the socket).
+const RCVBUF_UNSET_SENTINEL: u32 = 87380;
+
 // ── Data structures ────────────────────────────────────────────────────────────
 
 /// One unacknowledged segment sitting in the retransmit queue.
@@ -338,10 +358,11 @@ fn tcp_checksum(src: Ipv4Address, dst: Ipv4Address, tcp: &[u8]) -> u16 {
     super::ipv4::checksum(&buf)
 }
 
-/// Build a TCP segment (header + payload), checksum filled.
-fn build_segment(
+/// Build a TCP segment (header + payload) advertising an explicit receive
+/// `window` (RFC 9293 §3.8), checksum filled.
+fn build_segment_win(
     src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8,
+    seq: u32, ack: u32, flags: u8, window: u16,
     src_ip: Ipv4Address, dst_ip: Ipv4Address,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -352,7 +373,7 @@ fn build_segment(
     s.extend_from_slice(&ack.to_be_bytes());
     s.push(5 << 4);                          // data offset = 5 dwords
     s.push(flags);
-    s.extend_from_slice(&65535u16.to_be_bytes()); // advertise full window
+    s.extend_from_slice(&window.to_be_bytes());   // advertised receive window
     s.push(0); s.push(0);                    // checksum placeholder
     s.push(0); s.push(0);                    // urgent pointer
     s.extend_from_slice(payload);
@@ -360,6 +381,21 @@ fn build_segment(
     s[16] = (ck >> 8) as u8;
     s[17] = (ck & 0xFF) as u8;
     s
+}
+
+/// Build a TCP segment advertising the full 65535-byte window.  Used for
+/// control segments (SYN, SYN-ACK, RST, FIN, bare ACKs) where no per-TCB
+/// receive-buffer occupancy is available to compute a dynamic window; the
+/// data-ACK paths use [`build_segment_win`] with [`rcv_window`] so the
+/// advertised window shrinks as `recv_buffer` fills (flow control).
+fn build_segment(
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+    src_ip: Ipv4Address, dst_ip: Ipv4Address,
+    payload: &[u8],
+) -> Vec<u8> {
+    build_segment_win(src_port, dst_port, seq, ack, flags, 65535,
+                      src_ip, dst_ip, payload)
 }
 
 /// Send a flag-only TCP segment.
@@ -390,6 +426,35 @@ fn seq_gt(a: u32, b: u32) -> bool {
 #[inline]
 fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
+}
+
+// ── Receive-buffer flow control (RFC 9293 §3.8) ───────────────────────────────
+
+/// Effective `SO_RCVBUF` cap for this connection's `recv_buffer`, in bytes.
+/// The construction sentinel (`RCVBUF_UNSET_SENTINEL`) means "unset" →
+/// `DEFAULT_RCVBUF_BYTES`; any other value is the application's explicit
+/// `setsockopt(2)` request, clamped to at least one MSS so a tiny request
+/// cannot make the socket undeliverable.
+#[inline]
+fn effective_rcvbuf(conn: &TcpConnection) -> usize {
+    if conn.rcvbuf == RCVBUF_UNSET_SENTINEL {
+        DEFAULT_RCVBUF_BYTES
+    } else {
+        (conn.rcvbuf as usize).max(MSS as usize)
+    }
+}
+
+/// The receive window to advertise for this connection (RFC 9293 §3.8): the
+/// free space remaining in `recv_buffer` below the `SO_RCVBUF` cap, clamped to
+/// the 16-bit window field.  As the application falls behind and `recv_buffer`
+/// fills, the advertised window shrinks toward zero so a well-behaved peer
+/// stops sending BEFORE the buffer overflows — flow control proper, rather
+/// than silently dropping already-ACKed in-order data.
+#[inline]
+fn rcv_window(conn: &TcpConnection) -> u16 {
+    let cap = effective_rcvbuf(conn);
+    let free = cap.saturating_sub(conn.recv_buffer.len());
+    free.min(u16::MAX as usize) as u16
 }
 
 // ── Out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──────────────────────
@@ -787,11 +852,23 @@ fn receive_segment_data(conn: &mut TcpConnection, hdr: &TcpHeader,
         need_ack = true;
         let seg_end = hdr.seq_num.wrapping_add(payload.len() as u32);
         if hdr.seq_num == conn.recv_next {
-            // In-order: append and advance, then drain any now-contiguous
-            // out-of-order segments.
-            conn.recv_buffer.extend_from_slice(payload);
-            conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
-            drain_ooo(conn);
+            // In-order.  Enforce the `SO_RCVBUF` flow-control cap (RFC 9293
+            // §3.8): if the application is draining too slowly and the buffer
+            // is already at the cap, do NOT append (which would grow the
+            // kernel heap without bound on a bulk TLS/HTTP-2 response) and do
+            // NOT advance recv_next.  We re-ACK the unchanged recv_next with a
+            // shrunk (here zero) advertised window so the peer stops sending
+            // and retransmits once we drain — a proper zero-window stall, not
+            // a silent drop of ACKed data.  A well-behaved peer rarely reaches
+            // this point because `rcv_window` already shrank the advertised
+            // window as the buffer filled.
+            if conn.recv_buffer.len() < effective_rcvbuf(conn) {
+                conn.recv_buffer.extend_from_slice(payload);
+                conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+                drain_ooo(conn);
+            }
+            // else: buffer full — leave recv_next put; the shrunk-window ACK
+            // below applies back-pressure (RFC 9293 §3.8.6 zero window).
         } else if seq_gt(seg_end, conn.recv_next) {
             // Out-of-order but carries new data ahead of the gap: buffer it.
             insert_ooo(conn, hdr.seq_num, payload);
@@ -834,7 +911,8 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                 crate::serial_println!("[TCP] Established → {}:{}", rip[0], rp);
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                let win = rcv_window(conn);
+                let s = build_segment_win(lp, rp, sn, rn, ACK, win, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
@@ -868,7 +946,8 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                let win = rcv_window(conn);
+                let s = build_segment_win(lp, rp, sn, rn, ACK, win, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
@@ -907,7 +986,8 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                let win = rcv_window(conn);
+                let s = build_segment_win(lp, rp, sn, rn, ACK, win, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
@@ -936,7 +1016,8 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                let win = rcv_window(conn);
+                let s = build_segment_win(lp, rp, sn, rn, ACK, win, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
@@ -1638,6 +1719,33 @@ pub fn test_feed_ooo(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
         insert_ooo(conn, seq, payload);
     }
     Some((conn.ooo_segments.len(), conn.ooo_total_bytes, conn.recv_buffer.len()))
+}
+
+/// Test-only: set the `SO_RCVBUF` cap on the TCB matching the 4-tuple and feed
+/// one in-order data segment via the real `receive_segment_data` path, then
+/// report `(recv_buffer_len, advertised_window)`.  Lets the SO_RCVBUF-bound
+/// regression test (RFC 9293 §3.8) prove `recv_buffer` is capped and the
+/// advertised window shrinks as it fills.  Pass `set_rcvbuf = Some(n)` only on
+/// the first call to install the cap; `None` to feed without changing it.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn test_feed_inorder_capped(local_port: u16, remote_ip: Ipv4Address,
+                                remote_port: u16, payload: &[u8],
+                                set_rcvbuf: Option<u32>) -> Option<(usize, u16)> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)?;
+    if let Some(v) = set_rcvbuf { conn.rcvbuf = v; }
+    // In-order feed at recv_next (mirrors receive_segment_data's in-order arm
+    // including the SO_RCVBUF cap, RFC 9293 §3.8).
+    if conn.recv_buffer.len() < effective_rcvbuf(conn) {
+        conn.recv_buffer.extend_from_slice(payload);
+        conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+        drain_ooo(conn);
+    }
+    Some((conn.recv_buffer.len(), rcv_window(conn)))
 }
 
 /// Test-only: force the state of the TCB matching the given 4-tuple,

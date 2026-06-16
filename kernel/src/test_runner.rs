@@ -1111,6 +1111,10 @@ pub fn run() -> ! {
     total += 1;
     if test_tcp_ooo_bounded_drain() { passed += 1; }
 
+    // ── Test 89e: recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8) ─
+    total += 1;
+    if test_tcp_rcvbuf_cap() { passed += 1; }
+
     // ── Test 90: TCP congestion control (slow start + cwnd growth) ────────
 
     total += 1;
@@ -22896,6 +22900,70 @@ fn test_tcp_ooo_bounded_drain() -> bool {
 
     let _ = tcp::abort(PORT2);
     test_pass!("TCP OOO reassembly bounded + ordered drain (CVE-2018-5390)");
+    true
+}
+
+// ── Test 89e: TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8) ──
+//
+// A bulk TLS/HTTP-2 response to a slow-draining socket must not grow
+// `recv_buffer` until the kernel heap OOMs.  Pre-fix the buffer was unbounded
+// and the advertised window hardcoded to 65535.  This test installs a small
+// SO_RCVBUF, floods in-order data well past it WITHOUT draining, and asserts:
+//   (1) recv_buffer never exceeds the effective cap (the OOM guard);
+//   (2) the advertised window shrinks toward 0 as the buffer fills (flow
+//       control — the peer is told to stop sending, RFC 9293 §3.8).
+fn test_tcp_rcvbuf_cap() -> bool {
+    test_header!("TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8095;
+    let rip: [u8; 4] = [203, 0, 113, 11];
+    if let Err(e) = tcp::test_inject_established_tm(PORT, rip, 60000) {
+        test_fail!("rcvbuf_cap", "inject Established failed: {}", e);
+        return false;
+    }
+    // Small cap: 4096 requested → clamped to ≥ MSS (1460); effective cap is
+    // max(4096, 1460) = 4096.
+    const RCVBUF: u32 = 4096;
+    const CHUNK: usize = 1000;
+    const FLOODS: usize = 64; // 64 KiB of data into a 4 KiB buffer
+
+    let mut last_window = 65535u16;
+    let mut last_buflen = 0usize;
+    for i in 0..FLOODS {
+        let set = if i == 0 { Some(RCVBUF) } else { None };
+        let payload = [0x41u8; CHUNK];
+        match tcp::test_feed_inorder_capped(PORT, rip, 60000, &payload, set) {
+            Some((buflen, window)) => { last_buflen = buflen; last_window = window; }
+            None => { test_fail!("rcvbuf_cap", "feed returned None at i={}", i); return false; }
+        }
+    }
+    test_println!("  after {} KiB flood into a {} B cap: recv_buffer={} B, window={}",
+                  (FLOODS * CHUNK) / 1024, RCVBUF, last_buflen, last_window);
+
+    // (1) recv_buffer must be bounded.  The cap admits whole chunks until the
+    //     buffer reaches the cap; the last admitted chunk may push it up to
+    //     just under cap + one chunk.  Assert it never ran away with the flood.
+    let bound = (RCVBUF as usize) + CHUNK;
+    if last_buflen > bound {
+        test_fail!("rcvbuf_cap",
+            "recv_buffer {} B exceeded bound {} B — SO_RCVBUF cap absent (heap-OOM risk)",
+            last_buflen, bound);
+        return false;
+    }
+    test_println!("  recv_buffer bounded at {} B (≤ {} B) ✓ (no unbounded heap growth)", last_buflen, bound);
+
+    // (2) The advertised window must have shrunk toward 0 as the buffer filled.
+    if last_window >= 65535 {
+        test_fail!("rcvbuf_cap",
+            "advertised window still {} (did not shrink) — flow control absent", last_window);
+        return false;
+    }
+    // With recv_buffer ≥ cap, free space is 0 → window 0.
+    test_println!("  advertised window shrank to {} ✓ (RFC 9293 §3.8 flow control)", last_window);
+
+    let _ = tcp::abort(PORT);
+    test_pass!("TCP recv_buffer SO_RCVBUF cap + window shrink (RFC 9293 §3.8)");
     true
 }
 

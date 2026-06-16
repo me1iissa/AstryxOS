@@ -133,10 +133,13 @@ pub fn socket_setsockopt(id: u64, level: u64, optname: u64, val: u32) -> i32 {
     };
     // When SO_RCVBUF is set on a *bound* UDP socket we must propagate the
     // cap to the per-port UDP receive buffer (which enforces it in the RX
-    // path, per `setsockopt(2)`).  Capture what's needed under the
-    // SOCKETS lock, then release it before touching the UDP binding lock —
-    // lock order is socket → protocol, never inverted.
+    // path, per `setsockopt(2)`).  TCP is analogous: the per-connection
+    // `recv_buffer` cap lives on the TCB, so propagate to `tcp::set_option`.
+    // Capture what's needed under the SOCKETS lock, then release it before
+    // touching the protocol lock — lock order is socket → protocol, never
+    // inverted.
     let mut udp_rcvbuf_update: Option<(u16, usize)> = None;
+    let mut tcp_opt_update: Option<(u16, u32)> = None;
     match (level, optname) {
         (SOL_SOCKET,  SO_REUSEADDR) => { sock.reuseaddr = val != 0; }
         (SOL_SOCKET,  SO_KEEPALIVE) => { sock.keepalive = val != 0; }
@@ -144,6 +147,8 @@ pub fn socket_setsockopt(id: u64, level: u64, optname: u64, val: u32) -> i32 {
             sock.rcvbuf = val;
             if sock.socket_type == SocketType::Udp && sock.bound {
                 udp_rcvbuf_update = Some((sock.local_port, val as usize));
+            } else if sock.socket_type == SocketType::Tcp && sock.bound {
+                tcp_opt_update = Some((sock.local_port, val));
             }
         }
         (SOL_SOCKET,  SO_SNDBUF)    => { sock.sndbuf    = val; }
@@ -154,6 +159,9 @@ pub fn socket_setsockopt(id: u64, level: u64, optname: u64, val: u32) -> i32 {
     drop(sockets);
     if let Some((port, rcvbuf)) = udp_rcvbuf_update {
         super::udp::set_rcvbuf(port, rcvbuf);
+    }
+    if let Some((port, rcvbuf)) = tcp_opt_update {
+        super::tcp::set_option(port, None, None, Some(rcvbuf), None);
     }
     0
 }
