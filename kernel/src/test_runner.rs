@@ -2107,6 +2107,14 @@ pub fn run() -> ! {
     total += 1;
     if test_tlb_shootdown_coalesced_w133() { passed += 1; }
 
+    // ── TLB shootdown ACK-spin self-service (cross-CPU deadlock fix) ──
+    // A CPU spinning IRQ-disabled for sibling acks must drain its OWN
+    // pending slot inline, or two CPUs that shoot down the same shared
+    // CR3 from fault handlers mutually deadlock (each masked, neither can
+    // take the other's IPI).  This unit-exercises the self-service drain.
+    total += 1;
+    if test_tlb_self_service_drain() { passed += 1; }
+
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
     //   1. open(/proc/<target>/maps) from a different caller PID succeeds
@@ -42277,6 +42285,51 @@ fn test_tlb_shootdown_coalesced_w133() -> bool {
     tlb::forget_cr3(fake_cr3);
 
     test_pass!("TLB shootdown coalesced over range (W133)");
+    true
+}
+
+/// TLB shootdown ACK-spin self-service drain.
+///
+/// Regression guard for the cross-CPU ack-spin deadlock: a CPU that issues a
+/// shootdown from inside an interrupt-gate fault handler spins for sibling
+/// acks with RFLAGS.IF clear (Intel SDM Vol. 3A §6.12.1.2), so it cannot take
+/// an incoming `TLB_SHOOTDOWN_VECTOR` IPI and its own slot stays pending.  If
+/// a sibling is simultaneously spinning for *this* CPU's ack, neither can ack
+/// the other — a mutual deadlock that burns the full ACK bound on both
+/// (observed live as interleaved `[TLB/TIMEOUT] cpu=0 mask=0x2` /
+/// `cpu=1 mask=0x1`).  The fix has the spinner drain its OWN pending slot
+/// inline; this test exercises that drain end-to-end:
+///   1. First drain of a freshly-published pending slot returns `true`
+///      (claimed and acked exactly once) and advances `shootdowns_handled`.
+///   2. A second drain of the now-empty slot returns `false` (idempotent).
+fn test_tlb_self_service_drain() -> bool {
+    test_header!("TLB shootdown ACK-spin self-service drain");
+
+    use crate::mm::tlb;
+
+    let s_before = tlb::stats();
+    let (first, second) = tlb::test_self_service_drains_own_slot();
+    let s_after = tlb::stats();
+
+    if !first {
+        test_fail!("tlb/self-service", "first drain did not claim the pending slot");
+        return false;
+    }
+    if second {
+        test_fail!("tlb/self-service", "second drain re-claimed an empty slot (not idempotent)");
+        return false;
+    }
+    // Exactly one shootdown was handled by the inline drain.  We assert a
+    // monotonic advance of at least one (a concurrent real IPI on another
+    // CPU could add more, so the bound is ≥1, not ==1).
+    let handled_delta = s_after.shootdowns_handled.wrapping_sub(s_before.shootdowns_handled);
+    if handled_delta < 1 {
+        test_fail!("tlb/self-service",
+                   "shootdowns_handled did not advance (delta={})", handled_delta);
+        return false;
+    }
+
+    test_pass!("TLB shootdown ACK-spin self-service drain");
     true
 }
 

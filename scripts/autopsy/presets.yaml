@@ -376,3 +376,30 @@ presets:
         reg: rdx
         offset: 0
         len: 40
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # tlb-ack-spin
+  # ───────────────────────────────────────────────────────────────────────────
+  # Break at the TLB-shootdown ACK-spin (the `pause` in shootdown_range's
+  # bounded ack wait).  Captures the full register set — crucially RFLAGS,
+  # whose IF bit (bit 9) reveals whether the spinning CPU has interrupts
+  # masked (interrupt-gate entry per Intel SDM Vol. 3A §6.12.1.2 clears IF) —
+  # and the whole SHOOTDOWN_SLOTS array (16 slots x 32B) so the per-CPU
+  # `pending` byte (offset +0x18 in each slot) can be read to see which CPUs
+  # are mutually waiting.  Use to confirm a cross-CPU ack-spin deadlock:
+  # spinning CPU has IF=0 AND its OWN slot pending=1 (set by the sibling it
+  # is waiting on).
+  tlb-ack-spin:
+    description: |
+      ACK-spin snapshot.  Full regs (read RFLAGS bit 9 = IF) + the entire
+      SHOOTDOWN_SLOTS array (512B = 16 x 32B slots; pending byte at +0x18 in
+      each).  Confirms cross-CPU mutual ack-spin: IF=0 on the spinner while
+      its own slot.pending==1.
+    steps:
+      - name: regs
+        kind: regs
+      - name: shootdown_slots
+        kind: sym_window
+        sym: _RNvNtNtCs7Jo0tKRTyaU_13astryx_kernel2mm3tlb15SHOOTDOWN_SLOTS.llvm.5193700054269298329
+        offset: 0
+        len: 512
