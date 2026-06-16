@@ -80,7 +80,11 @@ if [ ! -x "${BB_STATIC}" ] || [ "${FORCE}" = true ]; then
         --arch x86_64 \
         --no-scripts \
         --update-cache \
-        add busybox-static 2>&1 | sed 's/^/[BUSYBOX-CLI]   /'
+        add busybox-static 2>&1 | sed 's/^/[BUSYBOX-CLI]   /' || true
+    # apk can exit non-zero on unprivileged post-install trigger failures even
+    # though busybox-static itself installed cleanly (the "N errors" tail).  The
+    # `|| true` keeps `set -e`/pipefail from aborting here; the binary-present +
+    # statically-linked checks below are the real validation gate.
 fi
 
 if [ ! -x "${BB_STATIC}" ]; then

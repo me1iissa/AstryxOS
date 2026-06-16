@@ -265,25 +265,176 @@ cat > "${DOCROOT}/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AstryxOS — WebXO</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto;
-           padding: 0 1rem; line-height: 1.5; color: #16181d; }
-    h1 { font-size: 2rem; }
-    code { background: #f0f1f4; padding: .1rem .35rem; border-radius: 4px; }
-    .ok { color: #1a7f37; font-weight: 600; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AstryxOS · live</title>
+<style>
+  :root{
+    --bg:#05060c; --ink:#e8ecff; --dim:#8b93b8;
+    --cyan:#38e8ff; --violet:#9d6bff; --magenta:#ff5ec4; --lime:#6bffb2;
+    --card:rgba(255,255,255,.04); --line:rgba(255,255,255,.10);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; min-height:100vh; color:var(--ink); background:var(--bg);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden; position:relative;
+  }
+  .aurora{position:fixed; inset:-20% -20% auto -20%; height:80vh; z-index:-2; filter:blur(70px); opacity:.55;
+    background:
+      radial-gradient(40% 60% at 20% 30%, var(--violet), transparent 60%),
+      radial-gradient(45% 55% at 75% 20%, var(--cyan), transparent 60%),
+      radial-gradient(40% 50% at 55% 60%, var(--magenta), transparent 60%);
+    animation:drift 18s ease-in-out infinite alternate;}
+  @keyframes drift{from{transform:translate3d(-3%,-2%,0) scale(1)}to{transform:translate3d(4%,3%,0) scale(1.15)}}
+  .stars{position:fixed; inset:0; z-index:-1; background-image:
+      radial-gradient(1px 1px at 20% 30%, #fff, transparent),
+      radial-gradient(1px 1px at 70% 60%, #cfe, transparent),
+      radial-gradient(1px 1px at 40% 80%, #fff, transparent),
+      radial-gradient(1.5px 1.5px at 85% 25%, #aef, transparent),
+      radial-gradient(1px 1px at 55% 15%, #fff, transparent),
+      radial-gradient(1px 1px at 10% 70%, #def, transparent);
+    background-repeat:repeat; background-size:600px 600px; opacity:.5; animation:twinkle 6s ease-in-out infinite alternate;}
+  @keyframes twinkle{from{opacity:.25}to{opacity:.6}}
+  .wrap{max-width:1000px; margin:0 auto; padding:clamp(1.2rem,4vw,3rem) 1.2rem 4rem;}
+  .pill{display:inline-flex; align-items:center; gap:.5ch; font-size:.78rem; letter-spacing:.04em;
+    color:var(--lime); border:1px solid rgba(107,255,178,.3); background:rgba(107,255,178,.07);
+    padding:.35rem .7rem; border-radius:999px; text-transform:uppercase; font-weight:600;}
+  .dot{width:.55rem; height:.55rem; border-radius:50%; background:var(--lime); box-shadow:0 0 10px var(--lime);
+    animation:pulse 1.6s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  h1{font-size:clamp(2.8rem,11vw,6rem); line-height:.95; margin:1.4rem 0 .2rem; font-weight:800; letter-spacing:-.03em;}
+  h1 .grad{background:linear-gradient(100deg,var(--cyan),var(--violet) 45%,var(--magenta));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    filter:drop-shadow(0 0 24px rgba(157,107,255,.35));}
+  .tag{font-size:clamp(1.05rem,2.6vw,1.5rem); color:var(--ink); min-height:1.6em; font-weight:500;}
+  .tag .cur{color:var(--cyan); animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .sub{color:var(--dim); max-width:60ch; margin:.8rem 0 0; font-size:1.02rem; line-height:1.6}
+  .stats{display:flex; flex-wrap:wrap; gap:.7rem; margin:2rem 0 1rem}
+  .stat{flex:1 1 150px; background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:1rem 1.1rem; backdrop-filter:blur(6px)}
+  .stat b{display:block; font-size:1.9rem; font-weight:800; letter-spacing:-.02em;
+    background:linear-gradient(120deg,#fff,var(--cyan)); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .stat span{color:var(--dim); font-size:.82rem}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin:2.2rem 0}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:18px; padding:1.3rem;
+    transition:transform .25s ease, border-color .25s ease, box-shadow .25s ease; position:relative; overflow:hidden}
+  .card:hover{transform:translateY(-4px); border-color:rgba(56,232,255,.4); box-shadow:0 18px 50px rgba(56,232,255,.08)}
+  .card .ic{font-size:1.5rem}
+  .card h3{margin:.6rem 0 .35rem; font-size:1.08rem}
+  .card p{margin:0; color:var(--dim); font-size:.92rem; line-height:1.55}
+  .card::after{content:""; position:absolute; inset:0 0 auto 0; height:2px;
+    background:linear-gradient(90deg,var(--cyan),var(--violet),var(--magenta)); opacity:.0; transition:opacity .25s}
+  .card:hover::after{opacity:.9}
+  .term{background:#070a13; border:1px solid var(--line); border-radius:16px; overflow:hidden; margin:2.2rem 0;
+    box-shadow:0 24px 60px rgba(0,0,0,.5)}
+  .term .bar{display:flex; align-items:center; gap:.5rem; padding:.65rem .9rem; border-bottom:1px solid var(--line);
+    background:rgba(255,255,255,.02)}
+  .term .b{width:.72rem; height:.72rem; border-radius:50%}
+  .b.r{background:#ff5f57}.b.y{background:#febc2e}.b.g{background:#28c840}
+  .term .ttl{margin-left:.4rem; color:var(--dim); font-size:.78rem; font-family:ui-monospace,monospace}
+  .term pre{margin:0; padding:1.1rem 1.1rem 1.4rem; font-family:ui-monospace,"JetBrains Mono",Menlo,monospace;
+    font-size:.86rem; line-height:1.6; color:#cdd6ff; white-space:pre-wrap; min-height:11.5em}
+  .term .p{color:var(--lime)} .term .ok{color:var(--cyan)} .term .w{color:#febc2e}
+  .term .c{display:inline-block; width:.6ch; background:var(--cyan); animation:blink 1s steps(1) infinite}
+  footer{margin-top:2.5rem; padding-top:1.4rem; border-top:1px solid var(--line); color:var(--dim);
+    font-size:.85rem; display:flex; flex-wrap:wrap; gap:.4rem 1.2rem; align-items:center; justify-content:space-between}
+  footer code{color:var(--cyan); background:rgba(56,232,255,.08); padding:.1rem .45rem; border-radius:6px;
+    font-family:ui-monospace,monospace}
+  .reveal{opacity:0; transform:translateY(14px); animation:rise .7s cubic-bezier(.2,.7,.2,1) forwards}
+  .reveal.d1{animation-delay:.05s}.reveal.d2{animation-delay:.15s}.reveal.d3{animation-delay:.28s}.reveal.d4{animation-delay:.42s}
+  @keyframes rise{to{opacity:1; transform:none}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}.reveal{opacity:1; transform:none}}
+</style>
 </head>
 <body>
-  <h1>It works.</h1>
-  <p class="ok">This page is served by <strong>WebXO</strong> running as a
-     userspace process on a live <strong>AstryxOS</strong> instance.</p>
-  <p>The same instance is reachable over SSH (dropbear) on TCP&nbsp;22.
-     This HTTP server is bound to <code>0.0.0.0:8080</code> inside the guest
-     and forwarded to your LAN by the QEMU host.</p>
-  <p>Server: <code>WebXO/1.6.0</code> &middot; HTTP/1.1 (RFC&nbsp;9110)</p>
+<div class="aurora"></div><div class="stars"></div>
+<main class="wrap">
+  <div class="reveal"><span class="pill"><span class="dot"></span>live · served by AstryxOS</span></div>
+  <h1 class="reveal d1">Hello from <span class="grad">AstryxOS</span></h1>
+  <p class="tag reveal d1" id="tag"><span class="cur">_</span></p>
+  <p class="sub reveal d2">
+    You're reading a page served by <strong>WebXO</strong> — a userspace HTTP/1.1 server running on
+    <strong>AstryxOS</strong>, a from-scratch operating system whose kernel is written in Rust. The same
+    machine boots an <em>unmodified</em> Firefox, speaks real TCP/IP + TLS, and lets you SSH straight in.
+    No Linux underneath — this OS does it itself.
+  </p>
+  <section class="stats">
+    <div class="stat reveal d2"><b data-to="7">0</b><span>real websites rendered</span></div>
+    <div class="stat reveal d2"><b data-to="100" data-suf="%">0</b><span>upstream Firefox</span></div>
+    <div class="stat reveal d3"><b data-to="202">0</b><span>peak threads, one render</span></div>
+    <div class="stat reveal d3"><b data-to="0" data-suf=" patches">0</b><span>to the Firefox binary</span></div>
+  </section>
+  <section class="grid">
+    <div class="card reveal d1"><div class="ic">🦊</div><h3>Runs real Firefox</h3>
+      <p>The actual upstream libxul/musl build — not a clone. It has rendered BBC News, CNN, Wikipedia and
+         more to pixel-perfect PNGs, headless.</p></div>
+    <div class="card reveal d2"><div class="ic">🌐</div><h3>Real network stack</h3>
+      <p>Hand-written TCP/IP, DNS, ARP and DHCP. HTTPS handshakes, sockets, epoll — enough to load the
+         live web over the wire.</p></div>
+    <div class="card reveal d3"><div class="ic">🔑</div><h3>SSH right in</h3>
+      <p>dropbear + a busybox shell with a proper PTY (cooked termios, ONLCR, the works). Connect from any
+         box on your LAN.</p></div>
+    <div class="card reveal d4"><div class="ic">⚡</div><h3>Serves this page</h3>
+      <p>WebXO binds <code style="color:var(--lime)">0.0.0.0:8080</code> as a normal userspace process —
+         co-resident with SSH, from a single boot.</p></div>
+  </section>
+  <section class="term reveal d2">
+    <div class="bar"><span class="b r"></span><span class="b y"></span><span class="b g"></span>
+      <span class="ttl">root@astryx:~ — live boot log</span></div>
+    <pre id="log"></pre>
+  </section>
+  <footer class="reveal d3">
+    <span>Served by <code>WebXO/1.6.0</code> · HTTP/1.1 (RFC&nbsp;9110) on <code>AstryxOS</code></span>
+    <span id="clock"></span>
+  </footer>
+</main>
+<script>
+(function(){
+  var phrases = [
+    "An OS that runs the real web.",
+    "Rust kernel. Upstream Firefox. Zero patches.",
+    "Boots, renders, serves — all by itself.",
+    "You found the web server. 👋"
+  ], pi=0, ci=0, del=false, el=document.getElementById('tag');
+  function type(){
+    var p=phrases[pi];
+    ci += del?-1:1;
+    el.innerHTML = p.slice(0,ci) + '<span class="cur">_</span>';
+    if(!del && ci===p.length){ del=true; return setTimeout(type,1700); }
+    if(del && ci===0){ del=false; pi=(pi+1)%phrases.length; return setTimeout(type,250); }
+    setTimeout(type, del?28:55);
+  }
+  type();
+  document.querySelectorAll('.stat b').forEach(function(b){
+    var to=+b.dataset.to, suf=b.dataset.suf||'', t0=null, dur=1100;
+    function step(ts){ t0=t0||ts; var k=Math.min(1,(ts-t0)/dur);
+      b.textContent = Math.round(to*(1-Math.pow(1-k,3))) + suf;
+      if(k<1) requestAnimationFrame(step); }
+    requestAnimationFrame(step);
+  });
+  var lines = [
+    ['p','astryx ›',' kernel up · SMP 2 cores · KVM'],
+    ['ok','  ✓',' virtio-blk online · ext2 mounted'],
+    ['ok','  ✓',' net: e1000 · DHCP 10.0.2.15 · DNS ok'],
+    ['ok','  ✓',' dropbear listening on :22'],
+    ['ok','  ✓',' WebXO bound 0.0.0.0:8080'],
+    ['w','  »',' GET / 200 — that\'s you, right now'],
+  ], log=document.getElementById('log'), li=0;
+  function emit(){
+    if(li>=lines.length){ log.innerHTML += '<span class="p">astryx ›</span> <span class="c">&nbsp;</span>'; return; }
+    var L=lines[li++];
+    log.innerHTML += '<span class="'+L[0]+'">'+L[1]+'</span>'+L[2]+'\n';
+    setTimeout(emit, 520);
+  }
+  setTimeout(emit, 700);
+  var clk=document.getElementById('clock');
+  function tick(){ clk.textContent = new Date().toLocaleString(); }
+  tick(); setInterval(tick,1000);
+})();
+</script>
 </body>
 </html>
 HTML
