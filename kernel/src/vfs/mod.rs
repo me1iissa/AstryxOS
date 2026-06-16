@@ -582,6 +582,18 @@ pub fn init() {
     let _ = symlink("/etc/ssl",            "/disk/etc/ssl");
     let _ = symlink("/etc/pki/tls/certs",  "/disk/etc/pki/tls/certs");
 
+    // fontconfig reads its configuration from /etc/fonts/fonts.conf at FcInit
+    // time (the library's compiled-in sysconfdir default; see fonts-conf(5)).
+    // The real config tree is staged on the data disk at /disk/etc/fonts/, so
+    // point /etc/fonts at it the same way /etc/ssl is handled above.  Without
+    // this every GTK/Firefox process — including the e10s content children,
+    // which do not reliably inherit FONTCONFIG_* — fails the default-config
+    // load ("Cannot load default config file: No such file") and degrades to
+    // fontconfig's minimal built-in fallback, breaking text/glyph rendering
+    // and the windowed (--ff-gui) paint path.  The longest-prefix symlink
+    // walker leaves the rest of the /etc tmpfs (hostname, hosts, ...) intact.
+    let _ = symlink("/etc/fonts",          "/disk/etc/fonts");
+
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
     let _ = create_file("/dev/zero");
