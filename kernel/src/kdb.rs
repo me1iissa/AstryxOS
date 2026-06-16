@@ -1028,6 +1028,25 @@ fn op_user_mem(req: &str, out: &mut String) {
 /// base64 chars, comfortably under the 32 KiB MAX_RESP_BYTES kdb response cap.
 const READ_FILE_CHUNK: u64 = 16384;
 
+/// Single-entry snapshot for the in-flight `read-file` extraction.
+///
+/// A multi-chunk extraction (e.g. a ~2 MB Firefox screenshot pulled in
+/// `ceil(N/16384)` chunks) used to call `vfs::read_file` — which returns an
+/// owned `Vec<u8>` CLONE of the whole file — on EVERY chunk request, copying
+/// the entire file once per chunk (O(file_size · chunks) ≈ hundreds of MB of
+/// memcpy to extract a 2 MB file).  This snapshot holds the bytes from the
+/// first (offset==0) chunk so subsequent offsets slice the same buffer in O(1),
+/// making an extraction O(file_size) overall.
+///
+/// Best-effort and read-only: a non-zero offset whose `(path, len)` does not
+/// match the snapshot falls back to a fresh `vfs::read_file`, so a missed/stale
+/// snapshot only costs the old per-chunk read — never wrong bytes.  The
+/// snapshot is replaced whenever a fresh offset==0 read arrives, so a re-read of
+/// the same path (or a different path) always re-snapshots.  kdb is read-only
+/// and single-threaded through the pump, so no writer can mutate the file
+/// underneath a snapshot mid-extraction.
+static READ_FILE_SNAPSHOT: Mutex<Option<(String, Vec<u8>)>> = Mutex::new(None);
+
 fn b64_append(out: &mut String, src: &[u8]) {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1065,20 +1084,43 @@ fn op_read_file(req: &str, out: &mut String) {
         .unwrap_or(READ_FILE_CHUNK)
         .min(READ_FILE_CHUNK);
 
-    // Read the whole file once (ramfs/cache-backed; cheap for the small
-    // artefacts this op targets), then slice — keeps the VFS surface minimal.
-    let bytes = match crate::vfs::read_file(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            use core::fmt::Write;
-            out.push('{');
-            j_kv_str(out, "path", &path);
-            let _ = write!(out, r#""error":"read failed: {:?}","#, e);
-            j_trim_comma(out);
-            out.push('}');
-            return;
+    // Resolve the file bytes via the single-entry extraction snapshot
+    // (READ_FILE_SNAPSHOT), so a multi-chunk pull reads/clones the whole file
+    // ONCE instead of once per chunk.  Hold the snapshot lock for the whole
+    // slice+encode so the borrowed bytes stay valid.
+    let mut snap = READ_FILE_SNAPSHOT.lock();
+
+    // Decide whether the cached snapshot serves this request:
+    //  * offset==0 always re-snapshots (start of a fresh extraction, or a
+    //    re-read of a possibly-changed file).
+    //  * offset>0 reuses the snapshot only when the path matches; otherwise it
+    //    is a stale/foreign snapshot and we read fresh.
+    let reuse = offset != 0
+        && snap.as_ref().map_or(false, |(p, _)| p.as_str() == path.as_str());
+
+    if !reuse {
+        match crate::vfs::read_file(&path) {
+            Ok(b) => { *snap = Some((path.clone(), b)); }
+            Err(e) => {
+                use core::fmt::Write;
+                // On a failed read, drop any stale snapshot for this path so a
+                // later retry re-reads rather than serving stale bytes.
+                if snap.as_ref().map_or(false, |(p, _)| p.as_str() == path.as_str()) {
+                    *snap = None;
+                }
+                out.push('{');
+                j_kv_str(out, "path", &path);
+                let _ = write!(out, r#""error":"read failed: {:?}","#, e);
+                j_trim_comma(out);
+                out.push('}');
+                return;
+            }
         }
-    };
+    }
+
+    // SAFETY of unwrap: `reuse` is only true when the snapshot is Some for this
+    // path, and the !reuse branch above just populated it (or returned early).
+    let bytes: &[u8] = &snap.as_ref().unwrap().1;
 
     let file_size = bytes.len() as u64;
     let start = offset.min(file_size) as usize;
@@ -1100,6 +1142,12 @@ fn op_read_file(req: &str, out: &mut String) {
     b64_append(out, slice);
     out.push('"');
     out.push('}');
+
+    // Free the snapshot once the final chunk has been served so it does not
+    // pin a multi-MB buffer in the kdb heap after the extraction completes.
+    if eof {
+        *snap = None;
+    }
 }
 
 // ── trace-status ──────────────────────────────────────────────────────────────
