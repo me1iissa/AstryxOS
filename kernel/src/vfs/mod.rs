@@ -2379,9 +2379,64 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             // Drop MOUNTS before the FS read: the read may fault on the
             // user buffer pages (file-backed VMA), and the page-fault
             // handler also needs MOUNTS — same-thread recursion (#82).
+            //
+            // Bounce the read through a kernel-heap buffer instead of letting
+            // the filesystem fill the user buffer directly.  A block-backed
+            // filesystem (ext2/fat32) services a large aligned read by handing
+            // the destination slice to the block device, which DMAs into it.
+            // The virtio-blk descriptor's address field is a *physical*
+            // address; the driver derives it from the buffer's kernel virtual
+            // address by the fixed higher-half direct-map offset and has no
+            // page-table walker, so a *user* virtual address gets written into
+            // the descriptor verbatim as if it were physical.  The device then
+            // targets a bogus address far outside RAM, the host rejects the
+            // descriptor, and the virtqueue halts — wedging all further disk
+            // I/O (observed: a multi-page uncached read froze the device's
+            // used.idx, immune to doorbell re-kick and reset).
+            //
+            // The kernel heap occupies one physically-contiguous range, so a
+            // heap `Vec` always has a valid contiguous physical address the
+            // driver's offset derivation handles.  Read into the bounce buffer,
+            // then CPU-copy into the user buffer (the copy may fault the
+            // file-backed user pages in — which is why MOUNTS was dropped
+            // above).  In-memory filesystems (ramfs/tmpfs/procfs) memcpy and are
+            // unaffected by either path.  All read variants
+            // (read/pread/readv/preadv) funnel through fd_read, so this covers
+            // every backing-store read.
             let n = {
                 let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
-                fs.read(inode, offset, &mut buffer)?
+                // Bounce in bounded chunks so a single read(2) with a huge
+                // `count` never allocates a `count`-sized kernel buffer (which
+                // could exhaust the 384 MiB kernel heap).  256 KiB comfortably
+                // exceeds the block device's per-request span, so a chunk is
+                // still serviced by at most one coalesced device read.
+                const BOUNCE_CHUNK: usize = 256 * 1024;
+                let chunk_cap = count.min(BOUNCE_CHUNK);
+                let mut bounce = alloc::vec![0u8; chunk_cap];
+                let mut done = 0usize;
+                loop {
+                    if done >= count {
+                        break;
+                    }
+                    let want = (count - done).min(chunk_cap);
+                    let got = fs.read(
+                        inode,
+                        offset + done as u64,
+                        &mut bounce[..want],
+                    )?;
+                    if got == 0 {
+                        break; // EOF / short read — stop.
+                    }
+                    // SAFETY: `buffer` is the caller's destination of length
+                    // `count`; `done + got <= count` because `want <= count -
+                    // done` and `got <= want`.
+                    buffer[done..done + got].copy_from_slice(&bounce[..got]);
+                    done += got;
+                    if got < want {
+                        break; // short read — backing store has no more here.
+                    }
+                }
+                done
             };
 
             // Update offset.
