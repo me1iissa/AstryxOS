@@ -147,6 +147,16 @@ pub fn alloc() -> Option<u8> {
     None
 }
 
+/// True if PTY pair `n` is currently allocated (both ends not yet freed).
+///
+/// Used by the `stat(2)` path for `/dev/pts/N` to distinguish a live slave
+/// node from a stale one: per `pts(4)` the slave node exists only while the
+/// pair is allocated, so a `stat` of a freed pair index must report ENOENT.
+pub fn is_alive(n: u8) -> bool {
+    let pairs = PAIRS.lock();
+    pairs.get(n as usize).map(|s| s.is_some()).unwrap_or(false)
+}
+
 /// Unlock the slave side (called by `unlockpt`).
 pub fn unlock_slave(n: u8) {
     let mut pairs = PAIRS.lock();

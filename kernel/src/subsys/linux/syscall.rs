@@ -7660,6 +7660,20 @@ fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
             Err(e) => return e,
         }
     };
+    // PTY slave nodes (/dev/pts/N) are not backed by a mounted filesystem —
+    // open(2) special-cases them (no devfs node exists), so vfs::stat would
+    // ENOENT here.  Synthesise the same character-device `struct stat` the
+    // fstat path produces for the corresponding slave fd, so that the two
+    // agree on st_dev/st_ino (the equality musl's ttyname_r requires — see
+    // ttyname(3)).  A stat of a freed/never-allocated pair index reports
+    // ENOENT, per pts(4) (the node exists only while the pair is allocated).
+    if let Some(n) = parse_devpts_index(resolved.as_str()) {
+        if crate::drivers::pty::is_alive(n) {
+            fill_linux_pty_stat(stat_buf as *mut u8, n, /*is_master=*/false);
+            return 0;
+        }
+        return -2; // ENOENT
+    }
     match crate::vfs::stat(resolved.as_str()) {
         Ok(st) => {
             fill_linux_stat(stat_buf as *mut u8, &st);
@@ -7667,6 +7681,13 @@ fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
         }
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
     }
+}
+
+/// Parse `/dev/pts/N` → Some(N) where N is a PTY pair index (0..=255).
+/// Returns None for any other path (including `/dev/pts` itself, which is
+/// the directory, and malformed indices).
+fn parse_devpts_index(path: &str) -> Option<u8> {
+    path.strip_prefix("/dev/pts/")?.parse::<u8>().ok()
 }
 
 /// Linux fstat(fd, statbuf) — uses Linux stat layout.
@@ -7694,6 +7715,24 @@ fn sys_fstat_linux(fd_num: usize, stat_buf: *mut u8) -> i64 {
             accessed: 0,
         };
         fill_linux_stat(stat_buf, &st);
+        return 0;
+    }
+
+    // PTY master/slave fds are not backed by a mounted filesystem
+    // (mount_idx == usize::MAX, no devfs inode), so the generic fs.stat()
+    // path below would EBADF.  Synthesise a character-device `struct stat`
+    // here.  The slave-side fields MUST match a path stat of /dev/pts/N so
+    // that musl's ttyname_r (which compares fstat(fd).st_dev/st_ino against
+    // stat("/dev/pts/N").st_dev/st_ino — see ttyname(3)) succeeds and an
+    // interactive login shell can resolve its controlling terminal.
+    // `fd.inode` holds the PTY pair index N (set in FileDescriptor::pty_*).
+    if matches!(fd.file_type,
+        crate::vfs::FileType::PtySlave | crate::vfs::FileType::PtyMaster)
+    {
+        let n = fd.inode as u8;
+        let is_master = fd.file_type == crate::vfs::FileType::PtyMaster;
+        drop(procs);
+        fill_linux_pty_stat(stat_buf, n, is_master);
         return 0;
     }
 
@@ -7912,6 +7951,83 @@ fn fill_linux_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
     // st_ctim (offset 104): created time (use as ctime)
     out[104..112].copy_from_slice(&(st.created as i64).to_le_bytes());
     // st_ctim.tv_nsec (offset 112): 0
+}
+
+// ── PTY (devpts) synthetic stat ─────────────────────────────────────────────
+
+/// Synthetic device id for the pseudo-terminal slave filesystem (devpts).
+/// On Linux a freshly-mounted devpts gets its own anonymous block-device id;
+/// any fixed nonzero value that is distinct from the real root filesystem's
+/// `st_dev` (which `fill_linux_stat` reports as 1) is sufficient here.  The
+/// only hard requirement (`ttyname(3)`) is that a path stat of /dev/pts/N and
+/// an fstat of the matching slave fd report the *same* st_dev — guaranteed
+/// because both go through `fill_linux_pty_stat`.
+const DEVPTS_ST_DEV: u64 = 0x18; // makedev(0, 24) — anon devpts superblock
+
+/// Linux pts major numbers: ptmx is major 5 minor 2; Unix98 pts slaves are
+/// major 136 minor N (documented at
+/// <https://www.kernel.org/doc/html/latest/admin-guide/devices.html>, the
+/// "LOCAL/EXPERIMENTAL USE" / Unix98 PTY allocation tables, and `pts(4)`).
+const PTS_SLAVE_MAJOR: u64 = 136;
+const PTMX_MAJOR: u64 = 5;
+const PTMX_MINOR: u64 = 2;
+
+/// Encode a (major, minor) pair into a Linux `dev_t` (glibc/kernel layout):
+/// minor bits 0..7 and 20..31, major bits 8..19 and 32..63.  See
+/// `makedev(3)` (`sys/sysmacros.h`).
+const fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xfff) << 8)
+        | ((major & !0xfff) << 32)
+        | (minor & 0xff)
+        | ((minor & !0xff) << 12)
+}
+
+/// Stable inode number for PTY slave `n`.  Mirrors the conventional devpts
+/// numbering (root = 1, ptmx = 2, slave N = N + 3) so distinct slaves get
+/// distinct inodes and the value is reproducible across the fstat and path
+/// stat of the same pair.
+const fn pts_slave_ino(n: u8) -> u64 {
+    n as u64 + 3
+}
+
+/// Fill a Linux x86_64 `struct stat` for a PTY master/slave character device.
+///
+/// Both the fstat(slave_fd) path and the stat("/dev/pts/N") path call this
+/// with the same pair index `n`, so they agree on every field — in particular
+/// st_dev and st_ino, the pair `ttyname(3)`/musl `ttyname_r` compares to
+/// confirm a slave fd's controlling-terminal path.  Reported as a character
+/// device (`S_IFCHR`) with the Unix98 pts rdev (major 136, minor N) for the
+/// slave and the ptmx rdev (major 5, minor 2) for the master.  Permissions
+/// follow the conventional devpts default of 0620 for slaves; the master is
+/// 0666.  See `pts(4)`, `ptmx(4)`, and POSIX `stat(2)`.
+fn fill_linux_pty_stat(buf: *mut u8, n: u8, is_master: bool) {
+    // SMAP bracket — `buf` is a user pointer in the syscall path.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, LINUX_STAT_SIZE) };
+    for b in out.iter_mut() {
+        *b = 0;
+    }
+    let (rdev, perm) = if is_master {
+        (makedev(PTMX_MAJOR, PTMX_MINOR), 0o666u32)
+    } else {
+        (makedev(PTS_SLAVE_MAJOR, n as u64), 0o620u32)
+    };
+    // dev (offset 0)
+    out[0..8].copy_from_slice(&DEVPTS_ST_DEV.to_le_bytes());
+    // ino (offset 8) — derived solely from the pair index N
+    out[8..16].copy_from_slice(&pts_slave_ino(n).to_le_bytes());
+    // nlink (offset 16)
+    out[16..24].copy_from_slice(&1u64.to_le_bytes());
+    // mode (offset 24): S_IFCHR | perm
+    let mode: u32 = 0o020000 | perm;
+    out[24..28].copy_from_slice(&mode.to_le_bytes());
+    // uid (offset 28), gid (offset 32): 0
+    // rdev (offset 40): the character-device number
+    out[40..48].copy_from_slice(&rdev.to_le_bytes());
+    // size (offset 48): 0 for a character device
+    // blksize (offset 56)
+    out[56..64].copy_from_slice(&4096i64.to_le_bytes());
+    // blocks/atime/mtime/ctime left zero — a PTY has no on-disk timestamps.
 }
 
 // ── New Linux-specific syscalls ─────────────────────────────────────────────

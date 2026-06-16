@@ -246,6 +246,19 @@ pub fn run() -> ! {
         if test_245_kstack_gen_quiesce_barrier() { passed += 1; }
     }
 
+    // ── Test 276b: PTY slave stat consistency — ttyname(3) substrate ─────
+    // Asserts fstat(slave_fd) and stat("/dev/pts/N") agree on st_dev+st_ino
+    // with S_IFCHR mode (the equality musl's ttyname_r requires before an
+    // interactive login shell — dropbear's `ssh -tt` PTY path — can resolve
+    // its controlling terminal).  Registered in the early-priority block so
+    // the regression signal lands even though the blocking-pipe suite below
+    // is known to wedge under dual-core on this branch.
+    #[cfg(any(feature = "test-mode", feature = "pivot-e-test"))]
+    {
+        total += 1;
+        if test_276b_pty_stat_ttyname() { passed += 1; }
+    }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
@@ -979,6 +992,10 @@ pub fn run() -> ! {
         total += 1;
         if test_275_pty_syscall_smoke() { passed += 1; }
     }
+    // Test 276b (PTY slave stat consistency — ttyname(3) substrate) is
+    // registered earlier, in the early-priority block, so its regression
+    // signal lands even though the blocking-pipe suite below wedges under
+    // dual-core on this branch.
 
     // ── Test 78: SysV SHM — shmget / shmat / shmdt / shmctl ─────────────────
 
@@ -51176,6 +51193,179 @@ fn test_275_pty_syscall_smoke() -> bool {
     test_println!("  275-13 close(master), close(slave) ✓");
 
     if ok { test_pass!("PTY syscall smoke — open/ioctl/read/write end-to-end (Test 275)"); }
+    ok
+}
+
+/// Test 276b: PTY slave stat consistency — `ttyname(3)` substrate.
+///
+/// musl's `ttyname_r` (and POSIX `ttyname(3)`) confirm a slave fd's
+/// controlling-terminal path by requiring that `fstat(slave_fd)` and
+/// `stat("/dev/pts/N")` report the *same* `st_dev` and `st_ino` (and that
+/// both calls succeed).  Without this an interactive SSH login shell whose
+/// server calls `ttyname()` on the openpty slave fails to start.  This test
+/// asserts:
+///   1. fstat(slave_fd) succeeds and reports S_IFCHR.
+///   2. stat("/dev/pts/N") succeeds and reports S_IFCHR.
+///   3. their st_dev AND st_ino are byte-identical.
+///   4. fstat(master_fd) succeeds and reports S_IFCHR (ptmx).
+///   5. stat("/dev/pts/<free index>") of a non-allocated pair → ENOENT.
+fn test_276b_pty_stat_ttyname() -> bool {
+    test_header!("PTY slave stat consistency — ttyname(3) substrate (Test 276b)");
+
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    const SYS_STAT:  u64 = 4;
+    const SYS_FSTAT: u64 = 5;
+    const SYS_OPEN:  u64 = 2;
+    const SYS_CLOSE: u64 = 3;
+    const SYS_IOCTL: u64 = 16;
+    const TIOCGPTN:  u64 = 0x8004_5430;
+    const O_RDWR:    u64 = 2;
+
+    // x86_64 `struct stat` field offsets (see fill_linux_stat docstring).
+    const OFF_DEV:  usize = 0;
+    const OFF_INO:  usize = 8;
+    const OFF_MODE: usize = 24;
+    const S_IFMT:   u32 = 0o170000;
+    const S_IFCHR:  u32 = 0o020000;
+    const STAT_SZ:  usize = 144;
+
+    let read_dev = |b: &[u8; STAT_SZ]| u64::from_le_bytes(b[OFF_DEV..OFF_DEV + 8].try_into().unwrap());
+    let read_ino = |b: &[u8; STAT_SZ]| u64::from_le_bytes(b[OFF_INO..OFF_INO + 8].try_into().unwrap());
+    let read_mode = |b: &[u8; STAT_SZ]| u32::from_le_bytes(b[OFF_MODE..OFF_MODE + 4].try_into().unwrap());
+
+    // ── Allocate a PTY pair ──────────────────────────────────────────────
+    let ptmx_path = b"/dev/ptmx\0";
+    let master = dispatch(SYS_OPEN, ptmx_path.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if master < 0 {
+        test_fail!("276b/open ptmx", "open(/dev/ptmx) → {}", master);
+        return false;
+    }
+    let mut pty_n: u32 = 0xFFFF_FFFF;
+    let r = dispatch(SYS_IOCTL, master as u64, TIOCGPTN,
+                     &mut pty_n as *mut u32 as u64, 0, 0, 0);
+    if r != 0 || pty_n > 15 {
+        test_fail!("276b/TIOCGPTN", "ioctl(TIOCGPTN) → r={} n={}", r, pty_n);
+        let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    let mut slave_path = [0u8; 16];
+    let prefix = b"/dev/pts/";
+    slave_path[..prefix.len()].copy_from_slice(prefix);
+    let plen = if pty_n < 10 {
+        slave_path[prefix.len()] = b'0' + (pty_n as u8);
+        slave_path[prefix.len() + 1] = 0;
+        prefix.len() + 1
+    } else {
+        slave_path[prefix.len()] = b'1';
+        slave_path[prefix.len() + 1] = b'0' + ((pty_n - 10) as u8);
+        slave_path[prefix.len() + 2] = 0;
+        prefix.len() + 2
+    };
+    let _ = plen;
+    let slave = dispatch(SYS_OPEN, slave_path.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if slave < 0 {
+        test_fail!("276b/open pts", "open(/dev/pts/{}) → {}", pty_n, slave);
+        let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  276b-0 pair {} (master fd {}, slave fd {}) ✓", pty_n, master, slave);
+
+    // ── 1: fstat(slave) ──────────────────────────────────────────────────
+    let mut fbuf = [0u8; STAT_SZ];
+    let r = dispatch(SYS_FSTAT, slave as u64, fbuf.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("276b/fstat slave", "fstat(slave) → {} (expected 0)", r);
+        ok = false;
+    } else if read_mode(&fbuf) & S_IFMT != S_IFCHR {
+        test_fail!("276b/fstat slave mode",
+            "fstat(slave) mode={:#o}, expected S_IFCHR", read_mode(&fbuf));
+        ok = false;
+    } else {
+        test_println!("  276b-1 fstat(slave) → dev={:#x} ino={} mode={:#o} (S_IFCHR) ✓",
+            read_dev(&fbuf), read_ino(&fbuf), read_mode(&fbuf));
+    }
+
+    // ── 2: stat("/dev/pts/N") ────────────────────────────────────────────
+    let mut sbuf = [0u8; STAT_SZ];
+    let r = dispatch(SYS_STAT, slave_path.as_ptr() as u64, sbuf.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("276b/stat path", "stat(/dev/pts/{}) → {} (expected 0)", pty_n, r);
+        ok = false;
+    } else if read_mode(&sbuf) & S_IFMT != S_IFCHR {
+        test_fail!("276b/stat path mode",
+            "stat(/dev/pts/{}) mode={:#o}, expected S_IFCHR", pty_n, read_mode(&sbuf));
+        ok = false;
+    } else {
+        test_println!("  276b-2 stat(/dev/pts/{}) → dev={:#x} ino={} mode={:#o} (S_IFCHR) ✓",
+            pty_n, read_dev(&sbuf), read_ino(&sbuf), read_mode(&sbuf));
+    }
+
+    // ── 3: the two MUST agree on st_dev + st_ino (the ttyname_r contract) ─
+    if ok {
+        if read_dev(&fbuf) != read_dev(&sbuf) {
+            test_fail!("276b/dev mismatch",
+                "fstat st_dev {:#x} != stat st_dev {:#x}", read_dev(&fbuf), read_dev(&sbuf));
+            ok = false;
+        } else if read_ino(&fbuf) != read_ino(&sbuf) {
+            test_fail!("276b/ino mismatch",
+                "fstat st_ino {} != stat st_ino {}", read_ino(&fbuf), read_ino(&sbuf));
+            ok = false;
+        } else {
+            test_println!("  276b-3 fstat(slave) == stat(/dev/pts/{}) on dev+ino ✓ (ttyname_r passes)", pty_n);
+        }
+    }
+
+    // ── 4: fstat(master) → S_IFCHR (ptmx) ────────────────────────────────
+    let mut mbuf = [0u8; STAT_SZ];
+    let r = dispatch(SYS_FSTAT, master as u64, mbuf.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if r != 0 || read_mode(&mbuf) & S_IFMT != S_IFCHR {
+        test_fail!("276b/fstat master",
+            "fstat(master) → r={} mode={:#o}, expected 0 / S_IFCHR", r, read_mode(&mbuf));
+        ok = false;
+    } else {
+        test_println!("  276b-4 fstat(master) → mode={:#o} (S_IFCHR ptmx) ✓", read_mode(&mbuf));
+    }
+
+    // ── 5: stat of a non-allocated slave index → ENOENT ──────────────────
+    // Find a slave index that is NOT currently allocated (we hold only `pty_n`).
+    let mut free_idx: Option<u8> = None;
+    for cand in 0u8..16 {
+        if cand != pty_n as u8 && !crate::drivers::pty::is_alive(cand) {
+            free_idx = Some(cand);
+            break;
+        }
+    }
+    if let Some(idx) = free_idx {
+        let mut p = [0u8; 16];
+        p[..prefix.len()].copy_from_slice(prefix);
+        if idx < 10 {
+            p[prefix.len()] = b'0' + idx;
+            p[prefix.len() + 1] = 0;
+        } else {
+            p[prefix.len()] = b'1';
+            p[prefix.len() + 1] = b'0' + (idx - 10);
+            p[prefix.len() + 2] = 0;
+        }
+        let mut zbuf = [0u8; STAT_SZ];
+        let r = dispatch(SYS_STAT, p.as_ptr() as u64, zbuf.as_mut_ptr() as u64, 0, 0, 0, 0);
+        if r != -2 {
+            test_fail!("276b/stale ENOENT",
+                "stat(/dev/pts/{}) of un-allocated pair → {} (expected -ENOENT)", idx, r);
+            ok = false;
+        } else {
+            test_println!("  276b-5 stat(/dev/pts/{}) un-allocated → ENOENT ✓", idx);
+        }
+    } else {
+        test_println!("  276b-5 (skipped: no free pts index to probe ENOENT)");
+    }
+
+    let _ = dispatch(SYS_CLOSE, slave as u64, 0, 0, 0, 0, 0);
+    let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+
+    if ok { test_pass!("PTY slave stat consistency — ttyname(3) substrate (Test 276b)"); }
     ok
 }
 
