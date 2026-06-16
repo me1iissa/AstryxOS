@@ -68,6 +68,12 @@ mod busybox_demo;
 mod httpd_demo;
 #[cfg(feature = "sshd-test")]
 mod sshd_demo;
+// webxo_demo provides the userspace WebXO HTTP-server launcher.  It is used
+// both by the standalone `webxo-test` feature (isolated bring-up) and by the
+// persistent SSH/web instance (`sshd-test`), which launches the web server on
+// the same boot so SSH (:22) and HTTP (:8080) are served from one instance.
+#[cfg(any(feature = "webxo-test", feature = "sshd-test"))]
+mod webxo_demo;
 #[cfg(feature = "tls-test")]
 mod tls_demo;
 #[cfg(any(feature = "oracle-test", feature = "oracle-daemon-test"))]
@@ -769,10 +775,57 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── webxo-test: WebXO userspace HTTP-server demo (web/httpd-bringup) ──
+        // Standalone bring-up of the web server in isolation (no SSH).  The
+        // combined SSH+web instance launches WebXO from inside run_sshd_demo.
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test-core"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
+                  not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
+                  not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
+                  not(feature = "pivot-e-git-test"),
+                  feature = "webxo-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            webxo_demo::run_webxo_demo();
+
+            serial_println!("[WEBXO] DONE");
+
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── tls-test: TLS userspace handshake demo (PIVOT-I1a, 2026-05-23) ──
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
                   not(feature = "firefox-test-core"),
+                  not(feature = "webxo-test"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -1760,7 +1813,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test-core", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test", feature = "oracle-test", feature = "oracle-daemon-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test-core", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "webxo-test", feature = "tls-test", feature = "oracle-test", feature = "oracle-daemon-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");

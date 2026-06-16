@@ -178,6 +178,23 @@ pub fn run_sshd_demo() {
     }
     crate::hal::enable_interrupts();
 
+    // ── Co-launch the WebXO HTTP server on the SAME instance ─────────────────
+    // The persistent instance serves both SSH (dropbear, :22) and HTTP (WebXO,
+    // :8080) so an operator can SSH in AND browse the guest web server over the
+    // LAN from one boot.  WebXO is staged by scripts/install-webxo.sh at
+    // /disk/usr/bin/webxo; if it is not present (e.g. an SSH-only image) the
+    // spawn is skipped with a diagnostic and the SSH service runs as before.
+    let webxo = crate::webxo_demo::spawn_webxo();
+    let mut webxo_captured: Vec<u8> = Vec::with_capacity(2048);
+    match webxo {
+        Some((wpid, _)) => serial_println!(
+            "[SSHD] co-launched WebXO HTTP server: pid={} (serving :8080)", wpid
+        ),
+        None => serial_println!(
+            "[SSHD] WebXO not co-launched (binary missing or spawn failed); SSH-only this boot"
+        ),
+    }
+
     let t_start = crate::arch::x86_64::irq::get_ticks();
     let mut captured: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = [0u8; 512];
@@ -185,6 +202,12 @@ pub fn run_sshd_demo() {
 
     loop {
         crate::sched::yield_cpu();
+
+        // Drain WebXO's stdout too so its bind/listen/serve markers reach the
+        // serial log alongside dropbear's (no-op if WebXO wasn't co-launched).
+        if let Some((_, wpipe)) = webxo {
+            crate::webxo_demo::pump_webxo_log(wpipe, &mut webxo_captured);
+        }
 
         // Drain stdout — dropbear writes init banner + per-event lines.
         if let Some(n) = crate::ipc::pipe::pipe_read_wake(pipe_id, &mut buf) {

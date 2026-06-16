@@ -157,6 +157,22 @@ httpd-test = []
 # RFC 4252 (SSH userauth), RFC 4253 (SSH transport), RFC 4254 (SSH
 # connection protocol), POSIX socket(2)/bind(2)/listen(2)/accept(2).
 sshd-test = []
+# webxo-test — userspace web-server demo (web/httpd-bringup).  Launches the
+# WebXO HTTP/1.1 server (a small musl-linked C++ static-page server, ~470 KB)
+# as a userspace process listening on guest TCP/8080, serving a static docroot
+# staged at /disk/var/www/ASTRYX by scripts/install-webxo.sh.  Exercises the
+# kernel personality stack on the SERVER side: socket(2), setsockopt(2)
+# SO_REUSEADDR, bind(2), listen(2), accept(2) from a pool of worker threads
+# all blocked on the shared listen fd, recv(2)/send(2), plus a std::thread
+# worker pool (clone(2)+futex(2)) and ifstream static-file reads.  The harness
+# `--http-host-port N` (auto-defaulted) injects a SLIRP hostfwd forwarding
+# host-port N to guest 10.0.2.15:8080 so a host `curl http://<host>:<port>/`
+# reaches it.  This is the isolated bring-up feature; the persistent SSH/web
+# instance (sshd-test) launches WebXO on the same boot via
+# webxo_demo::spawn_webxo so SSH (:22) and HTTP (:8080) come from one instance.
+# Public refs: RFC 9110 / RFC 7230 (HTTP/1.1), POSIX socket(2)/bind(2)/
+# listen(2)/accept(2)/send(2)/recv(2).
+webxo-test = []
 # wget-test — network-stack CLI probe (PIVOT-B Phase 2, 2026-05-23).  Same
 # Alpine busybox-static binary as busybox-test, but launched as
 # `busybox wget -q -O - http://<host>:<port>/` to fetch a small HTTP

@@ -67,6 +67,13 @@ BUSYBOX_CLI="${ASTRYXOS_BUSYBOX:-0}"
 # See scripts/install-sshd.sh.
 SSHD="${ASTRYXOS_SSHD:-0}"
 
+# When set (env or --webxo flag), also build + stage the WebXO HTTP server
+# (musl-linked, /usr/bin/webxo) + a static docroot at /var/www/ASTRYX into
+# build/disk/.  Used by the webxo-test cargo feature and co-launched by the
+# persistent SSH/web instance (sshd-test).  --sshd auto-enables --webxo so the
+# persistent instance serves both SSH and HTTP.  See scripts/install-webxo.sh.
+WEBXO="${ASTRYXOS_WEBXO:-0}"
+
 # When set (env or --tls flag), also stage Alpine's OpenSSL 3.x userspace
 # (libssl, libcrypto, /usr/bin/openssl, ossl-modules/legacy.so) plus the
 # Mozilla CA bundle at every conventional path (/etc/ssl/cert.pem,
@@ -181,6 +188,7 @@ for arg in "$@"; do
         --xeyes) XEYES=1; FORCE=true ;;
         --busybox) BUSYBOX_CLI=1; FORCE=true ;;
         --sshd) SSHD=1; FORCE=true ;;
+        --webxo) WEBXO=1; FORCE=true ;;
         --tls) TLS_STACK=1; FORCE=true ;;
         --oracle) ORACLE=1; FORCE=true ;;
         --pivot-e) PIVOT_E=1; FORCE=true ;;
@@ -558,6 +566,24 @@ if [ "${SSHD}" = "1" ] || [ "${SSHD}" = "true" ]; then
         [ "${FORCE}" = true ] && SSHD_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-sshd.sh" ${SSHD_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-sshd.sh failed"; exit 1; }
+    fi
+    # The persistent SSH instance also serves HTTP — auto-enable WebXO staging.
+    if [ "${WEBXO}" != "1" ] && [ "${WEBXO}" != "true" ]; then
+        echo "[DATA-DISK] NOTE: --sshd implies --webxo (HTTP server on the same instance) — auto-enabling."
+        WEBXO=1
+    fi
+fi
+
+# ── Optional: build + stage the WebXO HTTP server + docroot ─────────────────
+# install-webxo.sh builds WebXO from an external source checkout; set
+# WEBXO_SRC=/path/to/WebXO (inherited via the environment) if it is not in a
+# conventional location (~/WebXO, ~/src/WebXO).  See install-webxo.sh.
+if [ "${WEBXO}" = "1" ] || [ "${WEBXO}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-webxo.sh" ]; then
+        WEBXO_FLAGS=""
+        [ "${FORCE}" = true ] && WEBXO_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-webxo.sh" ${WEBXO_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-webxo.sh failed"; exit 1; }
     fi
 fi
 

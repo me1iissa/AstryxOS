@@ -1265,9 +1265,13 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     kdb_host_port: if > 0, adds a hostfwd rule forwarding host-port to
         guest 10.0.2.15:9999 for the kdb introspection server.
     http_host_port: if > 0, adds a hostfwd rule forwarding host-port to
-        guest 10.0.2.15:8080 for the httpd-test in-kernel HTTP responder.
-        Used by --features httpd-test (PIVOT-C, 2026-05-23) so a host
-        `curl http://127.0.0.1:<port>/` reaches the kernel HTTP server.
+        guest 10.0.2.15:8080 for an HTTP server on the guest. Two producers:
+        the httpd-test in-kernel responder (PIVOT-C, 2026-05-23), and the
+        webxo userspace server launched by the persistent sshd/web instance
+        (web/httpd-bringup). The rule binds the host side to 0.0.0.0 so the
+        AstryxOS web server is reachable from the LAN (an intentional,
+        operator-authorized exposure for this demo instance — mirrors the
+        ssh_host_port 0.0.0.0 bind), e.g. `curl http://<host-LAN-IP>:<port>/`.
     ssh_host_port: if > 0, adds a hostfwd rule forwarding host-port to
         guest 10.0.2.15:22 for the sshd-test userspace dropbear daemon.
         Used by --features sshd-test (PIVOT-D, 2026-05-23) so a host
@@ -1378,12 +1382,15 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     if http_host_port and http_host_port > 0:
         for i, arg in enumerate(cmd):
             if arg == "-netdev" and i + 1 < len(cmd) and cmd[i + 1].startswith("user,id=net0"):
-                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{http_host_port}-:8080"
+                # Bind the host side to 0.0.0.0 so the guest web server is
+                # reachable from the LAN (operator-authorized exposure for the
+                # demo instance — same posture as the ssh hostfwd below).
+                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:0.0.0.0:{http_host_port}-:8080"
                 break
     if ssh_host_port and ssh_host_port > 0:
         for i, arg in enumerate(cmd):
             if arg == "-netdev" and i + 1 < len(cmd) and cmd[i + 1].startswith("user,id=net0"):
-                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{ssh_host_port}-:22"
+                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:0.0.0.0:{ssh_host_port}-:22"
                 break
 
     proc = subprocess.Popen(
@@ -2982,8 +2989,12 @@ def cmd_start(args):
     # reaches it.  Derived deterministically from the sid (range
     # 8800..9799) so reruns are stable and concurrent sessions almost
     # certainly land on distinct ports.  Override with --http-host-port N.
+    # The persistent SSH/web instance (sshd-test, web/httpd-bringup) also
+    # launches the WebXO userspace HTTP server on TCP/8080, so auto-forward a
+    # host port for it too — same derivation, so an operator gets a stable
+    # LAN port for `curl http://<host>:<port>/` without extra flags.
     http_host_port = int(getattr(args, "http_host_port", 0) or 0)
-    if http_host_port == 0 and "httpd-test" in feats:
+    if http_host_port == 0 and ("httpd-test" in feats or "sshd-test" in feats):
         http_host_port = 8800 + (int(sid, 16) % 1000)
 
     # PIVOT-D (2026-05-23): when `sshd-test` is in the feature set the

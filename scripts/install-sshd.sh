@@ -296,6 +296,10 @@ fi
 # (which `man 8 sshd` documents) is per-user under $HOME/.ssh/.
 cp -fL "${CLIENT_PUB}" "${DISK_ROOT_SSH}/authorized_keys"
 chmod 600 "${DISK_ROOT_SSH}/authorized_keys"
+# Dropbear (like OpenSSH, per `man 8 sshd` STRICT MODES) refuses public-key
+# auth if HOME or HOME/.ssh is group- or other-writable.  Tighten both to 0700
+# so the staged authorized_keys is honoured.
+chmod 700 "${DISK_ROOT_SSH}" "${DISK_DIR}/root"
 echo "[SSHD] Staged /root/.ssh/authorized_keys ($(stat -c%s "${DISK_ROOT_SSH}/authorized_keys") bytes)"
 
 # ── Step 6: seed minimal /etc/passwd, /etc/shadow, /etc/shells, /etc/group ───
