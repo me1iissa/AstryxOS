@@ -1094,6 +1094,12 @@ pub fn run() -> ! {
     total += 1;
     if test_tcp_connections_cap() { passed += 1; }
 
+    // ── Test 89c: SYN-flood half-open reaper + backlog cap (RFC 4987) ─────
+    total += 1;
+    if test_tcp_syn_flood_reaper() { passed += 1; }
+
+
+
     // ── Test 90: TCP congestion control (slow start + cwnd growth) ────────
 
     total += 1;
@@ -22631,6 +22637,76 @@ fn test_tcp_connections_cap() -> bool {
                   after_gc, baseline);
 
     test_pass!("TCP_CONNECTIONS cap + GC of Closed entries");
+    true
+}
+
+// ── Test 89c: SYN-flood half-open reaper + per-port backlog cap ──────────────
+//
+// RFC 4987.  A passively-created `SynReceived` child sends its SYN-ACK via
+// `send_flags` WITHOUT enqueuing a retransmit entry, so its retransmit_queue
+// is empty and the retransmit-driven abort in `tcp_timer_tick` never fires
+// for it.  Pre-fix such a half-open was NEVER aged out → half-opens pile to
+// MAX_TCP_CONNECTIONS and permanently starve every listener.  This test:
+//   (1) injects a stale half-open (created_tick well past SYNACK_TIMEOUT) on
+//       a port with an empty retransmit queue, runs one tcp_timer_tick, and
+//       asserts the reaper RST+Closed it (SynReceived count → 0, live → 0);
+//   (2) injects a FRESH half-open and asserts a tick does NOT reap it (so a
+//       legitimate in-flight handshake is not torn down prematurely).
+fn test_tcp_syn_flood_reaper() -> bool {
+    test_header!("TCP SYN-flood half-open reaper (RFC 4987)");
+    use crate::net::tcp;
+
+    const PORT: u16 = 8099;
+    let rip: [u8; 4] = [203, 0, 113, 7]; // TEST-NET-3 (RFC 5737)
+
+    // (1) Stale half-open: aged 1000 ticks (≫ SYNACK_TIMEOUT_TICKS=300).
+    if let Err(e) = tcp::test_inject_syn_received(PORT, rip, 40000, 1000) {
+        test_fail!("syn_reaper", "inject stale half-open failed: {}", e);
+        return false;
+    }
+    if tcp::syn_received_count(PORT) != 1 {
+        test_fail!("syn_reaper", "expected 1 half-open before tick, got {}",
+                   tcp::syn_received_count(PORT));
+        return false;
+    }
+    // One timer tick must reap it (RST + mark_closed), REGARDLESS of the
+    // empty retransmit queue — the precise bug.
+    tcp::tcp_timer_tick();
+    if tcp::syn_received_count(PORT) != 0 {
+        test_fail!("syn_reaper",
+            "stale half-open NOT reaped — {} still SynReceived after tick (empty-retransmit-queue wedge)",
+            tcp::syn_received_count(PORT));
+        return false;
+    }
+    if tcp::live_conn_count_on_port(PORT) != 0 {
+        test_fail!("syn_reaper", "expected 0 live conns on :{} after reap, got {}",
+                   PORT, tcp::live_conn_count_on_port(PORT));
+        return false;
+    }
+    test_println!("  stale half-open RST+reaped after one tick ✓ (empty retransmit queue)");
+
+    // (2) Fresh half-open: aged 0 ticks — a tick must NOT reap it.
+    const PORT2: u16 = 8098;
+    if let Err(e) = tcp::test_inject_syn_received(PORT2, rip, 40001, 0) {
+        test_fail!("syn_reaper", "inject fresh half-open failed: {}", e);
+        return false;
+    }
+    tcp::tcp_timer_tick();
+    if tcp::syn_received_count(PORT2) != 1 {
+        test_fail!("syn_reaper",
+            "fresh half-open wrongly reaped (premature teardown of in-flight handshake): count={}",
+            tcp::syn_received_count(PORT2));
+        return false;
+    }
+    test_println!("  fresh half-open survives one tick ✓ (no premature teardown)");
+
+    // Cleanup: age the survivor out so the test leaves no residue.
+    // Re-inject won't work (duplicate 4-tuple); instead drive the reaper by
+    // injecting nothing and letting a future tick + GC drop it — but to keep
+    // the table clean for downstream tests, abort it explicitly.
+    let _ = tcp::abort(PORT2);
+
+    test_pass!("TCP SYN-flood half-open reaper (RFC 4987)");
     true
 }
 

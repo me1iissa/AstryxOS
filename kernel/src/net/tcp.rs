@@ -72,6 +72,28 @@ const OOO_MAX_BYTES: usize = 256 * 1024;
 /// brand-new TCB (with all its zero-init buffers) before being RST'd.
 const CLOSED_GC_GRACE_TICKS: u64 = 50;
 
+/// Maximum number of half-open (`SynReceived`) child TCBs admitted per
+/// local listening port at any instant — the SYN-flood backlog cap
+/// (RFC 4987 "TCP SYN Flooding Attacks", `net.ipv4.tcp_max_syn_backlog`
+/// precedent).  An inbound SYN that would exceed this on its target port
+/// is dropped: the legitimate peer retransmits the SYN (RFC 9293 §3.4),
+/// while a flood of spoofed SYNs cannot pin the global table and starve
+/// every listener.  256 comfortably absorbs a real connection burst for
+/// the in-kernel demo workload while bounding a single port's half-open
+/// pile far below `MAX_TCP_CONNECTIONS`.
+const MAX_SYN_BACKLOG_PER_PORT: usize = 256;
+
+/// A `SynReceived` child whose SYN-ACK has gone unacknowledged for this
+/// many ticks is RST and reaped, REGARDLESS of its retransmit queue
+/// (which a passively-created half-open never populates).  ~3 s at 100 Hz
+/// is comfortably longer than a real RTT yet short enough that a flood of
+/// abandoned half-opens drains continuously instead of pinning the table
+/// (RFC 4987; `net.ipv4.tcp_synack_retries` exponential-backoff window
+/// precedent).  Without this, a passive half-open with an empty
+/// `retransmit_queue` is never aged out by `tcp_timer_tick` and lives
+/// until something else evicts it — i.e. forever, the permanent-wedge bug.
+const SYNACK_TIMEOUT_TICKS: u64 = 300;
+
 // ── Data structures ────────────────────────────────────────────────────────────
 
 /// One unacknowledged segment sitting in the retransmit queue.
@@ -173,6 +195,17 @@ pub struct TcpConnection {
     /// `false`; only child TCBs created by the inbound SYN path are
     /// ever toggled.
     accepted: bool,
+
+    /// Tick at which this TCB was created (the inbound-SYN half-open path
+    /// stamps this so a stuck `SynReceived` can be aged out).  Used solely
+    /// by the SYN-flood reaper in `tcp_timer_tick`: a passively-created
+    /// half-open never enqueues a SYN-ACK retransmit entry, so the
+    /// retransmit-driven abort path never fires for it.  Without an
+    /// age-out keyed on `created_tick`, such a child is never reaped and
+    /// half-opens accumulate to `MAX_TCP_CONNECTIONS`, permanently
+    /// starving every listener (RFC 4987).  Set on all construction paths
+    /// for consistency; only consulted while `state == SynReceived`.
+    created_tick: u64,
 }
 
 // ── ISN generation ─────────────────────────────────────────────────────────────
@@ -612,6 +645,23 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
             // sweep first; if still full, drop the incoming SYN (peer
             // will retry — RFC 793 §3.4).
             let now = crate::arch::x86_64::irq::get_ticks();
+            // SYN-flood backlog cap (RFC 4987): never let one local port's
+            // half-open (`SynReceived`) pile grow past
+            // `MAX_SYN_BACKLOG_PER_PORT`.  A flood of spoofed SYNs whose
+            // ACK never returns would otherwise accumulate half-opens up to
+            // `MAX_TCP_CONNECTIONS` and permanently starve every listener.
+            // Drop the excess SYN; a legitimate peer retransmits (RFC 9293
+            // §3.4).  The reaper in `tcp_timer_tick` ages out the stuck
+            // half-opens so the backlog drains continuously.
+            let half_open_on_port = conns.iter().filter(|c|
+                c.local_port == lport && c.state == TcpState::SynReceived).count();
+            if half_open_on_port >= MAX_SYN_BACKLOG_PER_PORT {
+                drop(conns);
+                crate::serial_println!(
+                    "[TCP] syn-backlog full on :{} — dropping SYN from {}.{}.{}.{}:{}",
+                    lport, src_ip[0], src_ip[1], src_ip[2], src_ip[3], hdr.src_port);
+                return;
+            }
             if conns.len() >= MAX_TCP_CONNECTIONS {
                 gc_closed_in(&mut conns, now);
                 if conns.len() >= MAX_TCP_CONNECTIONS {
@@ -648,6 +698,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 timewait_start: 0,
                 closed_tick: 0,
                 accepted:    false,
+                created_tick: now,
             });
             drop(conns);
             send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
@@ -955,6 +1006,30 @@ pub fn tcp_timer_tick() {
                 if now.wrapping_sub(conn.timewait_start) >= TIMEWAIT_TICKS {
                     mark_closed(conn);
                 }
+                continue;
+            }
+
+            // SYN-flood half-open reaper (RFC 4987).  A passively-created
+            // `SynReceived` child sends its SYN-ACK via `send_flags` WITHOUT
+            // enqueuing a retransmit entry, so its `retransmit_queue` is
+            // empty and the retransmit-driven abort below never fires for it.
+            // Age such a child out by its creation tick: once its SYN-ACK has
+            // gone unacknowledged for `SYNACK_TIMEOUT_TICKS`, RST the peer
+            // and `mark_closed` it so `gc_closed_in` (end of this tick) frees
+            // the entry.  Without this an abandoned/spoofed half-open is never
+            // reaped and the half-open pile pins `TCP_CONNECTIONS`,
+            // permanently starving every listener.
+            if conn.state == TcpState::SynReceived
+                && now.wrapping_sub(conn.created_tick) >= SYNACK_TIMEOUT_TICKS
+            {
+                jobs.push(SendJob {
+                    lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    seq: conn.send_next, ack: 0, flags: RST,
+                    payload: Vec::new(),
+                });
+                mark_closed(conn);
+                conn.retransmit_queue.clear();
                 continue;
             }
 
@@ -1340,8 +1415,94 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         timewait_start: 0,
         closed_tick: 0,
         accepted:    false,
+        created_tick: now,
     });
     Ok(())
+}
+
+/// Test-only: synthesise a half-open `SynReceived` child TCB on `local_port`
+/// whose `created_tick` is `age_ticks` in the past, with an EMPTY retransmit
+/// queue — exactly the passively-created half-open that the inbound-SYN path
+/// produces (it sends the SYN-ACK via `send_flags`, which never enqueues a
+/// retransmit entry).  Lets the SYN-flood-reaper regression test prove that
+/// `tcp_timer_tick` ages out such a child by its creation tick (RFC 4987),
+/// rather than only via the never-populated retransmit queue.
+///
+/// Gated on the test profiles so CI (`test-mode`) exercises the reaper.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn test_inject_syn_received(local_port: u16, remote_ip: Ipv4Address,
+                                 remote_port: u16, age_ticks: u64)
+    -> Result<(), &'static str>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    if conns.iter().any(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        return Err("duplicate 4-tuple");
+    }
+    let isn = new_isn();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if conns.len() >= MAX_TCP_CONNECTIONS {
+        gc_closed_in(&mut conns, now);
+        if conns.len() >= MAX_TCP_CONNECTIONS {
+            return Err("TCP_CONNECTIONS cap reached");
+        }
+    }
+    conns.push(TcpConnection {
+        local_ip:    super::our_ip(),
+        local_port,
+        remote_ip,
+        remote_port,
+        state:       TcpState::SynReceived,
+        send_next:   isn.wrapping_add(1),
+        send_unack:  isn,
+        recv_next:   1,
+        recv_buffer: Vec::new(),
+        send_buffer: Vec::new(),
+        ooo_segments: Vec::new(),
+        retransmit_queue: VecDeque::new(), // EMPTY — the bug's whole point
+        rto:         RTO_INITIAL,
+        srtt:        RTO_INITIAL / 2,
+        cwnd:        MSS,
+        ssthresh:    65535,
+        dup_acks:    0,
+        peer_window: 65535,
+        reuseaddr:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        timewait_start: 0,
+        closed_tick: 0,
+        accepted:    false,
+        created_tick: now.wrapping_sub(age_ticks),
+    });
+    Ok(())
+}
+
+/// Test-only: count the `SynReceived` half-open child TCBs currently on
+/// `local_port`.  Used by the SYN-flood-reaper and backlog-cap regression
+/// tests to observe the half-open pile shrink after `tcp_timer_tick`.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn syn_received_count(local_port: u16) -> usize {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().filter(|c|
+        c.local_port == local_port && c.state == TcpState::SynReceived).count()
+}
+
+/// Test-only: count the live (non-`Closed`) TCBs on `local_port` regardless
+/// of state.  Lets a test confirm a reaped half-open has actually been
+/// dropped from the table after `gc_closed_in`, not merely flipped to
+/// `Closed`.
+#[cfg(any(feature = "kdb", feature = "test-mode", feature = "firefox-test-core",
+          feature = "oracle-test", feature = "httpd-test"))]
+pub fn live_conn_count_on_port(local_port: u16) -> usize {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().filter(|c|
+        c.local_port == local_port && c.state != TcpState::Closed).count()
 }
 
 /// Test-only: force the state of the TCB matching the given 4-tuple,
@@ -1550,6 +1711,7 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         timewait_start: 0,
         closed_tick: 0,
         accepted:    false,
+        created_tick: now,
     });
     Ok(())
 }
@@ -1596,6 +1758,7 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             timewait_start: 0,
             closed_tick: 0,
             accepted:    false,
+            created_tick: now,
         });
     }
     send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
