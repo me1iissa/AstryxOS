@@ -925,6 +925,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // In GUI mode this is intentionally omitted so libxul opens the
         // display and renders into an X11 window on the Xastryx server.
         envp_vec.push("MOZ_HEADLESS=1");
+        // Headless software-render only: keep the GPU/compositor work in the
+        // parent process (no out-of-process GPU child).  This is the
+        // gfx-testing gate Mozilla uses to force in-process compositing; it is
+        // correct for the headless screenshot path but must NOT leak into the
+        // windowed path, where the GPU/compositor child participates in
+        // allocating and presenting the real toplevel surface.
+        envp_vec.push("MOZ_GFX_TESTING_NO_CHILD_PROCESS=1");
     } else {
         // GUI (windowed) mode: collapse the command-line tab to in-process.
         //
@@ -1002,8 +1009,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // channel, the content actor renders the fragment, and its reply
         // drives drawSnapshot to the PNG.
         // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
-        // Skip GPU/glxtest process — software rendering only.
-        "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
+        //
+        // NB: MOZ_GFX_TESTING_NO_CHILD_PROCESS is set ONLY in headless mode
+        // (pushed in the `if !gui_mode` block above).  It is a gfx-test gate
+        // that forces the GPU/compositor work in-process; in the windowed
+        // path the out-of-process GPU/compositor child is part of how the
+        // toplevel surface is allocated and presented, so we must not suppress
+        // it here.
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
