@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::tty::{Termios, Winsize, NCCS,
-    ICRNL, OPOST, ONLCR, CS8, CREAD, CLOCAL,
+    ICRNL, INLCR, IGNCR, OPOST, ONLCR, CS8, CREAD, CLOCAL,
     ECHO, ECHOE, ICANON, ISIG, IEXTEN,
     VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN,
     VSTART, VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT};
@@ -225,31 +225,70 @@ pub fn free(n: u8) {
 
 /// Write to the master side (data appears on slave's read buffer).
 ///
-/// Bytes land in the slave's input queue (`m2s`).  If the slave's line
-/// discipline has `ECHO` set (`termios c_lflag & ECHO`, the cooked-terminal
-/// default), each byte is also echoed to the slave's OUTPUT — i.e. copied into
-/// `s2m`, the master's read side — so a remote terminal driving the master
-/// (an `ssh -tt` server) sees what it typed.  Per termios(3): echo is governed
-/// by the SLAVE termios, evaluated as the slave receives input, and emitted on
-/// the slave's output path.  An interactive program that switches the slave to
-/// raw mode (clearing `ECHO`) takes over echo itself (its own line editor), so
-/// this kernel echo correctly goes silent then.  Returns bytes accepted into
-/// `m2s` (flow control is driven by the input queue; the echo is best-effort).
+/// Bytes land in the slave's input queue (`m2s`) after per-byte INPUT
+/// processing governed by the SLAVE termios `c_iflag` (POSIX `termios(3)`):
+/// `ICRNL` maps a carriage-return to a newline ("Translate carriage return to
+/// newline on input", the cooked default), `INLCR` maps a newline to CR, and
+/// `IGNCR` drops a carriage-return entirely.  This is what makes a typed Enter
+/// — which an `ssh -tt` client sends as a bare CR — arrive at the shell as the
+/// `\n` it expects to terminate a line.
+///
+/// If the slave's line discipline has `ECHO` set (`termios c_lflag & ECHO`, the
+/// cooked-terminal default), the input is also echoed to the slave's OUTPUT —
+/// i.e. copied into `s2m`, the master's read side — so a remote terminal driving
+/// the master sees what it typed.  Per `termios(3)`, echo is emitted on the
+/// slave's output path and is therefore subject to the same `OPOST|ONLCR`
+/// output processing: an echoed newline becomes CR-NL, so a typed Enter shows
+/// as a clean CRLF (cursor to column 0 + line feed) rather than a bare LF that
+/// would leave the next prompt mid-line.  An interactive program that switches
+/// the slave to raw mode (clearing `ECHO`) takes over echo itself, so this
+/// kernel echo correctly goes silent then.
+///
+/// The return value is the number of *input* bytes consumed from `data` (POSIX
+/// `write(2)` semantics), bounded by `m2s` capacity; echo is best-effort and
+/// capacity-bounded so a flood never grows `s2m` unboundedly.
 pub fn master_write(n: u8, data: &[u8]) -> usize {
     let mut pairs = PAIRS.lock();
     if let Some(Some(p)) = pairs.get_mut(n as usize) {
-        let space = BUF_CAP.saturating_sub(p.m2s.len());
-        let to_copy = data.len().min(space);
-        p.m2s.extend_from_slice(&data[..to_copy]);
-        // ECHO: copy the just-received input to the slave output (= master
-        // read side) when the slave termios requests it.  Bounded by the
-        // s2m capacity so a flooded echo never grows the ring unboundedly.
-        if p.termios.c_lflag & ECHO != 0 && to_copy > 0 {
-            let echo_space = BUF_CAP.saturating_sub(p.s2m.len());
-            let echo_n = to_copy.min(echo_space);
-            p.s2m.extend_from_slice(&data[..echo_n]);
+        let iflag = p.termios.c_iflag;
+        let echo = p.termios.c_lflag & ECHO != 0;
+        // Output processing for the echo mirrors slave_write (OPOST|ONLCR).
+        let oproc = p.termios.c_oflag & OPOST != 0 && p.termios.c_oflag & ONLCR != 0;
+        let mut consumed = 0usize;
+        for &raw in data {
+            // IGNCR: drop a CR before it reaches the input queue (still counts
+            // as consumed — the byte was processed, just discarded).
+            if raw == b'\r' && iflag & IGNCR != 0 {
+                consumed += 1;
+                continue;
+            }
+            // ICRNL: CR→NL.  INLCR: NL→CR.  (Mutually applied per byte.)
+            let ch = if raw == b'\r' && iflag & ICRNL != 0 {
+                b'\n'
+            } else if raw == b'\n' && iflag & INLCR != 0 {
+                b'\r'
+            } else {
+                raw
+            };
+            if BUF_CAP.saturating_sub(p.m2s.len()) < 1 {
+                break; // input queue full — stop, report input consumed so far
+            }
+            p.m2s.push(ch);
+            // ECHO of this processed input character onto the slave output.
+            if echo {
+                if ch == b'\n' && oproc {
+                    // Echoed newline → CR-NL (clean Enter), space permitting.
+                    if BUF_CAP.saturating_sub(p.s2m.len()) >= 2 {
+                        p.s2m.push(b'\r');
+                        p.s2m.push(b'\n');
+                    }
+                } else if BUF_CAP.saturating_sub(p.s2m.len()) >= 1 {
+                    p.s2m.push(ch);
+                }
+            }
+            consumed += 1;
         }
-        to_copy
+        consumed
     } else {
         0
     }
@@ -278,13 +317,67 @@ pub fn master_readable(n: u8) -> bool {
 }
 
 /// Write to the slave side (data appears on master's read buffer).
+///
+/// This is the path the slave's stdout takes to reach a terminal driving the
+/// master (e.g. an `ssh -tt` server relaying to its client).  Per POSIX
+/// `termios(3)`, output written to a terminal is subject to output processing
+/// governed by the SLAVE termios `c_oflag`: when `OPOST` is set (the framework
+/// for implementation-defined output processing) and `ONLCR` is set ("Map NL to
+/// CR-NL on output"), each newline is translated to a carriage-return + newline
+/// so a line-oriented terminal returns the cursor to column 0 before advancing
+/// — without it, each line drifts right (the "staircase").  `ONLCR` is the
+/// default for a cooked terminal (see `const_default_termios`), and an
+/// `openpty(3)`/`stty`-managed slave leaves it on; clearing it (`stty -onlcr`)
+/// disables the translation, so the behaviour is strictly termios-driven.
+///
+/// We translate only a *bare* `\n` (one not already preceded by a `\r`) and pass
+/// an existing `\r\n` through unchanged, so a writer that already emits CRLF is
+/// not double-translated.  Only `ONLCR` is implemented; `ONLRET`/`OCRNL`/`ONOCR`
+/// and tab/column expansion are intentionally left out (a raw byte stream needs
+/// no column tracking).  Flow control is still driven by the destination ring:
+/// the return value is the number of *input* bytes consumed (so a partial-fill
+/// caused by a near-full `s2m` is reported in input units, as POSIX `write(2)`
+/// expects), never more than `data.len()`.
 pub fn slave_write(n: u8, data: &[u8]) -> usize {
     let mut pairs = PAIRS.lock();
     if let Some(Some(p)) = pairs.get_mut(n as usize) {
-        let space = BUF_CAP.saturating_sub(p.s2m.len());
-        let to_copy = data.len().min(space);
-        p.s2m.extend_from_slice(&data[..to_copy]);
-        to_copy
+        let opost = p.termios.c_oflag & OPOST != 0;
+        let onlcr = p.termios.c_oflag & ONLCR != 0;
+        if opost && onlcr {
+            // Translate slave output NL → CR-NL as bytes flow to the master.
+            // Track whether the previous byte was a CR so an existing `\r\n`
+            // is not turned into `\r\r\n` (only a bare `\n` gains a `\r`).
+            // `prev_cr` is seeded from the last byte already queued in `s2m`
+            // so the no-double-translate rule holds across successive writes.
+            let mut prev_cr = p.s2m.last().copied() == Some(b'\r');
+            let mut consumed = 0usize;
+            for &b in data {
+                if b == b'\n' && !prev_cr {
+                    // A bare newline needs CR+LF — both bytes must fit, or we
+                    // stop here (reporting only the fully-emitted input).
+                    if BUF_CAP.saturating_sub(p.s2m.len()) < 2 {
+                        break;
+                    }
+                    p.s2m.push(b'\r');
+                    p.s2m.push(b'\n');
+                } else {
+                    if BUF_CAP.saturating_sub(p.s2m.len()) < 1 {
+                        break;
+                    }
+                    p.s2m.push(b);
+                }
+                prev_cr = b == b'\r';
+                consumed += 1;
+            }
+            consumed
+        } else {
+            // OPOST/ONLCR cleared (e.g. `stty -onlcr`, or a TUI in raw mode):
+            // pass the bytes through verbatim.
+            let space = BUF_CAP.saturating_sub(p.s2m.len());
+            let to_copy = data.len().min(space);
+            p.s2m.extend_from_slice(&data[..to_copy]);
+            to_copy
+        }
     } else {
         0
     }

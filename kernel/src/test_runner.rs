@@ -271,6 +271,17 @@ pub fn run() -> ! {
         if test_277p_pty_data_relay() { passed += 1; }
     }
 
+    // ── Test 277q: PTY output processing — OPOST|ONLCR NL→CR-NL ──────────
+    // The "staircase" fix: slave stdout NL is translated to CR-NL on its way
+    // to the master (= the ssh client) when the slave termios has OPOST|ONLCR,
+    // and passed verbatim when ONLCR is cleared.  Registered alongside 277p in
+    // the early-priority block (see the note above on late-registration wedge).
+    #[cfg(any(feature = "test-mode", feature = "pivot-e-test"))]
+    {
+        total += 1;
+        if test_277q_pty_onlcr_output() { passed += 1; }
+    }
+
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
@@ -51553,6 +51564,76 @@ fn test_277p_pty_data_relay() -> bool {
     let _ = dispatch(SYS_CLOSE, slave as u64, 0, 0, 0, 0, 0);
 
     if ok { test_pass!("PTY data relay — master↔slave + block/EOF/hangup (Test 277p)"); }
+    ok
+}
+
+// ── Test 277q: PTY output processing — OPOST|ONLCR NL→CR-NL (the staircase) ──
+//
+// Regression for the "staircase" over `ssh -tt`: a cooked terminal expects
+// CR+LF at end of line so the cursor returns to column 0 before advancing.
+// Per POSIX termios(3), output written to the slave is processed by the slave
+// `c_oflag`: with OPOST set ("implementation-defined output processing") and
+// ONLCR set ("Map NL to CR-NL on output") every newline becomes CR-NL on the
+// path the slave's stdout takes to the master (= the ssh client).  This is the
+// default for a freshly-allocated pair; clearing ONLCR (`stty -onlcr`) must
+// disable the translation.  We also assert that an already-CRLF stream is not
+// double-translated into CR-CR-LF.
+//
+// Driven directly through the driver's slave_write/master_read API (the exact
+// bytes that flow slave→master) rather than full syscall dispatch, so the
+// assertion is on the processed byte stream itself.
+fn test_277q_pty_onlcr_output() -> bool {
+    test_header!("PTY output ONLCR — NL→CR-NL termios-driven (Test 277q)");
+    use crate::drivers::pty;
+    let mut ok = true;
+
+    let n = match pty::alloc() {
+        Some(n) => n,
+        None => { test_fail!("277q/alloc", "pty::alloc() → None"); return false; }
+    };
+
+    // Default termios (OPOST|ONLCR set): "a\nb\n" → master reads "a\r\nb\r\n".
+    let w = pty::slave_write(n, b"a\nb\n");
+    let mut rx = [0u8; 16];
+    let r = pty::master_read(n, &mut rx);
+    if w != 4 || &rx[..r] != b"a\r\nb\r\n" {
+        test_fail!("277q/onlcr-on", "write={} read={:?} want \"a\\r\\nb\\r\\n\"",
+            w, &rx[..r]);
+        ok = false;
+    } else {
+        test_println!("  277q-1 ONLCR set: \"a\\nb\\n\" → \"a\\r\\nb\\r\\n\" (in={}) ✓", w);
+    }
+
+    // An existing CRLF must NOT be doubled into CR-CR-LF.
+    let w = pty::slave_write(n, b"x\r\ny\n");
+    let mut rx = [0u8; 16];
+    let r = pty::master_read(n, &mut rx);
+    if &rx[..r] != b"x\r\ny\r\n" {
+        test_fail!("277q/no-double", "read={:?} want \"x\\r\\ny\\r\\n\" (no CR-CR-LF)",
+            &rx[..r]);
+        ok = false;
+    } else {
+        test_println!("  277q-2 existing CRLF passes through, bare NL translated ✓");
+    }
+
+    // Clear ONLCR (mirror `stty -onlcr`): "a\nb\n" → master reads "a\nb\n".
+    let mut t = pty::get_termios(n);
+    t.c_oflag &= !crate::drivers::tty::ONLCR;
+    pty::set_termios(n, t);
+    let w = pty::slave_write(n, b"a\nb\n");
+    let mut rx = [0u8; 16];
+    let r = pty::master_read(n, &mut rx);
+    if w != 4 || &rx[..r] != b"a\nb\n" {
+        test_fail!("277q/onlcr-off", "write={} read={:?} want \"a\\nb\\n\" (no translation)",
+            w, &rx[..r]);
+        ok = false;
+    } else {
+        test_println!("  277q-3 ONLCR clear: \"a\\nb\\n\" → \"a\\nb\\n\" verbatim ✓");
+    }
+
+    pty::free(n);
+
+    if ok { test_pass!("PTY output ONLCR — NL→CR-NL termios-driven (Test 277q)"); }
     ok
 }
 
