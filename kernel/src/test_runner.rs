@@ -296,6 +296,14 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_wait_completion_modes() { passed += 1; }
 
+    // ── Test 0e3: virtio-blk slot-quarantine lifecycle (completion-stall) ─
+    // Regression guard for the disk-completion stall: a timed-out request must
+    // be quarantined (slot stays reserved) — never released while still owned
+    // by the device — so descriptors are not reused and in-flight stays bounded
+    // by MAX_INFLIGHT (VIRTIO 1.2 §2.7.13.3 / §2.7.14).
+    total += 1;
+    if test_virtio_blk_quarantine_lifecycle() { passed += 1; }
+
     // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
@@ -35662,6 +35670,38 @@ fn test_virtio_blk_wait_completion_modes() -> bool {
 
     test_pass!("virtio-blk wait modes + run-queue depth (Test 0e2)");
     true
+}
+
+// ── Test 0e3: virtio-blk slot-quarantine lifecycle (completion-stall fix) ────
+//
+// Regression guard for the virtio-blk disk-completion stall: under heavy
+// demand-paging a `wait_completion` no-progress timeout previously called
+// `release_slot()` while the request was still owned by the device (published
+// to the avail ring, not yet retired in the used ring).  Recycling that slot's
+// descriptors let in-flight escape MAX_INFLIGHT and re-publish the same
+// descriptor head, which wedged the QEMU virtio-blk device (used.idx frozen,
+// 24/25 threads Blocked, dozens of `wait_completion timeout (slot=0)` markers).
+//
+// Per VIRTIO 1.2 §2.7.13.3 / §2.7.14 the device may access a descriptor chain
+// (and its data buffer) until it returns the chain via the used ring; the fix
+// QUARANTINES a timed-out slot — keeping it reserved so its descriptors are
+// never reused — until `drain_used_ring` reclaims it on the device's eventual
+// completion.  This test exercises the slot-allocation invariant directly (no
+// device I/O): a quarantined slot is never re-handed-out, in-flight never
+// exceeds MAX_INFLIGHT, and reclaiming the slot makes it acquirable again.
+fn test_virtio_blk_quarantine_lifecycle() -> bool {
+    test_header!("virtio-blk slot-quarantine lifecycle (Test 0e3)");
+    match crate::drivers::virtio_blk::test_quarantine_lifecycle() {
+        Ok(()) => {
+            test_println!("  quarantine reserves slot, bounds in-flight, reclaim re-frees ✓");
+            test_pass!("virtio-blk slot-quarantine lifecycle (Test 0e3)");
+            true
+        }
+        Err(why) => {
+            test_fail!("virtio_blk_quarantine_lifecycle", "{}", why);
+            false
+        }
+    }
 }
 
 // ── Test 0f: AHCI per-port mutex topology ───────────────────────────────────

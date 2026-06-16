@@ -309,6 +309,20 @@ struct Completion {
     /// by the wait-amplification histogram to compute per-round-trip latency;
     /// not load-bearing for completion detection.  0 before the first arm.
     submit_ns: AtomicU64,
+    /// Quarantine flag.  Set when a waiter abandons this slot on a timeout while
+    /// the request is still owned by the device (published to the avail ring but
+    /// not yet retired in the used ring).  Per VIRTIO 1.2 §2.7.13.3 the device
+    /// MAY access the descriptor chain — and the data buffer it points at — at
+    /// any time until it returns the chain via the used ring (§2.7.14); recycling
+    /// the slot's descriptors or its data buffer before then is a use-after-free
+    /// from the device's perspective and corrupts the virtqueue (the device sees
+    /// a chain it never expected to be re-published and stops the queue).  A
+    /// quarantined slot stays `in_use` — so `acquire_slot` skips it and never
+    /// overwrites its descriptors — until [`drain_used_ring`] observes its
+    /// used-ring entry and reclaims it.  See the completion-stall autopsy:
+    /// abandoning device-owned chains is what let in-flight escape `MAX_INFLIGHT`
+    /// and wedged the device.
+    quarantined: AtomicBool,
 }
 
 impl Completion {
@@ -319,6 +333,7 @@ impl Completion {
             status: AtomicU8::new(0),
             waiter_tid: AtomicU64::new(NO_WAITER),
             submit_ns: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
         }
     }
 }
@@ -343,6 +358,21 @@ static POLLED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Total `VIRTIO_BLK_T_FLUSH` requests submitted (diagnostic).  Bumped
 /// once per `do_flush` call, regardless of completion path.
 static FLUSH_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of slots quarantined on a wait timeout (request abandoned by its
+/// waiter while still owned by the device).  Diagnostic: a non-zero value
+/// means the device is taking longer than the no-progress deadline to retire
+/// some requests; a steadily-climbing value alongside forward progress is
+/// benign back-pressure, whereas a value that climbs while `used.idx` is
+/// frozen indicates a genuinely wedged device.
+static QUARANTINED_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of quarantined slots later reclaimed by `drain_used_ring` once the
+/// device retired their chains.  In steady state this tracks
+/// `QUARANTINED_TIMEOUTS` (every quarantine is eventually reclaimed); a gap
+/// (`QUARANTINED_TIMEOUTS - RECLAIMED_QUARANTINES`) is the count of slots the
+/// device still owes — bounded by `MAX_INFLIGHT`.
+static RECLAIMED_QUARANTINES: AtomicU64 = AtomicU64::new(0);
 
 // ── Wait-amplification sample ring (diagnostic) ──────────────────────────────
 //
@@ -554,6 +584,10 @@ pub fn wait_hist_reset() {
 /// (so descriptor and header writes are serialised), but the wait runs
 /// without the mutex held.  Returns `None` if every slot is busy — the
 /// caller spins (with `core::hint::spin_loop`) and retries.
+///
+/// A quarantined slot ([`quarantine_slot`]) has `in_use == true`, so its
+/// CAS fails here and it is skipped automatically — its descriptor chain is
+/// never reused while the device may still own it.
 fn acquire_slot() -> Option<usize> {
     for i in 0..MAX_INFLIGHT {
         if COMPLETIONS[i]
@@ -561,10 +595,13 @@ fn acquire_slot() -> Option<usize> {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // Reset slot state for new request.
+            // Reset slot state for new request.  `quarantined` is cleared on
+            // reclaim in `drain_used_ring`, but clear it here too so a slot
+            // can never be acquired while still flagged.
             COMPLETIONS[i].done.store(false, Ordering::Release);
             COMPLETIONS[i].status.store(0xFF, Ordering::Relaxed);
             COMPLETIONS[i].waiter_tid.store(NO_WAITER, Ordering::Release);
+            COMPLETIONS[i].quarantined.store(false, Ordering::Release);
             return Some(i);
         }
     }
@@ -572,10 +609,116 @@ fn acquire_slot() -> Option<usize> {
 }
 
 /// Release a slot for reuse.  Must be called by the same waiter that
-/// acquired it, after the wait has consumed `done` + `status`.
+/// acquired it, after the wait has consumed `done` + `status` — i.e. only
+/// once the device has retired this slot's descriptor chain (or the request
+/// was never published to the device).  Releasing a slot whose request is
+/// still in flight in the device is a use-after-free of the descriptor chain
+/// — use [`quarantine_slot`] for that case instead.
 fn release_slot(slot_idx: usize) {
     COMPLETIONS[slot_idx].waiter_tid.store(NO_WAITER, Ordering::Release);
+    COMPLETIONS[slot_idx].quarantined.store(false, Ordering::Release);
     COMPLETIONS[slot_idx].in_use.store(false, Ordering::Release);
+}
+
+/// Mark a slot quarantined: the waiter is giving up (timeout) but the request
+/// is still owned by the device — it was published to the avail ring and has
+/// not yet been retired in the used ring.  Per VIRTIO 1.2 §2.7.13.3 / §2.7.14
+/// the device may read or write the descriptor chain and its data buffer until
+/// it returns the chain via the used ring, so the slot must NOT be released for
+/// reuse (which would let a new request overwrite the device-owned descriptors
+/// and re-publish the same chain head, corrupting the queue).
+///
+/// The slot keeps `in_use == true` so `acquire_slot` skips it; `waiter_tid` is
+/// cleared so no stale wake targets a thread that has moved on.  The slot is
+/// reclaimed (its `in_use` cleared) by [`drain_used_ring`] when the device
+/// finally retires the chain.  Until then it counts against `MAX_INFLIGHT`,
+/// which is exactly the back-pressure that keeps in-flight bounded.
+fn quarantine_slot(slot_idx: usize) {
+    QUARANTINED_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    COMPLETIONS[slot_idx].waiter_tid.store(NO_WAITER, Ordering::Release);
+    COMPLETIONS[slot_idx].quarantined.store(true, Ordering::Release);
+    // `in_use` is left set — the slot stays reserved until the device retires
+    // its chain and `drain_used_ring` reclaims it.
+}
+
+/// Test-only exercise of the slot-quarantine lifecycle invariant (the
+/// completion-stall fix).  Operates purely on the in-memory `COMPLETIONS`
+/// slot-allocation state — it issues NO device I/O — so it is safe to call on
+/// a live system: it acquires only currently-free slots and restores them to
+/// `free` before returning.  Returns `Ok(())` if every invariant held, or
+/// `Err(&str)` naming the first violation.
+///
+/// Invariants checked:
+///   1. A quarantined slot stays `in_use` (counts against MAX_INFLIGHT) and is
+///      NOT handed out by `acquire_slot` — i.e. its device-owned descriptor
+///      chain can never be reused.
+///   2. Clearing the quarantine (the reclaim `drain_used_ring` performs once
+///      the device retires the chain) makes the slot acquirable again.
+///   3. `acquire_slot` never hands out the same slot twice (no double-use), and
+///      the number of simultaneously-held slots never exceeds MAX_INFLIGHT.
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_quarantine_lifecycle() -> Result<(), &'static str> {
+    // Snapshot which slots were free on entry so we can restore exactly those.
+    // We only ever touch slots we successfully acquire here.
+    let s0 = acquire_slot().ok_or("acquire_slot returned None with free slots expected")?;
+
+    // Invariant 1: quarantine the slot, then prove acquire_slot never returns it.
+    quarantine_slot(s0);
+    if !COMPLETIONS[s0].in_use.load(Ordering::Acquire) {
+        // Restore and fail.
+        release_slot(s0);
+        return Err("quarantined slot cleared in_use (should stay reserved)");
+    }
+    if !COMPLETIONS[s0].quarantined.load(Ordering::Acquire) {
+        release_slot(s0);
+        return Err("quarantine flag not set");
+    }
+    // Drain every other free slot; none of them may be s0 (it is quarantined).
+    let mut held: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    while let Some(s) = acquire_slot() {
+        if s == s0 {
+            // Catastrophic: the quarantined slot was handed out.
+            for h in &held { release_slot(*h); }
+            release_slot(s0);
+            return Err("acquire_slot handed out a quarantined slot");
+        }
+        if held.contains(&s) {
+            for h in &held { release_slot(*h); }
+            release_slot(s0);
+            return Err("acquire_slot handed out the same slot twice");
+        }
+        held.push(s);
+        if held.len() >= MAX_INFLIGHT {
+            // Defensive: must terminate before exceeding the slot count.
+            break;
+        }
+    }
+    // Invariant 3: with s0 quarantined, at most MAX_INFLIGHT-1 others are free.
+    if held.len() > MAX_INFLIGHT - 1 {
+        for h in &held { release_slot(*h); }
+        release_slot(s0);
+        return Err("acquired more slots than MAX_INFLIGHT-1 while one quarantined");
+    }
+
+    // Invariant 2: clear the quarantine (the reclaim path) and prove s0 is
+    // acquirable again.  Release everything else first.
+    for h in &held { release_slot(*h); }
+    // Simulate `drain_used_ring`'s reclaim of a quarantined slot.
+    COMPLETIONS[s0].quarantined.store(false, Ordering::Release);
+    COMPLETIONS[s0].in_use.store(false, Ordering::Release);
+    match acquire_slot() {
+        Some(s) => {
+            // It should be reusable now (may or may not be s0 depending on scan
+            // order, but acquisition must succeed and the slot must be clean).
+            if COMPLETIONS[s].quarantined.load(Ordering::Acquire) {
+                release_slot(s);
+                return Err("reclaimed slot still flagged quarantined after acquire");
+            }
+            release_slot(s);
+        }
+        None => return Err("no slot acquirable after reclaim"),
+    }
+    Ok(())
 }
 
 // ── Lock-Free Snapshot for the ISR ──────────────────────────────────────────
@@ -929,6 +1072,23 @@ pub fn spurious_count() -> u64 {
     SPURIOUS_IRQS.load(Ordering::Relaxed)
 }
 
+/// Diagnostics for the slot-quarantine path (completion-stall fix).  Returns
+/// `(quarantined, reclaimed)`:
+///   * `quarantined` — slots abandoned by a waiter on a no-progress timeout
+///     while still owned by the device.
+///   * `reclaimed`   — quarantined slots later retired by the device and
+///     reclaimed by `drain_used_ring`.
+/// In a healthy device these track each other; an outstanding gap
+/// (`quarantined - reclaimed`) is bounded by `MAX_INFLIGHT` and represents
+/// requests the device still owes.  A `quarantined` count that climbs while
+/// `reclaimed` stays flat is the signature of a genuinely wedged device.
+pub fn quarantine_counts() -> (u64, u64) {
+    (
+        QUARANTINED_TIMEOUTS.load(Ordering::Relaxed),
+        RECLAIMED_QUARANTINES.load(Ordering::Relaxed),
+    )
+}
+
 // ── ISR ─────────────────────────────────────────────────────────────────────
 
 /// Virtio-blk interrupt handler.  Called from the IDT stub with interrupts
@@ -1071,6 +1231,22 @@ fn drain_used_ring(qs: u16, vq_virt: u64) -> u32 {
             };
             COMPLETIONS[slot_idx].status.store(status_byte, Ordering::Relaxed);
             COMPLETIONS[slot_idx].done.store(true, Ordering::Release);
+
+            // If this slot was quarantined (its waiter timed out while the
+            // request was still owned by the device — see `quarantine_slot`),
+            // the device has now retired the chain, so the descriptors and the
+            // data buffer are no longer device-owned: reclaim the slot for
+            // reuse.  There is no waiter to wake.  The reclaim must happen
+            // AFTER the status read above so the device's status byte is fully
+            // consumed first.  Release ordering pairs with `acquire_slot`'s
+            // AcqRel CAS so the next acquirer observes the cleared state.
+            if COMPLETIONS[slot_idx].quarantined.load(Ordering::Acquire) {
+                COMPLETIONS[slot_idx].quarantined.store(false, Ordering::Release);
+                COMPLETIONS[slot_idx].in_use.store(false, Ordering::Release);
+                RECLAIMED_QUARANTINES.fetch_add(1, Ordering::Relaxed);
+                count += 1;
+                continue;
+            }
 
             // Wake the registered waiter, if any.  `try_lock` only — if
             // THREAD_TABLE is contended, the slot's `done` flag is
@@ -1329,6 +1505,8 @@ fn submit_request(
             let cur_used = unsafe { used_idx_ptr.read_volatile() };
             IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
             // Release the slot now since the caller won't enter wait_completion.
+            // Safe: the device retired this chain (`s != 0xFF`), so it no longer
+            // owns the descriptors or the data buffer.
             release_slot(slot);
             if s != 0 {
                 crate::serial_println!("[VIRTIO-BLK] Request failed: status={}", s);
@@ -1336,8 +1514,13 @@ fn submit_request(
             }
             return Ok(SubmitOutcome::PollDone);
         }
+        // Timed out before the device retired the chain — it is still device-owned
+        // (published to the avail ring, no used-ring entry yet).  Quarantine, not
+        // release, so the descriptors and data buffer are not recycled under the
+        // device (VIRTIO 1.2 §2.7.13.3).  `drain_used_ring` reclaims the slot when
+        // the device finally retires it.
         timeout = timeout.checked_sub(1).ok_or_else(|| {
-            release_slot(slot);
+            quarantine_slot(slot);
             BlockError::IoError
         })?;
         core::hint::spin_loop();
@@ -1473,6 +1656,7 @@ fn submit_flush_request(
             // SAFETY: reading the device's used.idx in owned VQ memory.
             let cur_used = unsafe { used_idx_ptr.read_volatile() };
             IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
+            // Safe: the device retired this chain, so it no longer owns it.
             release_slot(slot);
             if s != 0 {
                 crate::serial_println!("[VIRTIO-BLK] Flush failed: status={}", s);
@@ -1480,8 +1664,10 @@ fn submit_flush_request(
             }
             return Ok(SubmitOutcome::PollDone);
         }
+        // Still device-owned on timeout — quarantine, not release (see the read
+        // path's poll fallback; VIRTIO 1.2 §2.7.13.3).
         timeout = timeout.checked_sub(1).ok_or_else(|| {
-            release_slot(slot);
+            quarantine_slot(slot);
             BlockError::IoError
         })?;
         core::hint::spin_loop();
@@ -1584,12 +1770,17 @@ pub fn set_spin_budget(n: u32) -> u32 {
 ///       next 100 Hz tick.  This removes the 10–50 ms amplification cliff.
 ///   2b. LEGACY: unconditionally `schedule()` each poll round (the old path,
 ///       retained for the BEFORE/AFTER A/B on a single build).
-///   3.  Hard deadline at ~1 s wall-clock — a wedged device fails-fast rather
-///       than hanging the kernel.
+///   3.  No-forward-progress deadline (`NO_PROGRESS_DEADLINE_TICKS`, re-armed
+///       on device-side `used.idx` advance) — a genuinely wedged device
+///       fails-fast rather than hanging the kernel, while a merely-slow device
+///       or a descheduled waiter never trips it.
 ///
 /// The calling thread is never marked `Blocked`: it remains Ready and either
 /// spins or cooperatively yields, so it cannot be lost behind an interrupt that
-/// never arrives.  Always releases `slot` before returning (Ok or Err).
+/// never arrives.  On success the slot is released; on a deadline timeout the
+/// slot is QUARANTINED (not released) by `wait_adaptive`/`wait_legacy_yield`,
+/// because the request may still be owned by the device — `drain_used_ring`
+/// reclaims it when the device finally retires the chain.
 fn wait_completion(slot: usize) -> Result<(), BlockError> {
     debug_assert!(slot < MAX_INFLIGHT);
     let _ = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
@@ -1686,7 +1877,17 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
     let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
     let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
     let start_tick = crate::arch::x86_64::irq::get_ticks();
-    let deadline = start_tick.saturating_add(100); // ~1 s @ 100 Hz fail-fast
+    // Progress-based deadline: re-armed whenever the device retires ANY request
+    // (its `used.idx` advances), so it measures time-since-the-device-last-made-
+    // progress, never absolute wall-clock.  A descheduled waiter on a deep run
+    // queue no longer spuriously trips the deadline while the device is healthy —
+    // the previous absolute `start_tick + 100` fired on deschedule alone, abandoning
+    // an in-flight request (the completion-stall root cause).  The deadline now
+    // fires only when the device itself stops retiring requests for the whole
+    // window, which is a genuine wedge.  See VIRTIO 1.2 §2.7.14.
+    const NO_PROGRESS_TICKS: u64 = NO_PROGRESS_DEADLINE_TICKS;
+    let mut deadline = start_tick.saturating_add(NO_PROGRESS_TICKS);
+    let mut last_used = device_used_idx(qs, vq_virt);
     // Poll (don't yield) until the wait has lasted this many ticks; beyond it the
     // request is genuinely slow I/O and yielding to peers is worth the
     // re-selection cost.  5 ticks (~50 ms) comfortably exceeds the ~45 ms
@@ -1707,9 +1908,24 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
         }
 
         let now = crate::arch::x86_64::irq::get_ticks();
+        // Re-arm the deadline on any device-side forward progress.  The device's
+        // `used.idx` advances when it retires ANY queued request (not necessarily
+        // ours), which proves the device is alive and draining the queue — so our
+        // request is merely behind, not lost.  Only sustained zero progress means
+        // a wedge.
+        let cur_used = device_used_idx(qs, vq_virt);
+        if cur_used != last_used {
+            last_used = cur_used;
+            deadline = now.saturating_add(NO_PROGRESS_TICKS);
+        }
         if now >= deadline {
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            release_slot(slot);
+            // The request may still be owned by the device (it is in the avail
+            // ring but the device has not retired it).  Quarantine — do NOT
+            // release — so its descriptor chain and data buffer are not recycled
+            // under the device.  Releasing here is the bug that let in-flight
+            // escape MAX_INFLIGHT and wedged the device (VIRTIO 1.2 §2.7.13.3).
+            quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
 
@@ -1743,7 +1959,11 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
     let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
     let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
     let start_tick = crate::arch::x86_64::irq::get_ticks();
-    let deadline = start_tick.saturating_add(100); // ~1 s @ 100 Hz
+    // Progress-based deadline (see `wait_adaptive`): re-armed on device-side
+    // forward progress so a descheduled waiter never trips it while the device
+    // is healthy.
+    let mut deadline = start_tick.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+    let mut last_used = device_used_idx(qs, vq_virt);
     let mut yields: u16 = 0;
 
     loop {
@@ -1757,13 +1977,51 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
             POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
             return Ok(yields);
         }
-        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+        let now = crate::arch::x86_64::irq::get_ticks();
+        let cur_used = device_used_idx(qs, vq_virt);
+        if cur_used != last_used {
+            last_used = cur_used;
+            deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+        }
+        if now >= deadline {
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            release_slot(slot);
+            // Quarantine, not release — the request may still be device-owned.
+            quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
         crate::sched::schedule();
         yields = yields.saturating_add(1);
+    }
+}
+
+/// No-forward-progress deadline for a device-side stall, in 100 Hz timer ticks.
+/// The deadline is re-armed every time the device retires ANY request, so this
+/// bounds *time since the device last made progress*, not absolute wall-clock.
+/// 200 ticks ≈ 2 s of total device silence — generous enough that a merely-slow
+/// host backend or a descheduled waiter never trips it, tight enough that a
+/// genuinely wedged device still fails fast.  (The previous absolute 100-tick /
+/// 1 s wall-clock deadline tripped on deschedule alone — the completion-stall
+/// root cause; this is the same re-arm-on-progress correction the VFS
+/// path-resolution deadline received.)
+const NO_PROGRESS_DEADLINE_TICKS: u64 = 200;
+
+/// Read the device's current `used.idx` (the count of requests it has retired)
+/// from the virtqueue's used ring.  Used by the wait loops to re-arm the
+/// no-progress deadline on device-side forward progress.  Returns 0 when the
+/// ISR snapshot is not yet published (early boot), which simply means the
+/// deadline is not re-armed until the device starts retiring requests.
+#[inline]
+fn device_used_idx(qs: u16, vq_virt: u64) -> u16 {
+    if qs == 0 || vq_virt == 0 {
+        return 0;
+    }
+    // used.idx is a u16 at `used_ring_base + 2` (flags u16, idx u16, ring...).
+    // See VIRTIO 1.0 §2.4.8 (used ring layout).
+    // SAFETY: `vq_virt` is the kernel higher-half mapping of the virtqueue page,
+    // valid for the device's lifetime; the read is a single aligned volatile u16.
+    unsafe {
+        let p = (vq_virt as *const u8).add(used_ring_offset(qs) + 2) as *const u16;
+        p.read_volatile()
     }
 }
 
@@ -1906,9 +2164,39 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         // yield and retry.  Sched availability is checked because early
         // boot has no scheduler to yield to; in that window the slot is
         // almost always free anyway (single-threaded mount path).
+        // Acquire a slot.  If every slot is busy we yield and retry.  With the
+        // quarantine fix a genuinely wedged device eventually pins all
+        // MAX_INFLIGHT slots (each waiter quarantines on the no-progress
+        // deadline), so bound the retry on device-side forward progress: if the
+        // device's used.idx has not advanced for a full no-progress window while
+        // we cannot get a slot, the device is dead — fail the I/O rather than
+        // spinning forever.  A device that IS retiring requests reclaims
+        // quarantined slots via drain_used_ring, so a slot frees up promptly and
+        // this bound never trips in the healthy case.
+        let acq_qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
+        let acq_vq = IRQ_VQ_VIRT.load(Ordering::Acquire);
+        let mut acq_last_used = device_used_idx(acq_qs, acq_vq);
+        let mut acq_deadline = crate::arch::x86_64::irq::get_ticks()
+            .saturating_add(NO_PROGRESS_DEADLINE_TICKS);
         let slot = loop {
             if let Some(s) = acquire_slot() {
                 break s;
+            }
+            // Walk the used ring so quarantined slots get reclaimed promptly even
+            // if no other waiter is currently draining it.
+            if acq_qs != 0 && acq_vq != 0 {
+                drain_used_ring(acq_qs, acq_vq);
+            }
+            let now = crate::arch::x86_64::irq::get_ticks();
+            let cur_used = device_used_idx(acq_qs, acq_vq);
+            if cur_used != acq_last_used {
+                acq_last_used = cur_used;
+                acq_deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+            } else if crate::sched::is_active() && now >= acq_deadline {
+                // No slot freed and no device progress for the whole window —
+                // the device is wedged.  Fail-fast (matches the wait-completion
+                // deadline contract) instead of hanging the caller forever.
+                return Err(BlockError::IoError);
             }
             if crate::sched::is_active() {
                 crate::sched::schedule();
@@ -1942,11 +2230,15 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
             ) {
                 Ok(o) => o,
                 Err(e) => {
-                    // submit_request releases the slot on its poll-fallback
-                    // error path, but the IRQ-path error path here means
-                    // we never armed the slot — release it ourselves.
+                    // submit_request owns slot disposition on ALL of its error
+                    // paths: the poll fallback already either released the slot
+                    // (device-retired-with-error) or quarantined it (timeout,
+                    // request still device-owned).  The IRQ path returns Err
+                    // only BEFORE the doorbell, in which case it has likewise
+                    // not left the slot armed.  Releasing the slot here would
+                    // double-dispose — and worse, un-quarantine a device-owned
+                    // chain (the completion-stall bug).  Leave the slot alone.
                     drop(guard);
-                    release_slot(slot);
                     return Err(e);
                 }
             }
@@ -2019,8 +2311,10 @@ fn do_flush() -> Result<(), BlockError> {
         match submit_flush_request(dev, slot) {
             Ok(o) => o,
             Err(e) => {
+                // submit_flush_request owns slot disposition on all its error
+                // paths (release on retired-error, quarantine on timeout) — do
+                // not double-dispose here (see do_io).
                 drop(guard);
-                release_slot(slot);
                 return Err(e);
             }
         }
@@ -2142,6 +2436,21 @@ pub fn restart_device() -> bool {
     // Reset our cached used-ring index — the device's used idx is 0 again
     // after reset, and we just zeroed the used ring.
     dev.last_used_idx = 0;
+
+    // A hard reset drops every in-flight request: the device no longer owns
+    // any descriptor chain, so any quarantined slots (abandoned on a wait
+    // timeout, awaiting their used-ring entry) will NEVER be reclaimed by
+    // `drain_used_ring` — the used ring restarts from 0.  Fully release all
+    // slots here so they are reusable; doing this now (with no in-flight
+    // requests after the reset) is safe.
+    for i in 0..MAX_INFLIGHT {
+        COMPLETIONS[i].waiter_tid.store(NO_WAITER, Ordering::Release);
+        COMPLETIONS[i].done.store(false, Ordering::Release);
+        COMPLETIONS[i].status.store(0xFF, Ordering::Relaxed);
+        COMPLETIONS[i].quarantined.store(false, Ordering::Release);
+        COMPLETIONS[i].in_use.store(false, Ordering::Release);
+    }
+
     let io_base_snap = dev.io_base;
     let qs_snap = dev.queue_size;
     let vq_phys_snap = dev.vq_phys;
