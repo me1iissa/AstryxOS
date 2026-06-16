@@ -138,6 +138,36 @@ fn phys_to_virt<T>(phys: u64) -> *mut T {
     (PHYS_OFFSET + phys) as *mut T
 }
 
+/// Upper bound on a directly-DMA-able identity-low buffer, in bytes.
+///
+/// A buffer below `PHYS_OFFSET` is normally identity-mapped low physical memory
+/// (the boot stack / early-init scratch), for which `phys == virt`.  But a
+/// *userspace* virtual address is ALSO below `PHYS_OFFSET` (the user half lives
+/// at e.g. `0x0000_7eff_…`), and it is **not** a physical address — the device
+/// has no IOMMU here, so a descriptor pointing at a userspace VA tells the device
+/// to DMA to a bogus "physical" address far beyond installed RAM, which it can
+/// never service (the chain is never retired → the waiter times out → the
+/// slot-exhaustion cascade).  Any genuine identity-low physical buffer is within
+/// installed RAM, which is at most a few GiB; a userspace VA is orders of
+/// magnitude higher.  We treat a low address at or below this ceiling as a real
+/// physical buffer and anything between it and `PHYS_OFFSET` as a non-DMA-able
+/// userspace VA that must be bounced.  4 GiB is comfortably above any guest RAM
+/// size this kernel targets while still excluding the user VA range.
+const IDENTITY_LOW_DMA_CEILING: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Is `buf` a buffer the block device can DMA into/out of directly?
+///
+/// True for kernel higher-half buffers (heap, thread stacks — `phys = virt -
+/// PHYS_OFFSET`) and genuine identity-low physical buffers (`phys = virt`, below
+/// [`IDENTITY_LOW_DMA_CEILING`]).  False for userspace virtual addresses, which
+/// must be bounced through a kernel buffer before the device sees them.  Mirrors
+/// the `data_phys` derivation in [`submit_request`].
+#[inline]
+fn is_dma_capable(buf: *const u8) -> bool {
+    let v = buf as u64;
+    v >= PHYS_OFFSET || v < IDENTITY_LOW_DMA_CEILING
+}
+
 // ── Virtqueue Layout Helpers ────────────────────────────────────────────────
 
 /// Calculate the byte offset of the available ring within the virtqueue.
@@ -659,6 +689,97 @@ fn quarantine_slot(slot_idx: usize) {
     // its chain and `drain_used_ring` reclaims it.
 }
 
+/// Resolve a slot whose waiter has reached its no-progress deadline, closing the
+/// quarantine/reclaim race that otherwise leaks the slot permanently.
+///
+/// Returns:
+///   * `Some(Ok(()))`  — the completion landed; the slot is released, caller
+///                       returns success.
+///   * `None`          — the request really is still device-owned; the slot is
+///                       quarantined and the caller fails the I/O.
+///
+/// ## The race this closes
+///
+/// A waiter that gave up could previously be left holding a permanently-leaked
+/// quarantine.  The old order was: final `drain_used_ring`, then re-test `done`,
+/// then `quarantine_slot`.  Between the `done` test and the `quarantine_slot`
+/// store, a *peer* walker (another concurrent disk waiter — there can be up to
+/// `MAX_INFLIGHT` of them, all polling the one shared used ring) can consume THIS
+/// slot's used-ring entry: it finds the slot not-yet-quarantined, so it takes the
+/// wake branch, sets `done` and advances the shared `IRQ_LAST_USED_IDX` cursor
+/// past our entry.  Our waiter, already committed to the deadline branch, then
+/// stamps `quarantined = true` on a slot whose used-ring entry has *already been
+/// consumed*.  Reclaim only fires when a *future* used-ring entry appears for the
+/// slot (`drain_used_ring`), but no future entry will ever come — so the slot
+/// leaks.  Repeated across a read burst this exhausts `MAX_INFLIGHT` and forces a
+/// device reset; the leak is the wedge, not a sick device (which retires every
+/// chain — `avail.idx == used.idx`).
+///
+/// ## The fix: quarantine FIRST, then re-drain, then reconcile
+///
+/// 1. Set `quarantined = true` *before* the final drain.  Now if any walker
+///    (this one or a peer) consumes our entry, `drain_used_ring`'s reclaim branch
+///    observes `quarantined` and atomically reclaims the slot — `done` and the
+///    quarantine/`in_use` flags are cleared together under the cursor CAS, so the
+///    entry can never be consumed via the wake branch while we hold a stale
+///    quarantine.
+/// 2. Drain the ring one last time and re-test `done`.  If the completion landed
+///    (either our own final drain consumed it, or a peer did while we were
+///    quarantined and reclaim already freed the slot), report success.  When
+///    reclaim freed the slot, `in_use` is already clear, so a plain `release_slot`
+///    is an idempotent no-op; when our own drain set `done` without reclaiming
+///    (slot still quarantined), we clear the quarantine and release here.
+///
+/// Per VIRTIO 1.2 §2.7.13 a chain is retired by appending it to the used ring;
+/// this consumes exactly that.  Per §2.7.13.3 a still-owned chain's descriptors
+/// and data buffer must not be recycled, which is why a genuinely-outstanding
+/// request stays quarantined rather than released.
+fn finalize_or_quarantine(
+    slot: usize,
+    qs: u16,
+    vq_virt: u64,
+) -> Option<Result<(), BlockError>> {
+    // Step 1: arm the quarantine BEFORE the final drain so any concurrent
+    // consumer of this slot's used-ring entry takes the race-free reclaim path.
+    quarantine_slot(slot);
+
+    // Step 2: final drain + re-test.  A drain here may consume our own entry
+    // (reclaiming the slot, since it is now quarantined) or it may already have
+    // been consumed+reclaimed by a peer between step 1 and now.
+    if qs != 0 && vq_virt != 0 {
+        drain_used_ring(qs, vq_virt);
+    }
+    if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+        // The completion landed.  Two disjoint sub-cases, distinguished by whether
+        // `drain_used_ring`'s reclaim branch already ran for this slot:
+        //
+        //   (a) reclaim ran  — it cleared `quarantined` + `in_use` and bumped
+        //       RECLAIMED_QUARANTINES (so QUARANTINED/RECLAIMED stay balanced).
+        //       Nothing for us to undo; `release_slot` below is an idempotent
+        //       no-op on the already-clear `in_use`.
+        //   (b) reclaim did NOT run (our own drain set `done` via the wake branch
+        //       before observing the quarantine, or a peer did) — the slot is
+        //       still quarantined.  Unwind the speculative quarantine we set in
+        //       step 1 (it never corresponded to an outstanding chain) and free
+        //       the slot.
+        //
+        // Use the still-set `quarantined` flag as the discriminator so the
+        // QUARANTINED_TIMEOUTS gauge is decremented exactly once and only in
+        // case (b).  `swap` makes the test-and-clear atomic against a peer.
+        if COMPLETIONS[slot].quarantined.swap(false, Ordering::AcqRel) {
+            // Case (b): our quarantine was never reclaimed — net it back out.
+            QUARANTINED_TIMEOUTS.fetch_sub(1, Ordering::Relaxed);
+        }
+        release_slot(slot);
+        POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        return Some(Ok(()));
+    }
+
+    // Genuinely still device-owned: leave it quarantined for the eventual
+    // used-ring entry to reclaim.
+    None
+}
+
 /// Test-only exercise of the slot-quarantine lifecycle invariant (the
 /// completion-stall fix).  Operates purely on the in-memory `COMPLETIONS`
 /// slot-allocation state — it issues NO device I/O — so it is safe to call on
@@ -735,6 +856,35 @@ pub fn test_quarantine_lifecycle() -> Result<(), &'static str> {
             release_slot(s);
         }
         None => return Err("no slot acquirable after reclaim"),
+    }
+    Ok(())
+}
+
+/// Test-only classifier check for the DMA-capable / bounce decision.  Confirms
+/// that a kernel higher-half address and a genuine low-physical address are
+/// DMA-capable, while a userspace virtual address (below `PHYS_OFFSET` but far
+/// above any installed RAM) is NOT — i.e. it must be bounced rather than handed
+/// to the device verbatim.  Exercised by the test harness without touching the
+/// device.
+pub fn test_dma_classification() -> Result<(), &'static str> {
+    // Kernel higher-half (heap / thread-stack) — DMA-capable.
+    if !is_dma_capable(PHYS_OFFSET as *const u8) {
+        return Err("kernel higher-half address misclassified as non-DMA");
+    }
+    if !is_dma_capable((PHYS_OFFSET + 0x0080_0000) as *const u8) {
+        return Err("kernel heap address misclassified as non-DMA");
+    }
+    // Genuine low-physical (boot stack / identity-low) — DMA-capable.
+    if !is_dma_capable(0x10_0000 as *const u8) {
+        return Err("low-physical (1 MiB) address misclassified as non-DMA");
+    }
+    // Userspace VA range (e.g. 0x0000_7eff_…) — NOT DMA-capable; must bounce.
+    // This is the exact class the autopsy caught in a descriptor's data field.
+    if is_dma_capable(0x7eff_46c2_5060 as *const u8) {
+        return Err("userspace VA misclassified as DMA-capable (the read(2) bug)");
+    }
+    if is_dma_capable(0x7fff_ffff_f000 as *const u8) {
+        return Err("high userspace VA misclassified as DMA-capable");
     }
     Ok(())
 }
@@ -1906,6 +2056,23 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
     const NO_PROGRESS_TICKS: u64 = NO_PROGRESS_DEADLINE_TICKS;
     let mut deadline = start_tick.saturating_add(NO_PROGRESS_TICKS);
     let mut last_used = device_used_idx(qs, vq_virt);
+    // Tick observed on the previous loop iteration.  The no-progress deadline
+    // claims "the device retired nothing for NO_PROGRESS_TICKS" — but that claim
+    // is only valid for the time this waiter was actually RUNNING to watch the
+    // used ring.  A waiter cooperatively yielded into a deep run queue (the
+    // concurrent-read-burst case: ~24 disk waiters plus the app's own threads)
+    // may not be re-selected for whole seconds, during which the device retires
+    // every request silently.  When the waiter finally runs again `get_ticks()`
+    // has jumped far past `deadline`, yet it never observed the device's
+    // progress (the `used.idx` re-arm samples only the current value, which is
+    // already static once the queue drained), so it spuriously quarantines a
+    // slot the device retired long ago.  We therefore re-arm the deadline on a
+    // large inter-iteration tick gap too: if more than `RESCHED_GAP_TICKS`
+    // elapsed since we last looked, we were descheduled and cannot honestly
+    // claim the device made no progress in that gap.  This bounds the deadline
+    // to *observed* device silence, never to wall-clock-while-descheduled.
+    let mut last_iter_tick = start_tick;
+    const RESCHED_GAP_TICKS: u64 = YIELD_AFTER_TICKS + 1;
     // Poll (don't yield) until the wait has lasted this many ticks; beyond it the
     // request is genuinely slow I/O and yielding to peers is worth the
     // re-selection cost.  5 ticks (~50 ms) comfortably exceeds the ~45 ms
@@ -1935,7 +2102,12 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
         if cur_used != last_used {
             last_used = cur_used;
             deadline = now.saturating_add(NO_PROGRESS_TICKS);
+        } else if now.saturating_sub(last_iter_tick) > RESCHED_GAP_TICKS {
+            // We were descheduled across this gap and could not watch the ring.
+            // Do not count un-observed time toward device silence — re-arm.
+            deadline = now.saturating_add(NO_PROGRESS_TICKS);
         }
+        last_iter_tick = now;
         if now >= deadline {
             // FINAL-DRAIN re-check before quarantining (closes the spurious-
             // quarantine TOCTOU that leaks slots under load).  Between the last
@@ -1955,20 +2127,10 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
             // instead of leaking it via quarantine.  Per VIRTIO 1.2 §2.7.13 the
             // device retires a chain by appending it to the used ring; this
             // re-drain consumes exactly that.
-            if qs != 0 && vq_virt != 0 {
-                drain_used_ring(qs, vq_virt);
-            }
-            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
-                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Ok(yields);
+            if let Some(r) = finalize_or_quarantine(slot, qs, vq_virt) {
+                return r.map(|()| yields);
             }
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            // The request really is still owned by the device (it is in the avail
-            // ring but the device has not retired it).  Quarantine — do NOT
-            // release — so its descriptor chain and data buffer are not recycled
-            // under the device.  Releasing here is the bug that let in-flight
-            // escape MAX_INFLIGHT and wedged the device (VIRTIO 1.2 §2.7.13.3).
-            quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
 
@@ -2007,6 +2169,12 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
     // is healthy.
     let mut deadline = start_tick.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
     let mut last_used = device_used_idx(qs, vq_virt);
+    // See `wait_adaptive`: this path `schedule()`s every round, so it is even
+    // more exposed to multi-second deschedule gaps under a deep run queue.  Bound
+    // the deadline to *observed* device silence by re-arming across any large
+    // inter-iteration tick gap (we were not running to watch the ring).
+    let mut last_iter_tick = start_tick;
+    const RESCHED_GAP_TICKS: u64 = 1;
     let mut yields: u16 = 0;
 
     loop {
@@ -2025,23 +2193,15 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
         if cur_used != last_used {
             last_used = cur_used;
             deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
+        } else if now.saturating_sub(last_iter_tick) > RESCHED_GAP_TICKS {
+            deadline = now.saturating_add(NO_PROGRESS_DEADLINE_TICKS);
         }
+        last_iter_tick = now;
         if now >= deadline {
-            // FINAL-DRAIN re-check before quarantining — see the matching
-            // comment in `wait_adaptive`.  The device may have retired our chain
-            // since the last ring walk; re-draining and re-testing `done` here
-            // avoids needlessly quarantining (and leaking) a slot whose
-            // completion has already landed.  VIRTIO 1.2 §2.7.13.
-            if qs != 0 && vq_virt != 0 {
-                drain_used_ring(qs, vq_virt);
-            }
-            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
-                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Ok(yields);
+            if let Some(r) = finalize_or_quarantine(slot, qs, vq_virt) {
+                return r.map(|()| yields);
             }
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
-            // Quarantine, not release — the request really is still device-owned.
-            quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
         crate::sched::schedule();
@@ -2159,6 +2319,30 @@ impl BlockDevice for VirtioBlkBlockDevice {
 /// contiguous over the same span.  1 MiB stays well within the 128 MiB
 /// kernel heap.
 fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockError> {
+    // ── Bounce non-DMA-able (userspace) buffers ────────────────────────────
+    //
+    // The block layer DMAs straight into the caller's buffer (ext2's aligned
+    // fast path reads whole blocks directly into it).  That is correct only for
+    // kernel-physical buffers.  A `read(2)`/`write(2)` issued with a *userspace*
+    // buffer (the common case once `read(2)` stopped being fully shielded by the
+    // page cache) hands the device a userspace VA, which — with no IOMMU — the
+    // device interprets as a bogus physical address it can never service.  The
+    // request never retires, the waiter trips its no-progress deadline, the slot
+    // is quarantined, and the cascade exhausts the device (the autopsy
+    // signature: descriptor data addr in the userspace range, used.idx tracking
+    // avail.idx for every OTHER request).  Bounce through a kernel buffer so the
+    // device only ever sees a real physical address: read into the bounce then
+    // copy out to user; copy user in then write the bounce.  Per VIRTIO 1.2 §2.7
+    // the device accesses descriptor-referenced buffers by physical address.
+    if !is_dma_capable(buf as *const u8) {
+        return do_io_bounced(req_type, lba, count, buf);
+    }
+    do_io_dma(req_type, lba, count, buf)
+}
+
+/// Core DMA path: `buf` MUST be a kernel-physical (DMA-capable) buffer.  Callers
+/// with a userspace buffer go through [`do_io`], which bounces first.
+fn do_io_dma(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockError> {
     if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
         return Err(BlockError::IoError);
     }
@@ -2357,6 +2541,43 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         }
 
         sector_idx += batch;
+    }
+
+    Ok(())
+}
+
+/// Bounce a non-DMA-able (userspace) buffer through a kernel-heap staging buffer.
+///
+/// The kernel heap is one contiguous physical range, so a `Vec<u8>` is a valid
+/// single-descriptor DMA target ([`do_io`] doc).  For a read we DMA into the
+/// bounce and copy out to the user buffer; for a write we copy the user buffer
+/// into the bounce and DMA out of it.  Either way the device only ever sees a
+/// kernel-physical descriptor address.
+///
+/// SAFETY: `buf` covers `count * SECTOR_SIZE` bytes (validated by the
+/// `BlockDevice` trait impl before reaching `do_io`).  The copy touches the
+/// userspace buffer, which may demand-fault — that is fine here (we are on the
+/// caller's thread in process context, not under the device mutex).
+fn do_io_bounced(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockError> {
+    let len = (count as usize) * SECTOR_SIZE;
+    let mut bounce = alloc::vec![0u8; len];
+
+    if req_type == VIRTIO_BLK_T_OUT {
+        // Copy the user payload into the kernel bounce before issuing the write.
+        // SAFETY: `buf` covers `len` bytes per the trait contract.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf as *const u8, bounce.as_mut_ptr(), len);
+        }
+    }
+
+    do_io_dma(req_type, lba, count, bounce.as_mut_ptr())?;
+
+    if req_type == VIRTIO_BLK_T_IN {
+        // Copy the freshly-read bytes out to the user buffer.
+        // SAFETY: `buf` covers `len` bytes per the trait contract.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf, len);
+        }
     }
 
     Ok(())
