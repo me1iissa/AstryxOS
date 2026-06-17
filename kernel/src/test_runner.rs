@@ -813,7 +813,7 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_draw_cycle() { passed += 1; }
 
-    // ── X11 server — map event sequence (MapNotify→ConfigureNotify→Expose) ───
+    // ── X11 server — map event sequence (MapNotify→Expose) ──────────────────
 
     total += 1;
     if test_x11_map_event_sequence() { passed += 1; }
@@ -837,6 +837,11 @@ pub fn run() -> ! {
 
     total += 1;
     if test_x11_render_query() { passed += 1; }
+
+    // ── X11 QueryExtension first_event/first_error bases (xeyes paint gate) ───
+
+    total += 1;
+    if test_x11_query_extension_event_bases() { passed += 1; }
 
     // ── Test 69: X11 RENDER extension — Pixmap + Picture + FillRectangles ────
 
@@ -18202,7 +18207,7 @@ fn test_x11_poly_fill_arc() -> bool {
 // window is immediately viewable) and asserts the three events arrive in order
 // with the correct window id and 200×100 geometry.
 fn test_x11_map_event_sequence() -> bool {
-    test_header!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
+    test_header!("X11 map event sequence (MapNotify→Expose)");
 
     let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
         crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
@@ -18242,11 +18247,19 @@ fn test_x11_map_event_sequence() -> bool {
     crate::net::unix::write(client, &reqs);
     crate::x11::poll();
 
-    // Read the three queued events back as a single contiguous stream.
+    // Read the queued events back as a single contiguous stream.  Per the X11
+    // core protocol §MapWindow, a plain MapWindow that does not change the
+    // window's geometry emits MapNotify then Expose only — NO ConfigureNotify
+    // (which is reserved for an actual geometry change; see op_configure_window).
+    // A real X server's map sequence for an unmanaged window is therefore exactly
+    // two events = 64 bytes.  (An earlier revision emitted a spurious
+    // ConfigureNotify here, which made libXt's Shell run an extra geometry pass
+    // that swallowed a leaf widget's first Expose — observed as xeyes never
+    // painting its eyes.)
     let mut buf = [0u8; 96];
     let n = crate::net::unix::read(client, &mut buf);
-    if n < 96 {
-        test_fail!("x11_mapseq", "read returned {} (expected 96 = 3 events)", n);
+    if n != 64 {
+        test_fail!("x11_mapseq", "read returned {} (expected 64 = 2 events: MapNotify+Expose, NO ConfigureNotify)", n);
         crate::net::unix::close(client);
         return false;
     }
@@ -18264,42 +18277,26 @@ fn test_x11_map_event_sequence() -> bool {
     }
     test_println!("  [0] MapNotify window={:#x} ✓", wid(8));
 
-    // Event 1: ConfigureNotify (22), window = 0x610001, width=200 height=100.
-    if buf[32] != 22 {
-        test_fail!("x11_mapseq", "event1 type={} (expected 22=ConfigureNotify)", buf[32]);
+    // Event 1: Expose (12), window = 0x610001, width=200 height=100, count=0.
+    // (Directly after MapNotify — no intervening ConfigureNotify.)
+    if buf[32] != 12 {
+        test_fail!("x11_mapseq", "event1 type={} (expected 12=Expose, NOT ConfigureNotify)", buf[32]);
         crate::net::unix::close(client); return false;
     }
-    if wid(32 + 8) != 0x00610001 {
-        test_fail!("x11_mapseq", "ConfigureNotify window={:#x} (expected 0x610001)", wid(32 + 8));
+    if wid(32 + 4) != 0x00610001 {
+        test_fail!("x11_mapseq", "Expose window={:#x} (expected 0x610001)", wid(32 + 4));
         crate::net::unix::close(client); return false;
     }
-    let cw = u16le(32 + 20);
-    let ch = u16le(32 + 22);
-    if cw != 200 || ch != 100 {
-        test_fail!("x11_mapseq", "ConfigureNotify size={}x{} (expected 200x100)", cw, ch);
-        crate::net::unix::close(client); return false;
-    }
-    test_println!("  [1] ConfigureNotify window={:#x} {}x{} ✓", wid(32 + 8), cw, ch);
-
-    // Event 2: Expose (12), window = 0x610001, width=200 height=100, count=0.
-    if buf[64] != 12 {
-        test_fail!("x11_mapseq", "event2 type={} (expected 12=Expose)", buf[64]);
-        crate::net::unix::close(client); return false;
-    }
-    if wid(64 + 4) != 0x00610001 {
-        test_fail!("x11_mapseq", "Expose window={:#x} (expected 0x610001)", wid(64 + 4));
-        crate::net::unix::close(client); return false;
-    }
-    let ew = u16le(64 + 12);
-    let eh = u16le(64 + 14);
+    let ew = u16le(32 + 12);
+    let eh = u16le(32 + 14);
     if ew != 200 || eh != 100 {
         test_fail!("x11_mapseq", "Expose size={}x{} (expected 200x100)", ew, eh);
         crate::net::unix::close(client); return false;
     }
-    test_println!("  [2] Expose window={:#x} {}x{} ✓", wid(64 + 4), ew, eh);
+    test_println!("  [1] Expose window={:#x} {}x{} ✓", wid(32 + 4), ew, eh);
 
     crate::net::unix::close(client);
-    test_pass!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
+    test_pass!("X11 map event sequence (MapNotify→Expose)");
     true
 }
 
@@ -18637,6 +18634,103 @@ fn test_x11_render_query() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 RENDER extension query");
+    true
+}
+
+// ── X11 QueryExtension first_event / first_error bases ───────────────────────
+//
+// Regression for the xeyes "no eyes" gate: QueryExtension formerly returned
+// first_event=0 and first_error=0 for every extension.  Per the X11 core
+// protocol §QueryExtension the reply's first_event (byte 10) is the event-code
+// base from which a client offsets the extension's events.  A 0 base for an
+// extension that DOES define events (XInput, SHAPE, …) makes libXi/libXext build
+// a wire-event→extension dispatch map that overlaps the 64 core event codes —
+// in particular XInput's ~17 event types at base 0 hijack the converter for core
+// Expose (12), so the toolkit never dispatches the real Expose and a leaf widget
+// never paints.  This test pins the per-extension bases to non-zero, non-core
+// (≥64) values for the extensions that define events, and 0 only for those that
+// genuinely define none.
+fn test_x11_query_extension_event_bases() -> bool {
+    test_header!("X11 QueryExtension first_event/first_error bases");
+
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX { test_fail!("x11_qe_bases", "unix::create() failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_qe_bases", "connect failed");
+        crate::net::unix::close(client); return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_qe_bases", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client); return false;
+    }
+
+    // Issue QueryExtension(name) and return (present, major, first_event, first_error).
+    let query = |name: &[u8]| -> Option<(u8, u8, u8, u8)> {
+        let nlen = name.len();
+        let body = 8 + ((nlen + 3) & !3);
+        let mut req = [0u8; 32];
+        req[0] = 98;                         // OP_QUERY_EXTENSION
+        req[2] = (body / 4) as u8;           // request length in words
+        req[4] = nlen as u8;                 // name length
+        req[8..8 + nlen].copy_from_slice(name);
+        crate::net::unix::write(client, &req[..body]);
+        crate::x11::poll();
+        let mut rep = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut rep);
+        if n < 12 || rep[0] != 1 { return None; }
+        Some((rep[8], rep[9], rep[10], rep[11]))
+    };
+
+    // (name, expect_first_event, expect_first_error) — the bases from proto.rs.
+    // first_event MUST be 0 (no events) or ≥64 (clear of the core event range).
+    let cases: &[(&[u8], u8, u8)] = &[
+        (b"XInputExtension", crate::x11::proto::XINPUT_FIRST_EVENT,    crate::x11::proto::XINPUT_FIRST_ERROR),
+        (b"SHAPE",           crate::x11::proto::SHAPE_FIRST_EVENT,     crate::x11::proto::SHAPE_FIRST_ERROR),
+        (b"XKEYBOARD",       crate::x11::proto::XKEYBOARD_FIRST_EVENT, crate::x11::proto::XKEYBOARD_FIRST_ERROR),
+        (b"XFIXES",          crate::x11::proto::XFIXES_FIRST_EVENT,    crate::x11::proto::XFIXES_FIRST_ERROR),
+        (b"DAMAGE",          crate::x11::proto::DAMAGE_FIRST_EVENT,    crate::x11::proto::DAMAGE_FIRST_ERROR),
+        (b"RENDER",          crate::x11::proto::RENDER_FIRST_EVENT,    crate::x11::proto::RENDER_FIRST_ERROR),
+    ];
+    for (name, want_ev, want_err) in cases {
+        match query(name) {
+            None => {
+                test_fail!("x11_qe_bases", "QueryExtension reply missing/short");
+                crate::net::unix::close(client); return false;
+            }
+            Some((present, _major, fe, ferr)) => {
+                if present != 1 {
+                    test_fail!("x11_qe_bases", "extension not present (present={})", present);
+                    crate::net::unix::close(client); return false;
+                }
+                if fe != *want_ev || ferr != *want_err {
+                    test_fail!("x11_qe_bases",
+                        "first_event/first_error mismatch: got {}/{} want {}/{}",
+                        fe, ferr, want_ev, want_err);
+                    crate::net::unix::close(client); return false;
+                }
+                // An extension that defines events must NOT collide with the core
+                // event range [0,64): a non-zero base must be ≥64.
+                if fe != 0 && fe < 64 {
+                    test_fail!("x11_qe_bases",
+                        "first_event={} collides with core event codes (must be 0 or ≥64)", fe);
+                    crate::net::unix::close(client); return false;
+                }
+            }
+        }
+    }
+    test_println!("  XInput fe={}/ferr={}, SHAPE fe={}, all bases ≥64 or 0 ✓",
+        crate::x11::proto::XINPUT_FIRST_EVENT, crate::x11::proto::XINPUT_FIRST_ERROR,
+        crate::x11::proto::SHAPE_FIRST_EVENT);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 QueryExtension first_event/first_error bases");
     true
 }
 

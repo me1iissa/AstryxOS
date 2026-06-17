@@ -288,6 +288,29 @@ pub const XINPUT_MAJOR_OPCODE:    u8 = 131; // XInputExtension (XI2)
 pub const SHM_MAJOR_OPCODE:       u8 = 130; // MIT-SHM
 pub const RANDR_MAJOR_OPCODE:     u8 = 143; // RANDR (RandR)
 
+// QueryExtension event/error bases.  Per the X11 core protocol §QueryExtension,
+// an extension that defines events reports its first_event (the event-code base
+// from which the client offsets the extension's event numbers); one that defines
+// errors reports its first_error.  Reporting 0 for an extension that DOES define
+// events is a protocol violation: clients (libXi, libXext, libXrandr) build their
+// incoming-event → extension dispatch maps keyed on first_event, and a 0 base
+// makes them mis-route or drop the extension's events.  Real servers allocate
+// these dynamically as extensions initialise; we use fixed, non-overlapping bases
+// above the 64 core event codes, matching the per-extension event/error counts
+// from each extension's published protocol (SHAPE: 1 event; XInput: events +
+// 5 errors; XKEYBOARD: 1 event, 1 error; XFIXES: 1 event, 1 error; RANDR: 2
+// events, 4 errors; DAMAGE: 1 event, 1 error; SYNC: 2 events, 2 errors; RENDER:
+// 0 events, 5 errors).  Extensions with no events use first_event 0.
+pub const SHAPE_FIRST_EVENT:     u8 = 64;  pub const SHAPE_FIRST_ERROR:     u8 = 0;
+pub const XINPUT_FIRST_EVENT:    u8 = 66;  pub const XINPUT_FIRST_ERROR:    u8 = 129;
+pub const XKEYBOARD_FIRST_EVENT: u8 = 85;  pub const XKEYBOARD_FIRST_ERROR: u8 = 137;
+pub const XFIXES_FIRST_EVENT:    u8 = 87;  pub const XFIXES_FIRST_ERROR:    u8 = 140;
+pub const RANDR_FIRST_EVENT:     u8 = 89;  pub const RANDR_FIRST_ERROR:     u8 = 147;
+pub const DAMAGE_FIRST_EVENT:    u8 = 91;  pub const DAMAGE_FIRST_ERROR:    u8 = 152;
+pub const SYNC_FIRST_EVENT:      u8 = 92;  pub const SYNC_FIRST_ERROR:      u8 = 153;
+pub const RENDER_FIRST_EVENT:    u8 = 0;   pub const RENDER_FIRST_ERROR:    u8 = 142;
+pub const SHM_FIRST_EVENT:       u8 = 65;  pub const SHM_FIRST_ERROR:       u8 = 128;
+
 // ── MIT-SHM minor opcodes ──────────────────────────────────────────────────────
 pub const SHM_QUERY_VERSION:  u8 = 0;
 pub const SHM_ATTACH:         u8 = 1;
