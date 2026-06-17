@@ -282,6 +282,16 @@ fn create_user_process_impl(
 /// 3. Configures TSS.rsp[0] and SYSCALL_KERNEL_RSP for Ring 3 → Ring 0 transitions.
 /// 4. Performs IRETQ to enter Ring 3.
 pub fn user_mode_bootstrap() {
+    // A first-run thread reaches here via `switch_context_asm`'s `ret`, so
+    // this CPU has just completed a context switch onto this (the new)
+    // thread's kernel stack.  Bump the per-CPU switch generation — the
+    // resumed-kernel path bumps at the post-`switch_context` resume point in
+    // `schedule()`, but first-run threads never return there, so without
+    // this a CPU that only ever launches first-run threads would never
+    // advance its generation and the dead-stack quiescence gate's gen
+    // condition could stall.  See `sched::CPU_SWITCH_GEN`.
+    crate::sched::note_switch_completed();
+
     crate::serial_println!("[BOOT] tid={} entering bootstrap", crate::proc::current_tid());
 
     // Clear first_run immediately so that if this thread is ever re-scheduled

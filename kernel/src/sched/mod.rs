@@ -25,6 +25,70 @@ static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Per-CPU context-switch generation counter.
+///
+/// Incremented by `note_switch_completed()` every time a CPU finishes a
+/// `switch_context_asm` and is running on the *incoming* thread's kernel
+/// stack — i.e. once per completed context switch, for both resumed-kernel
+/// threads (post-`switch_context` resume point in `schedule()`) and
+/// first-run threads (top of `proc::usermode::user_mode_bootstrap`).
+///
+/// This is the SMP-correct quiescence signal for kernel-stack recycling.
+/// `ctx_rsp_valid` proves the *dying* thread's CPU executed `mov [rdi],rsp;
+/// mov byte[rdx],1` (it saved the dead frame), but at that instant the CPU
+/// is still at `mov rsp,rsi; popfq; pop …; ret` — the restore epilogue,
+/// physically *on the dead stack's VA* until `mov rsp,rsi` retires, and a
+/// device/timer interrupt can still push an interrupt frame onto that VA via
+/// `TSS.RSP[0]` during a ring transition (Intel SDM Vol. 3A §6.14 "Interrupt
+/// and Exception Handling": the stack switch on interrupt delivery uses the
+/// TSS RSP for the target privilege level).  Re-issuing the stack to a new
+/// thread in that window lets the old CPU's epilogue/interrupt-frame writes
+/// tear the new thread's freshly-initialised `switch_context_asm` frame —
+/// observed as a torn saved-RFLAGS slot (TF=1 garbage) that `popfq` loads,
+/// single-stepping the next instruction into a kernel-mode `#DB` →
+/// `UNEXPECTED_KERNEL_MODE_TRAP` (0x7f) bugcheck.
+///
+/// A dead stack records `CPU_SWITCH_GEN[last_cpu]` at reap time; the cache
+/// withholds the entry from re-issue until that CPU's generation has
+/// advanced (proving `last_cpu` completed at least one *further* switch and
+/// is therefore no longer executing on, nor delivering interrupts to, the
+/// recycled stack VA).  This is the kernel-side realisation of the
+/// POSIX clone(2) "no CPU references the thread" lifecycle contract — the
+/// same invariant a reference monolithic kernel enforces by deferring the
+/// dead task's stack release into the *successor* task's post-switch
+/// cleanup (which by construction runs on a different stack).
+static CPU_SWITCH_GEN: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Record that the calling CPU has completed a context switch and is now
+/// executing on the incoming thread's kernel stack.  Called from the two
+/// post-`switch_context` resume points (resumed-kernel in `schedule()` and
+/// first-run in `user_mode_bootstrap`).  Lock-free; safe with interrupts
+/// disabled.  See `CPU_SWITCH_GEN` for the full rationale.
+#[inline]
+pub fn note_switch_completed() {
+    let cpu = cpu_index();
+    if cpu < MAX_CPUS {
+        // Release: pair with the Acquire load in `entry_is_quiesced` so a
+        // reaper on another CPU that observes the advanced generation also
+        // observes all of this CPU's prior stack writes as retired.
+        CPU_SWITCH_GEN[cpu].fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Read the current switch generation for `cpu` (Acquire).  Used both to
+/// snapshot at reap time and to test eligibility at pop time.
+#[inline]
+fn cpu_switch_gen(cpu: usize) -> u64 {
+    if cpu < MAX_CPUS {
+        CPU_SWITCH_GEN[cpu].load(Ordering::Acquire)
+    } else {
+        // Unknown CPU: return a value that can never be "advanced past",
+        // forcing the conservative wall-clock-tick fallback to govern.
+        0
+    }
+}
+
 /// Global "a timer due-wake scan was deferred" flag.
 ///
 /// The 100 Hz timer ISR (`wake_sleeping_threads`) is the driver that re-Readies
@@ -516,9 +580,10 @@ fn reap_dead_threads_sched() {
     // schedule() and runs this function (with a different current_tid).
     let current_tid = crate::proc::current_tid();
 
-    // Collect (stack_base, stack_pages) for each reapable thread, removing
-    // them from THREAD_TABLE in the same pass.
-    let stacks: alloc::vec::Vec<(u64, usize)> = {
+    // Collect (stack_base, stack_pages, last_cpu) for each reapable thread,
+    // removing them from THREAD_TABLE in the same pass.  `last_cpu` feeds the
+    // per-CPU switch-generation quiescence gate (see `CPU_SWITCH_GEN`).
+    let stacks: alloc::vec::Vec<(u64, usize, usize)> = {
         let mut threads = THREAD_TABLE.lock();
         // A Dead thread is safe to reap only when ctx_rsp_valid == true, which
         // switch_context_asm sets AFTER saving the thread's RSP (meaning the CPU
@@ -543,9 +608,10 @@ fn reap_dead_threads_sched() {
             let pages = if t.kernel_stack_size > 0 {
                 (t.kernel_stack_size as usize + 4095) / 4096
             } else { 0 };
+            let last_cpu = t.last_cpu as usize;
             threads.swap_remove(idx);
             if base > 0 && pages > 0 {
-                out.push((base, pages));
+                out.push((base, pages, last_cpu));
             }
         }
         out
@@ -566,10 +632,10 @@ fn reap_dead_threads_sched() {
     // STACK_CANARY_CORRUPT closure rationale.  Overflow (cache full,
     // or push rejected by the defensive size check) falls through to
     // per-page PMM free as before.
-    for (stack_base, stack_pages) in stacks {
+    for (stack_base, stack_pages, last_cpu) in stacks {
         if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
             let stack_size_bytes = (stack_pages as u64) * 0x1000;
-            if push_dead_stack(stack_base, stack_size_bytes) {
+            if push_dead_stack(stack_base, stack_size_bytes, last_cpu) {
                 #[cfg(feature = "test-mode")]
                 {
                     let len = DEAD_STACK_CACHE.lock().len();
@@ -691,6 +757,19 @@ struct CachedDeadStack {
     /// `TIMER_ISR_PER_CPU` snapshot — see the struct-level doc comment
     /// for the rationale.
     push_tick: u64,
+
+    /// The CPU that last ran the dead thread (`Thread::last_cpu`) and the
+    /// value of `CPU_SWITCH_GEN[last_cpu]` at reap time.  The cache
+    /// withholds this entry until that CPU's switch generation has advanced
+    /// past `last_cpu_gen` — proving `last_cpu` completed at least one
+    /// further `switch_context_asm` since the thread died and is therefore
+    /// no longer executing on (or delivering interrupts to) this stack VA.
+    /// This closes the torn-`switch_context_asm`-frame `#DB` race that a
+    /// pure wall-clock-tick gate can miss when a context switch and a
+    /// recycle land inside the same tick under a clone-thread spawn burst.
+    /// See `CPU_SWITCH_GEN`.
+    last_cpu: usize,
+    last_cpu_gen: u64,
 }
 
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<CachedDeadStack>> =
@@ -712,8 +791,40 @@ fn current_tick_for_quiesce() -> u64 {
 /// `CachedDeadStack` struct doc for the full rationale.
 #[inline]
 fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
+    // Gate 1 (per-CPU switch generation — the primary, race-tight signal):
+    // the CPU that last ran the dead thread must have completed at least one
+    // further context switch since the thread died, proving it is no longer
+    // executing `switch_context_asm`'s restore epilogue on this stack VA and
+    // can no longer land an interrupt frame on it via TSS.RSP[0].  See
+    // `CPU_SWITCH_GEN`.  A snapshot of `u64::MAX` (set when `last_cpu` was
+    // unknown at reap) makes this gate vacuously pass so the tick gate
+    // governs alone — never under-waits, only the tick fallback applies.
+    let gen_ok = entry.last_cpu_gen == u64::MAX
+        || cpu_switch_gen(entry.last_cpu) > entry.last_cpu_gen;
+
+    // Gate 2 (wall-clock tick — defence-in-depth): bounds the re-issue
+    // against any in-flight switch the generation counter cannot attribute
+    // to a specific CPU.  The minimum wait is `DEAD_STACK_QUIESCE_TICKS`.
     let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
-    now >= entry.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS)
+    let tick_ok = now >= entry.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS);
+
+    // Liveness escape valve: if `last_cpu` goes idle (parks in `sti;hlt;cli`
+    // with no Ready work) it stops bumping its switch generation, so a pure
+    // `gen_ok && tick_ok` rule would withhold the entry until that CPU next
+    // schedules — a *leak* (never a UAF) under a quiet system.  After a much
+    // larger margin (`DEAD_STACK_QUIESCE_TICKS * GEN_ESCAPE_MULT` ≈ 160 ms at
+    // TICK_HZ=100) the in-flight `switch_context_asm` epilogue (microseconds)
+    // has unquestionably retired on any non-wedged CPU, so the entry is safe
+    // to re-issue on the tick gate alone.  This bounds the cache occupancy
+    // without re-opening the race the gen gate closes for the common
+    // (busy-CPU) case.  Cite Intel SDM Vol. 3A §6.14: an interrupt's TSS-RSP
+    // stack switch and the switch epilogue both complete in bounded time.
+    const GEN_ESCAPE_MULT: u64 = 8;
+    let escape_ok = now
+        >= entry.push_tick
+            .saturating_add(DEAD_STACK_QUIESCE_TICKS.saturating_mul(GEN_ESCAPE_MULT));
+
+    (gen_ok && tick_ok) || escape_ok
 }
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
@@ -764,7 +875,11 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
 /// until `TICK_COUNT` has advanced by at least `DEAD_STACK_QUIESCE_TICKS`
 /// (wall-clock: 20 ms at TICK_HZ=100).  See `CachedDeadStack` for the
 /// rationale.
-fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
+fn push_dead_stack(
+    stack_base_virt: u64,
+    stack_size_bytes: u64,
+    last_cpu: usize,
+) -> bool {
     // Defensive: refuse zero-sized or absurdly-large entries.  Both shapes
     // are programmer errors at the call site — the cache must never
     // hand back a base whose true extent we cannot honour.  Treat as
@@ -809,6 +924,19 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
 
     let push_tick = current_tick_for_quiesce();
 
+    // Snapshot the switch generation of the CPU that last ran the dead
+    // thread.  Re-issue is withheld until that CPU's generation advances
+    // (it completes another switch onto a different stack).  A `last_cpu`
+    // outside the valid range (e.g. a never-scheduled thread) records a
+    // `u64::MAX` sentinel so `entry_is_quiesced`'s gen gate passes
+    // vacuously and the wall-clock-tick gate governs alone — conservative,
+    // never under-waits.  See `CPU_SWITCH_GEN`.
+    let (last_cpu_norm, last_cpu_gen) = if last_cpu < MAX_CPUS {
+        (last_cpu, cpu_switch_gen(last_cpu))
+    } else {
+        (0usize, u64::MAX)
+    };
+
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.len() >= MAX_DEAD_STACKS {
         return false;
@@ -817,6 +945,8 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
         base: stack_base_virt,
         size: stack_size_bytes,
         push_tick,
+        last_cpu: last_cpu_norm,
+        last_cpu_gen,
     });
     true
 }
@@ -862,10 +992,14 @@ pub fn pop_dead_stack() -> Option<(u64, u64)> {
     if idx_found.is_none() && !cache.is_empty() {
         let e = &cache[0];
         let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        let cur_gen = cpu_switch_gen(e.last_cpu);
         crate::serial_println!(
-            "[KSTACK/QUIESCE] push_tick={} now={} need={} quiesced={}",
+            "[KSTACK/QUIESCE] push_tick={} now={} need={} tick_ok={} \
+             last_cpu={} snap_gen={} cur_gen={} gen_ok={}",
             e.push_tick, now, e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS),
-            now >= e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS));
+            now >= e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS),
+            e.last_cpu, e.last_cpu_gen, cur_gen,
+            e.last_cpu_gen == u64::MAX || cur_gen > e.last_cpu_gen);
     }
     let i = idx_found?;
     // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
@@ -884,7 +1018,11 @@ pub fn pop_dead_stack() -> Option<(u64, u64)> {
 /// `push_dead_stack` with the honest `kernel_stack_size`.
 pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
     let stack_size = (crate::proc::KERNEL_STACK_PAGES_PUB as u64) * 0x1000;
-    push_dead_stack(stack_base_virt, stack_size)
+    // Pre-allocated stacks never ran a thread, so there is no `last_cpu` that
+    // could still be switching off them.  Pass an out-of-range CPU index so
+    // `push_dead_stack` records the `u64::MAX` gen sentinel and only the
+    // wall-clock-tick gate governs eligibility.
+    push_dead_stack(stack_base_virt, stack_size, usize::MAX)
 }
 
 /// Test-only pop that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate so a
@@ -935,6 +1073,32 @@ pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
     if cache.is_empty() { return None; }
     let entry = cache.remove(0);
     Some((entry.base, entry.size))
+}
+
+/// Test-only: evaluate the `entry_is_quiesced` decision for a synthetic
+/// cache entry with the supplied `(push_tick, last_cpu, last_cpu_gen)`.
+///
+/// Lets the kernel test suite verify the per-CPU switch-generation gate
+/// (`CPU_SWITCH_GEN`) in isolation without spawning real threads:
+///   * gen not advanced + tick gate met            → withheld (false)
+///   * gen advanced     + tick gate met            → eligible (true)
+///   * `last_cpu_gen == u64::MAX` (unknown CPU)     → gen gate vacuous
+///   * tick margin ≥ escape valve                   → eligible regardless
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_entry_quiesced(push_tick: u64, last_cpu: usize, last_cpu_gen: u64) -> bool {
+    entry_is_quiesced(&CachedDeadStack {
+        base: 0,
+        size: 0,
+        push_tick,
+        last_cpu,
+        last_cpu_gen,
+    })
+}
+
+/// Test-only: read the live switch generation of `cpu`.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_cpu_switch_gen(cpu: usize) -> u64 {
+    cpu_switch_gen(cpu)
 }
 
 /// Schedule the next thread to run.
@@ -1654,6 +1818,15 @@ was_emergency_4k={}",
 
     // ── Resumed after being rescheduled back onto this thread ───────
     // Interrupts are still disabled (CLI was set by whoever rescheduled us).
+
+    // This CPU has just completed a context switch and is now executing on
+    // the incoming thread's kernel stack.  Bump the per-CPU switch
+    // generation so any dead stack whose `last_cpu` is this CPU (and which
+    // was reaped before this switch) becomes eligible for recycle — it is
+    // now proven that this CPU is no longer on the recycled stack VA.  See
+    // `CPU_SWITCH_GEN` / `note_switch_completed`.  (First-run threads jump
+    // to `user_mode_bootstrap` and never reach this line; they bump there.)
+    note_switch_completed();
 
     // ── FPU/SSE state restore for incoming thread ───────────────────
     {
