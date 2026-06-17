@@ -378,8 +378,69 @@ rm -rf "${DISK_USR_LIB}/apk" 2>/dev/null || true
 # gdk-pixbuf-query-loaders(1).  If qemu-user is unavailable the step is
 # skipped (non-fatal) and the GUI path falls back to whatever loaders are
 # statically built into libgdk_pixbuf.
+#
+# CRITICAL — built-in loaders are MISSING from the query-tool output.  This
+# build of libgdk_pixbuf links the PNG and JPEG decoders directly into the
+# main library (DT_NEEDED libpng16/libjpeg, no separate
+# libpixbufloader-png.so / -jpeg.so under loaders/).  Such loaders are
+# resolved at runtime by *module name*: a cache stanza named "png" or "jpeg"
+# makes gdk-pixbuf fill the loader vtable from the in-library symbol and never
+# dlopen()s the listed path.  But gdk-pixbuf-query-loaders only scans the
+# external loaders/ directory, so its output lists bmp/gif/ico/tiff/... and
+# omits png/jpeg entirely.  GdkPixbuf then has no "png" loader registered, the
+# very first image GTK decodes for the titlebar (a PNG symbolic icon out of
+# the in-memory GResource) returns NULL, and gdk_cairo_surface_create_from_*
+# faults on the NULL pixbuf before any toplevel is realized.  We therefore
+# append the canonical "png" and "jpeg" stanzas to the generated cache.  The
+# stanza format and the magic-signature escaping are per
+# gdk-pixbuf-query-loaders(1); the module-path line is a placeholder (it is
+# never opened for a name-matched built-in) but is kept non-empty so the
+# parser accepts the stanza.
 GDKP_DIR="${DISK_USR_LIB}/gdk-pixbuf-2.0/2.10.0"
 GDKP_QUERY="${ROOTFS}/usr/bin/gdk-pixbuf-query-loaders"
+GDKP_LIB="${DISK_USR_LIB}/libgdk_pixbuf-2.0.so.0"
+
+# Emit the loaders.cache stanzas for image formats whose decoder is linked
+# into libgdk_pixbuf itself (built-in / "included" loaders).  We only emit a
+# stanza when the corresponding decoder library is actually a DT_NEEDED of the
+# staged libgdk_pixbuf, so the cache never advertises a format the runtime
+# cannot decode.  Values (flags 5 = WRITABLE|THREADSAFE, mime/extension/magic)
+# match what an in-tree gdk-pixbuf-query-loaders emits for these formats.
+append_builtin_loader_stanzas() {
+    cache_file="$1"
+    added=0
+    # PNG — required for the GTK titlebar symbolic icons.  Magic per the PNG
+    # signature (ISO/IEC 15948): 89 50 4E 47 0D 0A 1A 0A.
+    if [ -f "${GDKP_LIB}" ] && \
+       readelf -dW "${GDKP_LIB}" 2>/dev/null | grep -q 'NEEDED.*libpng16'; then
+        if ! grep -q '^"png"' "${cache_file}" 2>/dev/null; then
+            printf '%s\n' \
+'"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-png.so"' \
+'"png" 5 "gdk-pixbuf" "PNG" "LGPL"' \
+'"image/png" ""' \
+'"png" ""' \
+'"\211PNG\r\n\032\n" "" 100' \
+'' >> "${cache_file}"
+            added=$((added + 1))
+        fi
+    fi
+    # JPEG — magic FF D8 (JFIF/Exif SOI marker).
+    if [ -f "${GDKP_LIB}" ] && \
+       readelf -dW "${GDKP_LIB}" 2>/dev/null | grep -q 'NEEDED.*libjpeg'; then
+        if ! grep -q '^"jpeg"' "${cache_file}" 2>/dev/null; then
+            printf '%s\n' \
+'"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-jpeg.so"' \
+'"jpeg" 5 "gdk-pixbuf" "JPEG" "LGPL"' \
+'"image/jpeg" ""' \
+'"jpeg" "jpe" "jpg" ""' \
+'"\377\330" "" 100' \
+'' >> "${cache_file}"
+            added=$((added + 1))
+        fi
+    fi
+    echo "${added}"
+}
+
 if [ -d "${GDKP_DIR}/loaders" ] && [ -x "${GDKP_QUERY}" ] && \
    command -v qemu-x86_64 >/dev/null 2>&1; then
     if qemu-x86_64 -L "${ROOTFS}" \
@@ -389,14 +450,33 @@ if [ -d "${GDKP_DIR}/loaders" ] && [ -x "${GDKP_QUERY}" ] && \
               s|^# LoaderDir = ${ROOTFS}|# LoaderDir = |" \
          > "${GDKP_DIR}/loaders.cache.tmp" 2>/dev/null \
        && grep -q '^"/usr/lib/gdk-pixbuf-2.0' "${GDKP_DIR}/loaders.cache.tmp"; then
+        builtin_added="$(append_builtin_loader_stanzas "${GDKP_DIR}/loaders.cache.tmp")"
         mv -f "${GDKP_DIR}/loaders.cache.tmp" "${GDKP_DIR}/loaders.cache"
-        echo "[install-firefox-musl] generated GdkPixbuf loaders.cache ($(grep -c '^"/usr/lib' "${GDKP_DIR}/loaders.cache") loaders)"
+        echo "[install-firefox-musl] generated GdkPixbuf loaders.cache ($(grep -c '^"/usr/lib' "${GDKP_DIR}/loaders.cache") loaders incl. ${builtin_added} built-in)"
     else
         rm -f "${GDKP_DIR}/loaders.cache.tmp" 2>/dev/null || true
         echo "[install-firefox-musl] WARNING: gdk-pixbuf-query-loaders produced no usable cache — GUI image loading may degrade"
     fi
 elif [ -d "${GDKP_DIR}/loaders" ]; then
-    echo "[install-firefox-musl] NOTE: qemu-x86_64 (qemu-user) not found; skipping GdkPixbuf loaders.cache generation (install with: apt-get install qemu-user)"
+    # qemu-user unavailable: we cannot enumerate the external loaders, but the
+    # built-in PNG/JPEG decoders are linked into libgdk_pixbuf and are all the
+    # windowed titlebar path needs.  Write a minimal cache with just those so
+    # GUI Firefox can still decode its PNG symbolic icons without crashing.
+    mkdir -p "${GDKP_DIR}"
+    {
+        echo '# GdkPixbuf Image Loader Modules file'
+        echo '# Automatically generated file, do not edit'
+        echo '# Created by install-firefox-musl.sh (built-in loaders only)'
+        echo '#'
+    } > "${GDKP_DIR}/loaders.cache.tmp"
+    builtin_added="$(append_builtin_loader_stanzas "${GDKP_DIR}/loaders.cache.tmp")"
+    if [ "${builtin_added}" -gt 0 ]; then
+        mv -f "${GDKP_DIR}/loaders.cache.tmp" "${GDKP_DIR}/loaders.cache"
+        echo "[install-firefox-musl] qemu-x86_64 absent; wrote built-in-only GdkPixbuf loaders.cache (${builtin_added} loaders)"
+    else
+        rm -f "${GDKP_DIR}/loaders.cache.tmp" 2>/dev/null || true
+        echo "[install-firefox-musl] NOTE: qemu-x86_64 absent and no built-in image loaders detected; skipping GdkPixbuf loaders.cache"
+    fi
 fi
 
 # (c2) Auxiliary data trees under /usr/share/.  Several Alpine packages
@@ -440,6 +520,67 @@ if [ -d "${ROOTFS}/usr/share" ]; then
                 "${DISK_USR_SHARE}/${share_subdir}/" 2>/dev/null || true
         fi
     done
+fi
+
+# (c3) Compile the GSettings schema cache and the shared-MIME database.
+#
+# Both of these are BINARY index files that Alpine's apk packages ship as a
+# post-install trigger output, not as a packaged file.  Because we extract
+# apks without firing their triggers (same reason loaders.cache is absent in
+# (c1)), only the human-readable sources land on the data disk:
+#
+#   /usr/share/glib-2.0/schemas/*.gschema.xml   but NOT gschemas.compiled
+#   /usr/share/mime/                            but NOT mime.cache
+#
+# Consequences on the windowed (--ff-gui) Firefox path:
+#
+#   * gschemas.compiled — GSettings (GIO) reads the compiled cache, never the
+#     XML.  With it absent, g_settings_new("org.gtk.Settings.*") finds no
+#     schema, GtkSettings cannot resolve its keys (gtk-theme-name,
+#     gtk-icon-theme-name, gtk-font-name, ...), and GTK emits the
+#     "Settings schema 'org.gtk.Settings.FileChooser' is not installed"-class
+#     warnings the GUI path was observed printing.  Theme/icon resolution then
+#     falls back to compiled-in defaults inconsistently.  The schema-compiler
+#     output format is defined by GSettings; see g_settings_schema_source.
+#
+#   * mime.cache — GIO/GTK content-type queries (g_content_type_guess and the
+#     GtkFileChooser/app-info machinery) read the compiled mime.cache.  Without
+#     it, GdkPixbuf/GTK log "Failed to load module"/MIME warnings at startup.
+#     The cache format is defined by the freedesktop.org Shared MIME-info
+#     Database specification.
+#
+# Run the staged musl tools under qemu-x86_64 user-mode emulation (with the
+# Alpine rootfs as sysroot), exactly as (c1) runs gdk-pixbuf-query-loaders.
+# Both steps are non-fatal: if qemu-user is unavailable the GUI path keeps
+# working with degraded settings/MIME behaviour, so a host without qemu-user
+# can still produce a bootable (headless) image.
+if command -v qemu-x86_64 >/dev/null 2>&1; then
+    # GSettings schema cache.
+    GSCHEMA_DIR="${DISK_USR_SHARE}/glib-2.0/schemas"
+    GSCHEMA_COMPILE="${ROOTFS}/usr/bin/glib-compile-schemas"
+    if [ -d "${GSCHEMA_DIR}" ] && [ -x "${GSCHEMA_COMPILE}" ] && \
+       ls "${GSCHEMA_DIR}"/*.gschema.xml >/dev/null 2>&1; then
+        if qemu-x86_64 -L "${ROOTFS}" "${GSCHEMA_COMPILE}" "${GSCHEMA_DIR}" \
+             >/dev/null 2>&1 && [ -f "${GSCHEMA_DIR}/gschemas.compiled" ]; then
+            echo "[install-firefox-musl] compiled GSettings schema cache ($(stat -c %s "${GSCHEMA_DIR}/gschemas.compiled") bytes)"
+        else
+            echo "[install-firefox-musl] WARNING: glib-compile-schemas failed — GtkSettings keys will be unresolved on the GUI path"
+        fi
+    fi
+
+    # Shared-MIME database cache.
+    MIME_DIR="${DISK_USR_SHARE}/mime"
+    MIME_UPDATE="${ROOTFS}/usr/bin/update-mime-database"
+    if [ -d "${MIME_DIR}" ] && [ -x "${MIME_UPDATE}" ]; then
+        if qemu-x86_64 -L "${ROOTFS}" "${MIME_UPDATE}" "${MIME_DIR}" \
+             >/dev/null 2>&1 && [ -f "${MIME_DIR}/mime.cache" ]; then
+            echo "[install-firefox-musl] compiled shared-MIME database ($(stat -c %s "${MIME_DIR}/mime.cache") bytes)"
+        else
+            echo "[install-firefox-musl] WARNING: update-mime-database failed — GIO MIME queries will warn on the GUI path"
+        fi
+    fi
+else
+    echo "[install-firefox-musl] NOTE: qemu-x86_64 absent; skipping gschemas.compiled / mime.cache generation (install with: apt-get install qemu-user)"
 fi
 
 # Within ${DISK_FF_TREE}: ensure both "firefox-bin" and "firefox" sentinel

@@ -3852,7 +3852,14 @@ def cmd_start(args):
     # via astryx_qemu._display_args) so the kernel framebuffer compositor
     # has somewhere to write and QMP can pull the image.  Idempotent guard
     # so an explicit caller-supplied `-vga` is not duplicated.
-    if "xeyes-test" in feats and not any(a == "-vga" for a in extra_qemu_args):
+    if ("xeyes-test" in feats or ff_gui) and not any(a == "-vga" for a in extra_qemu_args):
+        # The windowed (--ff-gui) Firefox path drives the in-kernel Xastryx
+        # server, whose compositor blits into the VMware SVGA II framebuffer
+        # (kernel/src/gui/compositor.rs).  Without a VGA card QEMU comes up
+        # with `-display none` and no framebuffer, so the X11 present has
+        # nowhere to land and QMP `screendump` returns an empty frame.  Inject
+        # the same `-vga vmware` device the gui-test / firefox-test paths use
+        # so the chrome the browser paints is visible to a screendump.
         extra_qemu_args += ["-vga", "vmware"]
 
     # Host-side packet capture on the e1000/SLIRP netdev (net0).
