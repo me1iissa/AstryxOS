@@ -792,6 +792,11 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_draw_cycle() { passed += 1; }
 
+    // ── X11 server — TranslateCoordinates (opcode 40) ────────────────────────
+
+    total += 1;
+    if test_x11_translate_coordinates() { passed += 1; }
+
     // ── Test 67: X11 server — key event injection + delivery ─────────────────
 
     total += 1;
@@ -18041,6 +18046,97 @@ fn test_x11_draw_cycle() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 CreateWindow + MapWindow + Draw cycle");
+    true
+}
+
+// ── X11 — TranslateCoordinates (opcode 40) ───────────────────────────────────
+//
+// Verifies the server answers TranslateCoordinates with a reply (not a
+// BadRequest error) and that the geometry is correct.  A point (60,70) in the
+// root window's coordinate space, translated into a child window whose origin
+// is (50,50), must come back as (10,20).  GDK issues this request during window
+// realization; before this op was wired the server replied BadRequest, which
+// the client (libX11 XTranslateCoordinates) reports as a failure.
+fn test_x11_translate_coordinates() -> bool {
+    test_header!("X11 TranslateCoordinates (opcode 40)");
+
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX {
+        test_fail!("x11_translate", "unix::create() failed");
+        return false;
+    }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_translate", "connect failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_translate", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+
+    // CreateWindow: wid=0x00610001, parent=ROOT, origin (50,50), 200x100.
+    let mut reqs = [0u8; 40];
+    reqs[0]  = 1; reqs[2] = 10;
+    reqs[4]  = 0x01; reqs[5] = 0x00; reqs[6] = 0x61; // wid = 0x00610001 LE
+    reqs[8]  = 0x01;                                 // parent = ROOT
+    reqs[12] = 50; reqs[14] = 50;                    // x=50 y=50
+    reqs[16] = 200; reqs[18] = 100;                  // w=200 h=100
+    reqs[22] = 1;                                    // class = InputOutput
+    reqs[24] = 32;                                   // visual = ROOT_VISUAL
+    // vmask = 0 (no optional attrs)
+    if crate::net::unix::write(client, &reqs) != 40 {
+        test_fail!("x11_translate", "CreateWindow write failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    crate::x11::poll();
+
+    // TranslateCoordinates (4 words = 16 bytes):
+    //   [0] opcode=40  [2] len=4  [4..8] src=ROOT(1)  [8..12] dst=0x00610001
+    //   [12..14] src_x=60  [14..16] src_y=70
+    let mut tc = [0u8; 16];
+    tc[0]  = 40; tc[2] = 4;
+    tc[4]  = 0x01;                                   // src = ROOT
+    tc[8]  = 0x01; tc[9] = 0x00; tc[10] = 0x61;      // dst = 0x00610001 LE
+    tc[12] = 60; tc[14] = 70;                        // src_x=60 src_y=70
+    if crate::net::unix::write(client, &tc) != 16 {
+        test_fail!("x11_translate", "TranslateCoordinates write failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    crate::x11::poll();
+
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(client, &mut rep);
+    if n < 32 {
+        test_fail!("x11_translate", "reply read returned {} (expected 32)", n);
+        crate::net::unix::close(client);
+        return false;
+    }
+    // byte 0 == 1 (reply, not 0 = error) is the primary regression guard.
+    if rep[0] != 1 {
+        test_fail!("x11_translate", "got type={} (expected 1=reply; 0=BadRequest error)", rep[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+    let dst_x = i16::from_le_bytes([rep[16], rep[17]]);
+    let dst_y = i16::from_le_bytes([rep[18], rep[19]]);
+    if dst_x != 10 || dst_y != 20 {
+        test_fail!("x11_translate", "dst=({},{}) expected (10,20)", dst_x, dst_y);
+        crate::net::unix::close(client);
+        return false;
+    }
+    test_println!("  TranslateCoordinates root(60,70) -> child(10,20) ✓");
+
+    crate::net::unix::close(client);
+    test_pass!("X11 TranslateCoordinates (opcode 40)");
     true
 }
 
