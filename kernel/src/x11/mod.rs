@@ -2786,15 +2786,57 @@ fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
     let minor = data[1];
     #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11XKB] minor={} seq={} len={}", minor, seq, data.len());
-    // XKB minor opcodes that need replies:
-    // 0=UseExtension, 4=GetState, 6=GetControls, 9=ListComponents,
-    // 10=GetMap, 17=GetCompatMap, 21=GetNames, 24=GetDeviceInfo, 31=SetDebuggingFlags
-    // No-reply: 1=SelectEvents, 3=DeviceBell, 5=SetControls, 7=LockControls, 11=SetMap, etc.
+    // XKB request minor-opcodes per the X Keyboard Extension Protocol
+    // Specification §New Requests (X.Org kbproto; the canonical X_kb* numbering
+    // also published in X11/extensions/XKB.h):
+    //   0  UseExtension*        1  SelectEvents       3  Bell
+    //   4  GetState*            5  LatchLockState     6  GetControls*
+    //   7  SetControls          8  GetMap*            9  SetMap
+    //   10 GetCompatMap*        11 SetCompatMap       12 GetIndicatorState*
+    //   13 GetIndicatorMap*     14 SetIndicatorMap    15 GetNamedIndicator*
+    //   16 SetNamedIndicator    17 GetNames*          18 SetNames
+    //   19 GetGeometry*         20 SetGeometry        21 PerClientFlags*
+    //   22 ListComponents*      23 GetKbdByName*      24 GetDeviceInfo*
+    //   25 SetDeviceInfo        101 SetDebuggingFlags*
+    // Starred (*) opcodes generate a 32-byte reply the client BLOCKS on; the
+    // others are request-only (no reply).  Sending a reply for a no-reply
+    // opcode — or, worse, withholding a reply for a reply opcode — desyncs the
+    // client's request/reply sequence accounting and wedges its event loop.
+    // GTK/GDK issues GetMap(8), GetNames(17) and PerClientFlags(21) during
+    // keymap initialization inside gdk_display_open(), so each MUST be
+    // answered or the toplevel is never realized.  We return well-formed but
+    // empty (no-components) replies — sufficient for a software-rendered,
+    // no-physical-keyboard display.
     match minor {
         0 => {
-            // XkbUseExtension: supported=1, serverMajor=1, serverMinor=0
+            // XkbUseExtension: report the extension as NOT supported for the
+            // client's requested version (the `supported` BOOL in byte 1 is 0).
+            //
+            // Per the X Keyboard Extension Protocol Specification §UseExtension,
+            // a client (libX11's XkbQueryExtension / XkbUseExtension) that sees
+            // supported=0 falls back to the *core* keyboard protocol — it stops
+            // issuing XkbGetMap and instead builds its keymap from
+            // GetKeyboardMapping(101) + GetModifierMapping(119), both of which
+            // this server answers with a complete, non-empty map (see
+            // op_get_keyboard_mapping / op_get_modifier_mapping).  GDK mirrors
+            // this: gdkkeys-x11 sets use_xkb=FALSE and uses the core path.
+            //
+            // We deliberately do NOT try to synthesize a full XkbGetMap reply.
+            // A *complete* XKB client map (key types, the per-keycode
+            // key_sym_map array, modifier maps) is required for correctness:
+            // libX11's XkbKeysymToModifiers walks
+            //   xkb->map->key_sym_map[kc] -> ->kt_index -> xkb->map->types[...]
+            // and dereferences those arrays unconditionally.  An "empty"
+            // (present=0) GetMap reply leaves them NULL, so the very next
+            // GTK keymap query faults on a NULL deref (NULL+4).  Reporting the
+            // extension unsupported routes the client onto the core protocol
+            // we already serve correctly, avoiding a large, fragile XKB map
+            // serializer for a display that has no physical keyboard.
+            //
+            // serverMajor/serverMinor still report a valid version (1.0) so
+            // the negotiation itself is well-formed.
             let mut b = [0u8; 32];
-            b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
+            b[0] = 1; b[1] = 0; w16(&mut b, 2, seq);
             w16(&mut b, 8, 1); w16(&mut b, 10, 0);
             with_client(fd, |c| c.send(&b));
         }
@@ -2807,43 +2849,58 @@ fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
             // ptr_btn_state=0, compat_state=0, etc.
             with_client(fd, |c| c.send(&b));
         }
-        6 | 31 => {
-            // XkbGetControls / SetDebuggingFlags: send empty 32-byte reply
-            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
-            with_client(fd, |c| c.send(&b));
-        }
-        10 => {
-            // XkbGetMap: send empty map reply.
-            // Reply header: type=1, deviceID=0, seq, length=0
-            // minKeyCode at b[8], maxKeyCode at b[9] (8..255 typical)
-            // present=0 (no components), firstType=0, nTypes=0, ...
-            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+        8 => {
+            // XkbGetMap (opcode 8): send an empty map reply.
+            // 32-byte reply header: type=1, deviceID, seq, length=0 (no
+            // trailing map components since present=0).  Per the XKB protocol
+            // the reply carries minKeyCode/maxKeyCode then a `present` bitmask
+            // selecting which map components follow; present=0 means the body
+            // is exactly the 32-byte header.
+            //   b[8]  minKeyCode   b[9]  maxKeyCode
+            //   b[10..12] present (CARD16) = 0 → no components → length=0
+            let mut b = [0u8; 32]; b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
             b[8] = 8; b[9] = 255; // min/max keycode
-            // present=0 → no map components → length stays 0
+            // present=0 (b[10..12]) → no map components → length stays 0
             with_client(fd, |c| c.send(&b));
         }
-        21 => {
-            // XkbGetNames: send reply with which=0 (no name components).
-            // The reply MUST have the correct format or Xlib reads beyond
-            // the 32-byte header, desynchronizing the XCB stream.
-            // Reply: type=1, deviceID=0, seq, length=0
-            //   b[8..12]  = which (CARD32) = 0 → no name components
-            //   b[12..16] = minKeyCode, maxKeyCode, nTypes, groupNames
-            //   b[16..20] = virtualMods, firstKey, nKeys, indicators
-            //   b[20..24] = nKTLevels, ...
-            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
-            // which=0 at offset 8 (all zeros) → Xlib reads 0 extra bytes
+        17 => {
+            // XkbGetNames (opcode 17): reply with which=0 (no name components).
+            // The reply MUST have the correct format or the client reads beyond
+            // the 32-byte header, desynchronizing the request stream.
+            // Reply: type=1, deviceID, seq, length=0
+            //   b[8..12]  = which (CARD32) = 0 → no name components follow
+            //   b[12]=minKeyCode, b[13]=maxKeyCode, then nTypes/groupNames/...
+            let mut b = [0u8; 32]; b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
+            // which=0 at offset 8 (all zeros) → client reads 0 extra bytes
             b[12] = 8;  // minKeyCode
             b[13] = 255; // maxKeyCode
             with_client(fd, |c| c.send(&b));
         }
-        9 | 17 | 24 => {
-            // XkbListComponents / GetCompatMap / GetDeviceInfo:
-            // Send minimal reply with length=0 (no extra data).
-            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+        21 => {
+            // XkbPerClientFlags (opcode 21): reply echoing the (now-zero)
+            // supported/value flag set.  GDK uses this to enable
+            // detectable-autorepeat; an empty 32-byte reply (all flags 0) is a
+            // valid "nothing changed" response and unblocks the caller.
+            let mut b = [0u8; 32]; b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
             with_client(fd, |c| c.send(&b));
         }
-        // No-reply opcodes (1=SelectEvents, 3=DeviceBell, 5=SetControls, etc.): ignore
+        6 | 10 | 12 | 13 | 15 | 19 | 22 | 23 | 24 | 101 => {
+            // Remaining reply-generating opcodes:
+            //   6  GetControls     10 GetCompatMap     12 GetIndicatorState
+            //   13 GetIndicatorMap 15 GetNamedIndicator 19 GetGeometry
+            //   22 ListComponents  23 GetKbdByName     24 GetDeviceInfo
+            //   101 SetDebuggingFlags
+            // Each blocks the client on a 32-byte reply; for a stub keyboard a
+            // minimal header with no trailing data (length=0) is a well-formed
+            // "empty / not-found / defaults" reply.  GetGeometry's `found`
+            // (b[1]) is left 0 = no geometry, which clients tolerate.
+            let mut b = [0u8; 32]; b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        // Request-only opcodes (1 SelectEvents, 3 Bell, 5 LatchLockState,
+        // 7 SetControls, 9 SetMap, 11 SetCompatMap, 14 SetIndicatorMap,
+        // 16 SetNamedIndicator, 18 SetNames, 20 SetGeometry, 25 SetDeviceInfo):
+        // no reply — sending one would desync the client.  Ignore.
         _ => {}
     }
 }

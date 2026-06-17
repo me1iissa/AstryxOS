@@ -18,6 +18,14 @@ use spin::Mutex;
 /// mutex acquisition in the common idle case.
 static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// When `true`, Firefox (and any subsequently launched GUI client) runs in
+/// X11/GUI mode: `spawn_async` omits `MOZ_HEADLESS=1` from the child envp so
+/// libxul takes the `gdk_display_open()` / `XOpenDisplay()` branch and paints
+/// into a real window on the in-kernel Xastryx server (`DISPLAY=:0`) instead of
+/// the headless screenshot path.  Set once at FF launch from the boot-config
+/// `astryx.ff_gui=1` fw_cfg token; default `false` (headless).
+pub static FF_GUI_MODE: AtomicBool = AtomicBool::new(false);
+
 /// PID of the most recently launched async child process.  0 = none.
 /// Stored so that `is_firefox_running()` can consult the thread table
 /// directly and detect exit even before `poll_output()` has reaped the
@@ -888,13 +896,22 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         _ => LD_PATH_GLIBC,
     };
 
-    let envp: &[&str] = &[
+    // GUI mode (astryx.ff_gui=1): run Firefox connected to the in-kernel
+    // Xastryx X11 server and paint into a real window, instead of the headless
+    // screenshot path.  The only env-var difference is MOZ_HEADLESS, which is
+    // omitted in GUI mode (see the conditional push below); everything else is
+    // identical.  Built as a Vec so the single variable can be included or
+    // skipped without duplicating the whole block.
+    let gui_mode = FF_GUI_MODE.load(Ordering::Acquire);
+    let mut envp_vec: alloc::vec::Vec<&str> = alloc::vec![
         "HOME=/home/user",
         "PATH=/bin:/disk/bin",
         "TCCDIR=/disk/lib/tcc",
         "TMPDIR=/tmp",
         "DISPLAY=:0",
         "GDK_BACKEND=x11",
+    ];
+    if !gui_mode {
         // Tell Firefox to run headless even when DISPLAY is set.  libxul
         // checks gfxPlatform::IsHeadless() / nsAppRunner XRE_main and skips
         // gdk_display_open() / XOpenDisplay() entirely on this branch.  Our
@@ -904,7 +921,83 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // (and the equivalent `--headless` argv flag) as the canonical
         // headless-mode trigger.
         // See: https://firefox-source-docs.mozilla.org/widget/headless.html
-        "MOZ_HEADLESS=1",
+        //
+        // In GUI mode this is intentionally omitted so libxul opens the
+        // display and renders into an X11 window on the Xastryx server.
+        envp_vec.push("MOZ_HEADLESS=1");
+        // Headless software-render only: keep the GPU/compositor work in the
+        // parent process (no out-of-process GPU child).  This is the
+        // gfx-testing gate Mozilla uses to force in-process compositing; it is
+        // correct for the headless screenshot path but must NOT leak into the
+        // windowed path, where the GPU/compositor child participates in
+        // allocating and presenting the real toplevel surface.
+        envp_vec.push("MOZ_GFX_TESTING_NO_CHILD_PROCESS=1");
+    } else {
+        // GUI (windowed) mode: collapse the command-line tab to in-process.
+        //
+        // The windowed path opens the command-line URL as an ordinary browser
+        // tab.  An ordinary tab's process model follows the window's
+        // multi-process state, which is seeded from the documented
+        // `MOZ_FORCE_DISABLE_E10S` switch: with the switch set, the chrome
+        // window is created without the remote flag, so the tab's <browser>
+        // is non-remote and its document is parsed, laid out, and rendered
+        // entirely in the parent process.  Because the X11/MOZ_X11 software
+        // compositor already runs in-process (the out-of-process GPU/compositor
+        // child is off by default on this widget backend), the whole pipeline
+        // — layer tree, compositing, and the X11 present — happens in one
+        // process with no cross-process content-init handshake to complete.
+        //
+        // This is the same single-process render path the headless
+        // screenshot path exercises, and it is deliberately NOT applied to
+        // that path: the headless `--screenshot` capture <browser> is created
+        // with an explicit remoteness that an environment default cannot
+        // override (see the note in the shared block below), so forcing the
+        // default off there would only desynchronise its actor routing.  In
+        // windowed mode there is no such explicit-remote browser, so the
+        // switch cleanly selects the in-process tab.
+        //
+        // IMPORTANT: on an official release/ESR build the
+        // `MOZ_FORCE_DISABLE_E10S` switch is itself gated behind the
+        // automation-mode flag — it is honoured ONLY when non-local
+        // connections are also disabled (a build hardening: the switch must
+        // not be flippable on a network-facing browser).  So pairing it with
+        // `MOZ_DISABLE_NONLOCAL_CONNECTIONS` is mandatory for the in-process
+        // collapse to take effect; with the latter unset the e10s-disable is
+        // silently ignored and the tab stays remote.  That pairing is only
+        // sound for a local (`file://`) target, which needs no network; the
+        // GUI demo loads exactly such a page, so the restriction is harmless
+        // here.  For a network URL the two are mutually exclusive and the
+        // windowed path necessarily runs the normal multi-process tree.
+        // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
+        envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
+        envp_vec.push("MOZ_DISABLE_NONLOCAL_CONNECTIONS=1");
+        // GUI-mode (windowed) runtime data that headless mode never needs.
+        // When libxul opens the display it brings up GTK/GDK, which loads
+        // image data through GdkPixbuf and resolves fonts through fontconfig.
+        // Both libraries read a generated index/config file at init time; if
+        // the file is absent they degrade to an EMPTY loader/config set and
+        // later return NULL where a non-NULL object is required — GTK then
+        // asserts `GDK_IS_PIXBUF (pixbuf)` / faults on the NULL deref before a
+        // toplevel is ever realized.  Naming the files explicitly via the
+        // documented environment variables is the robust, path-independent way
+        // to point each library at the data-disk copy.
+        //
+        //   GDK_PIXBUF_MODULE_FILE — absolute path to the loaders cache that
+        //     lists the available image-loader modules.  Documented by
+        //     GdkPixbuf (gdk_pixbuf_io_init / gdk-pixbuf-query-loaders(1)); it
+        //     overrides the compiled-in default cache location.
+        //   FONTCONFIG_FILE / FONTCONFIG_PATH — name the fontconfig
+        //     configuration file and directory.  Documented in
+        //     fonts-conf(5); without them real libfontconfig cannot resolve
+        //     its compiled sysconfdir default on this layout and reports
+        //     "Cannot load default config file".
+        envp_vec.push(
+            "GDK_PIXBUF_MODULE_FILE=/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+        );
+        envp_vec.push("FONTCONFIG_FILE=/etc/fonts/fonts.conf");
+        envp_vec.push("FONTCONFIG_PATH=/etc/fonts");
+    }
+    envp_vec.extend_from_slice(&[
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
@@ -930,8 +1023,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // channel, the content actor renders the fragment, and its reply
         // drives drawSnapshot to the PNG.
         // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
-        // Skip GPU/glxtest process — software rendering only.
-        "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
+        //
+        // NB: MOZ_GFX_TESTING_NO_CHILD_PROCESS is set ONLY in headless mode
+        // (pushed in the `if !gui_mode` block above).  It is a gfx-test gate
+        // that forces the GPU/compositor work in-process; in the windowed
+        // path the out-of-process GPU/compositor child is part of how the
+        // toplevel surface is allocated and presented, so we must not suppress
+        // it here.
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
@@ -989,7 +1087,8 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Defined by glibc's dynamic linker; see ld.so(8) §LD_DEBUG.
         "LD_DEBUG=files",
         "LD_DEBUG_OUTPUT=/tmp/lddbg",
-    ];
+    ]);
+    let envp: &[&str] = &envp_vec;
 
     // Spawn blocked so we can attach the pipe before the child can run.
     // linux_abi / subsystem are set inside create_user_process_with_args_blocked.

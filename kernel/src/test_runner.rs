@@ -187,6 +187,23 @@ pub fn run() -> ! {
         }
     }
 
+    // ── Test R0b: boot-config fw_cfg URL-parser self-tests ───────────────
+    // Pure-Rust unit tests for the `astryx.ff_url=<url>` parser + the
+    // scheme/length/printable validation that gates an untrusted fw_cfg
+    // blob (boot_config.rs).  No serial I/O cost when the module is absent
+    // (the module compiles under firefox-test-core OR test-mode; this
+    // arm only fires under test-mode where the runner itself exists).
+    {
+        total += 1;
+        let n = crate::boot_config::self_tests();
+        if n >= 10 {
+            passed += 1;
+            test_println!("  Test R0b: boot-config URL-parser self-tests passed ({} asserts)", n);
+        } else {
+            test_println!("  Test R0b: boot-config URL-parser self-tests FAILED ({} asserts ran)", n);
+        }
+    }
+
     // ── Test 0-heap: Heap free-list validation + canaries — healthy churn ─
     // Runs FIRST (before any test that could itself perturb the heap) so it
     // is a clean no-false-positive assertion for the hardened allocator: the
@@ -27109,14 +27126,20 @@ fn test_x11_xkb_use_extension() -> bool {
         crate::net::unix::close(fd);
         return false;
     }
-    // b[1] = supported flag
-    if krep[1] != 1 {
-        test_fail!("x11_xkb", "XkbUseExtension supported={} (expected 1)", krep[1]);
+    // b[1] = supported flag. The XKEYBOARD extension is advertised as present
+    // (QueryExtension above), but XkbUseExtension deliberately reports
+    // supported=0: per the X Keyboard Extension Protocol Specification
+    // §UseExtension, a client that sees supported=0 falls back to the *core*
+    // keyboard protocol (GetKeyboardMapping/GetModifierMapping). This is the
+    // intended contract — assert it so a future flip to a stubbed supported=1
+    // (which would hand clients empty XKB keymaps) is caught.
+    if krep[1] != 0 {
+        test_fail!("x11_xkb", "XkbUseExtension supported={} (expected 0: core-keyboard fallback)", krep[1]);
         crate::net::unix::close(fd);
         return false;
     }
     let server_major = u16::from_le_bytes([krep[8], krep[9]]);
-    test_println!("  XkbUseExtension: supported=1 serverMajor={} ✓", server_major);
+    test_println!("  XkbUseExtension: supported=0 (core-keyboard fallback) serverMajor={} ✓", server_major);
 
     crate::net::unix::close(fd);
     test_pass!("X11 XKB extension");

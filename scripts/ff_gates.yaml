@@ -64,6 +64,21 @@ gates:
     desc: "drawSnapshot invoked — paint of the target page begins"
 
   - id: png-write
-    marker_regex: 'Screenshot saved|out\.png|\[SCREENSHOT-B64:'
+    # Authoritative PNG-write signal: the kernel emits `[GATE] png-write
+    # path=<p> bytes=<n>` (vfs/mod.rs) on the close-after-write of the
+    # cmdline's --screenshot file — a genuine "the PNG was written and
+    # closed" event, NOT a stat/resolve probe.  The legacy substrings
+    # (`[FF-OUT-PNG:` host-extract header, the supervisor's `/tmp/out.png
+    # present` line) are kept as fallbacks for full-trace boots and the
+    # post-exit extract path.  `[SCREENSHOT-B64:` is intentionally DROPPED
+    # here — it is the QEMU VGA framebuffer stream (boot splash), not
+    # Firefox's render, and was a false positive that mis-flagged a stalled
+    # boot as a PNG win.
+    marker_regex: '\[GATE\]\s+png-write\b|\[FF-OUT-PNG:path=|/tmp/out\.png present|Screenshot saved'
     kind: line
-    desc: "PNG encoded / written — demo SUCCESS"
+    desc: "PNG written-and-closed ([GATE] png-write) — demo SUCCESS"
+
+  - id: ff-exit-clean
+    marker_regex: '\[GATE\]\s+ff-exit-clean\b'
+    kind: line
+    desc: "Firefox (pid 1) group-exited cleanly in firefox-test mode"
