@@ -1342,10 +1342,29 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // compiled default.  Announce which source won so a forensic reader
             // of a render boot can tell at a glance whether the harness's
             // `--ff-url` actually took effect.
+            // GUI (windowed) mode pairs MOZ_DISABLE_NONLOCAL_CONNECTIONS=1 with
+            // the e10s-disable switch (mandatory for the in-process tab
+            // collapse — that switch is honoured only in automation/non-local
+            // mode).  The gate refuses every non-loopback connection in-process
+            // before any SYN, so a network URL (the https default) can never be
+            // fetched and the tab stays on an empty document — no reflow, no
+            // first paint requested.  A local file:// target needs no network
+            // and loads under the gate, so it is the correct compiled default
+            // for GUI mode.  An explicit astryx.ff_url= override still wins for
+            // callers that have arranged a reachable target.  RFC 8089 (the
+            // file URI scheme) covers the local-page form used here.
+            const GUI_DEFAULT_FF_URL: &str = "file:///tmp/hello.html";
             let ff_url: alloc::string::String = match boot_config::ff_url_override() {
                 Some(u) => {
                     serial_println!("[FFTEST] target URL (fw_cfg override): {}", u);
                     u
+                }
+                None if gui_mode => {
+                    serial_println!(
+                        "[FFTEST] target URL (GUI compiled default): {}",
+                        GUI_DEFAULT_FF_URL
+                    );
+                    alloc::string::String::from(GUI_DEFAULT_FF_URL)
                 }
                 None => {
                     serial_println!("[FFTEST] target URL (compiled default): {}", DEFAULT_FF_URL);
