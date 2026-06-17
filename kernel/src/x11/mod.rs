@@ -591,6 +591,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_GRAB_SERVER           => {}
         proto::OP_UNGRAB_SERVER         => {}
         proto::OP_QUERY_POINTER         => op_query_pointer(fd, seq),
+        proto::OP_TRANSLATE_COORDINATES => op_translate_coordinates(fd, data, seq),
         proto::OP_WARP_POINTER          => {}
         proto::OP_SET_INPUT_FOCUS       => op_set_input_focus(fd, data),
         proto::OP_GET_INPUT_FOCUS       => op_get_input_focus(fd, seq),
@@ -1391,6 +1392,85 @@ fn op_query_pointer(fd: u64, seq: u16) {
     w16(&mut b,20, proto::SCREEN_WIDTH/2);  // root-x
     w16(&mut b,22, proto::SCREEN_HEIGHT/2); // root-y
     with_client(fd, |c| c.send(&b));
+}
+
+// ── TranslateCoordinates (40) ────────────────────────────────────────────────
+//
+// Per X11 core protocol §TranslateCoordinates: given a point (src_x, src_y) in
+// the coordinate space of src_window, return the equivalent point (dst_x, dst_y)
+// in the coordinate space of dst_window, the `child` of dst_window that contains
+// the point (or None), and `same_screen`.  GDK calls this through
+// gdk_window_get_origin / gdk_x11_window_get_root_coords during window
+// realization and pointer handling; an unanswered request (the server replying
+// BadRequest) makes those return garbage coordinates.
+//
+// Request layout (4 words, 16 bytes):
+//   [0] opcode/unused/length   [4] src_window   [8] dst_window
+//   [12] src_x (CARD16)        [14] src_y (CARD16)
+//
+// Reply (32 bytes): byte 1 = same_screen (BOOL), word at 8 = child (WINDOW,
+// 0 = None), INT16 at 16 = dst_x, INT16 at 18 = dst_y.
+//
+// We translate via each window's absolute (root-relative) origin: the point in
+// root space is src_abs_origin + (src_x, src_y), and the result is that minus
+// dst_abs_origin.  This is exact for the flat-under-root window model the
+// server presents (toplevels positioned by their x/y, children offset by their
+// parents'); `child` is reported as None (0), which is a valid answer when no
+// mapped child of dst_window contains the point and is what GDK tolerates.
+
+/// Absolute (root-relative) origin of a window resource, walking the parent
+/// chain.  Returns (0,0) for the root window or an unknown drawable.
+fn window_abs_origin(c: &Client, wid: u32) -> (i32, i32) {
+    let mut ax = 0i32;
+    let mut ay = 0i32;
+    let mut cur = wid;
+    // Bound the walk to the resource-table size to defend against a malformed
+    // parent cycle; a legitimate hierarchy is at most a few levels deep.
+    for _ in 0..resource::MAX_RESOURCES {
+        if cur == proto::ROOT_WINDOW_ID || cur == 0 { break; }
+        let found = c.resources.entries.iter().filter_map(|s| s.as_ref())
+            .find(|r| r.id == cur)
+            .and_then(|r| match &r.body {
+                ResourceBody::Window(w) => Some((w.x as i32, w.y as i32, w.parent)),
+                _ => None,
+            });
+        match found {
+            Some((x, y, parent)) => { ax += x; ay += y; cur = parent; }
+            None => break,
+        }
+    }
+    (ax, ay)
+}
+
+fn op_translate_coordinates(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 16 { return; }
+    let src_win = r32(data, 4);
+    let dst_win = r32(data, 8);
+    let src_x   = r16(data, 12) as i16 as i32;
+    let src_y   = r16(data, 14) as i16 as i32;
+    with_client(fd, |c| {
+        let valid = |w: u32| w == proto::ROOT_WINDOW_ID || c.resources.has(w);
+        if !valid(src_win) {
+            c.send_error(proto::ERR_WINDOW, src_win, proto::OP_TRANSLATE_COORDINATES);
+            return;
+        }
+        if !valid(dst_win) {
+            c.send_error(proto::ERR_WINDOW, dst_win, proto::OP_TRANSLATE_COORDINATES);
+            return;
+        }
+        let (sox, soy) = window_abs_origin(c, src_win);
+        let (dox, doy) = window_abs_origin(c, dst_win);
+        let dst_x = (sox + src_x) - dox;
+        let dst_y = (soy + src_y) - doy;
+        let mut b = [0u8; 32];
+        b[0] = 1; b[1] = 1; // same_screen = True (single-screen server)
+        w16(&mut b, 2, seq);
+        // child = 0 (None) at bytes 8-11; dst-x INT16 at byte 12, dst-y INT16 at
+        // byte 14 (X11 core protocol TranslateCoordinates reply encoding).
+        w16(&mut b, 12, dst_x as i16 as u16);
+        w16(&mut b, 14, dst_y as i16 as u16);
+        c.send(&b);
+    });
 }
 
 // ── GrabPointer/GrabKeyboard reply ─────────────────────────────────────────
