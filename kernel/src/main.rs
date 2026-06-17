@@ -592,8 +592,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 }
 
                 // xeyes is a draw-and-poll event loop — under the demo soak we
-                // exit when the workload itself exits, OR after 18000 ticks
-                // (~180 s) so a wedged process can't pin the CI watchdog.
+                // keep compositing until the bounded budget below so a wedged
+                // process can't pin the CI watchdog.
                 // Note whether xeyes has terminated, but do NOT break: keep the
                 // BSP composing so the eyes the client painted into its window
                 // remain on screen and a QMP screendump can capture them.  The
