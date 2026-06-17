@@ -1075,6 +1075,32 @@ pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
     Some((entry.base, entry.size))
 }
 
+/// Test-only: evaluate the `entry_is_quiesced` decision for a synthetic
+/// cache entry with the supplied `(push_tick, last_cpu, last_cpu_gen)`.
+///
+/// Lets the kernel test suite verify the per-CPU switch-generation gate
+/// (`CPU_SWITCH_GEN`) in isolation without spawning real threads:
+///   * gen not advanced + tick gate met            → withheld (false)
+///   * gen advanced     + tick gate met            → eligible (true)
+///   * `last_cpu_gen == u64::MAX` (unknown CPU)     → gen gate vacuous
+///   * tick margin ≥ escape valve                   → eligible regardless
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_entry_quiesced(push_tick: u64, last_cpu: usize, last_cpu_gen: u64) -> bool {
+    entry_is_quiesced(&CachedDeadStack {
+        base: 0,
+        size: 0,
+        push_tick,
+        last_cpu,
+        last_cpu_gen,
+    })
+}
+
+/// Test-only: read the live switch generation of `cpu`.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_cpu_switch_gen(cpu: usize) -> u64 {
+    cpu_switch_gen(cpu)
+}
+
 /// Schedule the next thread to run.
 ///
 /// This is the core scheduling function. It:

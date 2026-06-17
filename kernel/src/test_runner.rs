@@ -2229,6 +2229,19 @@ pub fn run() -> ! {
         if test_236_dead_stack_zeroing() { passed += 1; }
     }
 
+    // ── Test 294: dead-kstack per-CPU switch-generation quiescence gate ───
+    // Regression guard for the SMP clone-thread-spawn #DB race: a recycled
+    // kernel stack must be withheld until the CPU that last ran the dead
+    // thread has completed a further context switch (CPU_SWITCH_GEN).
+    // Verifies the gate decision across gen-not-advanced (withheld),
+    // gen-advanced (eligible), unknown-CPU sentinel, and the wall-clock
+    // escape valve.  Intel SDM Vol. 3A §6.14; Vol. 3B §17.3.1.4 (TF).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_294_kstack_switch_gen_gate() { passed += 1; }
+    }
+
     // ── Test 237: IPv4 total_length clamp (H6) ───────────────────────────
     // RFC 791 §3.1 — verifies `clamp_payload_to_total_length` produces
     // the right byte offset across truncation, padding, and adversarial
@@ -42996,6 +43009,93 @@ fn test_236_dead_stack_zeroing() -> bool {
     }
 
     test_pass!("push_dead_stack → pop_dead_stack: full kstack zeroed (CWE-244)");
+    true
+}
+
+// ── Test 294: dead-kstack per-CPU switch-generation quiescence gate ────────
+//
+// The SMP clone-thread-spawn #DB race (UNEXPECTED_KERNEL_MODE_TRAP 0x7f) was
+// a recycled kernel stack being re-issued while the CPU that last ran the
+// dead thread was still in `switch_context_asm`'s restore epilogue on that
+// stack VA — tearing the new thread's saved-RFLAGS slot (TF=1 garbage →
+// popfq → kernel #DB).  The fix gates re-issue on a per-CPU context-switch
+// generation (`CPU_SWITCH_GEN`): the dead stack records
+// `CPU_SWITCH_GEN[last_cpu]` and is withheld until that CPU's generation
+// advances.  This verifies the gate decision directly through the test-only
+// `sched::test_entry_quiesced` surface.
+//
+// Refs: Intel SDM Vol. 3A §6.14 (TSS-RSP stack switch on interrupt);
+// Vol. 3B §17.3.1.4 (RFLAGS.TF single-step); POSIX clone(2).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_294_kstack_switch_gen_gate() -> bool {
+    test_header!("sched: dead-kstack switch-generation quiescence gate (SMP #DB)");
+
+    // Use a long-elapsed push_tick (0) so the wall-clock tick gate is always
+    // satisfied; this isolates the *generation* condition.  TICK_COUNT is well
+    // past the escape-valve margin by the time the test suite runs, so we
+    // pick a recent push_tick for the cases that must observe withholding.
+    let now = crate::arch::x86_64::irq::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let cpu0_gen = crate::sched::test_cpu_switch_gen(0);
+
+    // Case A: gen NOT advanced (snapshot == live), recent push → WITHHELD.
+    // push_tick = now means only the 2-tick base gate is pending; even once
+    // that elapses, the gen gate must still hold because gen hasn't moved.
+    // We assert the *gen* component by using a push_tick far enough in the
+    // past that tick_ok is true but escape_ok is NOT (margin < 8×2 ticks).
+    // push_tick = now - 3 → tick_ok (>=2) true, escape_ok (>=16) false.
+    let recent = now.saturating_sub(3);
+    if crate::sched::test_entry_quiesced(recent, 0, cpu0_gen) {
+        test_fail!("test294",
+            "gen-not-advanced entry was eligible (snap={} live={}) — gate open",
+            cpu0_gen, crate::sched::test_cpu_switch_gen(0));
+        return false;
+    }
+    test_println!("  A: gen-not-advanced + tick-met + no-escape → withheld (ok)");
+
+    // Case B: gen ADVANCED (snapshot strictly below live) → ELIGIBLE.
+    // Use snapshot = cpu0_gen.saturating_sub(1) to model a snapshot taken
+    // before the CPU's most recent switch.
+    if cpu0_gen == 0 {
+        test_println!("  B: cpu0 gen still 0 (no switches yet) — skip strict-advance check");
+    } else if !crate::sched::test_entry_quiesced(recent, 0, cpu0_gen - 1) {
+        test_fail!("test294",
+            "gen-advanced entry was withheld (snap={} live={})",
+            cpu0_gen - 1, crate::sched::test_cpu_switch_gen(0));
+        return false;
+    } else {
+        test_println!("  B: gen-advanced + tick-met → eligible (ok)");
+    }
+
+    // Case C: unknown-CPU sentinel (last_cpu_gen == u64::MAX) → gen gate
+    // vacuous; eligibility governed by the tick gate alone.  recent push
+    // (tick_ok true) → eligible.
+    if !crate::sched::test_entry_quiesced(recent, 0, u64::MAX) {
+        test_fail!("test294", "u64::MAX sentinel entry withheld despite tick gate met");
+        return false;
+    }
+    test_println!("  C: unknown-CPU sentinel → tick-gate governs → eligible (ok)");
+
+    // Case D: escape valve — gen NOT advanced but a very old push (margin ≥
+    // 8×2 = 16 ticks) → eligible regardless of generation (bounds the leak
+    // if last_cpu parks idle).  push_tick = now - 100.
+    let very_old = now.saturating_sub(100);
+    if !crate::sched::test_entry_quiesced(very_old, 0, cpu0_gen) {
+        test_fail!("test294", "escape valve did not fire for stale entry (margin>=16t)");
+        return false;
+    }
+    test_println!("  D: gen-not-advanced + escape-margin → eligible via valve (ok)");
+
+    // Case E: too-recent push → base tick gate not met → WITHHELD even with
+    // the unknown-CPU sentinel.  push_tick = now → only 0 ticks elapsed.
+    if crate::sched::test_entry_quiesced(now, 0, u64::MAX) && now != 0 {
+        // now != 0 guard: at the very first tick the saturating arithmetic
+        // makes the 2-tick threshold equal to now, which is a benign edge.
+        test_fail!("test294", "too-recent entry (0 ticks) was eligible — tick gate open");
+        return false;
+    }
+    test_println!("  E: too-recent push → tick gate withholds (ok)");
+
+    test_pass!("switch-generation gate: withhold-until-advanced + escape valve correct");
     true
 }
 
