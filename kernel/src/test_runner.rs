@@ -813,7 +813,7 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_draw_cycle() { passed += 1; }
 
-    // ── X11 server — map event sequence (MapNotify→ConfigureNotify→Expose) ───
+    // ── X11 server — map event sequence (MapNotify→Expose) ──────────────────
 
     total += 1;
     if test_x11_map_event_sequence() { passed += 1; }
@@ -822,6 +822,11 @@ pub fn run() -> ! {
 
     total += 1;
     if test_x11_translate_coordinates() { passed += 1; }
+
+    // ── X11 server — PolyFillArc rasterises into the window pixel buffer ──────
+
+    total += 1;
+    if test_x11_poly_fill_arc() { passed += 1; }
 
     // ── Test 67: X11 server — key event injection + delivery ─────────────────
 
@@ -832,6 +837,11 @@ pub fn run() -> ! {
 
     total += 1;
     if test_x11_render_query() { passed += 1; }
+
+    // ── X11 QueryExtension first_event/first_error bases (xeyes paint gate) ───
+
+    total += 1;
+    if test_x11_query_extension_event_bases() { passed += 1; }
 
     // ── Test 69: X11 RENDER extension — Pixmap + Picture + FillRectangles ────
 
@@ -18075,6 +18085,114 @@ fn test_x11_draw_cycle() -> bool {
     true
 }
 
+// Verify PolyFillArc (X core protocol op 71) actually rasterises a filled
+// ellipse into the window pixel buffer.  A full-ellipse PolyFillArc covering the
+// whole window must paint the centre pixel with the GC foreground while leaving
+// a corner pixel (outside the inscribed ellipse) at the window background — the
+// distinguishing property of an *ellipse* fill versus a rectangle fill or a
+// no-op.  Regression guard for the geometry-op rasteriser.
+fn test_x11_poly_fill_arc() -> bool {
+    test_header!("X11 PolyFillArc rasterises a filled ellipse into the window");
+
+    let creds = crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, creds);
+    if client == u64::MAX { test_fail!("x11_arc", "unix::create failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", creds) < 0 {
+        test_fail!("x11_arc", "connect failed"); crate::net::unix::close(client); return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_arc", "setup failed (n={})", n); crate::net::unix::close(client); return false;
+    }
+
+    // CreateWindow 0x00710001, 100x100 at (10,10), background-pixel = black (0).
+    const WID: u32 = 0x0071_0001;
+    const GID: u32 = 0x0071_0002;
+    const W: u16 = 100;
+    const H: u16 = 100;
+    let mut reqs = [0u8; 48];
+    reqs[0] = 1; reqs[2] = 10;
+    reqs[4] = 0x01; reqs[5] = 0x00; reqs[6] = 0x71;          // wid = 0x00710001
+    reqs[8] = 0x01;                                          // parent = ROOT
+    reqs[12] = 10; reqs[14] = 10;                            // x=10, y=10
+    reqs[16] = (W & 0xFF) as u8; reqs[17] = (W >> 8) as u8;  // width
+    reqs[18] = (H & 0xFF) as u8; reqs[19] = (H >> 8) as u8;  // height
+    reqs[22] = 1;                                            // class = InputOutput
+    reqs[24] = 32;                                           // visual = ROOT_VISUAL
+    reqs[28] = 0x02; reqs[29] = 0x08;                        // vmask = BACK_PIXEL | EVENT_MASK
+    // bg_pixel = 0 (black); event_mask = EXPOSURE (0x8000).
+    reqs[36] = 0x00; reqs[37] = 0x80;
+    // MapWindow at offset 40.
+    reqs[40] = 8; reqs[42] = 2;
+    reqs[44] = 0x01; reqs[45] = 0x00; reqs[46] = 0x71;
+    if crate::net::unix::write(client, &reqs) != 48 {
+        test_fail!("x11_arc", "write CreateWindow+MapWindow failed"); crate::net::unix::close(client); return false;
+    }
+    crate::x11::poll();
+    // Drain the map event stream (MapNotify/ConfigureNotify/Expose).
+    let mut ev = [0u8; 32];
+    while crate::net::unix::has_data(client) { let _ = crate::net::unix::read(client, &mut ev); }
+    test_println!("  window created + mapped ✓");
+
+    // CreateGC (fg = 0x00FF00 green) + PolyFillArc (full ellipse over the window).
+    //   CreateGC: [0]=55 [2]=len5 [4..8]=gid [8..12]=wid [12..16]=GC_FOREGROUND(4) [16..20]=fg
+    //   PolyFillArc: [0]=71 [2]=len6 [4..8]=wid [8..12]=gid
+    //                + ARC{x=0,y=0,w=100,h=100,a1=0,a2=360*64}
+    let mut draw = [0u8; 44];
+    // CreateGC at 0
+    draw[0] = 55; draw[2] = 5;
+    draw[4] = 0x02; draw[5] = 0x00; draw[6] = 0x71;          // gid
+    draw[8] = 0x01; draw[9] = 0x00; draw[10] = 0x71;         // wid
+    draw[12] = 4;                                            // GC_FOREGROUND
+    draw[16] = 0x00; draw[17] = 0xFF; draw[18] = 0x00;       // fg = 0x0000FF00 LE (green)
+    // PolyFillArc at 20 (header 12 bytes + 1 arc of 12 bytes = 24 bytes = 6 words)
+    draw[20] = 71; draw[22] = 6;
+    draw[24] = 0x01; draw[25] = 0x00; draw[26] = 0x71;       // drawable = wid
+    draw[28] = 0x02; draw[29] = 0x00; draw[30] = 0x71;       // gc = gid
+    // ARC at 32: x=0,y=0,w=100,h=100,a1=0,a2=23040
+    draw[36] = 100; draw[38] = 100;                          // w=100, h=100 (x=y=0)
+    draw[40] = 0x00; draw[41] = 0x00;                        // a1 = 0
+    draw[42] = 0x00; draw[43] = 0x5A;                        // a2 = 0x5A00 = 23040 = 360*64
+    if crate::net::unix::write(client, &draw) != 44 {
+        test_fail!("x11_arc", "write CreateGC+PolyFillArc failed"); crate::net::unix::close(client); return false;
+    }
+    crate::x11::poll();
+    test_println!("  PolyFillArc (full ellipse, fg=green) sent + processed ✓");
+
+    // Centre pixel (50,50) must be the GC foreground (BGRA: B=0,G=0xFF,R=0).
+    let centre = crate::x11::test_read_window_pixel(WID, 50, 50);
+    match centre {
+        Some([b, g, r, _]) if g == 0xFF && b == 0x00 && r == 0x00 => {
+            test_println!("  centre pixel is green ✓");
+        }
+        other => {
+            test_fail!("x11_arc", "centre pixel = {:?} (expected green BGRA [0,255,0,*])", other);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    // A near-corner pixel (4,4) lies OUTSIDE the inscribed ellipse and must
+    // remain the window background (black) — proves an ellipse, not a rectangle.
+    let corner = crate::x11::test_read_window_pixel(WID, 4, 4);
+    match corner {
+        Some([b, g, r, _]) if g != 0xFF || b != 0x00 || r != 0x00 => {
+            test_println!("  corner pixel is NOT green (outside ellipse) ✓");
+        }
+        other => {
+            test_fail!("x11_arc", "corner pixel = {:?} (expected non-green — ellipse must not fill corners)", other);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    crate::net::unix::close(client);
+    test_pass!("X11 PolyFillArc fills an ellipse into the window pixel buffer");
+    true
+}
+
 // ── X11 — map event sequence (MapNotify → ConfigureNotify → Expose) ──────────
 //
 // Per the X11 core protocol, mapping a window that selected StructureNotify +
@@ -18089,7 +18207,7 @@ fn test_x11_draw_cycle() -> bool {
 // window is immediately viewable) and asserts the three events arrive in order
 // with the correct window id and 200×100 geometry.
 fn test_x11_map_event_sequence() -> bool {
-    test_header!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
+    test_header!("X11 map event sequence (MapNotify→Expose)");
 
     let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
         crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
@@ -18129,11 +18247,19 @@ fn test_x11_map_event_sequence() -> bool {
     crate::net::unix::write(client, &reqs);
     crate::x11::poll();
 
-    // Read the three queued events back as a single contiguous stream.
+    // Read the queued events back as a single contiguous stream.  Per the X11
+    // core protocol §MapWindow, a plain MapWindow that does not change the
+    // window's geometry emits MapNotify then Expose only — NO ConfigureNotify
+    // (which is reserved for an actual geometry change; see op_configure_window).
+    // A real X server's map sequence for an unmanaged window is therefore exactly
+    // two events = 64 bytes.  (An earlier revision emitted a spurious
+    // ConfigureNotify here, which made libXt's Shell run an extra geometry pass
+    // that swallowed a leaf widget's first Expose — observed as xeyes never
+    // painting its eyes.)
     let mut buf = [0u8; 96];
     let n = crate::net::unix::read(client, &mut buf);
-    if n < 96 {
-        test_fail!("x11_mapseq", "read returned {} (expected 96 = 3 events)", n);
+    if n != 64 {
+        test_fail!("x11_mapseq", "read returned {} (expected 64 = 2 events: MapNotify+Expose, NO ConfigureNotify)", n);
         crate::net::unix::close(client);
         return false;
     }
@@ -18151,42 +18277,26 @@ fn test_x11_map_event_sequence() -> bool {
     }
     test_println!("  [0] MapNotify window={:#x} ✓", wid(8));
 
-    // Event 1: ConfigureNotify (22), window = 0x610001, width=200 height=100.
-    if buf[32] != 22 {
-        test_fail!("x11_mapseq", "event1 type={} (expected 22=ConfigureNotify)", buf[32]);
+    // Event 1: Expose (12), window = 0x610001, width=200 height=100, count=0.
+    // (Directly after MapNotify — no intervening ConfigureNotify.)
+    if buf[32] != 12 {
+        test_fail!("x11_mapseq", "event1 type={} (expected 12=Expose, NOT ConfigureNotify)", buf[32]);
         crate::net::unix::close(client); return false;
     }
-    if wid(32 + 8) != 0x00610001 {
-        test_fail!("x11_mapseq", "ConfigureNotify window={:#x} (expected 0x610001)", wid(32 + 8));
+    if wid(32 + 4) != 0x00610001 {
+        test_fail!("x11_mapseq", "Expose window={:#x} (expected 0x610001)", wid(32 + 4));
         crate::net::unix::close(client); return false;
     }
-    let cw = u16le(32 + 20);
-    let ch = u16le(32 + 22);
-    if cw != 200 || ch != 100 {
-        test_fail!("x11_mapseq", "ConfigureNotify size={}x{} (expected 200x100)", cw, ch);
-        crate::net::unix::close(client); return false;
-    }
-    test_println!("  [1] ConfigureNotify window={:#x} {}x{} ✓", wid(32 + 8), cw, ch);
-
-    // Event 2: Expose (12), window = 0x610001, width=200 height=100, count=0.
-    if buf[64] != 12 {
-        test_fail!("x11_mapseq", "event2 type={} (expected 12=Expose)", buf[64]);
-        crate::net::unix::close(client); return false;
-    }
-    if wid(64 + 4) != 0x00610001 {
-        test_fail!("x11_mapseq", "Expose window={:#x} (expected 0x610001)", wid(64 + 4));
-        crate::net::unix::close(client); return false;
-    }
-    let ew = u16le(64 + 12);
-    let eh = u16le(64 + 14);
+    let ew = u16le(32 + 12);
+    let eh = u16le(32 + 14);
     if ew != 200 || eh != 100 {
         test_fail!("x11_mapseq", "Expose size={}x{} (expected 200x100)", ew, eh);
         crate::net::unix::close(client); return false;
     }
-    test_println!("  [2] Expose window={:#x} {}x{} ✓", wid(64 + 4), ew, eh);
+    test_println!("  [1] Expose window={:#x} {}x{} ✓", wid(32 + 4), ew, eh);
 
     crate::net::unix::close(client);
-    test_pass!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
+    test_pass!("X11 map event sequence (MapNotify→Expose)");
     true
 }
 
@@ -18524,6 +18634,103 @@ fn test_x11_render_query() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 RENDER extension query");
+    true
+}
+
+// ── X11 QueryExtension first_event / first_error bases ───────────────────────
+//
+// Regression for the xeyes "no eyes" gate: QueryExtension formerly returned
+// first_event=0 and first_error=0 for every extension.  Per the X11 core
+// protocol §QueryExtension the reply's first_event (byte 10) is the event-code
+// base from which a client offsets the extension's events.  A 0 base for an
+// extension that DOES define events (XInput, SHAPE, …) makes libXi/libXext build
+// a wire-event→extension dispatch map that overlaps the 64 core event codes —
+// in particular XInput's ~17 event types at base 0 hijack the converter for core
+// Expose (12), so the toolkit never dispatches the real Expose and a leaf widget
+// never paints.  This test pins the per-extension bases to non-zero, non-core
+// (≥64) values for the extensions that define events, and 0 only for those that
+// genuinely define none.
+fn test_x11_query_extension_event_bases() -> bool {
+    test_header!("X11 QueryExtension first_event/first_error bases");
+
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX { test_fail!("x11_qe_bases", "unix::create() failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_qe_bases", "connect failed");
+        crate::net::unix::close(client); return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_qe_bases", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client); return false;
+    }
+
+    // Issue QueryExtension(name) and return (present, major, first_event, first_error).
+    let query = |name: &[u8]| -> Option<(u8, u8, u8, u8)> {
+        let nlen = name.len();
+        let body = 8 + ((nlen + 3) & !3);
+        let mut req = [0u8; 32];
+        req[0] = 98;                         // OP_QUERY_EXTENSION
+        req[2] = (body / 4) as u8;           // request length in words
+        req[4] = nlen as u8;                 // name length
+        req[8..8 + nlen].copy_from_slice(name);
+        crate::net::unix::write(client, &req[..body]);
+        crate::x11::poll();
+        let mut rep = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut rep);
+        if n < 12 || rep[0] != 1 { return None; }
+        Some((rep[8], rep[9], rep[10], rep[11]))
+    };
+
+    // (name, expect_first_event, expect_first_error) — the bases from proto.rs.
+    // first_event MUST be 0 (no events) or ≥64 (clear of the core event range).
+    let cases: &[(&[u8], u8, u8)] = &[
+        (b"XInputExtension", crate::x11::proto::XINPUT_FIRST_EVENT,    crate::x11::proto::XINPUT_FIRST_ERROR),
+        (b"SHAPE",           crate::x11::proto::SHAPE_FIRST_EVENT,     crate::x11::proto::SHAPE_FIRST_ERROR),
+        (b"XKEYBOARD",       crate::x11::proto::XKEYBOARD_FIRST_EVENT, crate::x11::proto::XKEYBOARD_FIRST_ERROR),
+        (b"XFIXES",          crate::x11::proto::XFIXES_FIRST_EVENT,    crate::x11::proto::XFIXES_FIRST_ERROR),
+        (b"DAMAGE",          crate::x11::proto::DAMAGE_FIRST_EVENT,    crate::x11::proto::DAMAGE_FIRST_ERROR),
+        (b"RENDER",          crate::x11::proto::RENDER_FIRST_EVENT,    crate::x11::proto::RENDER_FIRST_ERROR),
+    ];
+    for (name, want_ev, want_err) in cases {
+        match query(name) {
+            None => {
+                test_fail!("x11_qe_bases", "QueryExtension reply missing/short");
+                crate::net::unix::close(client); return false;
+            }
+            Some((present, _major, fe, ferr)) => {
+                if present != 1 {
+                    test_fail!("x11_qe_bases", "extension not present (present={})", present);
+                    crate::net::unix::close(client); return false;
+                }
+                if fe != *want_ev || ferr != *want_err {
+                    test_fail!("x11_qe_bases",
+                        "first_event/first_error mismatch: got {}/{} want {}/{}",
+                        fe, ferr, want_ev, want_err);
+                    crate::net::unix::close(client); return false;
+                }
+                // An extension that defines events must NOT collide with the core
+                // event range [0,64): a non-zero base must be ≥64.
+                if fe != 0 && fe < 64 {
+                    test_fail!("x11_qe_bases",
+                        "first_event={} collides with core event codes (must be 0 or ≥64)", fe);
+                    crate::net::unix::close(client); return false;
+                }
+            }
+        }
+    }
+    test_println!("  XInput fe={}/ferr={}, SHAPE fe={}, all bases ≥64 or 0 ✓",
+        crate::x11::proto::XINPUT_FIRST_EVENT, crate::x11::proto::XINPUT_FIRST_ERROR,
+        crate::x11::proto::SHAPE_FIRST_EVENT);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 QueryExtension first_event/first_error bases");
     true
 }
 

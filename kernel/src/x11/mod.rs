@@ -77,6 +77,28 @@ impl Client {
             crate::serial_println!("[X11REPLY] fd={} seq={} reply_len={} total={}",
                 self.fd, seq, extra, data.len());
         }
+        #[cfg(feature = "xeyes-test")]
+        if data.len() == 32 && data[0] != 1 {
+            // Event (type != 1 reply, != connection-setup) or Error (type 0).
+            // Log type + the window field for Expose/Map/Configure correlation.
+            let etype = data[0] & 0x7f;
+            let win = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let win2 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            crate::serial_println!("[X11EVT] fd={} type={} seq={} win={:#x} win2={:#x}",
+                self.fd, etype, u16::from_le_bytes([data[2], data[3]]), win, win2);
+            // Full 32-byte hexdump of the event so the golden diff can compare the
+            // exact wire encoding (x/y/w/h/count for Expose, override-redirect for
+            // MapNotify, etc.) against a real X server's event bytes.
+            let mut hx = [0u8; 3*32];
+            let mut p = 0usize;
+            for &byte in &data[..32] {
+                const H: &[u8;16] = b"0123456789abcdef";
+                hx[p] = H[(byte>>4) as usize]; hx[p+1] = H[(byte&0xf) as usize];
+                hx[p+2] = b' '; p += 3;
+            }
+            let s = core::str::from_utf8(&hx[..p]).unwrap_or("");
+            crate::serial_println!("[X11EVTHEX] type={}: {}", etype, s);
+        }
         unix::write(self.fd, data);
     }
     fn send_error(&self, code: u8, bad_id: u32, opcode: u8) {
@@ -522,11 +544,47 @@ fn service_fd(fd: u64) {
     if !setup { handle_setup(fd, data); return; }
     let mut off = 0usize;
     while off + 4 <= data.len() {
-        let rlen = r16(data, off + 2) as usize;
-        if rlen == 0 { break; }
-        let end = off + rlen * 4;
-        if end > data.len() { break; }
-        handle_request(fd, &data[off..end]);
+        // X11 core request length is a 16-bit count of 4-byte units (§Requests).
+        // Under the BIG-REQUESTS extension a length field of 0 means the real
+        // length is the following 32-bit word (in 4-byte units), inserted
+        // between the 4-byte request header and the body — so the body that
+        // would normally start at offset 4 starts at offset 8.  Treating length
+        // 0 as "stop parsing" would silently drop this request AND every request
+        // batched after it in the same read — desynchronising the client's
+        // reply/sequence expectations.  (X11 BIG-REQUESTS extension spec.)
+        let short_len = r16(data, off + 2) as usize;
+        let req_len_units = if short_len == 0 {
+            if off + 8 > data.len() { break; }
+            // A big request always spans >= 2 units: the 4-byte request header
+            // plus the inserted 4-byte extended-length word.  A reported length
+            // of 0 or 1 is malformed; accepting it makes the body splice
+            // [off+8..end] have start > end (end <= off+4) → slice-index panic
+            // (and panic=abort would take the whole kernel down on hostile
+            // client input).  Reject malformed big requests instead.
+            let big = r32(data, off + 4) as usize;
+            if big < 2 { break; }
+            big
+        } else {
+            short_len
+        };
+        if req_len_units == 0 { break; } // malformed: zero even in big form
+        let end = off + req_len_units * 4;
+        if end > data.len() || end <= off { break; }
+        if short_len == 0 {
+            // Big request: normalise to standard layout before dispatch so the
+            // per-op handlers (which read fields at fixed standard offsets) see
+            // a conventional request.  Splice out the inserted 4-byte
+            // extended-length word: keep the 4-byte header [off..off+4], then
+            // the body [off+8..end].  The reconstructed 16-bit length field is
+            // left as the request's true length truncated into 16 bits (the
+            // handlers key off the slice length, not this field).
+            let mut norm = alloc::vec::Vec::with_capacity(4 + (end - (off + 8)));
+            norm.extend_from_slice(&data[off..off + 4]);
+            norm.extend_from_slice(&data[off + 8..end]);
+            handle_request(fd, &norm);
+        } else {
+            handle_request(fd, &data[off..end]);
+        }
         off = end;
     }
 }
@@ -601,13 +659,37 @@ fn handle_request(fd: u64, data: &[u8]) {
     {
         static X11_REQ_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = X11_REQ_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 200 {
+        if n < 400 {
             // For core ops (opcode 1-127) data[1] is op-specific (CW depth, etc.).
             // For extension major opcodes (128-255) it is the minor opcode per X11
             // protocol §10.  Logging both unifies the trace for downstream parsing.
             let minor = data[1];
-            crate::serial_println!("[X11] req#{} op={} minor={} len={}",
-                                   n, opcode, minor, data.len());
+            // For draw ops the drawable id is at bytes 4..8 (X11 core protocol
+            // §PolyFillArc/§PolyArc/§PolyFillRectangle/§CopyArea/§ClearArea/
+            // §PutImage all carry the destination drawable there).  Surface it so
+            // the trace shows WHICH window/pixmap a draw targets.
+            let drawable = if data.len() >= 8 && matches!(opcode,
+                61 | 62 | 64 | 65 | 66 | 67 | 70 | 71 | 72 | 76) {
+                u32::from_le_bytes([data[4], data[5], data[6], data[7]])
+            } else { 0 };
+            crate::serial_println!("[X11] req#{} op={} minor={} len={} drawable={:#x}",
+                                   n, opcode, minor, data.len(), drawable);
+            // Full hexdump of CreateWindow(1)/CreateGC(55)/RENDER(139)/SHAPE(128)/
+            // map-cluster requests so the GOLDEN protocol diff can compare wire
+            // bytes (visual id, event-mask, border-width, picture-format) exactly.
+            if matches!(opcode, 1 | 2 | 8 | 9 | 12 | 55 | 98 | 128 | 131 | 139)
+                && n < 120 {
+                let m = core::cmp::min(data.len(), 64);
+                let mut hx = [0u8; 3*64];
+                let mut p = 0usize;
+                for &byte in &data[..m] {
+                    const H: &[u8;16] = b"0123456789abcdef";
+                    hx[p] = H[(byte>>4) as usize]; hx[p+1] = H[(byte&0xf) as usize];
+                    hx[p+2] = b' '; p += 3;
+                }
+                let s = core::str::from_utf8(&hx[..p]).unwrap_or("");
+                crate::serial_println!("[X11HEX] req#{} op={}: {}", n, opcode, s);
+            }
         }
     }
     let seq = { let mut srv = SERVER.lock();
@@ -679,20 +761,18 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::XKEYBOARD_MAJOR_OPCODE  => op_xkeyboard(fd, data, seq),
         proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
         proto::RANDR_MAJOR_OPCODE      => op_randr(fd, data, seq),
-        // Polygon / arc drawing ops.  Per X11 protocol §PolyArc /
-        // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint
-        // / §PolyRectangle — no reply, request data is (drawable, gc,
-        // [coords...]).  Minimal stub: accept and discard.  A future
-        // revision can rasterise into the drawable's pixel buffer for
-        // full visual fidelity.
-        proto::OP_POLY_POINT            => {}
-        proto::OP_POLY_LINE             => {}
-        proto::OP_POLY_SEGMENT          => {}
-        proto::OP_POLY_RECTANGLE        => {}
-        proto::OP_POLY_ARC              => {}
-        proto::OP_FILL_POLY             => {}
+        // Polygon / arc drawing ops.  Per X11 core protocol §PolyArc /
+        // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint /
+        // §PolyRectangle — no reply; the request carries (drawable, gc,
+        // [coords...]) and is rasterised into the drawable's pixel buffer.
+        proto::OP_POLY_POINT            => op_poly_point(fd, data),
+        proto::OP_POLY_LINE             => op_poly_line(fd, data),
+        proto::OP_POLY_SEGMENT          => op_poly_segment(fd, data),
+        proto::OP_POLY_RECTANGLE        => op_poly_rectangle(fd, data),
+        proto::OP_POLY_ARC              => op_poly_arc(fd, data),
+        proto::OP_FILL_POLY             => {} // filled polygons: not used by xeyes
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
-        proto::OP_POLY_FILL_ARC         => {}
+        proto::OP_POLY_FILL_ARC         => op_poly_fill_arc(fd, data),
         proto::OP_PUT_IMAGE             => op_put_image(fd, data),
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
         proto::OP_IMAGE_TEXT16          => {}
@@ -752,6 +832,108 @@ fn window_fill_pixels(fd: u64, win_id: u32, x: i32, y: i32, w: i32, h: i32, bgra
                     }
                 }
             }
+        }
+    });
+}
+
+/// Paint a window-local region to the window's background, honouring the X core
+/// protocol `background-pixmap` attribute: if the window has a background pixmap
+/// set, the pixmap is tiled (origin at the window's top-left) into the region;
+/// otherwise the region is filled with the solid `background-pixel`.  `(x,y,w,h)`
+/// is window-local; `w`/`h` of 0 mean "to the window's right/bottom edge" per
+/// the ClearArea semantics.  Used on ClearArea and MapWindow so that clients
+/// (e.g. the xeyes Eyes widget) which draw static content into a background
+/// pixmap and rely on the server to paint it become visible.
+/// Paint a window's background (background_pixel or background_pixmap) into its
+/// persistent `pixels` surface.
+///
+/// `full_window` distinguishes the two callers:
+///   - `true`  — the implicit "window became viewable" background paint issued
+///     on MapWindow / MapSubwindows.  Per the X core protocol the server paints
+///     the background ONCE when the window first becomes viewable; afterwards,
+///     client draws (RENDER Composite, core arcs, PutImage) layer on top and
+///     must persist.  This path is therefore idempotent: it is gated on the
+///     `bg_painted` flag so a second MapWindow over already-drawn content cannot
+///     clobber it.  (Was the #581 `x11_render_d` regression: a MapWindow after a
+///     Composite re-painted black over the red.)
+///   - `false` — an explicit ClearArea request.  ClearArea is a deliberate
+///     erase-to-background of a client-specified region and always paints.
+fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i32,
+                           full_window: bool) {
+    // Resolve background pixmap id + window size, then (if a pixmap) snapshot it.
+    let (bg_pixmap, ww, wh, bg_pixel, already_painted) = {
+        let srv = SERVER.lock();
+        match srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
+                .find(|r| r.id == win_id)
+                .and_then(|r| if let ResourceBody::Window(ref w) = r.body {
+                    Some((w.background_pixmap, w.width as i32, w.height as i32,
+                          w.background_pixel, w.bg_painted))
+                } else { None })) {
+            Some(v) => v,
+            None => return,
+        }
+    };
+    // Idempotent viewable-time background paint: if the surface already had its
+    // background applied (and possibly subsequent client draws layered on top),
+    // a repeat full-window paint must NOT overwrite that content.
+    if full_window && already_painted { return; }
+    let region_w = if rw == 0 { ww - x } else { rw };
+    let region_h = if rh == 0 { wh - y } else { rh };
+    if region_w <= 0 || region_h <= 0 { return; }
+
+    // bg_pixmap: 0 = None (solid background-pixel), 1 = ParentRelative (treat as
+    // solid for our flat hierarchy), other = a Pixmap id to tile.
+    if bg_pixmap <= 1 {
+        let bgra = [(bg_pixel & 0xFF) as u8, ((bg_pixel >> 8) & 0xFF) as u8,
+                    ((bg_pixel >> 16) & 0xFF) as u8, 0xFF];
+        window_fill_pixels(fd, win_id, x, y, region_w, region_h, bgra);
+        if full_window { mark_bg_painted(fd, win_id); }
+        return;
+    }
+
+    // Snapshot the background pixmap (clone to drop the lock before drawing).
+    let snap = {
+        let srv = SERVER.lock();
+        srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| c.resources.get_pixmap(bg_pixmap)
+                .map(|p| (p.pixels.clone(), p.width as i32, p.height as i32)))
+    };
+    let (px, pw, ph) = match snap { Some(v) => v, None => return };
+    if pw <= 0 || ph <= 0 { return; }
+
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.ensure_pixels();
+            let dww = win.width as i32;
+            let dwh = win.height as i32;
+            for py in y.max(0)..((y + region_h).min(dwh)) {
+                // Tile: source row wraps the pixmap height (background tiling
+                // is relative to the window origin per X core protocol).
+                let sy = py.rem_euclid(ph);
+                for dx in x.max(0)..((x + region_w).min(dww)) {
+                    let sx = dx.rem_euclid(pw);
+                    let so = ((sy * pw + sx) * 4) as usize;
+                    let dofs = ((py * dww + dx) * 4) as usize;
+                    if so + 4 <= px.len() && dofs + 4 <= win.pixels.len() {
+                        win.pixels[dofs..dofs + 4].copy_from_slice(&px[so..so + 4]);
+                    }
+                }
+            }
+            if full_window { win.bg_painted = true; }
+        }
+    });
+}
+
+/// Mark a window's persistent surface as having had its viewable-time
+/// background painted, so a subsequent full-window background paint becomes a
+/// no-op (later client draws must persist).  Used by the solid-fill path of
+/// `paint_window_background`, which routes through `window_fill_pixels` and so
+/// does not itself touch the `bg_painted` flag.
+fn mark_bg_painted(fd: u64, win_id: u32) {
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.bg_painted = true;
         }
     });
 }
@@ -866,10 +1048,10 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
     let class  = r16(data, 22);
     let visual = r32(data, 24);
     let vmask  = r32(data, 28);
-    let mut event_mask = 0u32; let mut bg_pixel = 0u32;
+    let mut event_mask = 0u32; let mut bg_pixel = 0u32; let mut bg_pixmap = 0u32;
     let mut override_redirect = false;
     let mut vi = 32usize;
-    if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
+    if vmask & proto::CW_BACK_PIXMAP       != 0 { bg_pixmap = r32(data, vi); vi += 4; }
     if vmask & proto::CW_BACK_PIXEL        != 0 { bg_pixel = r32(data, vi); vi += 4; }
     if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
     if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
@@ -892,6 +1074,7 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
             bw, if class == 0 { 1 } else { class },
             if visual == 0 { proto::ROOT_VISUAL } else { visual });
         w.event_mask = event_mask; w.background_pixel = bg_pixel;
+        w.background_pixmap = bg_pixmap;
         w.override_redirect = override_redirect;
         if !c.resources.insert(wid, ResourceBody::Window(w)) {
             c.send_error(proto::ERR_ALLOC, wid, proto::OP_CREATE_WINDOW);
@@ -929,8 +1112,13 @@ fn op_change_win_attrs(fd: u64, data: &[u8]) {
         }
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
-            if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
-            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); vi += 4; }
+            // X core protocol: a new background takes effect on the next expose
+            // or ClearArea, not immediately — so we only record it here.  Clear
+            // `bg_painted` so the next viewable-time background paint re-applies
+            // the new background (a window whose background changed has not yet
+            // had THAT background painted).
+            if vmask & proto::CW_BACK_PIXMAP       != 0 { w.background_pixmap = r32(data, vi); w.bg_painted = false; vi += 4; }
+            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); w.background_pixmap = 0; w.bg_painted = false; vi += 4; }
             if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
             if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
             if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
@@ -1046,7 +1234,15 @@ fn is_viewable(c: &Client, wid: u32) -> bool {
 /// to `root_wid` and to every descendant that has just become viewable and has
 /// selected Exposure.  MapNotify is emitted separately by the caller before
 /// this runs (the protocol orders MapNotify before Expose).
-fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
+///
+/// Returns the list of viewable, mapped windows in the subtree (root +
+/// descendants).  Per the X core protocol the server paints a window's
+/// background when it first becomes viewable, BEFORE delivering its Expose, so
+/// the client's Expose-driven redraw lands on the initialised background rather
+/// than an uninitialised (black) surface.  The caller paints these backgrounds
+/// after releasing the SERVER lock — `paint_window_background` re-acquires it,
+/// so it cannot run inside the `with_client` block that wraps this call.
+fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) -> alloc::vec::Vec<u32> {
     // Collect the subtree (root + transitive descendants) from the flat table.
     let mut subtree: alloc::vec::Vec<WinInfo> = alloc::vec::Vec::new();
     if let Some(root) = win_info(c, root_wid) { subtree.push(root); }
@@ -1064,14 +1260,26 @@ fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
         }
         i += 1;
     }
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     for wi in &subtree {
-        if wi.mapped
-            && wi.evmask & proto::EVENT_MASK_EXPOSURE != 0
-            && is_viewable(c, wi.id)
-        {
-            c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
+        let viewable = is_viewable(c, wi.id);
+        #[cfg(feature = "xeyes-test")]
+        crate::serial_println!("[X11EXPOSE] subtree wid={:#x} mapped={} evmask={:#x} exposure={} viewable={}",
+            wi.id, wi.mapped, wi.evmask,
+            wi.evmask & proto::EVENT_MASK_EXPOSURE != 0, viewable);
+        if wi.mapped && viewable {
+            // Every newly-viewable window (root, container, or leaf widget such
+            // as the Eyes child) needs its background painted so an Expose-driven
+            // redraw has an initialised surface to draw over.  Collect it for the
+            // caller's post-lock paint pass.  Exposure delivery below is a
+            // separate, ExposureMask-gated decision.
+            to_paint.push(wi.id);
+            if wi.evmask & proto::EVENT_MASK_EXPOSURE != 0 {
+                c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
+            }
         }
     }
+    to_paint
 }
 
 /// Send a ConfigureNotify to `wid` reporting its current geometry, if it
@@ -1094,6 +1302,7 @@ fn configure_notify_if_selected(c: &Client, wid: u32, seq: u16) {
 fn op_map_window(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let wid = r32(data, 4);
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     with_client(fd, |c| {
         let (width, height, evmask) = match c.resources.get_window_mut(wid) {
             Some(w) => {
@@ -1104,22 +1313,42 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
             }
             None => { c.send_error(proto::ERR_WINDOW, wid, proto::OP_MAP_WINDOW); return; }
         };
-        // StructureNotify: MapNotify always fires on the window's own map,
-        // followed by a ConfigureNotify reporting the window's geometry — the
-        // X11 core-protocol map sequence is MapNotify → ConfigureNotify →
-        // Expose for a window that selected StructureNotify.
+        // StructureNotify: MapNotify fires on the window's own map.  Per the
+        // X11 core protocol §MapWindow, a ConfigureNotify is NOT generated by a
+        // plain MapWindow — it is sent only when mapping actually changes the
+        // window's geometry (e.g. via win-gravity adjustment or a pending
+        // ConfigureWindow).  A real X server's map sequence for an unmanaged,
+        // unchanged-geometry window is therefore MapNotify → Expose with no
+        // intervening ConfigureNotify; emitting a spurious ConfigureNotify makes
+        // libXt's Shell run an extra geometry pass that can swallow the child's
+        // first Expose (observed: the Eyes leaf widget never runs its
+        // Expose-driven Redisplay).  See op_configure_window for the legitimate
+        // ConfigureNotify path on an actual geometry change.
         if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
             c.send(&event::encode_map_notify(seq, wid));
         }
-        configure_notify_if_selected(c, wid, seq);
         // Exposure: mapping this window may have made it AND a subtree of
         // already-mapped descendants viewable for the first time.  Send Expose
         // to every window in that subtree that is now viewable and selected
         // Exposure — this is where a child mapped earlier (while this ancestor
-        // was unmapped) finally gets its Expose.
-        expose_viewable_subtree(c, wid, seq);
+        // was unmapped) finally gets its Expose.  The returned ids are the
+        // windows that just became viewable and need their backgrounds painted.
+        to_paint = expose_viewable_subtree(c, wid, seq);
         crate::serial_println!("[X11] MapWindow {:#x} {}x{}", wid, width, height);
     });
+    // Paint each newly-viewable window's background now (X core protocol: the
+    // server paints the background when a window becomes viewable, before its
+    // Expose-driven redraw runs).  Done AFTER the with_client block above
+    // because paint_window_background re-acquires the SERVER lock — calling it
+    // inside would deadlock.  `full_window=true`: idempotent viewable-time paint
+    // gated on `bg_painted`, so a second MapWindow over content already drawn
+    // into a surface (e.g. a prior RENDER Composite or core-arc draw) is a
+    // no-op.  This covers the CHILD widget windows (e.g. the xeyes Eyes child),
+    // whose backgrounds were previously never painted — leaving the Eyes child
+    // an uninitialised black rectangle even after its Expose drove a redraw.
+    for &pwid in &to_paint {
+        paint_window_background(fd, pwid, 0, 0, 0, 0, true);
+    }
 }
 
 // ── MapSubwindows (9) ─────────────────────────────────────────────────────────
@@ -1135,6 +1364,7 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
 fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let parent = r32(data, 4);
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     with_client(fd, |c| {
         // Collect child ids first (avoid borrowing the resource table mutably
         // while iterating it).  Children are windows whose `parent` field
@@ -1165,17 +1395,27 @@ fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
                 c.send(&event::encode_map_notify(seq, cid));
             }
             configure_notify_if_selected(c, cid, seq);
-            crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}",
-                cid, parent, width, height);
+            crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{} evmask={:#x}",
+                cid, parent, width, height, evmask);
         }
         // Exposure: only the children that became viewable get an Expose.  If
         // the parent is unmapped they are Unviewable and Expose is deferred to
         // the parent's MapWindow.  Run the subtree pass per mapped child so
-        // grandchildren are covered too.
+        // grandchildren are covered too.  Accumulate the viewable windows whose
+        // backgrounds must be painted after the lock is released.
         for &cid in &children {
-            expose_viewable_subtree(c, cid, seq);
+            let mut sub = expose_viewable_subtree(c, cid, seq);
+            to_paint.append(&mut sub);
         }
     });
+    // Paint each newly-viewable child/grandchild background (post-lock; see
+    // op_map_window for the deadlock rationale).  Without this a leaf widget
+    // mapped via MapSubwindows under an already-viewable parent never had its
+    // background initialised, so its Expose-driven redraw drew onto a black
+    // surface.
+    for &pwid in &to_paint {
+        paint_window_background(fd, pwid, 0, 0, 0, 0, true);
+    }
 }
 
 // ── UnmapWindow (10) ──────────────────────────────────────────────────────────
@@ -2035,28 +2275,14 @@ fn op_clear_area(fd: u64, data: &[u8]) {
             }
         });
     } else {
-        // ClearArea on a window resets the region to the window's background.
-        // w/h == 0 means "to the right/bottom edge of the window" per the X11
-        // core protocol; we clamp to the window bounds inside window_fill_pixels.
-        let (bg_bgra, full_w, full_h) = {
-            let srv = SERVER.lock();
-            srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
-                .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
-                    .find(|r| r.id == draw)
-                    .and_then(|r| if let ResourceBody::Window(ref win) = r.body {
-                        let bg = win.background_pixel;
-                        Some(([
-                            (bg & 0xFF) as u8,         // B
-                            ((bg >> 8) & 0xFF) as u8,  // G
-                            ((bg >> 16) & 0xFF) as u8, // R
-                            0xFF,
-                        ], win.width as i32, win.height as i32))
-                    } else { None }))
-                .unwrap_or(([0, 0, 0, 0xFF], 0, 0))
-        };
-        let pw = if w == 0 { full_w } else { w };
-        let ph = if h == 0 { full_h } else { h };
-        window_fill_pixels(fd, draw, x, y, pw, ph, bg_bgra);
+        // ClearArea on a window resets the region to the window's background,
+        // honouring `background-pixmap` (tiled) or `background-pixel` (solid).
+        // w/h == 0 means "to the right/bottom edge of the window" per the X core
+        // protocol; paint_window_background applies that and clamps to bounds.
+        // `full_window=false`: ClearArea is an explicit client-requested erase
+        // and always paints the requested region (it is not the idempotent
+        // viewable-time background paint).
+        paint_window_background(fd, draw, x, y, w, h, false);
     }
 }
 
@@ -2264,6 +2490,175 @@ fn op_poly_fill_rect(fd: u64, data: &[u8]) {
     }
 }
 
+// ── Geometry ops (PolyPoint/Line/Segment/Rectangle/Arc/FillArc) ───────────────
+//
+// All share the same request prologue: [4-7] drawable, [8-11] gc, then a list
+// of op-specific coordinate records.  Each rasterises into the drawable's
+// pixel buffer (window or pixmap) via the `resource::raster` software
+// rasteriser, using the GC's foreground colour.  The compositor re-blits every
+// window's `pixels` each frame, so no explicit dirty flag is needed.
+
+/// Resolve the GC foreground (as 0x00RRGGBB) and whether `draw` is a pixmap.
+fn gc_fg_and_target(fd: u64, draw: u32, gcid: u32) -> Option<(u32, bool)> {
+    let srv = SERVER.lock();
+    let c = srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)?;
+    let fg = c.resources.entries.iter().filter_map(|s| s.as_ref())
+        .find(|r| r.id == gcid)
+        .and_then(|r| if let ResourceBody::Gc(ref g) = r.body { Some(g.foreground) } else { None })
+        .unwrap_or(0);
+    let is_pix = c.resources.entries.iter().filter_map(|s| s.as_ref())
+        .find(|r| r.id == draw)
+        .map_or(false, |r| matches!(r.body, ResourceBody::Pixmap(_)));
+    Some((fg & 0x00FF_FFFF, is_pix))
+}
+
+/// Run `f(pixels, width, height)` against the pixel buffer of drawable `draw`,
+/// allocating the window buffer if needed.  `f` is the rasteriser body.
+fn with_drawable_pixels<F: FnMut(&mut [u8], i32, i32)>(fd: u64, draw: u32, is_pix: bool, mut f: F) {
+    with_client(fd, |c| {
+        if is_pix {
+            if let Some(p) = c.resources.get_pixmap_mut(draw) {
+                let (w, h) = (p.width as i32, p.height as i32);
+                f(&mut p.pixels, w, h);
+            }
+        } else if let Some(w) = c.resources.get_window_mut(draw) {
+            w.ensure_pixels();
+            let (ww, wh) = (w.width as i32, w.height as i32);
+            f(&mut w.pixels, ww, wh);
+        }
+    });
+}
+
+// PolyFillArc (71): list of ARC {x:i16,y:i16,w:u16,h:u16,a1:i16,a2:i16} (12 B).
+fn op_poly_fill_arc(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    #[cfg(feature = "xeyes-test")]
+    crate::serial_println!("[X11DRAW] PolyFillArc draw={:#x} is_pixmap={} fg={:#x} narcs={}",
+        draw, is_pix, fg, (data.len().saturating_sub(12)) / 12);
+    let mut i = 12usize;
+    while i + 12 <= data.len() {
+        let ax = r16(data, i) as i16 as i32;
+        let ay = r16(data, i + 2) as i16 as i32;
+        let aw = r16(data, i + 4) as i32;
+        let ah = r16(data, i + 6) as i32;
+        let a1 = r16(data, i + 8) as i16 as i32;
+        let a2 = r16(data, i + 10) as i16 as i32;
+        i += 12;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::fill_arc(px, w, h, ax, ay, aw, ah, a1, a2, fg);
+        });
+    }
+}
+
+// PolyArc (68): same ARC record list, outline stroke.
+fn op_poly_arc(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 12 <= data.len() {
+        let ax = r16(data, i) as i16 as i32;
+        let ay = r16(data, i + 2) as i16 as i32;
+        let aw = r16(data, i + 4) as i32;
+        let ah = r16(data, i + 6) as i32;
+        let a1 = r16(data, i + 8) as i16 as i32;
+        let a2 = r16(data, i + 10) as i16 as i32;
+        i += 12;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::stroke_arc(px, w, h, ax, ay, aw, ah, a1, a2, fg);
+        });
+    }
+}
+
+// PolySegment (70): list of SEGMENT {x1:i16,y1:i16,x2:i16,y2:i16} (8 B).
+fn op_poly_segment(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 8 <= data.len() {
+        let x1 = r16(data, i) as i16 as i32;
+        let y1 = r16(data, i + 2) as i16 as i32;
+        let x2 = r16(data, i + 4) as i16 as i32;
+        let y2 = r16(data, i + 6) as i16 as i32;
+        i += 8;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::line(px, w, h, x1, y1, x2, y2, fg);
+        });
+    }
+}
+
+// PolyLine (65): polyline of POINT {x:i16,y:i16} (4 B); coordinate-mode in
+// data[1] (0=Origin, 1=Previous).  Connected segments between consecutive pts.
+fn op_poly_line(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let relative = data[1] == 1;
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut pts: alloc::vec::Vec<(i32, i32)> = alloc::vec::Vec::new();
+    let mut i = 12usize;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut first = true;
+    while i + 4 <= data.len() {
+        let px = r16(data, i) as i16 as i32;
+        let py = r16(data, i + 2) as i16 as i32;
+        i += 4;
+        if relative && !first { cx += px; cy += py; } else { cx = px; cy = py; }
+        first = false;
+        pts.push((cx, cy));
+    }
+    with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+        for win in pts.windows(2) {
+            resource::raster::line(buf, w, h, win[0].0, win[0].1, win[1].0, win[1].1, fg);
+        }
+    });
+}
+
+// PolyPoint (64): list of POINT {x:i16,y:i16} (4 B).
+fn op_poly_point(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let relative = data[1] == 1;
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut first = true;
+    while i + 4 <= data.len() {
+        let px = r16(data, i) as i16 as i32;
+        let py = r16(data, i + 2) as i16 as i32;
+        i += 4;
+        if relative && !first { cx += px; cy += py; } else { cx = px; cy = py; }
+        first = false;
+        let (dx, dy) = (cx, cy);
+        with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+            resource::raster::plot(buf, w, h, dx, dy, fg);
+        });
+    }
+}
+
+// PolyRectangle (67): list of RECTANGLE {x:i16,y:i16,w:u16,h:u16} (8 B) — outline.
+fn op_poly_rectangle(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 8 <= data.len() {
+        let rx = r16(data, i) as i16 as i32;
+        let ry = r16(data, i + 2) as i16 as i32;
+        let rw = r16(data, i + 4) as i32;
+        let rh = r16(data, i + 6) as i32;
+        i += 8;
+        with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+            resource::raster::line(buf, w, h, rx, ry, rx + rw, ry, fg);
+            resource::raster::line(buf, w, h, rx, ry + rh, rx + rw, ry + rh, fg);
+            resource::raster::line(buf, w, h, rx, ry, rx, ry + rh, fg);
+            resource::raster::line(buf, w, h, rx + rw, ry, rx + rw, ry + rh, fg);
+        });
+    }
+}
+
 // ── PutImage (72) ────────────────────────────────────────────────────────────
 
 fn op_put_image(fd: u64, data: &[u8]) {
@@ -2390,22 +2785,27 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     let nlen = r16(data, 4) as usize;
     let name = if data.len() >= 8+nlen { core::str::from_utf8(&data[8..8+nlen]).unwrap_or("") } else { "" };
     let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
+    // Per X11 core protocol §QueryExtension, the reply carries
+    // [8]=present, [9]=major_opcode, [10]=first_event, [11]=first_error.
+    // first_event/first_error MUST be the extension's real base codes (or 0 when
+    // the extension defines no events/errors); see proto.rs for the rationale —
+    // clients key their event-dispatch maps on first_event.
     match name {
-        "MIT-SHM"        => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
-        "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE; b[10]=0; b[11]=0; }
-        "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=0; b[11]=0; }
-        "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
-        "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
-        "XFIXES"    => { b[8]=1; b[9]=proto::XFIXES_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
-        "DAMAGE"    => { b[8]=1; b[9]=proto::DAMAGE_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
-        "XTEST"     => { b[8]=1; b[9]=proto::XTEST_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
+        "MIT-SHM"        => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;       b[10]=proto::SHM_FIRST_EVENT;       b[11]=proto::SHM_FIRST_ERROR; }
+        "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE;    b[10]=0;                            b[11]=0; }
+        "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=proto::XKEYBOARD_FIRST_EVENT; b[11]=proto::XKEYBOARD_FIRST_ERROR; }
+        "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=proto::SHAPE_FIRST_EVENT;  b[11]=proto::SHAPE_FIRST_ERROR; }
+        "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE;  b[10]=proto::RENDER_FIRST_EVENT; b[11]=proto::RENDER_FIRST_ERROR; }
+        "XFIXES"    => { b[8]=1; b[9]=proto::XFIXES_MAJOR_OPCODE;  b[10]=proto::XFIXES_FIRST_EVENT; b[11]=proto::XFIXES_FIRST_ERROR; }
+        "DAMAGE"    => { b[8]=1; b[9]=proto::DAMAGE_MAJOR_OPCODE;  b[10]=proto::DAMAGE_FIRST_EVENT; b[11]=proto::DAMAGE_FIRST_ERROR; }
+        "XTEST"     => { b[8]=1; b[9]=proto::XTEST_MAJOR_OPCODE;   b[10]=0;                         b[11]=0; }
         "XInputExtension" | "XI" | "XInput" => {
-            b[8]=1; b[9]=proto::XINPUT_MAJOR_OPCODE; b[10]=0; b[11]=0;
+            b[8]=1; b[9]=proto::XINPUT_MAJOR_OPCODE; b[10]=proto::XINPUT_FIRST_EVENT; b[11]=proto::XINPUT_FIRST_ERROR;
         }
-        "DPMS"      => { b[8]=1; b[9]=proto::DPMS_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
-        "SYNC"      => { b[8]=1; b[9]=proto::SYNC_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
-        "COMPOSITE" => { b[8]=1; b[9]=proto::COMPOSITE_MAJOR_OPCODE; b[10]=0; b[11]=0; }
-        "RANDR" | "RandR" => { b[8]=1; b[9]=proto::RANDR_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        "DPMS"      => { b[8]=1; b[9]=proto::DPMS_MAJOR_OPCODE;    b[10]=0;                       b[11]=0; }
+        "SYNC"      => { b[8]=1; b[9]=proto::SYNC_MAJOR_OPCODE;    b[10]=proto::SYNC_FIRST_EVENT; b[11]=proto::SYNC_FIRST_ERROR; }
+        "COMPOSITE" => { b[8]=1; b[9]=proto::COMPOSITE_MAJOR_OPCODE; b[10]=0;                     b[11]=0; }
+        "RANDR" | "RandR" => { b[8]=1; b[9]=proto::RANDR_MAJOR_OPCODE; b[10]=proto::RANDR_FIRST_EVENT; b[11]=proto::RANDR_FIRST_ERROR; }
         _           => {} // not present
     }
     with_client(fd, |c| c.send(&b));
@@ -2691,6 +3091,10 @@ fn op_render_composite(fd: u64, data: &[u8]) {
             .map_or(false, |r| matches!(r.body, ResourceBody::Pixmap(_)));
         (sp, dp)
     };
+    #[cfg(feature = "xeyes-test")]
+    crate::serial_println!("[X11RENDER] Composite op={} src_pic={:#x}->draw={:#x}(pix={}) dst_pic={:#x}->draw={:#x}(pix={}) dst_xy=({},{}) wh=({},{})",
+        op, src_id, src_draw, src_is_pixmap, dst_id, dst_draw, dst_is_pixmap,
+        dst_x, dst_y, width, height);
 
     // Clone src pixels (needed to avoid simultaneous mutable borrow of client)
     let src_pixels: alloc::vec::Vec<u8> = if src_is_pixmap {

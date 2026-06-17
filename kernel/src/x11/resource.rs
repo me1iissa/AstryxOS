@@ -51,10 +51,23 @@ pub struct WindowData {
     pub background_pixel: u32,
     pub mapped:          bool,
     pub override_redirect: bool,
+    /// Background pixmap resource id (X core protocol `background-pixmap`).
+    /// 0 = None, 1 = ParentRelative; any other value is a Pixmap id whose
+    /// contents are tiled into the window on expose/clear (per CreateWindow
+    /// / ChangeWindowAttributes / ClearArea semantics).
+    pub background_pixmap: u32,
     pub properties:      [Option<PropertyEntry>; MAX_PROPERTIES],
     /// Pixel buffer (BGRA, width×height×4 bytes) for compositor blitting.
     /// Allocated on MapWindow with background_pixel fill.
     pub pixels:          alloc::vec::Vec<u8>,
+    /// True once the window's persistent surface has had its background
+    /// (background_pixel or background_pixmap) painted across its full extent.
+    /// The X core protocol paints the background when a window first becomes
+    /// viewable; subsequent draws (RENDER Composite, core arcs, PutImage) layer
+    /// on top and must persist.  This flag makes the full-window background
+    /// paint idempotent so a later MapWindow/ClearArea cannot clobber content
+    /// already drawn into `pixels`.
+    pub bg_painted:      bool,
 }
 
 impl WindowData {
@@ -67,13 +80,25 @@ impl WindowData {
             background_pixel: 0xFFFFFFFF,
             mapped: false,
             override_redirect: false,
+            background_pixmap: 0,
             properties: [const { None }; MAX_PROPERTIES],
             pixels: alloc::vec::Vec::new(),
+            bg_painted: false,
         }
     }
 
     /// Ensure pixel buffer is allocated (BGRA format, w×h×4 bytes).
     /// Called on MapWindow and before any drawing operation.
+    ///
+    /// On first allocation the surface is filled with the solid
+    /// `background_pixel`.  For a window with a SOLID (or ParentRelative)
+    /// background this IS the complete viewable-time background paint, so
+    /// `bg_painted` is set — a later full-window `paint_window_background`
+    /// (issued on MapWindow) then becomes a no-op and cannot clobber a client
+    /// draw (e.g. a RENDER Composite) that landed in the surface first.  For a
+    /// window with a real background-PIXMAP, the solid fill here is only a
+    /// placeholder; the pixmap must still be tiled by `paint_window_background`,
+    /// so `bg_painted` is left clear for that one-shot tiling paint to run.
     pub fn ensure_pixels(&mut self) {
         let needed = (self.width as usize) * (self.height as usize) * 4;
         if self.pixels.len() == needed { return; }
@@ -85,6 +110,10 @@ impl WindowData {
         let b = (bg & 0xFF) as u8;
         for chunk in self.pixels.chunks_exact_mut(4) {
             chunk[0] = b; chunk[1] = g; chunk[2] = r; chunk[3] = 0xFF;
+        }
+        // background_pixmap: 0 = None, 1 = ParentRelative — both solid here.
+        if self.background_pixmap <= 1 {
+            self.bg_painted = true;
         }
     }
 
@@ -269,6 +298,217 @@ impl PixmapData {
                 }
             }
         }
+    }
+}
+
+// ── Software rasteriser (core protocol geometry ops) ──────────────────────────
+//
+// Free functions operating on a flat BGRA pixel buffer (`width × height × 4`,
+// little-endian B,G,R,A per pixel).  Both `WindowData::pixels` and
+// `PixmapData::pixels` use this layout, so windows and pixmaps share these
+// routines.  Coordinates are clipped to the buffer bounds; out-of-range writes
+// are silently dropped.
+//
+// Colour input is the GC foreground as 0x00RRGGBB (X core protocol pixel for a
+// 24-bit TrueColor visual); alpha is forced opaque so the compositor's OVER
+// blend keeps the drawn pixels visible.
+pub mod raster {
+    /// Plot a single opaque pixel at `(x, y)` with colour `rgb` (0x00RRGGBB).
+    #[inline]
+    pub fn plot(px: &mut [u8], w: i32, h: i32, x: i32, y: i32, rgb: u32) {
+        if x < 0 || y < 0 || x >= w || y >= h { return; }
+        let off = ((y * w + x) * 4) as usize;
+        if off + 3 >= px.len() { return; }
+        px[off]     = ( rgb        & 0xFF) as u8; // B
+        px[off + 1] = ((rgb >>  8) & 0xFF) as u8; // G
+        px[off + 2] = ((rgb >> 16) & 0xFF) as u8; // R
+        px[off + 3] = 0xFF;                        // A (opaque)
+    }
+
+    /// Fill a horizontal span `[x0, x1]` inclusive at row `y`.
+    #[inline]
+    fn span(px: &mut [u8], w: i32, h: i32, mut x0: i32, mut x1: i32, y: i32, rgb: u32) {
+        if x0 > x1 { core::mem::swap(&mut x0, &mut x1); }
+        for x in x0..=x1 { plot(px, w, h, x, y, rgb); }
+    }
+
+    /// Bresenham line from `(x0,y0)` to `(x1,y1)`.
+    pub fn line(px: &mut [u8], w: i32, h: i32,
+                mut x0: i32, mut y0: i32, x1: i32, y1: i32, rgb: u32) {
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            plot(px, w, h, x0, y0, rgb);
+            if x0 == x1 && y0 == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x0 += sx; }
+            if e2 <= dx { err += dx; y0 += sy; }
+        }
+    }
+
+    /// Integer sqrt (floor) — Newton's method on u64.
+    #[inline]
+    fn isqrt(n: u64) -> u64 {
+        if n == 0 { return 0; }
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+        while y < x { x = y; y = (x + n / x) / 2; }
+        x
+    }
+
+    // X11 angles are in 1/64-degree units, measured CCW from the +x (3-o'clock)
+    // direction.  A full ellipse is angle1=0, angle2=360*64=23040.  To test
+    // membership without trig we map a point's (dx, dy) — in ellipse-normalised
+    // space — into a 1/64-degree angle via a 256-entry integer atan table over
+    // one octant, then mirror into the full circle.
+    fn point_angle64(dx: i32, dy_up: i32) -> i32 {
+        // dy_up is +up (mathematical orientation, already negated by caller).
+        let (ax, ay) = (dx.unsigned_abs() as u64, dy_up.unsigned_abs() as u64);
+        // angle within first octant [0,45°] = atan(min/max)
+        let (lo, hi, swap) = if ay <= ax { (ay, ax, false) } else { (ax, ay, true) };
+        let oct = if hi == 0 { 0 } else { ATAN_T[((lo * 256) / hi) as usize] as i32 };
+        // oct ∈ [0, 45*64] = atan(lo/hi).  When ay>ax we measured atan(ax/ay),
+        // which is the complement, so the in-quadrant angle is 90°-oct.
+        let a = if swap { 90 * 64 - oct } else { oct };
+        let q = match (dx >= 0, dy_up >= 0) {
+            (true,  true)  => a,                 // Q1
+            (false, true)  => 180 * 64 - a,      // Q2
+            (false, false) => 180 * 64 + a,      // Q3
+            (true,  false) => 360 * 64 - a,      // Q4
+        };
+        ((q % (360 * 64)) + 360 * 64) % (360 * 64)
+    }
+
+    #[inline]
+    fn angle_in_sweep(a64: i32, angle1: i32, angle2: i32) -> bool {
+        let full = 360 * 64;
+        if angle2.abs() >= full { return true; }
+        let start = ((angle1 % full) + full) % full;
+        if angle2 >= 0 {
+            let end = start + angle2;
+            let a = if a64 < start { a64 + full } else { a64 };
+            a >= start && a <= end
+        } else {
+            let end = start + angle2;
+            let a = if a64 > start { a64 - full } else { a64 };
+            a <= start && a >= end
+        }
+    }
+
+    /// Fill the (portion of the) ellipse bounded by rect (x,y,bw,bh), sweeping
+    /// from `angle1` for `angle2` (1/64-degree units), per X core PolyFillArc.
+    /// For a full ellipse (|angle2| >= 360*64) the per-pixel angle test is
+    /// skipped and whole scanline spans are filled.  Integer arithmetic only.
+    pub fn fill_arc(px: &mut [u8], w: i32, h: i32,
+                    x: i32, y: i32, bw: i32, bh: i32,
+                    angle1: i32, angle2: i32, rgb: u32) {
+        if bw <= 0 || bh <= 0 { return; }
+        // Centre in doubled coordinates lands on an integer grid:
+        //   2·cx = 2x+bw, 2·cy = 2y+bh.  Radii rx=bw/2, ry=bh/2.
+        let cx2 = (2 * x + bw) as i64;    // 2·cx
+        let cy2 = (2 * y + bh) as i64;    // 2·cy
+        let bh2 = (bh as i64) * (bh as i64);
+        let full = angle2.abs() >= 360 * 64;
+        let y0 = y.max(0);
+        let y1 = (y + bh).min(h);
+        for py in y0..y1 {
+            // dyn_ = 2·(py+0.5 - cy)
+            let dyn_ = (2 * py + 1) as i64 - cy2;
+            // half-width of the scanline span:
+            //   half_real² = (bw²/4)·(bh² - dyn_²)/bh²
+            let num = bh2 - dyn_ * dyn_;
+            if num <= 0 { continue; }
+            // i128 intermediate: bw²·num can exceed i64 for adversarial CARD16
+            // dimensions (65535⁴ > i64::MAX); the result fits i64 after /(4·bh²).
+            let half2 = ((bw as i128) * (bw as i128) * (num as i128)) / (4 * bh2 as i128);
+            let half = isqrt(half2 as u64) as i32;
+            let cx_real = (cx2 / 2) as i32;
+            let xl = cx_real - half;
+            let xr = cx_real + half;
+            if full {
+                span(px, w, h, xl, xr, py, rgb);
+            } else {
+                let dy_up = -dyn_ as i32; // +up
+                for pxx in xl..=xr {
+                    let dx = (2 * pxx + 1) as i32 - cx2 as i32; // 2·(px+0.5 - cx)
+                    let a64 = point_angle64(dx, dy_up);
+                    if angle_in_sweep(a64, angle1, angle2) {
+                        plot(px, w, h, pxx, py, rgb);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stroke the outline of the ellipse bounded by rect (x,y,bw,bh) over the
+    /// sweep [angle1, angle1+angle2), per X core PolyArc.  One pixel wide.
+    /// Implemented as the boundary of the filled region: a pixel is on the
+    /// outline if it is inside the ellipse but at least one 4-neighbour is not.
+    pub fn stroke_arc(px: &mut [u8], w: i32, h: i32,
+                      x: i32, y: i32, bw: i32, bh: i32,
+                      angle1: i32, angle2: i32, rgb: u32) {
+        if bw <= 0 || bh <= 0 { return; }
+        let bh2 = (bh as i64) * (bh as i64);
+        let bw2 = (bw as i64) * (bw as i64);
+        let cx2 = (2 * x + bw) as i64;
+        let cy2 = (2 * y + bh) as i64;
+        let full = angle2.abs() >= 360 * 64;
+        // inside-test in doubled coords: (dx²·bh² + dy²·bw²) <= bw²·bh².
+        // i128 intermediates: the products can exceed i64 for adversarial
+        // CARD16 dimensions (65535⁴ > i64::MAX).
+        let inside = |pxx: i32, py: i32| -> bool {
+            let dx = (2 * pxx + 1) as i128 - cx2 as i128;
+            let dy = (2 * py + 1) as i128 - cy2 as i128;
+            dx * dx * bh2 as i128 + dy * dy * bw2 as i128 <= bw2 as i128 * bh2 as i128
+        };
+        let y0 = (y - 1).max(0);
+        let y1 = (y + bh + 1).min(h);
+        let x0 = (x - 1).max(0);
+        let x1 = (x + bw + 1).min(w);
+        for py in y0..y1 {
+            for pxx in x0..x1 {
+                if !inside(pxx, py) { continue; }
+                let edge = !inside(pxx - 1, py) || !inside(pxx + 1, py)
+                        || !inside(pxx, py - 1) || !inside(pxx, py + 1);
+                if !edge { continue; }
+                if !full {
+                    let dx = (2 * pxx + 1) as i32 - cx2 as i32;
+                    let dy_up = -((2 * py + 1) as i32 - cy2 as i32);
+                    if !angle_in_sweep(point_angle64(dx, dy_up), angle1, angle2) { continue; }
+                }
+                plot(px, w, h, pxx, py, rgb);
+            }
+        }
+    }
+
+    // 257-entry table: ATAN_T[i] = round(atan(i/256) in 1/64-degree units),
+    // i.e. ∈ [0, 45*64].  Generated at compile time from the integer ratio.
+    const ATAN_T: [u16; 257] = build_atan_table();
+
+    const fn build_atan_table() -> [u16; 257] {
+        // const fns can't use f64 trig; approximate atan(t) for t∈[0,1] with a
+        // rational minimax good to <0.3° (adequate for xeyes — which only ever
+        // draws full ellipses, so this table is a robustness margin, not a
+        // correctness-critical path).  atan(t) ≈ t·(0.9956 - 0.2899·t²) [rad].
+        // We scale to 1/64 degree: deg = rad·180/π, ×64.
+        let mut t = [0u16; 257];
+        let mut i = 0;
+        while i <= 256 {
+            // fixed-point: ratio = i/256 in Q16
+            let r = (i as i64) * 65536 / 256;           // t in Q16
+            let r2 = (r * r) >> 16;                      // t² in Q16
+            // poly in Q16: 0.9956 = 65248, 0.2899 = 19000
+            let p = (65248 - ((19000 * r2) >> 16)) as i64; // Q16
+            let rad_q16 = (r * p) >> 16;                 // atan(t) [rad] Q16
+            // deg64 = rad·(180/π)·64 ; 180/π·64 ≈ 3666.93 → Q16 const 240312832>>16
+            let deg64 = (rad_q16 * 3667) >> 16;          // 1/64 degree
+            t[i] = deg64 as u16;
+            i += 1;
+        }
+        t
     }
 }
 
