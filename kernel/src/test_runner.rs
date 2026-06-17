@@ -1519,7 +1519,7 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_big_requests_enable() { passed += 1; }
 
-    // ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ───
+    // ── Test 134: X11 MIT-SHM — QueryExtension reports the extension absent ──
 
     total += 1;
     if test_x11_query_extension_mit_shm() { passed += 1; }
@@ -28605,12 +28605,21 @@ fn test_x11_big_requests_enable() -> bool {
     true
 }
 
-// ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ─────────
-
+// ── Test 134: X11 MIT-SHM — QueryExtension reports the extension absent ──────
+//
+// This server has no shared-memory transport for ShmPutImage, so it
+// deliberately does NOT advertise MIT-SHM (op_query_extension returns
+// present=0).  Per the X11 core protocol §QueryExtension a present=0 reply
+// means the extension is absent, and a conformant client (e.g. GDK's
+// WindowSurfaceProvider) then falls back to core XPutImage, which this server
+// blits inline.  Verify the QueryExtension reply reports the extension absent
+// so the fallback is actually triggered.
+//
+// Test 75b (test_x11_shm_absent_core_present) covers the same absence plus the
+// positive core-PutImage path; this case keeps the focused extension-query
+// assertion in the X11 extension test block.
 fn test_x11_query_extension_mit_shm() -> bool {
-    test_header!("X11 MIT-SHM — QueryExtension present + ShmQueryVersion");
-
-    use crate::x11::proto;
+    test_header!("X11 MIT-SHM — QueryExtension reports the extension absent");
 
     let fd = x11_connect_and_setup("mitshm");
     if fd == u64::MAX {
@@ -28637,40 +28646,18 @@ fn test_x11_query_extension_mit_shm() -> bool {
         crate::net::unix::close(fd);
         return false;
     }
-    if rep[8] != 1 {
-        test_fail!("x11_mitshm", "MIT-SHM not present (present={})", rep[8]);
+    // Reply byte 8 = present (BOOL): must be 0 (absent) because this server has
+    // no shared-memory transport.  Advertising it would push every frame into a
+    // segment the server cannot read and the window would stay blank.
+    if rep[8] != 0 {
+        test_fail!("x11_mitshm", "MIT-SHM present={} (expected 0 = absent)", rep[8]);
         crate::net::unix::close(fd);
         return false;
     }
-    let major = rep[9];
-    if major == 0 {
-        test_fail!("x11_mitshm", "MIT-SHM major opcode is 0");
-        crate::net::unix::close(fd);
-        return false;
-    }
-    test_println!("  QueryExtension(MIT-SHM): present=1 major={} ✓", major);
-
-    // ── ShmQueryVersion (minor 0) ────────────────────────────────────────────
-    let req: [u8; 4] = [proto::SHM_MAJOR_OPCODE, proto::SHM_QUERY_VERSION, 1, 0];
-    crate::net::unix::write(fd, &req);
-    crate::x11::poll();
-    let mut vrep = [0u8; 32];
-    let n = crate::net::unix::read(fd, &mut vrep);
-    if n < 12 || vrep[0] != 1 {
-        test_fail!("x11_mitshm", "ShmQueryVersion no reply n={}", n);
-        crate::net::unix::close(fd);
-        return false;
-    }
-    let shm_major = u16::from_le_bytes([vrep[8], vrep[9]]);
-    if shm_major != 1 {
-        test_fail!("x11_mitshm", "SHM major={} (expected 1)", shm_major);
-        crate::net::unix::close(fd);
-        return false;
-    }
-    test_println!("  ShmQueryVersion: {}.{} ✓", shm_major, u16::from_le_bytes([vrep[10], vrep[11]]));
+    test_println!("  QueryExtension(MIT-SHM): present=0 (absent) ✓");
 
     crate::net::unix::close(fd);
-    test_pass!("X11 MIT-SHM extension");
+    test_pass!("X11 MIT-SHM extension reported absent (clients fall back to core XPutImage)");
     true
 }
 
