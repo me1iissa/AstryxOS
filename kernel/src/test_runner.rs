@@ -823,6 +823,11 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_translate_coordinates() { passed += 1; }
 
+    // ── X11 server — PolyFillArc rasterises into the window pixel buffer ──────
+
+    total += 1;
+    if test_x11_poly_fill_arc() { passed += 1; }
+
     // ── Test 67: X11 server — key event injection + delivery ─────────────────
 
     total += 1;
@@ -18072,6 +18077,114 @@ fn test_x11_draw_cycle() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 CreateWindow + MapWindow + Draw cycle");
+    true
+}
+
+// Verify PolyFillArc (X core protocol op 71) actually rasterises a filled
+// ellipse into the window pixel buffer.  A full-ellipse PolyFillArc covering the
+// whole window must paint the centre pixel with the GC foreground while leaving
+// a corner pixel (outside the inscribed ellipse) at the window background — the
+// distinguishing property of an *ellipse* fill versus a rectangle fill or a
+// no-op.  Regression guard for the geometry-op rasteriser.
+fn test_x11_poly_fill_arc() -> bool {
+    test_header!("X11 PolyFillArc rasterises a filled ellipse into the window");
+
+    let creds = crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, creds);
+    if client == u64::MAX { test_fail!("x11_arc", "unix::create failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", creds) < 0 {
+        test_fail!("x11_arc", "connect failed"); crate::net::unix::close(client); return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_arc", "setup failed (n={})", n); crate::net::unix::close(client); return false;
+    }
+
+    // CreateWindow 0x00710001, 100x100 at (10,10), background-pixel = black (0).
+    const WID: u32 = 0x0071_0001;
+    const GID: u32 = 0x0071_0002;
+    const W: u16 = 100;
+    const H: u16 = 100;
+    let mut reqs = [0u8; 48];
+    reqs[0] = 1; reqs[2] = 10;
+    reqs[4] = 0x01; reqs[5] = 0x00; reqs[6] = 0x71;          // wid = 0x00710001
+    reqs[8] = 0x01;                                          // parent = ROOT
+    reqs[12] = 10; reqs[14] = 10;                            // x=10, y=10
+    reqs[16] = (W & 0xFF) as u8; reqs[17] = (W >> 8) as u8;  // width
+    reqs[18] = (H & 0xFF) as u8; reqs[19] = (H >> 8) as u8;  // height
+    reqs[22] = 1;                                            // class = InputOutput
+    reqs[24] = 32;                                           // visual = ROOT_VISUAL
+    reqs[28] = 0x02; reqs[29] = 0x08;                        // vmask = BACK_PIXEL | EVENT_MASK
+    // bg_pixel = 0 (black); event_mask = EXPOSURE (0x8000).
+    reqs[36] = 0x00; reqs[37] = 0x80;
+    // MapWindow at offset 40.
+    reqs[40] = 8; reqs[42] = 2;
+    reqs[44] = 0x01; reqs[45] = 0x00; reqs[46] = 0x71;
+    if crate::net::unix::write(client, &reqs) != 48 {
+        test_fail!("x11_arc", "write CreateWindow+MapWindow failed"); crate::net::unix::close(client); return false;
+    }
+    crate::x11::poll();
+    // Drain the map event stream (MapNotify/ConfigureNotify/Expose).
+    let mut ev = [0u8; 32];
+    while crate::net::unix::has_data(client) { let _ = crate::net::unix::read(client, &mut ev); }
+    test_println!("  window created + mapped ✓");
+
+    // CreateGC (fg = 0x00FF00 green) + PolyFillArc (full ellipse over the window).
+    //   CreateGC: [0]=55 [2]=len5 [4..8]=gid [8..12]=wid [12..16]=GC_FOREGROUND(4) [16..20]=fg
+    //   PolyFillArc: [0]=71 [2]=len6 [4..8]=wid [8..12]=gid
+    //                + ARC{x=0,y=0,w=100,h=100,a1=0,a2=360*64}
+    let mut draw = [0u8; 44];
+    // CreateGC at 0
+    draw[0] = 55; draw[2] = 5;
+    draw[4] = 0x02; draw[5] = 0x00; draw[6] = 0x71;          // gid
+    draw[8] = 0x01; draw[9] = 0x00; draw[10] = 0x71;         // wid
+    draw[12] = 4;                                            // GC_FOREGROUND
+    draw[16] = 0x00; draw[17] = 0xFF; draw[18] = 0x00;       // fg = 0x0000FF00 LE (green)
+    // PolyFillArc at 20 (header 12 bytes + 1 arc of 12 bytes = 24 bytes = 6 words)
+    draw[20] = 71; draw[22] = 6;
+    draw[24] = 0x01; draw[25] = 0x00; draw[26] = 0x71;       // drawable = wid
+    draw[28] = 0x02; draw[29] = 0x00; draw[30] = 0x71;       // gc = gid
+    // ARC at 32: x=0,y=0,w=100,h=100,a1=0,a2=23040
+    draw[36] = 100; draw[38] = 100;                          // w=100, h=100 (x=y=0)
+    draw[40] = 0x00; draw[41] = 0x00;                        // a1 = 0
+    draw[42] = 0x00; draw[43] = 0x5A;                        // a2 = 0x5A00 = 23040 = 360*64
+    if crate::net::unix::write(client, &draw) != 44 {
+        test_fail!("x11_arc", "write CreateGC+PolyFillArc failed"); crate::net::unix::close(client); return false;
+    }
+    crate::x11::poll();
+    test_println!("  PolyFillArc (full ellipse, fg=green) sent + processed ✓");
+
+    // Centre pixel (50,50) must be the GC foreground (BGRA: B=0,G=0xFF,R=0).
+    let centre = crate::x11::test_read_window_pixel(WID, 50, 50);
+    match centre {
+        Some([b, g, r, _]) if g == 0xFF && b == 0x00 && r == 0x00 => {
+            test_println!("  centre pixel is green ✓");
+        }
+        other => {
+            test_fail!("x11_arc", "centre pixel = {:?} (expected green BGRA [0,255,0,*])", other);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    // A near-corner pixel (4,4) lies OUTSIDE the inscribed ellipse and must
+    // remain the window background (black) — proves an ellipse, not a rectangle.
+    let corner = crate::x11::test_read_window_pixel(WID, 4, 4);
+    match corner {
+        Some([b, g, r, _]) if g != 0xFF || b != 0x00 || r != 0x00 => {
+            test_println!("  corner pixel is NOT green (outside ellipse) ✓");
+        }
+        other => {
+            test_fail!("x11_arc", "corner pixel = {:?} (expected non-green — ellipse must not fill corners)", other);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    crate::net::unix::close(client);
+    test_pass!("X11 PolyFillArc fills an ellipse into the window pixel buffer");
     true
 }
 
