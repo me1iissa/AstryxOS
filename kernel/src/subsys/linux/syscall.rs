@@ -4165,7 +4165,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // never returns.  The trailing `0` is dead code — POSIX exit(2):
         // "The exit() function shall not return."
         231 => {
-            crate::serial_println!("[SYSCALL/Linux] exit_group({})", arg1 as i32);
+            // SAFETY: read-only access to the per-CPU saved user RIP (RCX at
+            // SYSCALL entry); identifies which userspace mapping issued the
+            // exit so a silent non-zero exit (e.g. ld-musl exit 127) can be
+            // attributed to the interpreter vs the program image.
+            let urip = unsafe { crate::syscall::get_user_rip() };
+            crate::serial_println!("[SYSCALL/Linux] exit_group({}) from user_rip={:#x}",
+                arg1 as i32, urip);
             crate::proc::exit_group(arg1 as i64);
             0 // dead — exit_group diverges
         }

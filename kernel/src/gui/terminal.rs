@@ -910,7 +910,27 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "TMPDIR=/tmp",
         "DISPLAY=:0",
         "GDK_BACKEND=x11",
+        // Library search scope for every dynamically-linked child.  Selected
+        // above from the binary's PT_INTERP (musl vs glibc).  A bare X11 client
+        // such as xeyes needs this to find libX11/libXt under /usr/lib; without
+        // it ld.so falls back to compiled defaults and may miss the data-disk
+        // tree.  (ELF gABI §5.4; ld.so(8) / ld-musl(8).)
+        ld_library_path,
     ];
+
+    // The heavy Mozilla-specific environment below (LD_PRELOAD of a glibc
+    // fontconfig interposer, the MOZ_*/GDK/FONTCONFIG/DBUS/LD_DEBUG variables)
+    // is required only by the Firefox bring-up path and is actively HARMFUL to
+    // an unrelated client.  In particular `LD_PRELOAD=/lib64/lib…-interposer.so`
+    // is a glibc DSO (NEEDED libc.so.6); force-loading it into a musl-linked
+    // process (e.g. the Alpine xeyes) drags in an incompatible libc and the
+    // musl dynamic linker aborts the process before main() — observed as a
+    // silent `exit(127)` from inside ld-musl.  So gate the Mozilla block on
+    // whether the target is actually Firefox; a generic Linux app gets only the
+    // small, portable base environment above.  Detection is by binary name —
+    // the Firefox launcher is `firefox` / `firefox-bin`.
+    let is_firefox = name.contains("firefox");
+    if is_firefox {
     if !gui_mode {
         // Tell Firefox to run headless even when DISPLAY is set.  libxul
         // checks gfxPlatform::IsHeadless() / nsAppRunner XRE_main and skips
@@ -1033,17 +1053,9 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
-        // Variant-aware library search scope, selected above from the binary's
-        // PT_INTERP (LD_PATH_MUSL vs LD_PATH_GLIBC).  Common tail in both:
-        //   /usr/lib/firefox-esr — Alpine canonical Mozilla tree (DT_RUNPATH
-        //     target baked into every Mozilla DSO per readelf -d).
-        //   /opt/firefox         — Mozilla-official tarball tree.
-        //   /disk/lib/firefox    — legacy build-firefox.sh in-tree path.
-        // LD_LIBRARY_PATH precedes DT_RUNPATH in the search order (ELF gABI
-        // §5.4; ld.so(8) / ld-musl(8)), so listing /usr/lib/firefox-esr here is
-        // a belt-and-braces guard for any dlopen("libfoo.so") call lacking
-        // RUNPATH propagation.
-        ld_library_path,
+        // LD_LIBRARY_PATH (the variant-aware search scope selected from the
+        // binary's PT_INTERP) is already in the base environment above; it
+        // covers the firefox-esr / opt / in-tree tail for both libcs.
         // libfontconfig-interposer.so — defensive FcPatternGetString *out
         // wrapper.  Real libfontconfig (PR #179) leaves *out untouched on
         // FcResultNoMatch per spec; Mozilla's gfxFcPlatformFontList caller
@@ -1088,6 +1100,7 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "LD_DEBUG=files",
         "LD_DEBUG_OUTPUT=/tmp/lddbg",
     ]);
+    } // end if is_firefox — Mozilla-only environment
     let envp: &[&str] = &envp_vec;
 
     // Spawn blocked so we can attach the pipe before the child can run.
