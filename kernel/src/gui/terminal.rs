@@ -1070,8 +1070,22 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // default off there would only desynchronise its actor routing.  In
         // windowed mode there is no such explicit-remote browser, so the
         // switch cleanly selects the in-process tab.
+        //
+        // IMPORTANT: on an official release/ESR build the
+        // `MOZ_FORCE_DISABLE_E10S` switch is itself gated behind the
+        // automation-mode flag — it is honoured ONLY when non-local
+        // connections are also disabled (a build hardening: the switch must
+        // not be flippable on a network-facing browser).  So pairing it with
+        // `MOZ_DISABLE_NONLOCAL_CONNECTIONS` is mandatory for the in-process
+        // collapse to take effect; with the latter unset the e10s-disable is
+        // silently ignored and the tab stays remote.  That pairing is only
+        // sound for a local (`file://`) target, which needs no network; the
+        // GUI demo loads exactly such a page, so the restriction is harmless
+        // here.  For a network URL the two are mutually exclusive and the
+        // windowed path necessarily runs the normal multi-process tree.
         // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
         envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
+        envp_vec.push("MOZ_DISABLE_NONLOCAL_CONNECTIONS=1");
         // GUI-mode (windowed) runtime data that headless mode never needs.
         // When libxul opens the display it brings up GTK/GDK, which loads
         // image data through GdkPixbuf and resolves fonts through fontconfig.
