@@ -813,6 +813,11 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_draw_cycle() { passed += 1; }
 
+    // ── X11 server — map event sequence (MapNotify→ConfigureNotify→Expose) ───
+
+    total += 1;
+    if test_x11_map_event_sequence() { passed += 1; }
+
     // ── X11 server — TranslateCoordinates (opcode 40) ────────────────────────
 
     total += 1;
@@ -18067,6 +18072,121 @@ fn test_x11_draw_cycle() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 CreateWindow + MapWindow + Draw cycle");
+    true
+}
+
+// ── X11 — map event sequence (MapNotify → ConfigureNotify → Expose) ──────────
+//
+// Per the X11 core protocol, mapping a window that selected StructureNotify +
+// Exposure must generate, in this order:
+//   1. MapNotify     (StructureNotify) — the window is now mapped
+//   2. ConfigureNotify(StructureNotify) — reports the window geometry
+//   3. Expose        (Exposure)        — the window became viewable
+// and the geometry carried by ConfigureNotify/Expose must match the window's
+// real size.  Toolkits (libXt's XtRealizeWidget) depend on this sequence to
+// learn the realized geometry of the shell and run their first layout/redisplay
+// pass.  This test maps a top-level window (parent = root, always mapped, so the
+// window is immediately viewable) and asserts the three events arrive in order
+// with the correct window id and 200×100 geometry.
+fn test_x11_map_event_sequence() -> bool {
+    test_header!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
+
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX { test_fail!("x11_mapseq", "unix::create() failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_mapseq", "connect failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_mapseq", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+
+    // CreateWindow (40 bytes): wid=0x00610001, parent=root(1), 200x100 at (30,40),
+    // event_mask = STRUCTURE_NOTIFY(0x20000) | EXPOSURE(0x8000) = 0x28000.
+    let mut reqs = [0u8; 48];
+    reqs[0]  = 1; reqs[2] = 10;
+    reqs[4]  = 0x01; reqs[5] = 0x00; reqs[6] = 0x61; // wid = 0x00610001
+    reqs[8]  = 0x01;                                  // parent = ROOT
+    reqs[12] = 30; reqs[14] = 40;                     // x=30 y=40
+    reqs[16] = 200; reqs[18] = 100;                   // 200x100
+    reqs[22] = 1;                                     // class = InputOutput
+    reqs[24] = 32;                                    // visual = ROOT_VISUAL
+    reqs[28] = 0x00; reqs[29] = 0x08;                 // vmask = CW_EVENT_MASK(0x0800)
+    reqs[32] = 0x00; reqs[33] = 0x80; reqs[34] = 0x02; reqs[35] = 0x00; // event_mask=0x00028000
+    // MapWindow at offset 40
+    reqs[40] = 8; reqs[42] = 2;
+    reqs[44] = 0x01; reqs[45] = 0x00; reqs[46] = 0x61; // wid
+    crate::net::unix::write(client, &reqs);
+    crate::x11::poll();
+
+    // Read the three queued events back as a single contiguous stream.
+    let mut buf = [0u8; 96];
+    let n = crate::net::unix::read(client, &mut buf);
+    if n < 96 {
+        test_fail!("x11_mapseq", "read returned {} (expected 96 = 3 events)", n);
+        crate::net::unix::close(client);
+        return false;
+    }
+    let wid = |o: usize| u32::from_le_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]);
+    let u16le = |o: usize| u16::from_le_bytes([buf[o], buf[o+1]]);
+
+    // Event 0: MapNotify (19), window = 0x610001.
+    if buf[0] != 19 {
+        test_fail!("x11_mapseq", "event0 type={} (expected 19=MapNotify)", buf[0]);
+        crate::net::unix::close(client); return false;
+    }
+    if wid(8) != 0x00610001 {
+        test_fail!("x11_mapseq", "MapNotify window={:#x} (expected 0x610001)", wid(8));
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  [0] MapNotify window={:#x} ✓", wid(8));
+
+    // Event 1: ConfigureNotify (22), window = 0x610001, width=200 height=100.
+    if buf[32] != 22 {
+        test_fail!("x11_mapseq", "event1 type={} (expected 22=ConfigureNotify)", buf[32]);
+        crate::net::unix::close(client); return false;
+    }
+    if wid(32 + 8) != 0x00610001 {
+        test_fail!("x11_mapseq", "ConfigureNotify window={:#x} (expected 0x610001)", wid(32 + 8));
+        crate::net::unix::close(client); return false;
+    }
+    let cw = u16le(32 + 20);
+    let ch = u16le(32 + 22);
+    if cw != 200 || ch != 100 {
+        test_fail!("x11_mapseq", "ConfigureNotify size={}x{} (expected 200x100)", cw, ch);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  [1] ConfigureNotify window={:#x} {}x{} ✓", wid(32 + 8), cw, ch);
+
+    // Event 2: Expose (12), window = 0x610001, width=200 height=100, count=0.
+    if buf[64] != 12 {
+        test_fail!("x11_mapseq", "event2 type={} (expected 12=Expose)", buf[64]);
+        crate::net::unix::close(client); return false;
+    }
+    if wid(64 + 4) != 0x00610001 {
+        test_fail!("x11_mapseq", "Expose window={:#x} (expected 0x610001)", wid(64 + 4));
+        crate::net::unix::close(client); return false;
+    }
+    let ew = u16le(64 + 12);
+    let eh = u16le(64 + 14);
+    if ew != 200 || eh != 100 {
+        test_fail!("x11_mapseq", "Expose size={}x{} (expected 200x100)", ew, eh);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  [2] Expose window={:#x} {}x{} ✓", wid(64 + 4), ew, eh);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 map event sequence (MapNotify→ConfigureNotify→Expose)");
     true
 }
 
