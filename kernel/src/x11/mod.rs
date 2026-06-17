@@ -772,20 +772,40 @@ fn window_fill_pixels(fd: u64, win_id: u32, x: i32, y: i32, w: i32, h: i32, bgra
 /// the ClearArea semantics.  Used on ClearArea and MapWindow so that clients
 /// (e.g. the xeyes Eyes widget) which draw static content into a background
 /// pixmap and rely on the server to paint it become visible.
-fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i32) {
+/// Paint a window's background (background_pixel or background_pixmap) into its
+/// persistent `pixels` surface.
+///
+/// `full_window` distinguishes the two callers:
+///   - `true`  — the implicit "window became viewable" background paint issued
+///     on MapWindow / MapSubwindows.  Per the X core protocol the server paints
+///     the background ONCE when the window first becomes viewable; afterwards,
+///     client draws (RENDER Composite, core arcs, PutImage) layer on top and
+///     must persist.  This path is therefore idempotent: it is gated on the
+///     `bg_painted` flag so a second MapWindow over already-drawn content cannot
+///     clobber it.  (Was the #581 `x11_render_d` regression: a MapWindow after a
+///     Composite re-painted black over the red.)
+///   - `false` — an explicit ClearArea request.  ClearArea is a deliberate
+///     erase-to-background of a client-specified region and always paints.
+fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i32,
+                           full_window: bool) {
     // Resolve background pixmap id + window size, then (if a pixmap) snapshot it.
-    let (bg_pixmap, ww, wh, bg_pixel) = {
+    let (bg_pixmap, ww, wh, bg_pixel, already_painted) = {
         let srv = SERVER.lock();
         match srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
             .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
                 .find(|r| r.id == win_id)
                 .and_then(|r| if let ResourceBody::Window(ref w) = r.body {
-                    Some((w.background_pixmap, w.width as i32, w.height as i32, w.background_pixel))
+                    Some((w.background_pixmap, w.width as i32, w.height as i32,
+                          w.background_pixel, w.bg_painted))
                 } else { None })) {
             Some(v) => v,
             None => return,
         }
     };
+    // Idempotent viewable-time background paint: if the surface already had its
+    // background applied (and possibly subsequent client draws layered on top),
+    // a repeat full-window paint must NOT overwrite that content.
+    if full_window && already_painted { return; }
     let region_w = if rw == 0 { ww - x } else { rw };
     let region_h = if rh == 0 { wh - y } else { rh };
     if region_w <= 0 || region_h <= 0 { return; }
@@ -796,6 +816,7 @@ fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i3
         let bgra = [(bg_pixel & 0xFF) as u8, ((bg_pixel >> 8) & 0xFF) as u8,
                     ((bg_pixel >> 16) & 0xFF) as u8, 0xFF];
         window_fill_pixels(fd, win_id, x, y, region_w, region_h, bgra);
+        if full_window { mark_bg_painted(fd, win_id); }
         return;
     }
 
@@ -827,6 +848,20 @@ fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i3
                     }
                 }
             }
+            if full_window { win.bg_painted = true; }
+        }
+    });
+}
+
+/// Mark a window's persistent surface as having had its viewable-time
+/// background painted, so a subsequent full-window background paint becomes a
+/// no-op (later client draws must persist).  Used by the solid-fill path of
+/// `paint_window_background`, which routes through `window_fill_pixels` and so
+/// does not itself touch the `bg_painted` flag.
+fn mark_bg_painted(fd: u64, win_id: u32) {
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.bg_painted = true;
         }
     });
 }
@@ -1006,9 +1041,12 @@ fn op_change_win_attrs(fd: u64, data: &[u8]) {
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
             // X core protocol: a new background takes effect on the next expose
-            // or ClearArea, not immediately — so we only record it here.
-            if vmask & proto::CW_BACK_PIXMAP       != 0 { w.background_pixmap = r32(data, vi); vi += 4; }
-            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); w.background_pixmap = 0; vi += 4; }
+            // or ClearArea, not immediately — so we only record it here.  Clear
+            // `bg_painted` so the next viewable-time background paint re-applies
+            // the new background (a window whose background changed has not yet
+            // had THAT background painted).
+            if vmask & proto::CW_BACK_PIXMAP       != 0 { w.background_pixmap = r32(data, vi); w.bg_painted = false; vi += 4; }
+            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); w.background_pixmap = 0; w.bg_painted = false; vi += 4; }
             if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
             if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
             if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
@@ -1124,7 +1162,15 @@ fn is_viewable(c: &Client, wid: u32) -> bool {
 /// to `root_wid` and to every descendant that has just become viewable and has
 /// selected Exposure.  MapNotify is emitted separately by the caller before
 /// this runs (the protocol orders MapNotify before Expose).
-fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
+///
+/// Returns the list of viewable, mapped windows in the subtree (root +
+/// descendants).  Per the X core protocol the server paints a window's
+/// background when it first becomes viewable, BEFORE delivering its Expose, so
+/// the client's Expose-driven redraw lands on the initialised background rather
+/// than an uninitialised (black) surface.  The caller paints these backgrounds
+/// after releasing the SERVER lock — `paint_window_background` re-acquires it,
+/// so it cannot run inside the `with_client` block that wraps this call.
+fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) -> alloc::vec::Vec<u32> {
     // Collect the subtree (root + transitive descendants) from the flat table.
     let mut subtree: alloc::vec::Vec<WinInfo> = alloc::vec::Vec::new();
     if let Some(root) = win_info(c, root_wid) { subtree.push(root); }
@@ -1142,19 +1188,26 @@ fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
         }
         i += 1;
     }
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     for wi in &subtree {
         let viewable = is_viewable(c, wi.id);
         #[cfg(feature = "xeyes-test")]
         crate::serial_println!("[X11EXPOSE] subtree wid={:#x} mapped={} evmask={:#x} exposure={} viewable={}",
             wi.id, wi.mapped, wi.evmask,
             wi.evmask & proto::EVENT_MASK_EXPOSURE != 0, viewable);
-        if wi.mapped
-            && wi.evmask & proto::EVENT_MASK_EXPOSURE != 0
-            && viewable
-        {
-            c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
+        if wi.mapped && viewable {
+            // Every newly-viewable window (root, container, or leaf widget such
+            // as the Eyes child) needs its background painted so an Expose-driven
+            // redraw has an initialised surface to draw over.  Collect it for the
+            // caller's post-lock paint pass.  Exposure delivery below is a
+            // separate, ExposureMask-gated decision.
+            to_paint.push(wi.id);
+            if wi.evmask & proto::EVENT_MASK_EXPOSURE != 0 {
+                c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
+            }
         }
     }
+    to_paint
 }
 
 /// Send a ConfigureNotify to `wid` reporting its current geometry, if it
@@ -1177,6 +1230,7 @@ fn configure_notify_if_selected(c: &Client, wid: u32, seq: u16) {
 fn op_map_window(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let wid = r32(data, 4);
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     with_client(fd, |c| {
         let (width, height, evmask) = match c.resources.get_window_mut(wid) {
             Some(w) => {
@@ -1199,16 +1253,24 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
         // already-mapped descendants viewable for the first time.  Send Expose
         // to every window in that subtree that is now viewable and selected
         // Exposure — this is where a child mapped earlier (while this ancestor
-        // was unmapped) finally gets its Expose.
-        expose_viewable_subtree(c, wid, seq);
+        // was unmapped) finally gets its Expose.  The returned ids are the
+        // windows that just became viewable and need their backgrounds painted.
+        to_paint = expose_viewable_subtree(c, wid, seq);
         crate::serial_println!("[X11] MapWindow {:#x} {}x{}", wid, width, height);
     });
-    // Paint the window background now that it is viewable, honouring a
-    // background-pixmap (X core protocol: the server paints the background when
-    // a window becomes viewable, before sending Expose).  Done AFTER the
-    // with_client block above because paint_window_background re-acquires the
-    // SERVER lock (which with_client holds) — calling it inside would deadlock.
-    paint_window_background(fd, wid, 0, 0, 0, 0);
+    // Paint each newly-viewable window's background now (X core protocol: the
+    // server paints the background when a window becomes viewable, before its
+    // Expose-driven redraw runs).  Done AFTER the with_client block above
+    // because paint_window_background re-acquires the SERVER lock — calling it
+    // inside would deadlock.  `full_window=true`: idempotent viewable-time paint
+    // gated on `bg_painted`, so a second MapWindow over content already drawn
+    // into a surface (e.g. a prior RENDER Composite or core-arc draw) is a
+    // no-op.  This covers the CHILD widget windows (e.g. the xeyes Eyes child),
+    // whose backgrounds were previously never painted — leaving the Eyes child
+    // an uninitialised black rectangle even after its Expose drove a redraw.
+    for &pwid in &to_paint {
+        paint_window_background(fd, pwid, 0, 0, 0, 0, true);
+    }
 }
 
 // ── MapSubwindows (9) ─────────────────────────────────────────────────────────
@@ -1224,6 +1286,7 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
 fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let parent = r32(data, 4);
+    let mut to_paint: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     with_client(fd, |c| {
         // Collect child ids first (avoid borrowing the resource table mutably
         // while iterating it).  Children are windows whose `parent` field
@@ -1260,11 +1323,21 @@ fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
         // Exposure: only the children that became viewable get an Expose.  If
         // the parent is unmapped they are Unviewable and Expose is deferred to
         // the parent's MapWindow.  Run the subtree pass per mapped child so
-        // grandchildren are covered too.
+        // grandchildren are covered too.  Accumulate the viewable windows whose
+        // backgrounds must be painted after the lock is released.
         for &cid in &children {
-            expose_viewable_subtree(c, cid, seq);
+            let mut sub = expose_viewable_subtree(c, cid, seq);
+            to_paint.append(&mut sub);
         }
     });
+    // Paint each newly-viewable child/grandchild background (post-lock; see
+    // op_map_window for the deadlock rationale).  Without this a leaf widget
+    // mapped via MapSubwindows under an already-viewable parent never had its
+    // background initialised, so its Expose-driven redraw drew onto a black
+    // surface.
+    for &pwid in &to_paint {
+        paint_window_background(fd, pwid, 0, 0, 0, 0, true);
+    }
 }
 
 // ── UnmapWindow (10) ──────────────────────────────────────────────────────────
@@ -2128,7 +2201,10 @@ fn op_clear_area(fd: u64, data: &[u8]) {
         // honouring `background-pixmap` (tiled) or `background-pixel` (solid).
         // w/h == 0 means "to the right/bottom edge of the window" per the X core
         // protocol; paint_window_background applies that and clamps to bounds.
-        paint_window_background(fd, draw, x, y, w, h);
+        // `full_window=false`: ClearArea is an explicit client-requested erase
+        // and always paints the requested region (it is not the idempotent
+        // viewable-time background paint).
+        paint_window_background(fd, draw, x, y, w, h, false);
     }
 }
 

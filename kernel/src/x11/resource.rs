@@ -60,6 +60,14 @@ pub struct WindowData {
     /// Pixel buffer (BGRA, width×height×4 bytes) for compositor blitting.
     /// Allocated on MapWindow with background_pixel fill.
     pub pixels:          alloc::vec::Vec<u8>,
+    /// True once the window's persistent surface has had its background
+    /// (background_pixel or background_pixmap) painted across its full extent.
+    /// The X core protocol paints the background when a window first becomes
+    /// viewable; subsequent draws (RENDER Composite, core arcs, PutImage) layer
+    /// on top and must persist.  This flag makes the full-window background
+    /// paint idempotent so a later MapWindow/ClearArea cannot clobber content
+    /// already drawn into `pixels`.
+    pub bg_painted:      bool,
 }
 
 impl WindowData {
@@ -75,11 +83,22 @@ impl WindowData {
             background_pixmap: 0,
             properties: [const { None }; MAX_PROPERTIES],
             pixels: alloc::vec::Vec::new(),
+            bg_painted: false,
         }
     }
 
     /// Ensure pixel buffer is allocated (BGRA format, w×h×4 bytes).
     /// Called on MapWindow and before any drawing operation.
+    ///
+    /// On first allocation the surface is filled with the solid
+    /// `background_pixel`.  For a window with a SOLID (or ParentRelative)
+    /// background this IS the complete viewable-time background paint, so
+    /// `bg_painted` is set — a later full-window `paint_window_background`
+    /// (issued on MapWindow) then becomes a no-op and cannot clobber a client
+    /// draw (e.g. a RENDER Composite) that landed in the surface first.  For a
+    /// window with a real background-PIXMAP, the solid fill here is only a
+    /// placeholder; the pixmap must still be tiled by `paint_window_background`,
+    /// so `bg_painted` is left clear for that one-shot tiling paint to run.
     pub fn ensure_pixels(&mut self) {
         let needed = (self.width as usize) * (self.height as usize) * 4;
         if self.pixels.len() == needed { return; }
@@ -91,6 +110,10 @@ impl WindowData {
         let b = (bg & 0xFF) as u8;
         for chunk in self.pixels.chunks_exact_mut(4) {
             chunk[0] = b; chunk[1] = g; chunk[2] = r; chunk[3] = 0xFF;
+        }
+        // background_pixmap: 0 = None, 1 = ParentRelative — both solid here.
+        if self.background_pixmap <= 1 {
+            self.bg_painted = true;
         }
     }
 

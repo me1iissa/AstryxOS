@@ -1359,6 +1359,12 @@ pub fn poll_output() {
     // Append ALL stdout bytes to the terminal grid, then render ONCE.
     for chunk in &chunks {
         let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
+        // Mirror child stdout/stderr to the serial console under the GUI test
+        // features so the harness can see dynamic-linker / client diagnostics
+        // (e.g. ld-musl "Error relocating …" → exit 127) that otherwise land
+        // only on the invisible terminal grid.
+        #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
+        crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
         state.write_ansi_str(text);
     }
     if any_data {
@@ -1377,6 +1383,8 @@ pub fn poll_output() {
 
         if tn > 0 {
             let text = core::str::from_utf8(&tail[..tn]).unwrap_or("\u{FFFD}");
+            #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
+            crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
             state2.write_ansi_str(text);
         }
         if code != 0 {
