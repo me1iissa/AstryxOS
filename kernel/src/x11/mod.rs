@@ -366,20 +366,51 @@ pub struct X11WindowSnapshot {
     pub pixels: Vec<u8>, // BGRA, width×height×4
 }
 
+/// Resolve a window's absolute (screen-space) origin by summing the
+/// parent-relative offsets up the window tree until the root (id 1) or an
+/// unknown parent is reached.  Window coordinates in the protocol are relative
+/// to the parent, so a child widget's screen position is the sum of its and its
+/// ancestors' offsets.  Bounded to avoid cycles in a corrupt tree.
+fn absolute_origin(client: &Client, mut id: u32) -> (i32, i32) {
+    let (mut ax, mut ay) = (0i32, 0i32);
+    for _ in 0..32 {
+        let mut found = false;
+        for r in client.resources.entries.iter().filter_map(|s| s.as_ref()) {
+            if r.id == id {
+                if let resource::ResourceBody::Window(ref w) = r.body {
+                    ax += w.x as i32;
+                    ay += w.y as i32;
+                    if w.parent == proto::ROOT_WINDOW_ID || w.parent == 0 { return (ax, ay); }
+                    id = w.parent;
+                    found = true;
+                }
+                break;
+            }
+        }
+        if !found { break; }
+    }
+    (ax, ay)
+}
+
 /// Collect all mapped X11 client windows for compositor rendering.
 /// Returns a Vec of snapshots (copies pixel data to avoid holding locks).
+/// Coordinates are absolute (screen-space); child widget windows are resolved
+/// relative to their ancestors.  Resources iterate in creation order, so a
+/// parent precedes its children — i.e. children are blitted on top, matching
+/// the X11 stacking model where later-mapped children draw over their parent.
 pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
     if !X11_INITIALIZED.load(Ordering::Acquire) { return Vec::new(); }
     let srv = SERVER.lock();
     let mut result = Vec::new();
     for slot in srv.clients.iter() {
         if let Some(client) = slot {
-            for (_rid, body) in client.resources.iter_all() {
+            for (rid, body) in client.resources.iter_all() {
                 if let resource::ResourceBody::Window(ref w) = body {
                     if w.mapped && !w.pixels.is_empty() && w.width > 0 && w.height > 0 {
+                        let (ax, ay) = absolute_origin(client, rid);
                         result.push(X11WindowSnapshot {
-                            x: w.x,
-                            y: w.y,
+                            x: ax as i16,
+                            y: ay as i16,
                             width: w.width,
                             height: w.height,
                             pixels: w.pixels.clone(),
@@ -591,7 +622,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_CHANGE_SAVE_SET       => {} // ICCCM bookkeeping; ignored
         proto::OP_REPARENT_WINDOW       => {} // no WM hierarchy beyond root
         proto::OP_MAP_WINDOW            => op_map_window(fd, data, seq),
-        proto::OP_MAP_SUBWINDOWS        => {} // children unmapped; no-op
+        proto::OP_MAP_SUBWINDOWS        => op_map_subwindows(fd, data, seq),
         proto::OP_UNMAP_WINDOW          => op_unmap_window(fd, data, seq),
         proto::OP_UNMAP_SUBWINDOWS      => {} // no-op
         proto::OP_CIRCULATE_WINDOW      => {} // no Z-order beyond top window
@@ -977,6 +1008,47 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
             }
             crate::serial_println!("[X11] MapWindow {:#x} {}x{}+{},{}", wid, width, height, x, y);
         } else { c.send_error(proto::ERR_WINDOW, wid, proto::OP_MAP_WINDOW); }
+    });
+}
+
+// ── MapSubwindows (9) ─────────────────────────────────────────────────────────
+//
+// Map every unmapped child of `parent` in bottom-to-top order, as required by
+// the X11 core protocol: toolkits (libXt's XtRealizeWidget, GTK) map the
+// container then call MapSubwindows to map the leaf widget windows.  Each newly
+// mapped child gets its pixel buffer allocated and, per its event mask, a
+// MapNotify and an initial Expose so the client paints it.
+fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 8 { return; }
+    let parent = r32(data, 4);
+    with_client(fd, |c| {
+        // Collect child ids first (avoid borrowing the resource table mutably
+        // while iterating it).  Children are windows whose `parent` field
+        // matches; the protocol maps them bottom-to-top, i.e. in stacking order
+        // — our resource table preserves creation order which suffices here.
+        let mut children: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for r in c.resources.entries.iter().filter_map(|s| s.as_ref()) {
+            if let ResourceBody::Window(ref w) = r.body {
+                if w.parent == parent && !w.mapped {
+                    children.push(r.id);
+                }
+            }
+        }
+        for &cid in &children {
+            if let Some(w) = c.resources.get_window_mut(cid) {
+                let (x, y, width, height, evmask) = (w.x, w.y, w.width, w.height, w.event_mask);
+                w.mapped = true;
+                w.ensure_pixels();
+                if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+                    c.send(&event::encode_map_notify(seq, cid));
+                }
+                if evmask & proto::EVENT_MASK_EXPOSURE != 0 {
+                    c.send(&event::encode_expose(seq, cid, x, y, width, height));
+                }
+                crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}+{},{}",
+                    cid, parent, width, height, x, y);
+            }
+        }
     });
 }
 
