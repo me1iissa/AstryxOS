@@ -366,20 +366,51 @@ pub struct X11WindowSnapshot {
     pub pixels: Vec<u8>, // BGRA, width×height×4
 }
 
+/// Resolve a window's absolute (screen-space) origin by summing the
+/// parent-relative offsets up the window tree until the root (id 1) or an
+/// unknown parent is reached.  Window coordinates in the protocol are relative
+/// to the parent, so a child widget's screen position is the sum of its and its
+/// ancestors' offsets.  Bounded to avoid cycles in a corrupt tree.
+fn absolute_origin(client: &Client, mut id: u32) -> (i32, i32) {
+    let (mut ax, mut ay) = (0i32, 0i32);
+    for _ in 0..32 {
+        let mut found = false;
+        for r in client.resources.entries.iter().filter_map(|s| s.as_ref()) {
+            if r.id == id {
+                if let resource::ResourceBody::Window(ref w) = r.body {
+                    ax += w.x as i32;
+                    ay += w.y as i32;
+                    if w.parent == proto::ROOT_WINDOW_ID || w.parent == 0 { return (ax, ay); }
+                    id = w.parent;
+                    found = true;
+                }
+                break;
+            }
+        }
+        if !found { break; }
+    }
+    (ax, ay)
+}
+
 /// Collect all mapped X11 client windows for compositor rendering.
 /// Returns a Vec of snapshots (copies pixel data to avoid holding locks).
+/// Coordinates are absolute (screen-space); child widget windows are resolved
+/// relative to their ancestors.  Resources iterate in creation order, so a
+/// parent precedes its children — i.e. children are blitted on top, matching
+/// the X11 stacking model where later-mapped children draw over their parent.
 pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
     if !X11_INITIALIZED.load(Ordering::Acquire) { return Vec::new(); }
     let srv = SERVER.lock();
     let mut result = Vec::new();
     for slot in srv.clients.iter() {
         if let Some(client) = slot {
-            for (_rid, body) in client.resources.iter_all() {
+            for (rid, body) in client.resources.iter_all() {
                 if let resource::ResourceBody::Window(ref w) = body {
                     if w.mapped && !w.pixels.is_empty() && w.width > 0 && w.height > 0 {
+                        let (ax, ay) = absolute_origin(client, rid);
                         result.push(X11WindowSnapshot {
-                            x: w.x,
-                            y: w.y,
+                            x: ax as i16,
+                            y: ay as i16,
                             width: w.width,
                             height: w.height,
                             pixels: w.pixels.clone(),
@@ -390,6 +421,33 @@ pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
         }
     }
     result
+}
+
+/// Test-only: read a single window-local BGRA pixel from a window's persistent
+/// pixel buffer (`w.pixels`, the compositor source of truth).  Searches every
+/// connected client for a window resource matching `win_id` (test windows use
+/// globally-unique IDs), so callers need not know the server-side socket fd.
+/// Returns `None` if no matching window/pixel is present or its buffer is
+/// unallocated.
+#[cfg(feature = "test-mode")]
+pub fn test_read_window_pixel(win_id: u32, x: u32, y: u32) -> Option<[u8; 4]> {
+    let srv = SERVER.lock();
+    for c in srv.clients.iter().filter_map(|s| s.as_ref()) {
+        for sl in c.resources.entries.iter() {
+            if let Some(r) = sl {
+                if r.id == win_id {
+                    if let resource::ResourceBody::Window(ref w) = r.body {
+                        if x >= w.width as u32 || y >= w.height as u32 { return None; }
+                        let off = ((y * w.width as u32 + x) * 4) as usize;
+                        if off + 4 > w.pixels.len() { return None; }
+                        return Some([w.pixels[off], w.pixels[off + 1],
+                                     w.pixels[off + 2], w.pixels[off + 3]]);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Accept new clients and service pending reads.  Call from idle/scheduler loop.
@@ -564,7 +622,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_CHANGE_SAVE_SET       => {} // ICCCM bookkeeping; ignored
         proto::OP_REPARENT_WINDOW       => {} // no WM hierarchy beyond root
         proto::OP_MAP_WINDOW            => op_map_window(fd, data, seq),
-        proto::OP_MAP_SUBWINDOWS        => {} // children unmapped; no-op
+        proto::OP_MAP_SUBWINDOWS        => op_map_subwindows(fd, data, seq),
         proto::OP_UNMAP_WINDOW          => op_unmap_window(fd, data, seq),
         proto::OP_UNMAP_SUBWINDOWS      => {} // no-op
         proto::OP_CIRCULATE_WINDOW      => {} // no Z-order beyond top window
@@ -664,6 +722,133 @@ fn handle_request(fd: u64, data: &[u8]) {
 fn with_client<F: FnOnce(&mut Client)>(fd: u64, f: F) {
     let mut srv = SERVER.lock();
     if let Some(c) = srv.clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd) { f(c); }
+}
+
+// ── Window-destination drawing helpers ───────────────────────────────────────
+//
+// The compositor's source of truth for a mapped client window is its
+// persistent per-window pixel buffer `WindowData::pixels` (BGRA, row-major,
+// stride = width*4, window-local coordinates).  `compositor::compose()` refills
+// the backbuffer with the root gradient and re-blits every window's `pixels`
+// each frame, so any draw-op that targets a window MUST write into that buffer
+// — writing the transient screen backbuffer directly is erased on the next
+// frame.  All window-destination op handlers route through the helpers below so
+// the screen backbuffer is never the destination for window content.
+
+/// Fill a window-local rectangle in `w.pixels` with a solid BGRA colour.
+/// Coordinates are window-relative; the rectangle is clipped to window bounds.
+fn window_fill_pixels(fd: u64, win_id: u32, x: i32, y: i32, w: i32, h: i32, bgra: [u8; 4]) {
+    if w <= 0 || h <= 0 { return; }
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.ensure_pixels();
+            let ww = win.width as i32;
+            let wh = win.height as i32;
+            for py in y.max(0)..((y + h).min(wh)) {
+                for px in x.max(0)..((x + w).min(ww)) {
+                    let off = ((py * ww + px) * 4) as usize;
+                    if off + 4 <= win.pixels.len() {
+                        win.pixels[off..off + 4].copy_from_slice(&bgra);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Draw an 8×16 VGA-font string into a window's `w.pixels` (compositor source
+/// of truth).  `fg`/`bg` are 0x00RRGGBB; the glyph cell background is filled
+/// with `bg` (X11 ImageText8 semantics) and foreground pixels with `fg`.
+/// `(tx, ty)` is the window-local baseline-top-left of the first glyph.
+fn window_draw_text_pixels(fd: u64, win_id: u32, tx: i32, ty: i32, text: &str, fg: u32, bg: u32) {
+    use crate::gui::compositor::VGA_FONT_8X16;
+    const FW: i32 = 8;
+    const FH: i32 = 16;
+    let to_bgra = |c: u32| -> [u8; 4] {
+        [(c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8, 0xFF]
+    };
+    let fg_bgra = to_bgra(fg);
+    let bg_bgra = to_bgra(bg);
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.ensure_pixels();
+            let ww = win.width as i32;
+            let wh = win.height as i32;
+            let mut cx = tx;
+            for ch in text.chars() {
+                let cc = ch as u32;
+                // ImageText8 draws over a solid background cell.
+                for row in 0..FH {
+                    let py = ty + row;
+                    if py < 0 || py >= wh { continue; }
+                    let glyph_byte = if (0x20..=0x7E).contains(&cc) {
+                        VGA_FONT_8X16[((cc - 0x20) as usize) * 16 + row as usize]
+                    } else { 0 };
+                    for col in 0..FW {
+                        let px = cx + col;
+                        if px < 0 || px >= ww { continue; }
+                        let off = ((py * ww + px) * 4) as usize;
+                        if off + 4 > win.pixels.len() { continue; }
+                        let bit = (glyph_byte >> (7 - col)) & 1 != 0;
+                        win.pixels[off..off + 4].copy_from_slice(if bit { &fg_bgra } else { &bg_bgra });
+                    }
+                }
+                cx += FW;
+            }
+        }
+    });
+}
+
+/// Composite a window-local BGRA source rectangle into `w.pixels`.
+///
+/// `src` is a tightly packed BGRA buffer of `src_w × src_h` pixels; the region
+/// `[(0,0)..(rw,rh)]` of `src` is placed at window-local `(dx,dy)`.  `op` is the
+/// X Render PictOp: SRC/CLEAR copy the source; OVER (and any other value, which
+/// the X Render protocol treats here as the default OVER for our purposes)
+/// performs straight-alpha Porter-Duff "over" using the source alpha channel.
+/// Both source and destination are clipped to their respective bounds.
+fn window_composite_pixels(
+    fd: u64, win_id: u32,
+    dx: i32, dy: i32, rw: i32, rh: i32,
+    src: &[u8], src_w: i32, src_h: i32, op: u8,
+) {
+    if rw <= 0 || rh <= 0 || src_w <= 0 || src_h <= 0 { return; }
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.ensure_pixels();
+            let ww = win.width as i32;
+            let wh = win.height as i32;
+            for row in 0..rh {
+                let py = dy + row;
+                if py < 0 || py >= wh || row >= src_h { continue; }
+                for col in 0..rw {
+                    let px = dx + col;
+                    if px < 0 || px >= ww || col >= src_w { continue; }
+                    let so = ((row * src_w + col) * 4) as usize;
+                    let do_ = ((py * ww + px) * 4) as usize;
+                    if so + 4 > src.len() || do_ + 4 > win.pixels.len() { continue; }
+                    let sa = src[so + 3] as u32;
+                    match op {
+                        proto::RENDER_OP_SRC | proto::RENDER_OP_CLEAR => {
+                            win.pixels[do_..do_ + 4].copy_from_slice(&src[so..so + 4]);
+                        }
+                        // RENDER_OP_OVER and default: straight-alpha "over".
+                        _ => {
+                            if sa == 255 {
+                                win.pixels[do_..do_ + 4].copy_from_slice(&src[so..so + 4]);
+                            } else if sa > 0 {
+                                let ia = 255 - sa;
+                                win.pixels[do_]     = ((src[so]     as u32 * sa + win.pixels[do_]     as u32 * ia) / 255) as u8;
+                                win.pixels[do_ + 1] = ((src[so + 1] as u32 * sa + win.pixels[do_ + 1] as u32 * ia) / 255) as u8;
+                                win.pixels[do_ + 2] = ((src[so + 2] as u32 * sa + win.pixels[do_ + 2] as u32 * ia) / 255) as u8;
+                                win.pixels[do_ + 3] = (sa + win.pixels[do_ + 3] as u32 * ia / 255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ── CreateWindow (1) ──────────────────────────────────────────────────────────
@@ -823,6 +1008,47 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
             }
             crate::serial_println!("[X11] MapWindow {:#x} {}x{}+{},{}", wid, width, height, x, y);
         } else { c.send_error(proto::ERR_WINDOW, wid, proto::OP_MAP_WINDOW); }
+    });
+}
+
+// ── MapSubwindows (9) ─────────────────────────────────────────────────────────
+//
+// Map every unmapped child of `parent` in bottom-to-top order, as required by
+// the X11 core protocol: toolkits (libXt's XtRealizeWidget, GTK) map the
+// container then call MapSubwindows to map the leaf widget windows.  Each newly
+// mapped child gets its pixel buffer allocated and, per its event mask, a
+// MapNotify and an initial Expose so the client paints it.
+fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 8 { return; }
+    let parent = r32(data, 4);
+    with_client(fd, |c| {
+        // Collect child ids first (avoid borrowing the resource table mutably
+        // while iterating it).  Children are windows whose `parent` field
+        // matches; the protocol maps them bottom-to-top, i.e. in stacking order
+        // — our resource table preserves creation order which suffices here.
+        let mut children: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for r in c.resources.entries.iter().filter_map(|s| s.as_ref()) {
+            if let ResourceBody::Window(ref w) = r.body {
+                if w.parent == parent && !w.mapped {
+                    children.push(r.id);
+                }
+            }
+        }
+        for &cid in &children {
+            if let Some(w) = c.resources.get_window_mut(cid) {
+                let (x, y, width, height, evmask) = (w.x, w.y, w.width, w.height, w.event_mask);
+                w.mapped = true;
+                w.ensure_pixels();
+                if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+                    c.send(&event::encode_map_notify(seq, cid));
+                }
+                if evmask & proto::EVENT_MASK_EXPOSURE != 0 {
+                    c.send(&event::encode_expose(seq, cid, x, y, width, height));
+                }
+                crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}+{},{}",
+                    cid, parent, width, height, x, y);
+            }
+        }
     });
 }
 
@@ -1683,10 +1909,28 @@ fn op_clear_area(fd: u64, data: &[u8]) {
             }
         });
     } else {
-        let (wx, wy) = window_origin(fd, draw);
-        let pw = if w == 0 { proto::SCREEN_WIDTH as i32 } else { w };
-        let ph = if h == 0 { proto::SCREEN_HEIGHT as i32 } else { h };
-        crate::gdi::fill_rect_screen(wx + x, wy + y, pw, ph, 0x000000);
+        // ClearArea on a window resets the region to the window's background.
+        // w/h == 0 means "to the right/bottom edge of the window" per the X11
+        // core protocol; we clamp to the window bounds inside window_fill_pixels.
+        let (bg_bgra, full_w, full_h) = {
+            let srv = SERVER.lock();
+            srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+                .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
+                    .find(|r| r.id == draw)
+                    .and_then(|r| if let ResourceBody::Window(ref win) = r.body {
+                        let bg = win.background_pixel;
+                        Some(([
+                            (bg & 0xFF) as u8,         // B
+                            ((bg >> 8) & 0xFF) as u8,  // G
+                            ((bg >> 16) & 0xFF) as u8, // R
+                            0xFF,
+                        ], win.width as i32, win.height as i32))
+                    } else { None }))
+                .unwrap_or(([0, 0, 0, 0xFF], 0, 0))
+        };
+        let pw = if w == 0 { full_w } else { w };
+        let ph = if h == 0 { full_h } else { h };
+        window_fill_pixels(fd, draw, x, y, pw, ph, bg_bgra);
     }
 }
 
@@ -1781,8 +2025,12 @@ fn op_copy_area(fd: u64, data: &[u8]) {
             });
         }
         (true, false) => {
-            // pixmap → window: blit to screen
-            let pixels: alloc::vec::Vec<u8> = {
+            // pixmap → window: copy into the window's persistent pixel buffer
+            // (the compositor source of truth), NOT the transient screen
+            // backbuffer.  Build a tightly packed BGRA buffer of the clipped
+            // source rectangle and record the clip offset so the copy lands at
+            // the correct window-local position.
+            let (pixels, rw, rh, off_x, off_y) = {
                 let srv = SERVER.lock();
                 let c = srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd);
                 match c.and_then(|c| c.resources.get_pixmap(src_id)) {
@@ -1802,15 +2050,18 @@ fn op_copy_area(fd: u64, data: &[u8]) {
                                 buf[bo..bo+4].copy_from_slice(&p.pixels[so..so+4]);
                             }
                         }
-                        buf
+                        // Window-local destination shifts by the amount the
+                        // source origin was clipped (x0 - src_x, y0 - src_y).
+                        (buf, rw as i32, rh as i32, x0 - src_x, y0 - src_y)
                     }
                     None => return,
                 }
             };
-            let (wx, wy) = window_origin(fd, dst_id);
-            crate::gdi::blit_pixels_screen(
-                wx + dst_x, wy + dst_y,
-                width as u32, height as u32, &pixels);
+            // CopyArea is a plain copy (RENDER_OP_SRC) of opaque pixels.
+            window_composite_pixels(
+                fd, dst_id,
+                dst_x + off_x, dst_y + off_y, rw, rh,
+                &pixels, rw, rh, proto::RENDER_OP_SRC);
         }
         _ => {} // window→* not supported
     }
@@ -1928,8 +2179,13 @@ fn op_put_image(fd: u64, data: &[u8]) {
             }
         });
     } else {
-        let (wx, wy) = window_origin(fd, draw);
-        crate::gdi::blit_pixels_screen(wx+dx, wy+dy, width, height, &data[24..24+px_len]);
+        // PutImage into a window writes the window's persistent pixel buffer
+        // (compositor source of truth), not the transient screen backbuffer.
+        // ZPixmap data is a packed width×height BGRA image; a plain copy.
+        window_composite_pixels(
+            fd, draw, dx, dy, width as i32, height as i32,
+            &data[24..24 + px_len], width as i32, height as i32,
+            proto::RENDER_OP_SRC);
     }
 }
 
@@ -1944,11 +2200,16 @@ fn op_image_text8(fd: u64, data: &[u8]) {
     let (fg,bg) = SERVER.lock().clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd)
         .and_then(|c| c.resources.get_gc_mut(gcid).map(|g| (g.foreground,g.background)))
         .unwrap_or((0,0xFFFFFF));
-    let (wx, wy) = window_origin(fd, draw);
-    crate::gdi::draw_text_screen(wx+tx, wy+ty, text, fg & 0xFFFFFF, bg & 0xFFFFFF);
+    // ImageText8 into a window writes the window's persistent pixel buffer
+    // (compositor source of truth), not the transient screen backbuffer.
+    // Coordinates are window-local; w.pixels is the window-local surface.
+    window_draw_text_pixels(fd, draw, tx, ty, text, fg & 0xFFFFFF, bg & 0xFFFFFF);
 }
 
 /// Return the (x,y) screen-space origin of a window resource, or (0,0).
+/// Retained for window→screen coordinate mapping; window-destination draw ops
+/// now render into the window-local `w.pixels` surface and no longer need it.
+#[allow(dead_code)]
 fn window_origin(fd: u64, draw: u32) -> (i32, i32) {
     SERVER.lock().clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
         .and_then(|c| {
@@ -2368,8 +2629,10 @@ fn op_render_composite(fd: u64, data: &[u8]) {
             }
         });
     } else {
-        // dst is a window — blit to screen
-        // Build the output BGRA buffer
+        // dst is a window — composite into the window's persistent pixel buffer
+        // (compositor source of truth), preserving the PictOp.  Build a packed
+        // width×height BGRA buffer (alpha carried from the source picture) so
+        // the OVER blend in window_composite_pixels has correct per-pixel alpha.
         let mut out = alloc::vec![0u8; (width * height * 4) as usize];
         for row in 0..height {
             let sy = src_y + row;
@@ -2382,8 +2645,9 @@ fn op_render_composite(fd: u64, data: &[u8]) {
                 out[oo..oo+4].copy_from_slice(&src_pixels[so..so+4]);
             }
         }
-        let (wx, wy) = window_origin(fd, dst_draw);
-        crate::gdi::blit_pixels_screen(wx + dst_x, wy + dst_y, width as u32, height as u32, &out);
+        window_composite_pixels(
+            fd, dst_draw, dst_x, dst_y, width, height,
+            &out, width, height, op);
     }
 }
 
@@ -2446,9 +2710,15 @@ fn op_render_fill_rectangles(fd: u64, data: &[u8]) {
                 }
             });
         } else {
-            let (wx, wy) = window_origin(fd, dst_draw);
-            let rgb = ((cr as u32) << 16) | ((cg as u32) << 8) | (cb as u32);
-            crate::gdi::fill_rect_screen(wx + rx, wy + ry, rw, rh, rgb);
+            // RENDER fill into a window writes the window's persistent pixel
+            // buffer (compositor source of truth), not the screen backbuffer.
+            // CLEAR yields fully transparent black; any other op fills the
+            // solid colour with its alpha.
+            let bgra = match op {
+                proto::RENDER_OP_CLEAR => [0u8, 0, 0, 0],
+                _ => [cb, cg, cr, ca],
+            };
+            window_fill_pixels(fd, dst_draw, rx, ry, rw, rh, bgra);
         }
     }
 }
@@ -3288,8 +3558,8 @@ fn op_render_composite_glyphs(fd: u64, data: &[u8], elem_size: u8) {
             }
         });
     } else {
-        // Window destination — blit composite to screen framebuffer
-        let (wx, wy) = window_origin(fd, dst_draw);
+        // Window destination — composite glyphs into the window's persistent
+        // pixel buffer (compositor source of truth), not the screen backbuffer.
         // Find bounding box of all glyphs
         let (mut min_x, mut min_y, mut max_x, mut max_y) =
             (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -3324,6 +3594,8 @@ fn op_render_composite_glyphs(fd: u64, data: &[u8], elem_size: u8) {
                 }
             }
         }
-        crate::gdi::blit_pixels_screen(wx + min_x, wy + min_y, bw as u32, bh as u32, &out);
+        window_composite_pixels(
+            fd, dst_draw, min_x, min_y, bw as i32, bh as i32,
+            &out, bw as i32, bh as i32, proto::RENDER_OP_OVER);
     }
 }

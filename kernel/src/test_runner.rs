@@ -18472,12 +18472,12 @@ fn test_x11_render_draw() -> bool {
     test_println!("  CreatePixmap + CreatePicture(pixmap) sent ✓");
 
     // ── RenderFillRectangles: fill 16x16 at (0,0) with opaque red ────────────
-    // [0]=RENDER_MAJOR [1]=22 [2-3]=7 [4]=OP_OVER [8-11]=pic_id
+    // [0]=RENDER_MAJOR [1]=26(FillRectangles) [2-3]=7 [4]=OP_OVER [8-11]=pic_id
     // [12-13]=R=0xFF00 [14-15]=G=0 [16-17]=B=0 [18-19]=A=0xFF00
     // [20-21]=x=0 [22-23]=y=0 [24-25]=w=16 [26-27]=h=16
     let mut rfr = [0u8; 28];
     rfr[0] = crate::x11::proto::RENDER_MAJOR_OPCODE;
-    rfr[1] = 22; rfr[2] = 7;
+    rfr[1] = crate::x11::proto::RENDER_FILL_RECTANGLES; rfr[2] = 7;
     rfr[4] = crate::x11::proto::RENDER_OP_OVER;
     rfr[8..12].copy_from_slice(&PIC_ID.to_le_bytes());
     rfr[12..14].copy_from_slice(&0xFF00u16.to_le_bytes()); // red
@@ -18514,6 +18514,44 @@ fn test_x11_render_draw() -> bool {
     crate::net::unix::write(client, &rc);
     crate::x11::poll();
     test_println!("  RenderComposite(pixmap→window, 16x16) sent ✓");
+
+    // ── Regression: window-destination RENDER Composite must land in the
+    //    window's persistent pixel buffer (w.pixels), the compositor source of
+    //    truth — NOT the transient screen backbuffer (which compose() erases).
+    //    Map the window first so the compositor would consume it, then assert
+    //    the composited red pixels are present and SURVIVE a compose() tick. ──
+    let mut mw = [0u8; 8];
+    mw[0] = 8; mw[2] = 2; // MapWindow
+    mw[4..8].copy_from_slice(&WIN_ID.to_le_bytes());
+    crate::net::unix::write(client, &mw);
+    crate::x11::poll();
+
+    // The pixmap was filled opaque red (0xFF0000) over the window; in BGRA the
+    // composited pixel at window-local (4,4) must be [B=0, G=0, R=0xFF, A=0xFF].
+    let before = crate::x11::test_read_window_pixel(WIN_ID, 4, 4);
+    match before {
+        Some([0, 0, 0xFF, 0xFF]) => {
+            test_println!("  RENDER Composite landed in w.pixels (red) ✓");
+        }
+        other => {
+            test_fail!("x11_render_d",
+                "RENDER Composite did NOT reach w.pixels: got {:?} (expected red BGRA)", other);
+            crate::net::unix::close(client);
+            return false;
+        }
+    }
+
+    // Drive one compositor frame: compose() refills the root gradient and
+    // re-blits each mapped window's w.pixels. The window pixel must persist.
+    crate::gui::compositor::compose();
+    let after = crate::x11::test_read_window_pixel(WIN_ID, 4, 4);
+    if after != Some([0, 0, 0xFF, 0xFF]) {
+        test_fail!("x11_render_d",
+            "window pixel did not SURVIVE compose() tick: got {:?} (expected red BGRA)", after);
+        crate::net::unix::close(client);
+        return false;
+    }
+    test_println!("  window content survived compose() tick ✓");
 
     // ── FreePicture × 2, FreePixmap ──────────────────────────────────────────
     let mut fp = [0u8; 8];
