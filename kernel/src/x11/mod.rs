@@ -136,6 +136,21 @@ impl Server {
 unsafe impl Send for Server {}
 static SERVER: Mutex<Server> = Mutex::new(Server::new());
 
+// Present-path opcode counters (diagnostic).  Incremented in the request
+// dispatcher to answer the "which present path does the client use?" question
+// at runtime without flooding the serial log.  Read via x11::present_counts().
+use core::sync::atomic::{AtomicU64, Ordering as PresentOrdering};
+static N_PUT_IMAGE:     AtomicU64 = AtomicU64::new(0);
+static N_COPY_AREA:     AtomicU64 = AtomicU64::new(0);
+static N_SHM_PUT_IMAGE: AtomicU64 = AtomicU64::new(0);
+
+/// (core PutImage, core CopyArea, MIT-SHM ShmPutImage) request counts.
+pub fn present_counts() -> (u64, u64, u64) {
+    (N_PUT_IMAGE.load(PresentOrdering::Relaxed),
+     N_COPY_AREA.load(PresentOrdering::Relaxed),
+     N_SHM_PUT_IMAGE.load(PresentOrdering::Relaxed))
+}
+
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 
 #[inline] fn r16(b: &[u8], o: usize) -> u16  { proto::read_u16le(b, o) }
@@ -606,7 +621,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_COPY_GC               => op_copy_gc(fd, data),
         proto::OP_FREE_GC               => op_free_gc(fd, data),
         proto::OP_CLEAR_AREA            => op_clear_area(fd, data),
-        proto::OP_COPY_AREA             => op_copy_area(fd, data),
+        proto::OP_COPY_AREA             => { N_COPY_AREA.fetch_add(1, PresentOrdering::Relaxed); op_copy_area(fd, data) }
         proto::RENDER_MAJOR_OPCODE      => op_render(fd, data, seq),
         proto::SHM_MAJOR_OPCODE        => op_shm(fd, data, seq),
         proto::BIGREQ_MAJOR_OPCODE     => op_bigreq(fd, data, seq),
@@ -634,7 +649,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_FILL_POLY             => {}
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
         proto::OP_POLY_FILL_ARC         => {}
-        proto::OP_PUT_IMAGE             => op_put_image(fd, data),
+        proto::OP_PUT_IMAGE             => { N_PUT_IMAGE.fetch_add(1, PresentOrdering::Relaxed); op_put_image(fd, data) }
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
         proto::OP_IMAGE_TEXT16          => {}
         proto::OP_CREATE_COLORMAP       => {}
@@ -1924,7 +1939,14 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     let name = if data.len() >= 8+nlen { core::str::from_utf8(&data[8..8+nlen]).unwrap_or("") } else { "" };
     let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
     match name {
-        "MIT-SHM"        => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
+        // MIT-SHM is intentionally reported as NOT present.  This server has no
+        // shared-memory transport for ShmPutImage, so a client that negotiated
+        // MIT-SHM would push every frame into a segment we cannot read and the
+        // window would stay blank.  Per the MIT-SHM extension spec a client must
+        // fall back to core XPutImage when the extension is absent, which routes
+        // pixels inline through the protocol stream where PutImage(72) actually
+        // blits them.  X11 core protocol §QueryExtension: present=0 ⇒ absent.
+        "MIT-SHM"        => {} // not present
         "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE; b[10]=0; b[11]=0; }
         "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=0; b[11]=0; }
         "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
@@ -1947,8 +1969,10 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
 // ── ListExtensions (99) ──────────────────────────────────────────────────────
 
 fn op_list_extensions(fd: u64, seq: u16) {
+    // MIT-SHM is deliberately omitted — see op_query_extension; the server has
+    // no shared-memory transport, so clients must use core XPutImage instead.
     let names: &[&[u8]] = &[
-        b"MIT-SHM", b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
+        b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
         b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
         b"DPMS", b"SYNC", b"COMPOSITE", b"RANDR",
     ];
@@ -2393,7 +2417,7 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
         // SHM_ATTACH / SHM_DETACH: side-effect, accept silently
         proto::SHM_ATTACH | proto::SHM_DETACH => {}
         // SHM_PUT_IMAGE: stub — no real shared memory backing
-        proto::SHM_PUT_IMAGE => {}
+        proto::SHM_PUT_IMAGE => { N_SHM_PUT_IMAGE.fetch_add(1, PresentOrdering::Relaxed); }
         // SHM_GET_IMAGE: return unimplemented error
         proto::SHM_GET_IMAGE => {
             with_client(fd, |c| c.send_error(proto::ERR_IMPLEMENTATION, 0, proto::SHM_MAJOR_OPCODE));

@@ -991,6 +991,11 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_extensions() { passed += 1; }
 
+    // ── Test 75b: MIT-SHM absent → core PutImage present path ────────────────
+
+    total += 1;
+    if test_x11_shm_absent_core_present() { passed += 1; }
+
     // ── Test 76: SIGSEGV signal handler infrastructure ────────────────────────
 
     total += 1;
@@ -20631,6 +20636,114 @@ fn test_x11_extensions() -> bool {
 
     crate::net::unix::close(cfd);
     test_pass!("X11 extension handlers — SHM / XFIXES / DAMAGE / XI2");
+    true
+}
+
+// ── Test 75b: MIT-SHM is reported absent → clients fall back to core present ───
+// The server has no shared-memory transport for ShmPutImage, so it must NOT
+// advertise MIT-SHM via QueryExtension (X11 core protocol §QueryExtension): a
+// client that negotiated it would push frames into a segment the server cannot
+// read and the window would stay blank.  Per the MIT-SHM extension spec a
+// client must use core XPutImage when the extension is absent, which the
+// counter half of this test confirms reaches op_put_image.
+fn test_x11_shm_absent_core_present() -> bool {
+    test_header!("X11 MIT-SHM reported absent → core PutImage present path");
+
+    let client = crate::net::unix::create(
+        crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX {
+        test_fail!("x11_shm_absent", "unix::create() failed");
+        return false;
+    }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+            crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_shm_absent", "connect failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_shm_absent", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+
+    // ── QueryExtension("MIT-SHM") must report present=0 ──────────────────────
+    // name="MIT-SHM" (7 bytes + 1 pad = 8); total = 16 bytes = 4 words.
+    let mut qe = [0u8; 16];
+    qe[0] = 98;   // OP_QUERY_EXTENSION
+    qe[2] = 4;    // request length = 4 words
+    qe[4] = 7;    // name length = 7
+    qe[8..15].copy_from_slice(b"MIT-SHM");
+    crate::net::unix::write(client, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(client, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_shm_absent", "QueryExtension reply bad (n={} b0={})", n, rep[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+    if rep[8] != 0 {
+        test_fail!("x11_shm_absent", "MIT-SHM present={} (expected 0/absent)", rep[8]);
+        crate::net::unix::close(client);
+        return false;
+    }
+    test_println!("  QueryExtension(MIT-SHM) → present=0 ✓");
+
+    // ── A core PutImage(72) to a mapped window must reach op_put_image ────────
+    // Create a small window, map it, and PutImage a 2×2 ZPixmap.  The present
+    // counter (x11::present_counts) must observe the core PutImage so we know
+    // the XPutImage fallback path is live for clients that lost MIT-SHM.
+    let (pi_before, _, _) = crate::x11::present_counts();
+    // Client id-base is 0x0040_0000 (echoed in the setup reply); 0x0040_0055 is
+    // a valid client-allocated XID for this connection.
+    let wid: u32 = 0x0040_0055;
+    // CreateWindow(1): depth=24, wid, parent=root, x=0 y=0 w=2 h=2, bw=0,
+    // class=InputOutput(1), visual=root, value-mask=0 → 8 words = 32 bytes.
+    let mut cw = [0u8; 32];
+    cw[0] = 1; cw[1] = crate::x11::proto::ROOT_DEPTH; cw[2] = 8; // len = 8 words
+    cw[4..8].copy_from_slice(&wid.to_le_bytes());
+    cw[8..12].copy_from_slice(&crate::x11::proto::ROOT_WINDOW_ID.to_le_bytes());
+    cw[20..22].copy_from_slice(&2u16.to_le_bytes()); // width
+    cw[22..24].copy_from_slice(&2u16.to_le_bytes()); // height
+    cw[26] = 1; // class = InputOutput
+    crate::net::unix::write(client, &cw);
+    // MapWindow(8): wid → 2 words = 8 bytes.
+    let mut mw = [0u8; 8];
+    mw[0] = 8; mw[2] = 2;
+    mw[4..8].copy_from_slice(&wid.to_le_bytes());
+    crate::net::unix::write(client, &mw);
+    crate::x11::poll();
+    // PutImage(72): ZPixmap (format=2), drawable=wid, gc unused here, w=2 h=2,
+    // dst-x=0 dst-y=0, left-pad=0, depth=24; header = 24 bytes, then 2×2×4 = 16
+    // pixel bytes → total 40 bytes = 10 words.
+    let mut pimg = [0u8; 40];
+    pimg[0] = 72; pimg[1] = 2; // ZPixmap
+    pimg[2] = 10;              // request length = 10 words
+    pimg[4..8].copy_from_slice(&wid.to_le_bytes());
+    pimg[12..14].copy_from_slice(&2u16.to_le_bytes()); // width
+    pimg[14..16].copy_from_slice(&2u16.to_le_bytes()); // height
+    pimg[21] = crate::x11::proto::ROOT_DEPTH;           // depth = 24
+    // pixels (BGRA) zero-filled is fine — we only assert the op was dispatched.
+    crate::net::unix::write(client, &pimg);
+    crate::x11::poll();
+    let (pi_after, _, _) = crate::x11::present_counts();
+    if pi_after <= pi_before {
+        test_fail!("x11_shm_absent",
+            "core PutImage not dispatched (before={} after={})", pi_before, pi_after);
+        crate::net::unix::close(client);
+        return false;
+    }
+    test_println!("  core PutImage(72) dispatched: {} → {} ✓", pi_before, pi_after);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 MIT-SHM absent → core PutImage present path");
     true
 }
 
