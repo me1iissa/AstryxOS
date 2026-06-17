@@ -109,6 +109,12 @@ impl Pipe {
         self.writers == 0
     }
 
+    /// Check if every read end is closed.  A blocking `write(2)` on such a
+    /// pipe must fail with `EPIPE` rather than park forever (man 2 write).
+    pub fn reader_closed(&self) -> bool {
+        self.readers == 0
+    }
+
     /// Available bytes (count of unread data).
     pub fn available(&self) -> usize {
         self.count
@@ -119,6 +125,13 @@ impl Pipe {
         PIPE_BUF_SIZE - self.count
     }
 }
+
+/// Atomic-write threshold per POSIX `pipe(7)` / `PIPE_BUF`: writes of at most
+/// this many bytes to a pipe are guaranteed to be delivered atomically (never
+/// interleaved with another writer and never split into a short write on a
+/// blocking fd).  Exposed so the `write(2)` syscall layer can enforce the
+/// all-or-block contract.
+pub const PIPE_BUF: usize = PIPE_BUF_SIZE;
 
 /// Global pipe table.
 static PIPE_TABLE: Mutex<Vec<Pipe>> = Mutex::new(Vec::new());
@@ -169,6 +182,26 @@ pub fn pipe_write(pipe_id: u64, data: &[u8]) -> Option<usize> {
     let mut pipes = PIPE_TABLE.lock();
     let pipe = pipes.iter_mut().find(|p| p.id == pipe_id)?;
     Some(pipe.write(data))
+}
+
+/// True if every read end of `pipe_id` is closed (or the pipe no longer
+/// exists).  Drives the `EPIPE` decision in the blocking-write path so a
+/// writer that filled the buffer and then lost its reader fails per
+/// `man 2 write` instead of parking forever.
+pub fn pipe_reader_closed(pipe_id: u64) -> bool {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.reader_closed())
+        .unwrap_or(true)
+}
+
+/// Free space (bytes) remaining in `pipe_id`'s ring buffer, or 0 if the pipe
+/// no longer exists.  Used by the blocking-write atomicity check.
+pub fn pipe_space(pipe_id: u64) -> usize {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.space())
+        .unwrap_or(0)
 }
 
 /// Increment the writer count (e.g. when a second fd aliases the write-end).

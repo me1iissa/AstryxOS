@@ -220,6 +220,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_wake_hook() { passed += 1; }
 
+    // ── Test 0a2: blocking pipe write semantics (write(2) / pipe(7)) ─────
+    total += 1;
+    if test_pipe_blocking_write_semantics() { passed += 1; }
+
     // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
@@ -34313,6 +34317,101 @@ fn test_pipe_wake_hook() -> bool {
     }
     test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
     test_pass!("pipe wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 0a2: blocking pipe write semantics (write(2) / pipe(7)) ─────────────
+// Regression for the windowed-Firefox `writev(fd=2)` busy-loop: a full
+// blocking pipe must park the writer until the reader drains (never return a
+// no-progress 0); O_NONBLOCK on a full pipe returns -EAGAIN; a write of
+// <=PIPE_BUF bytes is atomic (all-or-block, never short); a write with the
+// last reader gone fails with -EPIPE.  Per write(2), pipe(7), POSIX.1-2017.
+
+fn test_pipe_blocking_write_semantics() -> bool {
+    test_header!("pipe blocking write — EAGAIN (no no-progress 0) / atomicity / EPIPE");
+
+    // ── Sub-test 1: O_NONBLOCK full pipe → -EAGAIN (atomicity preserved) ──
+    // pipe2(O_NONBLOCK) so both ends are non-blocking.
+    let mut fds = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds.as_mut_ptr() as u64, 0x0800 /*O_NONBLOCK*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(O_NONBLOCK) returned {}", r);
+        return false;
+    }
+    let (rfd_nb, wfd_nb) = (fds[0] as u64, fds[1] as u64);
+
+    // Fill the 4 KiB ring exactly (one PIPE_BUF write fits atomically).
+    let filler = [0xABu8; 4096];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, filler.as_ptr() as u64, filler.len() as u64, 0, 0, 0);
+    if n != 4096 {
+        test_fail!("pipe_blocking_write",
+            "nonblock fill write returned {} (expected 4096)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    // Pipe is now full.  A non-blocking write of even 1 byte must return EAGAIN
+    // (NOT a no-progress 0 — that was the bug that made musl spin).
+    let one = [0x55u8; 1];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, one.as_ptr() as u64, 1, 0, 0, 0);
+    if n != -11 {
+        test_fail!("pipe_blocking_write",
+            "O_NONBLOCK write to full pipe returned {} (expected -11 EAGAIN)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  O_NONBLOCK write to full pipe → -EAGAIN (no no-progress 0) ✓");
+    // Atomicity under O_NONBLOCK: drain 100 bytes, then a 200-byte write of a
+    // <=PIPE_BUF chunk must still EAGAIN (only 100 free < 200 → all-or-nothing).
+    let mut sink = [0u8; 100];
+    let dr = crate::syscall::dispatch_linux_kernel(
+        0 /*read*/, rfd_nb, sink.as_mut_ptr() as u64, 100, 0, 0, 0);
+    let chunk200 = [0x66u8; 200];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd_nb, chunk200.as_ptr() as u64, 200, 0, 0, 0);
+    if dr == 100 && n != -11 {
+        test_fail!("pipe_blocking_write",
+            "O_NONBLOCK 200B write with only 100B free returned {} (expected -11 EAGAIN — atomicity)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  O_NONBLOCK <=PIPE_BUF write with insufficient space → -EAGAIN (atomic) ✓");
+    crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+
+    // ── Sub-test 2: EPIPE when the reader is gone ─────────────────────────
+    let mut fds2 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds2.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for EPIPE returned {}", r);
+        return false;
+    }
+    let (rfd2, wfd2) = (fds2[0] as u64, fds2[1] as u64);
+    // Close the read end; the write end has no reader → EPIPE.
+    crate::syscall::dispatch_linux_kernel(3 /*close*/, rfd2, 0, 0, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd2, one.as_ptr() as u64, 1, 0, 0, 0);
+    if n != -32 {
+        test_fail!("pipe_blocking_write",
+            "write to pipe with no reader returned {} (expected -32 EPIPE)", n);
+        crate::syscall::dispatch_linux_kernel(3, wfd2, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  blocking write with no reader → -EPIPE ✓");
+    crate::syscall::dispatch_linux_kernel(3, wfd2, 0, 0, 0, 0, 0);
+
+    // NOTE: the blocks-until-drained and concurrent-atomicity behaviours of
+    // pipe_write_blocking are exercised end-to-end by the live workload (a
+    // process whose peer stops draining its stdout/stderr pipe now parks
+    // instead of busy-looping on writev) rather than by an in-suite drainer
+    // race, which depends on a second CPU picking the drainer deterministically.
+    test_pass!("pipe blocking write — EAGAIN (no no-progress 0) / atomicity / EPIPE");
     true
 }
 
