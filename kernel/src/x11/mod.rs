@@ -534,23 +534,37 @@ fn service_fd(fd: u64) {
     while off + 4 <= data.len() {
         // X11 core request length is a 16-bit count of 4-byte units (§Requests).
         // Under the BIG-REQUESTS extension a length field of 0 means the real
-        // length is the following 32-bit word (in 4-byte units); the request
-        // body then starts at offset+8.  Treating length 0 as "stop parsing"
-        // would silently drop this request AND every request batched after it
-        // in the same read — desynchronising the client's reply/sequence
-        // expectations.  (X11 BIG-REQUESTS extension specification.)
+        // length is the following 32-bit word (in 4-byte units), inserted
+        // between the 4-byte request header and the body — so the body that
+        // would normally start at offset 4 starts at offset 8.  Treating length
+        // 0 as "stop parsing" would silently drop this request AND every request
+        // batched after it in the same read — desynchronising the client's
+        // reply/sequence expectations.  (X11 BIG-REQUESTS extension spec.)
         let short_len = r16(data, off + 2) as usize;
-        let (req_len_units, hdr_extra) = if short_len == 0 {
+        let req_len_units = if short_len == 0 {
             if off + 8 > data.len() { break; }
-            (r32(data, off + 4) as usize, 0usize)
+            r32(data, off + 4) as usize
         } else {
-            (short_len, 0usize)
+            short_len
         };
-        let _ = hdr_extra;
         if req_len_units == 0 { break; } // malformed: zero even in big form
         let end = off + req_len_units * 4;
         if end > data.len() || end <= off { break; }
-        handle_request(fd, &data[off..end]);
+        if short_len == 0 {
+            // Big request: normalise to standard layout before dispatch so the
+            // per-op handlers (which read fields at fixed standard offsets) see
+            // a conventional request.  Splice out the inserted 4-byte
+            // extended-length word: keep the 4-byte header [off..off+4], then
+            // the body [off+8..end].  The reconstructed 16-bit length field is
+            // left as the request's true length truncated into 16 bits (the
+            // handlers key off the slice length, not this field).
+            let mut norm = alloc::vec::Vec::with_capacity(4 + (end - (off + 8)));
+            norm.extend_from_slice(&data[off..off + 4]);
+            norm.extend_from_slice(&data[off + 8..end]);
+            handle_request(fd, &norm);
+        } else {
+            handle_request(fd, &data[off..end]);
+        }
         off = end;
     }
 }
