@@ -110,7 +110,9 @@ pub fn dispatch(
                 // the guard scope.
                 let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
                 let buf = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, count) };
-                match crate::ipc::pipe::pipe_read(pipe_id, buf) {
+                // Wake any writer parked for buffer space once this read frees
+                // it (POSIX `write(2)` blocking semantics; `man 7 pipe`).
+                match crate::ipc::pipe::pipe_read_and_wake(pipe_id, buf) {
                     Some(n) => n as i64,
                     None => -9, // EBADF
                 }

@@ -81,6 +81,15 @@ impl WaitList {
         }
     }
 
+    /// Test-only: push a raw `tid` onto the list without touching
+    /// `THREAD_TABLE`.  Lets the in-kernel test runner simulate a parked
+    /// waiter (for asserting wake/drain invariants) without a live Blocked
+    /// thread or a second CPU.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+    pub fn push_tid_raw(&mut self, tid: u64) {
+        self.tids.push(tid);
+    }
+
     /// Drain up to `max` parked TIDs and return them to the caller, who is
     /// expected to call `wake_tids` *after* dropping the outer wait-list
     /// lock.  Splitting drain-from-list and flip-thread-state into two

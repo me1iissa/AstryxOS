@@ -6194,7 +6194,10 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 .unwrap_or(false)
         };
         loop {
-            match crate::ipc::pipe::pipe_read(pipe_id, buf) {
+            // `pipe_read_and_wake` drains the pipe AND wakes any writer parked
+            // for buffer space (POSIX `write(2)` blocking semantics — a reader
+            // that frees space must notify the parked writer; see `man 7 pipe`).
+            match crate::ipc::pipe::pipe_read_and_wake(pipe_id, buf) {
                 None => return -9, // EBADF — pipe vanished (both ends closed).
                 Some(n) if n > 0 => return n as i64,
                 Some(_) => {
@@ -6679,20 +6682,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
         if is_pipe {
             let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
-            return match crate::ipc::pipe::pipe_write(pipe_id, data) {
-                Some(n) => {
-                    // Per `man 7 pipe`: writes that deposit data MUST wake
-                    // any readers parked on this pipe (the matching wait
-                    // list lives in `crate::ipc::pipe::PIPE_READ_WAITERS`).
-                    // Skip the wake on a zero-byte write — the buffer state
-                    // did not change.
-                    if n > 0 {
-                        crate::ipc::pipe::wake_readers_all(pipe_id);
-                    }
-                    n as i64
-                }
-                None => -9,
-            };
+            return pipe_write_blocking(pid, fd as usize, pipe_id, data);
         }
         if is_unix {
             let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
@@ -6751,6 +6741,155 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     };
     crate::drivers::tty::TTY0.lock().write(&tty_snap);
     count as i64
+}
+
+/// True if `fd`'s status flags carry `O_NONBLOCK` (bit `0x0800`, Linux ABI).
+/// A missing fd is reported non-blocking so a vanished pipe never traps the
+/// writer in an indefinite park.
+fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter()
+        .find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd))
+        .and_then(|slot| slot.as_ref())
+        .map(|f| (f.flags & 0x0800) != 0)
+        .unwrap_or(true)
+}
+
+/// Blocking-aware pipe `write(2)`.
+///
+/// Implements the POSIX `write(2)` / `pipe(7)` contract that the prior
+/// one-shot `pipe_write` violated: it deposited whatever fit and returned
+/// immediately, so a full pipe yielded a no-progress `0` return and musl
+/// stdio / NSPR retried the same write forever — wedging a process on its
+/// first stderr line once the peer stopped draining the read end (the
+/// `writev(fd=2)` busy-loop seen on the windowed-Firefox boot, where the
+/// main thread never returns to its `poll()` and the X11 server therefore
+/// never drains, so no frame is ever presented).
+///
+///   * **Atomicity (`count <= PIPE_BUF`)** — delivered all in one piece or
+///     not at all.  On a blocking fd we park until `count` contiguous bytes
+///     of space exist, then write them in a single shot; a blocking fd never
+///     returns a short write for `count <= PIPE_BUF`.
+///   * **Large writes (`count > PIPE_BUF`)** — may be split: write what
+///     fits, wake readers, block for more space, continue.
+///   * **`O_NONBLOCK`** — if no progress can be made, return `-EAGAIN`; for
+///     `count <= PIPE_BUF` "progress" means the whole write fits.
+///   * **No reader (`EPIPE`)** — if every read end is closed the write fails
+///     with `-EPIPE` (SIGPIPE delivery is a separate pre-existing gap).
+///
+/// Blocking reuses the existing per-pipe writer wait list
+/// (`PIPE_WRITE_WAITERS`) via `pipe::wait_writable`.  No pipe lock is held
+/// across `schedule()`: `wait_writable` takes and drops
+/// `PIPE_TABLE`/`PIPE_WRITE_WAITERS` internally and its under-lock re-check
+/// closes the TOCTOU window against a reader drain that races our space
+/// check, so there is no lost wakeup and no hold-across-dispatch deadlock.
+///
+/// A parked writer is woken whenever a reader frees buffer space: every drain
+/// consumer reads through `pipe::pipe_read_and_wake`, which calls
+/// `wake_writers_all(pipe_id)` after a successful (`n > 0`) read.  The wired
+/// consumers are `sys_read_linux` (the `read(2)` pipe branch), the native
+/// Aether read path, and `gui::terminal::poll_output` (the in-kernel terminal
+/// that drains a child's stdout/stderr — the producer whose deadlock this
+/// edge prevents).  The fd-close paths (`pipe_close_reader` /
+/// `pipe_close_writer`) also call `wake_writers_all` so a writer that loses its
+/// reader wakes to observe `EPIPE`.
+///
+/// Refs: write(2), pipe(7), POSIX.1-2017 §write.
+fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {
+    let count = data.len();
+    // A zero-byte write to a pipe is a no-op returning 0 (write(2)).
+    if count == 0 {
+        return 0;
+    }
+    let nonblock = fd_is_nonblocking(pid, fd);
+    let atomic = count <= crate::ipc::pipe::PIPE_BUF;
+
+    let mut total: usize = 0;
+    loop {
+        // EPIPE if the reader is gone (write(2)).  Checked first so a writer
+        // that filled the buffer and then lost its reader fails rather than
+        // parking forever.
+        if crate::ipc::pipe::pipe_reader_closed(pipe_id) {
+            if total > 0 {
+                return total as i64;
+            }
+            return -32; // EPIPE
+        }
+
+        let space = crate::ipc::pipe::pipe_space(pipe_id);
+        let remaining = count - total;
+
+        // How much we may write THIS pass without violating atomicity:
+        //   * count <= PIPE_BUF: all-or-nothing — only when the whole
+        //     remaining (== count) fits.
+        //   * count  > PIPE_BUF: whatever fits, up to `remaining`.
+        let writable_now = if atomic {
+            if space >= remaining { remaining } else { 0 }
+        } else {
+            space.min(remaining)
+        };
+
+        if writable_now > 0 {
+            let chunk = &data[total..total + writable_now];
+            match crate::ipc::pipe::pipe_write(pipe_id, chunk) {
+                Some(n) => {
+                    if n > 0 {
+                        total += n;
+                        // Wake readers parked on an empty pipe (man 7 pipe).
+                        crate::ipc::pipe::wake_readers_all(pipe_id);
+                    }
+                    if total >= count {
+                        return total as i64;
+                    }
+                    // Partial (count > PIPE_BUF) — loop to write the rest.
+                    continue;
+                }
+                // Pipe vanished mid-write: EBADF if no progress, else partial.
+                None => {
+                    if total > 0 { return total as i64; }
+                    return -9; // EBADF
+                }
+            }
+        }
+
+        // No room to make progress this pass.
+        if nonblock {
+            // O_NONBLOCK: never block.  Nothing written → EAGAIN; a
+            // >PIPE_BUF write that already deposited bytes returns partial.
+            if total > 0 { return total as i64; }
+            return -11; // EAGAIN
+        }
+
+        // A signal arriving before ANY data is written aborts with EINTR;
+        // after partial progress on a large write, return the partial count.
+        if signal_pending(pid) {
+            if total > 0 { return total as i64; }
+            return -4; // EINTR
+        }
+
+        // Park atomically against the reader's `wake_writers_all`.  The lock
+        // order PIPE_WRITE_WAITERS -> PIPE_TABLE is taken and released
+        // entirely inside `wait_writable`; we hold no pipe lock across the
+        // `schedule()` below.
+        let tid = crate::proc::current_tid();
+        match crate::ipc::pipe::wait_writable(pipe_id, u64::MAX) {
+            // Space appeared (or the reader closed) between our check and the
+            // wait-list re-check — retry the loop, which re-evaluates
+            // reader-closed (EPIPE) and available space.
+            crate::ipc::pipe::WaitOutcome::Ready => continue,
+            // Pipe id no longer exists — EBADF if no progress, else partial.
+            crate::ipc::pipe::WaitOutcome::Gone => {
+                if total > 0 { return total as i64; }
+                return -9; // EBADF
+            }
+            crate::ipc::pipe::WaitOutcome::Enqueued => {
+                crate::sched::schedule();
+                // Drop any stale entry so we never leak a dead waiter.
+                crate::ipc::pipe::waiter_cleanup_writer(pipe_id, tid);
+            }
+        }
+    }
 }
 
 /// Linux open(pathname, flags, mode) — pathname is a C string.
