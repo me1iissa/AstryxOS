@@ -77,6 +77,16 @@ impl Client {
             crate::serial_println!("[X11REPLY] fd={} seq={} reply_len={} total={}",
                 self.fd, seq, extra, data.len());
         }
+        #[cfg(feature = "xeyes-test")]
+        if data.len() == 32 && data[0] != 1 {
+            // Event (type != 1 reply, != connection-setup) or Error (type 0).
+            // Log type + the window field for Expose/Map/Configure correlation.
+            let etype = data[0] & 0x7f;
+            let win = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let win2 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            crate::serial_println!("[X11EVT] fd={} type={} seq={} win={:#x} win2={:#x}",
+                self.fd, etype, u16::from_le_bytes([data[2], data[3]]), win, win2);
+        }
         unix::write(self.fd, data);
     }
     fn send_error(&self, code: u8, bad_id: u32, opcode: u8) {
@@ -679,20 +689,18 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::XKEYBOARD_MAJOR_OPCODE  => op_xkeyboard(fd, data, seq),
         proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
         proto::RANDR_MAJOR_OPCODE      => op_randr(fd, data, seq),
-        // Polygon / arc drawing ops.  Per X11 protocol §PolyArc /
-        // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint
-        // / §PolyRectangle — no reply, request data is (drawable, gc,
-        // [coords...]).  Minimal stub: accept and discard.  A future
-        // revision can rasterise into the drawable's pixel buffer for
-        // full visual fidelity.
-        proto::OP_POLY_POINT            => {}
-        proto::OP_POLY_LINE             => {}
-        proto::OP_POLY_SEGMENT          => {}
-        proto::OP_POLY_RECTANGLE        => {}
-        proto::OP_POLY_ARC              => {}
-        proto::OP_FILL_POLY             => {}
+        // Polygon / arc drawing ops.  Per X11 core protocol §PolyArc /
+        // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint /
+        // §PolyRectangle — no reply; the request carries (drawable, gc,
+        // [coords...]) and is rasterised into the drawable's pixel buffer.
+        proto::OP_POLY_POINT            => op_poly_point(fd, data),
+        proto::OP_POLY_LINE             => op_poly_line(fd, data),
+        proto::OP_POLY_SEGMENT          => op_poly_segment(fd, data),
+        proto::OP_POLY_RECTANGLE        => op_poly_rectangle(fd, data),
+        proto::OP_POLY_ARC              => op_poly_arc(fd, data),
+        proto::OP_FILL_POLY             => {} // filled polygons: not used by xeyes
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
-        proto::OP_POLY_FILL_ARC         => {}
+        proto::OP_POLY_FILL_ARC         => op_poly_fill_arc(fd, data),
         proto::OP_PUT_IMAGE             => op_put_image(fd, data),
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
         proto::OP_IMAGE_TEXT16          => {}
@@ -1065,9 +1073,14 @@ fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
         i += 1;
     }
     for wi in &subtree {
+        let viewable = is_viewable(c, wi.id);
+        #[cfg(feature = "xeyes-test")]
+        crate::serial_println!("[X11EXPOSE] subtree wid={:#x} mapped={} evmask={:#x} exposure={} viewable={}",
+            wi.id, wi.mapped, wi.evmask,
+            wi.evmask & proto::EVENT_MASK_EXPOSURE != 0, viewable);
         if wi.mapped
             && wi.evmask & proto::EVENT_MASK_EXPOSURE != 0
-            && is_viewable(c, wi.id)
+            && viewable
         {
             c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
         }
@@ -1165,8 +1178,8 @@ fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
                 c.send(&event::encode_map_notify(seq, cid));
             }
             configure_notify_if_selected(c, cid, seq);
-            crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}",
-                cid, parent, width, height);
+            crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{} evmask={:#x}",
+                cid, parent, width, height, evmask);
         }
         // Exposure: only the children that became viewable get an Expose.  If
         // the parent is unmapped they are Unviewable and Expose is deferred to
@@ -2261,6 +2274,172 @@ fn op_poly_fill_rect(fd: u64, data: &[u8]) {
                 }
             });
         }
+    }
+}
+
+// ── Geometry ops (PolyPoint/Line/Segment/Rectangle/Arc/FillArc) ───────────────
+//
+// All share the same request prologue: [4-7] drawable, [8-11] gc, then a list
+// of op-specific coordinate records.  Each rasterises into the drawable's
+// pixel buffer (window or pixmap) via the `resource::raster` software
+// rasteriser, using the GC's foreground colour.  The compositor re-blits every
+// window's `pixels` each frame, so no explicit dirty flag is needed.
+
+/// Resolve the GC foreground (as 0x00RRGGBB) and whether `draw` is a pixmap.
+fn gc_fg_and_target(fd: u64, draw: u32, gcid: u32) -> Option<(u32, bool)> {
+    let srv = SERVER.lock();
+    let c = srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)?;
+    let fg = c.resources.entries.iter().filter_map(|s| s.as_ref())
+        .find(|r| r.id == gcid)
+        .and_then(|r| if let ResourceBody::Gc(ref g) = r.body { Some(g.foreground) } else { None })
+        .unwrap_or(0);
+    let is_pix = c.resources.entries.iter().filter_map(|s| s.as_ref())
+        .find(|r| r.id == draw)
+        .map_or(false, |r| matches!(r.body, ResourceBody::Pixmap(_)));
+    Some((fg & 0x00FF_FFFF, is_pix))
+}
+
+/// Run `f(pixels, width, height)` against the pixel buffer of drawable `draw`,
+/// allocating the window buffer if needed.  `f` is the rasteriser body.
+fn with_drawable_pixels<F: FnMut(&mut [u8], i32, i32)>(fd: u64, draw: u32, is_pix: bool, mut f: F) {
+    with_client(fd, |c| {
+        if is_pix {
+            if let Some(p) = c.resources.get_pixmap_mut(draw) {
+                let (w, h) = (p.width as i32, p.height as i32);
+                f(&mut p.pixels, w, h);
+            }
+        } else if let Some(w) = c.resources.get_window_mut(draw) {
+            w.ensure_pixels();
+            let (ww, wh) = (w.width as i32, w.height as i32);
+            f(&mut w.pixels, ww, wh);
+        }
+    });
+}
+
+// PolyFillArc (71): list of ARC {x:i16,y:i16,w:u16,h:u16,a1:i16,a2:i16} (12 B).
+fn op_poly_fill_arc(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 12 <= data.len() {
+        let ax = r16(data, i) as i16 as i32;
+        let ay = r16(data, i + 2) as i16 as i32;
+        let aw = r16(data, i + 4) as i32;
+        let ah = r16(data, i + 6) as i32;
+        let a1 = r16(data, i + 8) as i16 as i32;
+        let a2 = r16(data, i + 10) as i16 as i32;
+        i += 12;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::fill_arc(px, w, h, ax, ay, aw, ah, a1, a2, fg);
+        });
+    }
+}
+
+// PolyArc (68): same ARC record list, outline stroke.
+fn op_poly_arc(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 12 <= data.len() {
+        let ax = r16(data, i) as i16 as i32;
+        let ay = r16(data, i + 2) as i16 as i32;
+        let aw = r16(data, i + 4) as i32;
+        let ah = r16(data, i + 6) as i32;
+        let a1 = r16(data, i + 8) as i16 as i32;
+        let a2 = r16(data, i + 10) as i16 as i32;
+        i += 12;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::stroke_arc(px, w, h, ax, ay, aw, ah, a1, a2, fg);
+        });
+    }
+}
+
+// PolySegment (70): list of SEGMENT {x1:i16,y1:i16,x2:i16,y2:i16} (8 B).
+fn op_poly_segment(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 8 <= data.len() {
+        let x1 = r16(data, i) as i16 as i32;
+        let y1 = r16(data, i + 2) as i16 as i32;
+        let x2 = r16(data, i + 4) as i16 as i32;
+        let y2 = r16(data, i + 6) as i16 as i32;
+        i += 8;
+        with_drawable_pixels(fd, draw, is_pix, |px, w, h| {
+            resource::raster::line(px, w, h, x1, y1, x2, y2, fg);
+        });
+    }
+}
+
+// PolyLine (65): polyline of POINT {x:i16,y:i16} (4 B); coordinate-mode in
+// data[1] (0=Origin, 1=Previous).  Connected segments between consecutive pts.
+fn op_poly_line(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let relative = data[1] == 1;
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut pts: alloc::vec::Vec<(i32, i32)> = alloc::vec::Vec::new();
+    let mut i = 12usize;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut first = true;
+    while i + 4 <= data.len() {
+        let px = r16(data, i) as i16 as i32;
+        let py = r16(data, i + 2) as i16 as i32;
+        i += 4;
+        if relative && !first { cx += px; cy += py; } else { cx = px; cy = py; }
+        first = false;
+        pts.push((cx, cy));
+    }
+    with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+        for win in pts.windows(2) {
+            resource::raster::line(buf, w, h, win[0].0, win[0].1, win[1].0, win[1].1, fg);
+        }
+    });
+}
+
+// PolyPoint (64): list of POINT {x:i16,y:i16} (4 B).
+fn op_poly_point(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let relative = data[1] == 1;
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut first = true;
+    while i + 4 <= data.len() {
+        let px = r16(data, i) as i16 as i32;
+        let py = r16(data, i + 2) as i16 as i32;
+        i += 4;
+        if relative && !first { cx += px; cy += py; } else { cx = px; cy = py; }
+        first = false;
+        let (dx, dy) = (cx, cy);
+        with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+            resource::raster::plot(buf, w, h, dx, dy, fg);
+        });
+    }
+}
+
+// PolyRectangle (67): list of RECTANGLE {x:i16,y:i16,w:u16,h:u16} (8 B) — outline.
+fn op_poly_rectangle(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let draw = r32(data, 4); let gcid = r32(data, 8);
+    let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    let mut i = 12usize;
+    while i + 8 <= data.len() {
+        let rx = r16(data, i) as i16 as i32;
+        let ry = r16(data, i + 2) as i16 as i32;
+        let rw = r16(data, i + 4) as i32;
+        let rh = r16(data, i + 6) as i32;
+        i += 8;
+        with_drawable_pixels(fd, draw, is_pix, |buf, w, h| {
+            resource::raster::line(buf, w, h, rx, ry, rx + rw, ry, fg);
+            resource::raster::line(buf, w, h, rx, ry + rh, rx + rw, ry + rh, fg);
+            resource::raster::line(buf, w, h, rx, ry, rx, ry + rh, fg);
+            resource::raster::line(buf, w, h, rx + rw, ry, rx + rw, ry + rh, fg);
+        });
     }
 }
 
