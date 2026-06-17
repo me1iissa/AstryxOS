@@ -4364,7 +4364,7 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         // pure fd handoff (e.g. an IPC channel/shared-memory fd pass).
         let has_scm = has_scm_deliverable(uid, crate::net::unix::recv_consumed(uid));
         let readable = has_d || has_p || has_scm;
-        #[cfg(feature = "firefox-test-core")]
+        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
         if pid >= 1 && events & POLLIN != 0 {
             crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
                 pid, fd, uid, has_d, crate::net::unix::bytes_available(uid), events);

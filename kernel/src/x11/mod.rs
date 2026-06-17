@@ -532,10 +532,24 @@ fn service_fd(fd: u64) {
     if !setup { handle_setup(fd, data); return; }
     let mut off = 0usize;
     while off + 4 <= data.len() {
-        let rlen = r16(data, off + 2) as usize;
-        if rlen == 0 { break; }
-        let end = off + rlen * 4;
-        if end > data.len() { break; }
+        // X11 core request length is a 16-bit count of 4-byte units (§Requests).
+        // Under the BIG-REQUESTS extension a length field of 0 means the real
+        // length is the following 32-bit word (in 4-byte units); the request
+        // body then starts at offset+8.  Treating length 0 as "stop parsing"
+        // would silently drop this request AND every request batched after it
+        // in the same read — desynchronising the client's reply/sequence
+        // expectations.  (X11 BIG-REQUESTS extension specification.)
+        let short_len = r16(data, off + 2) as usize;
+        let (req_len_units, hdr_extra) = if short_len == 0 {
+            if off + 8 > data.len() { break; }
+            (r32(data, off + 4) as usize, 0usize)
+        } else {
+            (short_len, 0usize)
+        };
+        let _ = hdr_extra;
+        if req_len_units == 0 { break; } // malformed: zero even in big form
+        let end = off + req_len_units * 4;
+        if end > data.len() || end <= off { break; }
         handle_request(fd, &data[off..end]);
         off = end;
     }
@@ -616,8 +630,16 @@ fn handle_request(fd: u64, data: &[u8]) {
             // For extension major opcodes (128-255) it is the minor opcode per X11
             // protocol §10.  Logging both unifies the trace for downstream parsing.
             let minor = data[1];
-            crate::serial_println!("[X11] req#{} op={} minor={} len={}",
-                                   n, opcode, minor, data.len());
+            // For draw ops the drawable id is at bytes 4..8 (X11 core protocol
+            // §PolyFillArc/§PolyArc/§PolyFillRectangle/§CopyArea/§ClearArea/
+            // §PutImage all carry the destination drawable there).  Surface it so
+            // the trace shows WHICH window/pixmap a draw targets.
+            let drawable = if data.len() >= 8 && matches!(opcode,
+                61 | 62 | 64 | 65 | 66 | 67 | 70 | 71 | 72 | 76) {
+                u32::from_le_bytes([data[4], data[5], data[6], data[7]])
+            } else { 0 };
+            crate::serial_println!("[X11] req#{} op={} minor={} len={} drawable={:#x}",
+                                   n, opcode, minor, data.len(), drawable);
         }
     }
     let seq = { let mut srv = SERVER.lock();
@@ -2456,6 +2478,9 @@ fn op_poly_fill_arc(fd: u64, data: &[u8]) {
     if data.len() < 12 { return; }
     let draw = r32(data, 4); let gcid = r32(data, 8);
     let (fg, is_pix) = match gc_fg_and_target(fd, draw, gcid) { Some(v) => v, None => return };
+    #[cfg(feature = "xeyes-test")]
+    crate::serial_println!("[X11DRAW] PolyFillArc draw={:#x} is_pixmap={} fg={:#x} narcs={}",
+        draw, is_pix, fg, (data.len().saturating_sub(12)) / 12);
     let mut i = 12usize;
     while i + 12 <= data.len() {
         let ax = r16(data, i) as i16 as i32;
@@ -3005,6 +3030,10 @@ fn op_render_composite(fd: u64, data: &[u8]) {
             .map_or(false, |r| matches!(r.body, ResourceBody::Pixmap(_)));
         (sp, dp)
     };
+    #[cfg(feature = "xeyes-test")]
+    crate::serial_println!("[X11RENDER] Composite op={} src_pic={:#x}->draw={:#x}(pix={}) dst_pic={:#x}->draw={:#x}(pix={}) dst_xy=({},{}) wh=({},{})",
+        op, src_id, src_draw, src_is_pixmap, dst_id, dst_draw, dst_is_pixmap,
+        dst_x, dst_y, width, height);
 
     // Clone src pixels (needed to avoid simultaneous mutable borrow of client)
     let src_pixels: alloc::vec::Vec<u8> = if src_is_pixmap {
