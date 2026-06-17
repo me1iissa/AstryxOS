@@ -594,19 +594,37 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 // xeyes is a draw-and-poll event loop — under the demo soak we
                 // exit when the workload itself exits, OR after 18000 ticks
                 // (~180 s) so a wedged process can't pin the CI watchdog.
-                if elapsed > 60 && !crate::gui::terminal::is_firefox_running() {
-                    serial_println!("[XEYES] xeyes exited after {} ticks", elapsed);
+                // Note whether xeyes has terminated, but do NOT break: keep the
+                // BSP composing so the eyes the client painted into its window
+                // remain on screen and a QMP screendump can capture them.  The
+                // window's `pixels` (and thus the composited frame) persist after
+                // the client exits because the X resources are reaped lazily.
+                if elapsed > 60 && !xeyes_exited && !crate::gui::terminal::is_firefox_running() {
+                    serial_println!("[XEYES] xeyes exited after {} ticks (exec_pid={} exit={:?}) — continuing to composite",
+                        elapsed, crate::gui::terminal::exec_pid(),
+                        crate::gui::terminal::exec_exit_status());
                     xeyes_exited = true;
-                    break;
                 }
 
-                if elapsed >= 18000 {
+                // Bounded soak so a wedged process can't pin the CI watchdog.
+                // 4000 ticks (~40 s) is ample for the screendump after the eyes
+                // are painted; the post-exit window keeps compositing until then.
+                if elapsed >= 4000 {
                     serial_println!("[XEYES] Soak budget reached at {} ticks", elapsed);
                     break;
                 }
 
+                // Busy-spin (no `hlt`) — mirrors the firefox-test soak loop.
+                // Under KVM the BSP's LAPIC timer is not reliably re-delivered
+                // after a `hlt` (the compositor-tick wakeup is lost), so an
+                // `hlt` here parks CPU0 indefinitely: compose() then stops and
+                // the screen freezes on a stale blank frame while xeyes sits in
+                // poll(2).  Yielding to the scheduler keeps cooperative work
+                // moving without surrendering the CPU to the unreliable timer
+                // wake.  See gui/compositor.rs (COMPOSITOR_TICK_DUE) and the
+                // identical firefox-test loop tail.
                 crate::sched::yield_cpu();
-                unsafe { core::arch::asm!("hlt"); }
+                core::hint::spin_loop();
             }
 
             serial_println!("[XEYES] xeyes_exited={}", xeyes_exited);

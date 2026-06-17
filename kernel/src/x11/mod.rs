@@ -764,6 +764,73 @@ fn window_fill_pixels(fd: u64, win_id: u32, x: i32, y: i32, w: i32, h: i32, bgra
     });
 }
 
+/// Paint a window-local region to the window's background, honouring the X core
+/// protocol `background-pixmap` attribute: if the window has a background pixmap
+/// set, the pixmap is tiled (origin at the window's top-left) into the region;
+/// otherwise the region is filled with the solid `background-pixel`.  `(x,y,w,h)`
+/// is window-local; `w`/`h` of 0 mean "to the window's right/bottom edge" per
+/// the ClearArea semantics.  Used on ClearArea and MapWindow so that clients
+/// (e.g. the xeyes Eyes widget) which draw static content into a background
+/// pixmap and rely on the server to paint it become visible.
+fn paint_window_background(fd: u64, win_id: u32, x: i32, y: i32, rw: i32, rh: i32) {
+    // Resolve background pixmap id + window size, then (if a pixmap) snapshot it.
+    let (bg_pixmap, ww, wh, bg_pixel) = {
+        let srv = SERVER.lock();
+        match srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
+                .find(|r| r.id == win_id)
+                .and_then(|r| if let ResourceBody::Window(ref w) = r.body {
+                    Some((w.background_pixmap, w.width as i32, w.height as i32, w.background_pixel))
+                } else { None })) {
+            Some(v) => v,
+            None => return,
+        }
+    };
+    let region_w = if rw == 0 { ww - x } else { rw };
+    let region_h = if rh == 0 { wh - y } else { rh };
+    if region_w <= 0 || region_h <= 0 { return; }
+
+    // bg_pixmap: 0 = None (solid background-pixel), 1 = ParentRelative (treat as
+    // solid for our flat hierarchy), other = a Pixmap id to tile.
+    if bg_pixmap <= 1 {
+        let bgra = [(bg_pixel & 0xFF) as u8, ((bg_pixel >> 8) & 0xFF) as u8,
+                    ((bg_pixel >> 16) & 0xFF) as u8, 0xFF];
+        window_fill_pixels(fd, win_id, x, y, region_w, region_h, bgra);
+        return;
+    }
+
+    // Snapshot the background pixmap (clone to drop the lock before drawing).
+    let snap = {
+        let srv = SERVER.lock();
+        srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| c.resources.get_pixmap(bg_pixmap)
+                .map(|p| (p.pixels.clone(), p.width as i32, p.height as i32)))
+    };
+    let (px, pw, ph) = match snap { Some(v) => v, None => return };
+    if pw <= 0 || ph <= 0 { return; }
+
+    with_client(fd, |c| {
+        if let Some(win) = c.resources.get_window_mut(win_id) {
+            win.ensure_pixels();
+            let dww = win.width as i32;
+            let dwh = win.height as i32;
+            for py in y.max(0)..((y + region_h).min(dwh)) {
+                // Tile: source row wraps the pixmap height (background tiling
+                // is relative to the window origin per X core protocol).
+                let sy = py.rem_euclid(ph);
+                for dx in x.max(0)..((x + region_w).min(dww)) {
+                    let sx = dx.rem_euclid(pw);
+                    let so = ((sy * pw + sx) * 4) as usize;
+                    let dofs = ((py * dww + dx) * 4) as usize;
+                    if so + 4 <= px.len() && dofs + 4 <= win.pixels.len() {
+                        win.pixels[dofs..dofs + 4].copy_from_slice(&px[so..so + 4]);
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Draw an 8×16 VGA-font string into a window's `w.pixels` (compositor source
 /// of truth).  `fg`/`bg` are 0x00RRGGBB; the glyph cell background is filled
 /// with `bg` (X11 ImageText8 semantics) and foreground pixels with `fg`.
@@ -874,10 +941,10 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
     let class  = r16(data, 22);
     let visual = r32(data, 24);
     let vmask  = r32(data, 28);
-    let mut event_mask = 0u32; let mut bg_pixel = 0u32;
+    let mut event_mask = 0u32; let mut bg_pixel = 0u32; let mut bg_pixmap = 0u32;
     let mut override_redirect = false;
     let mut vi = 32usize;
-    if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
+    if vmask & proto::CW_BACK_PIXMAP       != 0 { bg_pixmap = r32(data, vi); vi += 4; }
     if vmask & proto::CW_BACK_PIXEL        != 0 { bg_pixel = r32(data, vi); vi += 4; }
     if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
     if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
@@ -900,6 +967,7 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
             bw, if class == 0 { 1 } else { class },
             if visual == 0 { proto::ROOT_VISUAL } else { visual });
         w.event_mask = event_mask; w.background_pixel = bg_pixel;
+        w.background_pixmap = bg_pixmap;
         w.override_redirect = override_redirect;
         if !c.resources.insert(wid, ResourceBody::Window(w)) {
             c.send_error(proto::ERR_ALLOC, wid, proto::OP_CREATE_WINDOW);
@@ -937,8 +1005,10 @@ fn op_change_win_attrs(fd: u64, data: &[u8]) {
         }
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
-            if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
-            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); vi += 4; }
+            // X core protocol: a new background takes effect on the next expose
+            // or ClearArea, not immediately — so we only record it here.
+            if vmask & proto::CW_BACK_PIXMAP       != 0 { w.background_pixmap = r32(data, vi); vi += 4; }
+            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); w.background_pixmap = 0; vi += 4; }
             if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
             if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
             if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
@@ -1133,6 +1203,12 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
         expose_viewable_subtree(c, wid, seq);
         crate::serial_println!("[X11] MapWindow {:#x} {}x{}", wid, width, height);
     });
+    // Paint the window background now that it is viewable, honouring a
+    // background-pixmap (X core protocol: the server paints the background when
+    // a window becomes viewable, before sending Expose).  Done AFTER the
+    // with_client block above because paint_window_background re-acquires the
+    // SERVER lock (which with_client holds) — calling it inside would deadlock.
+    paint_window_background(fd, wid, 0, 0, 0, 0);
 }
 
 // ── MapSubwindows (9) ─────────────────────────────────────────────────────────
@@ -2048,28 +2124,11 @@ fn op_clear_area(fd: u64, data: &[u8]) {
             }
         });
     } else {
-        // ClearArea on a window resets the region to the window's background.
-        // w/h == 0 means "to the right/bottom edge of the window" per the X11
-        // core protocol; we clamp to the window bounds inside window_fill_pixels.
-        let (bg_bgra, full_w, full_h) = {
-            let srv = SERVER.lock();
-            srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
-                .and_then(|c| c.resources.entries.iter().filter_map(|s| s.as_ref())
-                    .find(|r| r.id == draw)
-                    .and_then(|r| if let ResourceBody::Window(ref win) = r.body {
-                        let bg = win.background_pixel;
-                        Some(([
-                            (bg & 0xFF) as u8,         // B
-                            ((bg >> 8) & 0xFF) as u8,  // G
-                            ((bg >> 16) & 0xFF) as u8, // R
-                            0xFF,
-                        ], win.width as i32, win.height as i32))
-                    } else { None }))
-                .unwrap_or(([0, 0, 0, 0xFF], 0, 0))
-        };
-        let pw = if w == 0 { full_w } else { w };
-        let ph = if h == 0 { full_h } else { h };
-        window_fill_pixels(fd, draw, x, y, pw, ph, bg_bgra);
+        // ClearArea on a window resets the region to the window's background,
+        // honouring `background-pixmap` (tiled) or `background-pixel` (solid).
+        // w/h == 0 means "to the right/bottom edge of the window" per the X core
+        // protocol; paint_window_background applies that and clamps to bounds.
+        paint_window_background(fd, draw, x, y, w, h);
     }
 }
 

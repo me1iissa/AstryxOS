@@ -51,6 +51,11 @@ pub struct WindowData {
     pub background_pixel: u32,
     pub mapped:          bool,
     pub override_redirect: bool,
+    /// Background pixmap resource id (X core protocol `background-pixmap`).
+    /// 0 = None, 1 = ParentRelative; any other value is a Pixmap id whose
+    /// contents are tiled into the window on expose/clear (per CreateWindow
+    /// / ChangeWindowAttributes / ClearArea semantics).
+    pub background_pixmap: u32,
     pub properties:      [Option<PropertyEntry>; MAX_PROPERTIES],
     /// Pixel buffer (BGRA, width×height×4 bytes) for compositor blitting.
     /// Allocated on MapWindow with background_pixel fill.
@@ -67,6 +72,7 @@ impl WindowData {
             background_pixel: 0xFFFFFFFF,
             mapped: false,
             override_redirect: false,
+            background_pixmap: 0,
             properties: [const { None }; MAX_PROPERTIES],
             pixels: alloc::vec::Vec::new(),
         }
