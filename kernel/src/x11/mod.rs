@@ -555,7 +555,15 @@ fn service_fd(fd: u64) {
         let short_len = r16(data, off + 2) as usize;
         let req_len_units = if short_len == 0 {
             if off + 8 > data.len() { break; }
-            r32(data, off + 4) as usize
+            // A big request always spans >= 2 units: the 4-byte request header
+            // plus the inserted 4-byte extended-length word.  A reported length
+            // of 0 or 1 is malformed; accepting it makes the body splice
+            // [off+8..end] have start > end (end <= off+4) → slice-index panic
+            // (and panic=abort would take the whole kernel down on hostile
+            // client input).  Reject malformed big requests instead.
+            let big = r32(data, off + 4) as usize;
+            if big < 2 { break; }
+            big
         } else {
             short_len
         };
