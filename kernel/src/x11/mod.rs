@@ -1465,9 +1465,10 @@ fn op_translate_coordinates(fd: u64, data: &[u8], seq: u16) {
         let mut b = [0u8; 32];
         b[0] = 1; b[1] = 1; // same_screen = True (single-screen server)
         w16(&mut b, 2, seq);
-        // child = 0 (None); dst_x / dst_y as INT16.
-        w16(&mut b, 16, dst_x as i16 as u16);
-        w16(&mut b, 18, dst_y as i16 as u16);
+        // child = 0 (None) at bytes 8-11; dst-x INT16 at byte 12, dst-y INT16 at
+        // byte 14 (X11 core protocol TranslateCoordinates reply encoding).
+        w16(&mut b, 12, dst_x as i16 as u16);
+        w16(&mut b, 14, dst_y as i16 as u16);
         c.send(&b);
     });
 }

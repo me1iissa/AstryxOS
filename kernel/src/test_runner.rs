@@ -18126,8 +18126,9 @@ fn test_x11_translate_coordinates() -> bool {
         crate::net::unix::close(client);
         return false;
     }
-    let dst_x = i16::from_le_bytes([rep[16], rep[17]]);
-    let dst_y = i16::from_le_bytes([rep[18], rep[19]]);
+    // Spec offsets: dst-x at byte 12, dst-y at byte 14 (X11 TranslateCoordinates reply).
+    let dst_x = i16::from_le_bytes([rep[12], rep[13]]);
+    let dst_y = i16::from_le_bytes([rep[14], rep[15]]);
     if dst_x != 10 || dst_y != 20 {
         test_fail!("x11_translate", "dst=({},{}) expected (10,20)", dst_x, dst_y);
         crate::net::unix::close(client);
