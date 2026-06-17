@@ -398,7 +398,9 @@ pub mod raster {
             //   half_real² = (bw²/4)·(bh² - dyn_²)/bh²
             let num = bh2 - dyn_ * dyn_;
             if num <= 0 { continue; }
-            let half2 = ((bw as i64) * (bw as i64) * num) / (4 * bh2);
+            // i128 intermediate: bw²·num can exceed i64 for adversarial CARD16
+            // dimensions (65535⁴ > i64::MAX); the result fits i64 after /(4·bh²).
+            let half2 = ((bw as i128) * (bw as i128) * (num as i128)) / (4 * bh2 as i128);
             let half = isqrt(half2 as u64) as i32;
             let cx_real = (cx2 / 2) as i32;
             let xl = cx_real - half;
@@ -431,11 +433,13 @@ pub mod raster {
         let cx2 = (2 * x + bw) as i64;
         let cy2 = (2 * y + bh) as i64;
         let full = angle2.abs() >= 360 * 64;
-        // inside-test in doubled coords: (dx²·bh² + dy²·bw²) <= bw²·bh²
+        // inside-test in doubled coords: (dx²·bh² + dy²·bw²) <= bw²·bh².
+        // i128 intermediates: the products can exceed i64 for adversarial
+        // CARD16 dimensions (65535⁴ > i64::MAX).
         let inside = |pxx: i32, py: i32| -> bool {
-            let dx = (2 * pxx + 1) as i64 - cx2;
-            let dy = (2 * py + 1) as i64 - cy2;
-            dx * dx * bh2 + dy * dy * bw2 <= bw2 * bh2
+            let dx = (2 * pxx + 1) as i128 - cx2 as i128;
+            let dy = (2 * py + 1) as i128 - cy2 as i128;
+            dx * dx * bh2 as i128 + dy * dy * bw2 as i128 <= bw2 as i128 * bh2 as i128
         };
         let y0 = (y - 1).max(0);
         let y1 = (y + bh + 1).min(h);
@@ -457,7 +461,7 @@ pub mod raster {
         }
     }
 
-    // 256-entry table: ATAN_T[i] = round(atan(i/255) in 1/64-degree units),
+    // 257-entry table: ATAN_T[i] = round(atan(i/256) in 1/64-degree units),
     // i.e. ∈ [0, 45*64].  Generated at compile time from the integer ratio.
     const ATAN_T: [u16; 257] = build_atan_table();
 
