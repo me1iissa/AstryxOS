@@ -426,10 +426,26 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             x11::init();
             serial_println!("[XEYES] X11 server ready");
 
-            gui::desktop::launch_desktop();
+            // DECLUTTER (xeyes-test only): unlike the default desktop boot, we
+            // deliberately do NOT call gui::desktop::launch_desktop() here.  That
+            // helper spawns the Orbit Shell taskbar + five demo windows, which
+            // would clutter the frame and obscure the single X11 client we want
+            // to observe.  The compositor and window manager are already brought
+            // up at boot (gui::init / wm::init, main.rs ~300/310), and the
+            // compositor's compose() unconditionally paints a neutral root
+            // background (a subtle navy→teal gradient) before blitting any
+            // mapped windows.  With launch_desktop() skipped, the xeyes toplevel
+            // is therefore the SOLE visible client on a clean root — giving a
+            // known-good baseline that isolates the native X11 paint path
+            // (X server → WM/compositor → framebuffer) from the desktop shell.
+            //
+            // This is confined to the xeyes-test feature block and does not
+            // affect the default desktop, headless, firefox, or test-suite boots.
+            serial_println!("[XEYES] declutter: launch_desktop() skipped — xeyes is sole client");
             hal::enable_interrupts();
 
-            // Let the desktop settle (mirrors FFTEST wait).
+            // Let the compositor settle and paint the clean root a few times
+            // before the workload maps its window (mirrors FFTEST wait).
             let t0 = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
                 gui::compositor::compose();
