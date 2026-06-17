@@ -6194,7 +6194,10 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 .unwrap_or(false)
         };
         loop {
-            match crate::ipc::pipe::pipe_read(pipe_id, buf) {
+            // `pipe_read_and_wake` drains the pipe AND wakes any writer parked
+            // for buffer space (POSIX `write(2)` blocking semantics — a reader
+            // that frees space must notify the parked writer; see `man 7 pipe`).
+            match crate::ipc::pipe::pipe_read_and_wake(pipe_id, buf) {
                 None => return -9, // EBADF — pipe vanished (both ends closed).
                 Some(n) if n > 0 => return n as i64,
                 Some(_) => {
@@ -6781,7 +6784,16 @@ fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
 /// `PIPE_TABLE`/`PIPE_WRITE_WAITERS` internally and its under-lock re-check
 /// closes the TOCTOU window against a reader drain that races our space
 /// check, so there is no lost wakeup and no hold-across-dispatch deadlock.
-/// The reader's drain in `sys_read_linux` already calls `wake_writers_all`.
+///
+/// A parked writer is woken whenever a reader frees buffer space: every drain
+/// consumer reads through `pipe::pipe_read_and_wake`, which calls
+/// `wake_writers_all(pipe_id)` after a successful (`n > 0`) read.  The wired
+/// consumers are `sys_read_linux` (the `read(2)` pipe branch), the native
+/// Aether read path, and `gui::terminal::poll_output` (the in-kernel terminal
+/// that drains a child's stdout/stderr — the producer whose deadlock this
+/// edge prevents).  The fd-close paths (`pipe_close_reader` /
+/// `pipe_close_writer`) also call `wake_writers_all` so a writer that loses its
+/// reader wakes to observe `EPIPE`.
 ///
 /// Refs: write(2), pipe(7), POSIX.1-2017 §write.
 fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {

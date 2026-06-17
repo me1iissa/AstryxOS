@@ -169,6 +169,30 @@ pub fn pipe_read(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
     Some(pipe.read(buf))
 }
 
+/// Read from a pipe by ID, then wake any writers parked for buffer space.
+///
+/// This is the canonical drain entry point for consumers that share a pipe
+/// with a *blocking* writer (per `man 7 pipe`: a writer that fills the buffer
+/// blocks until a reader removes data — the reader must therefore notify the
+/// writer once it frees space, exactly as the symmetric `pipe_write` ->
+/// `wake_readers` edge notifies a parked reader).  Without this wake a writer
+/// parked in the blocking-write path (`sys_write_linux`) is woken only when an
+/// fd closes, never when space is actually freed, which converts a transient
+/// full-pipe stall into a permanent deadlock.
+///
+/// Locking: `pipe_read` takes and *drops* `PIPE_TABLE` before returning, so
+/// `wake_writers_all` (which acquires `PIPE_WRITE_WAITERS` then, via
+/// `wake_tids`, `THREAD_TABLE`) never nests under `PIPE_TABLE`.  Lock order
+/// `PIPE_WRITE_WAITERS -> THREAD_TABLE` is preserved.
+pub fn pipe_read_and_wake(pipe_id: u64, buf: &mut [u8]) -> Option<usize> {
+    let n = pipe_read(pipe_id, buf)?;
+    if n > 0 {
+        // We freed `n` bytes — wake every writer parked waiting for space.
+        wake_writers_all(pipe_id);
+    }
+    Some(n)
+}
+
 /// Write to a pipe by ID.
 ///
 /// On a successful write of one or more bytes the caller should invoke
@@ -465,4 +489,16 @@ pub fn debug_reader_waiter_count(pipe_id: u64) -> usize {
 pub fn debug_writer_waiter_count(pipe_id: u64) -> usize {
     let waiters = PIPE_WRITE_WAITERS.lock();
     waiters.get(&pipe_id).map(|l| l.len()).unwrap_or(0)
+}
+
+/// Test-only: enqueue `tid` directly onto `pipe_id`'s writer wait list,
+/// simulating a writer parked in `wait_writable` WITHOUT requiring a second
+/// CPU to actually run `pipe_write_blocking` and `schedule()` away.  Unlike
+/// `wait_writable`/`enqueue_self_blocked` this does NOT touch `THREAD_TABLE`
+/// (the tid need not name a live Blocked thread), so the in-suite drainer can
+/// assert the reader-wakes-writer edge deterministically on a single core.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_enqueue_writer_waiter(pipe_id: u64, tid: u64) {
+    let mut waiters = PIPE_WRITE_WAITERS.lock();
+    waiters.entry(pipe_id).or_insert_with(WaitList::new).push_tid_raw(tid);
 }

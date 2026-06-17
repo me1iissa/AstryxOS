@@ -1336,7 +1336,11 @@ pub fn poll_output() {
     // First pass: read all available data before locking TERMINAL
     let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     loop {
-        let n = crate::ipc::pipe::pipe_read(pipe_id, &mut raw).unwrap_or(0);
+        // `pipe_read_and_wake` wakes any writer (e.g. the Firefox stdout/stderr
+        // producer) parked for buffer space once this drain frees it.  Without
+        // the wake the producer parks forever and never returns to its event
+        // loop — the actual deadlock this consumer must avoid (`man 7 pipe`).
+        let n = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut raw).unwrap_or(0);
         if n == 0 { break; }
         chunks.push(raw[..n].to_vec());
         any_data = true;
@@ -1365,7 +1369,7 @@ pub fn poll_output() {
         // Drain any final bytes the child wrote before exiting.
         drop(guard); // release TERMINAL before pipe_read
         let mut tail = [0u8; 4096];
-        let tn = crate::ipc::pipe::pipe_read(pipe_id, &mut tail).unwrap_or(0);
+        let tn = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut tail).unwrap_or(0);
         crate::ipc::pipe::pipe_close_reader(pipe_id);
 
         let mut guard2 = TERMINAL.lock();

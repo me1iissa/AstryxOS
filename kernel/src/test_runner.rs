@@ -34406,12 +34406,83 @@ fn test_pipe_blocking_write_semantics() -> bool {
     test_println!("  blocking write with no reader → -EPIPE ✓");
     crate::syscall::dispatch_linux_kernel(3, wfd2, 0, 0, 0, 0, 0);
 
-    // NOTE: the blocks-until-drained and concurrent-atomicity behaviours of
-    // pipe_write_blocking are exercised end-to-end by the live workload (a
-    // process whose peer stops draining its stdout/stderr pipe now parks
-    // instead of busy-looping on writev) rather than by an in-suite drainer
-    // race, which depends on a second CPU picking the drainer deterministically.
-    test_pass!("pipe blocking write — EAGAIN (no no-progress 0) / atomicity / EPIPE");
+    // ── Sub-test 3: reader-wakes-writer drain edge (lost-wakeup regression) ──
+    // A blocking writer that fills the pipe parks on PIPE_WRITE_WAITERS until a
+    // reader frees space.  The bug: the only callers of wake_writers_all were
+    // the fd-close paths, so a drain that freed space NEVER woke the parked
+    // writer → permanent deadlock (the windowed-Firefox stdout/stderr pipe).
+    // We drive the edge deterministically on a single core: enqueue a fake
+    // writer-waiter (no second CPU needed), then drain via the canonical
+    // consumer entry point `pipe_read_and_wake` and assert the waiter is woken
+    // (writer-waiter count drops to 0).  A plain `pipe_read` must NOT drain it
+    // (proving the wake is load-bearing, not incidental).  Per write(2)/pipe(7).
+    let mut fds3 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds3.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for wake-edge returned {}", r);
+        return false;
+    }
+    let (rfd3, wfd3) = (fds3[0] as u64, fds3[1] as u64);
+    let pipe_id3 = crate::syscall::get_pipe_id(
+        crate::proc::current_pid() as u64, wfd3 as usize);
+
+    // Fill the ring so a real writer would park here.
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd3, filler.as_ptr() as u64, filler.len() as u64, 0, 0, 0);
+    if n != 4096 {
+        test_fail!("pipe_blocking_write", "wake-edge fill returned {} (expected 4096)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Simulate a writer parked on the full pipe.
+    let fake_writer_tid: u64 = 0xDEAD_BEEF;
+    crate::ipc::pipe::test_enqueue_writer_waiter(pipe_id3, fake_writer_tid);
+    if crate::ipc::pipe::debug_writer_waiter_count(pipe_id3) != 1 {
+        test_fail!("pipe_blocking_write", "writer-waiter not enqueued (count != 1)");
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Negative control: a raw `pipe_read` (the OLD drain path, no wake) must
+    // free space but leave the parked writer untouched.
+    let mut sink3 = [0u8; 512];
+    let dr = crate::ipc::pipe::pipe_read(pipe_id3, &mut sink3).unwrap_or(0);
+    if dr == 0 || crate::ipc::pipe::debug_writer_waiter_count(pipe_id3) != 1 {
+        test_fail!("pipe_blocking_write",
+            "raw pipe_read drained={} but writer-waiter count={} (expected 1 — the lost-wakeup bug)",
+            dr, crate::ipc::pipe::debug_writer_waiter_count(pipe_id3));
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  raw pipe_read frees space but does NOT wake writer (bug reproduced) ✓");
+
+    // The fix: the canonical drain consumer `pipe_read_and_wake` frees space
+    // AND wakes the parked writer → waiter count drops to 0.
+    let dr2 = crate::ipc::pipe::pipe_read_and_wake(pipe_id3, &mut sink3).unwrap_or(0);
+    if dr2 == 0 {
+        test_fail!("pipe_blocking_write", "pipe_read_and_wake drained 0 bytes (expected >0)");
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
+    if crate::ipc::pipe::debug_writer_waiter_count(pipe_id3) != 0 {
+        test_fail!("pipe_blocking_write",
+            "after pipe_read_and_wake drain, writer-waiter count={} (expected 0 — writer NOT woken = deadlock)",
+            crate::ipc::pipe::debug_writer_waiter_count(pipe_id3));
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  pipe_read_and_wake drains AND wakes parked writer (count → 0) ✓");
+    crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+
+    test_pass!("pipe blocking write — EAGAIN / atomicity / EPIPE / reader-wakes-writer");
     true
 }
 
