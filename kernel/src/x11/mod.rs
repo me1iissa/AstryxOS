@@ -990,24 +990,135 @@ fn op_destroy_window(fd: u64, data: &[u8], seq: u16) {
     });
 }
 
+// ── Window viewability + exposure helpers ─────────────────────────────────────
+//
+// Per the X11 core protocol, a mapped window is "viewable" only if it AND all
+// of its ancestors are mapped.  Exposure (Expose) events are generated when a
+// window *becomes viewable*, not merely when its own MapWindow request is
+// processed — a window mapped while an ancestor is still unmapped is
+// "Unviewable" and gets no Expose until the ancestor maps.  These helpers let
+// the map handlers obey that rule: MapNotify fires on the window's own map
+// (StructureNotify), but Expose fires for the whole now-viewable subtree only
+// once the window is actually viewable.
+
+/// Snapshot of the fields needed for exposure processing, keyed by window id.
+#[derive(Clone, Copy)]
+struct WinInfo { id: u32, parent: u32, mapped: bool, evmask: u32,
+                 x: i16, y: i16, w: u16, h: u16, bw: u16 }
+
+/// Look up a window's exposure-relevant fields without holding a mutable borrow.
+fn win_info(c: &Client, wid: u32) -> Option<WinInfo> {
+    for r in c.resources.entries.iter().filter_map(|s| s.as_ref()) {
+        if r.id == wid {
+            if let ResourceBody::Window(ref w) = r.body {
+                return Some(WinInfo { id: wid, parent: w.parent, mapped: w.mapped,
+                    evmask: w.event_mask, x: w.x, y: w.y, w: w.width, h: w.height,
+                    bw: w.border_width });
+            }
+        }
+    }
+    None
+}
+
+/// True if `wid` is viewable: it is mapped and every ancestor up to (and
+/// including the implicit) root is mapped.  The root window has no per-client
+/// resource entry and is always mapped, so reaching it (or an unknown
+/// ancestor that is the root) terminates the walk successfully.  A depth cap
+/// guards against malformed parent cycles.
+fn is_viewable(c: &Client, wid: u32) -> bool {
+    let mut cur = wid;
+    for _ in 0..64 {
+        if cur == proto::ROOT_WINDOW_ID { return true; }
+        match win_info(c, cur) {
+            Some(wi) => {
+                if !wi.mapped { return false; }
+                cur = wi.parent;
+            }
+            // Parent not in our table (e.g. reparented under the root/WM frame)
+            // — treat as the always-mapped root boundary.
+            None => return true,
+        }
+    }
+    false
+}
+
+/// Run exposure processing for the subtree rooted at `root_wid`: send an Expose
+/// to `root_wid` and to every descendant that has just become viewable and has
+/// selected Exposure.  MapNotify is emitted separately by the caller before
+/// this runs (the protocol orders MapNotify before Expose).
+fn expose_viewable_subtree(c: &Client, root_wid: u32, seq: u16) {
+    // Collect the subtree (root + transitive descendants) from the flat table.
+    let mut subtree: alloc::vec::Vec<WinInfo> = alloc::vec::Vec::new();
+    if let Some(root) = win_info(c, root_wid) { subtree.push(root); }
+    let mut i = 0;
+    while i < subtree.len() {
+        let pid = subtree[i].id;
+        for r in c.resources.entries.iter().filter_map(|s| s.as_ref()) {
+            if let ResourceBody::Window(ref w) = r.body {
+                if w.parent == pid && !subtree.iter().any(|s| s.id == r.id) {
+                    subtree.push(WinInfo { id: r.id, parent: w.parent, mapped: w.mapped,
+                        evmask: w.event_mask, x: w.x, y: w.y, w: w.width, h: w.height,
+                        bw: w.border_width });
+                }
+            }
+        }
+        i += 1;
+    }
+    for wi in &subtree {
+        if wi.mapped
+            && wi.evmask & proto::EVENT_MASK_EXPOSURE != 0
+            && is_viewable(c, wi.id)
+        {
+            c.send(&event::encode_expose(seq, wi.id, wi.x, wi.y, wi.w, wi.h));
+        }
+    }
+}
+
+/// Send a ConfigureNotify to `wid` reporting its current geometry, if it
+/// selected StructureNotify.  Per the X11 core protocol map sequence, a window
+/// that selected StructureNotify receives MapNotify and then, before Expose, a
+/// ConfigureNotify describing its on-screen geometry.  Toolkits (libXt) use
+/// this to learn the realized size of the shell before running their first
+/// layout/redisplay pass; without it the widget tree can stay un-configured and
+/// never paint.
+fn configure_notify_if_selected(c: &Client, wid: u32, seq: u16) {
+    if let Some(wi) = win_info(c, wid) {
+        if wi.evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+            c.send(&event::encode_configure_notify(seq, wid, wi.x, wi.y, wi.w, wi.h, wi.bw));
+        }
+    }
+}
+
 // ── MapWindow (8) ─────────────────────────────────────────────────────────────
 
 fn op_map_window(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let wid = r32(data, 4);
     with_client(fd, |c| {
-        if let Some(w) = c.resources.get_window_mut(wid) {
-            let (x,y,width,height,evmask) = (w.x, w.y, w.width, w.height, w.event_mask);
-            w.mapped = true;
-            w.ensure_pixels(); // Allocate pixel buffer for compositor
-            if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
-                c.send(&event::encode_map_notify(seq, wid));
+        let (width, height, evmask) = match c.resources.get_window_mut(wid) {
+            Some(w) => {
+                let dims = (w.width, w.height, w.event_mask);
+                w.mapped = true;
+                w.ensure_pixels(); // Allocate pixel buffer for compositor
+                dims
             }
-            if evmask & proto::EVENT_MASK_EXPOSURE != 0 {
-                c.send(&event::encode_expose(seq, wid, x, y, width, height));
-            }
-            crate::serial_println!("[X11] MapWindow {:#x} {}x{}+{},{}", wid, width, height, x, y);
-        } else { c.send_error(proto::ERR_WINDOW, wid, proto::OP_MAP_WINDOW); }
+            None => { c.send_error(proto::ERR_WINDOW, wid, proto::OP_MAP_WINDOW); return; }
+        };
+        // StructureNotify: MapNotify always fires on the window's own map,
+        // followed by a ConfigureNotify reporting the window's geometry — the
+        // X11 core-protocol map sequence is MapNotify → ConfigureNotify →
+        // Expose for a window that selected StructureNotify.
+        if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+            c.send(&event::encode_map_notify(seq, wid));
+        }
+        configure_notify_if_selected(c, wid, seq);
+        // Exposure: mapping this window may have made it AND a subtree of
+        // already-mapped descendants viewable for the first time.  Send Expose
+        // to every window in that subtree that is now viewable and selected
+        // Exposure — this is where a child mapped earlier (while this ancestor
+        // was unmapped) finally gets its Expose.
+        expose_viewable_subtree(c, wid, seq);
+        crate::serial_println!("[X11] MapWindow {:#x} {}x{}", wid, width, height);
     });
 }
 
@@ -1016,8 +1127,11 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
 // Map every unmapped child of `parent` in bottom-to-top order, as required by
 // the X11 core protocol: toolkits (libXt's XtRealizeWidget, GTK) map the
 // container then call MapSubwindows to map the leaf widget windows.  Each newly
-// mapped child gets its pixel buffer allocated and, per its event mask, a
-// MapNotify and an initial Expose so the client paints it.
+// mapped child gets its pixel buffer allocated and a MapNotify (per its event
+// mask).  Expose is generated only for children that have actually become
+// viewable — i.e. only when `parent` is itself viewable.  If `parent` is still
+// unmapped, the children are mapped-but-Unviewable and their Expose is deferred
+// until the parent maps (handled by MapWindow's subtree exposure pass).
 fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let parent = r32(data, 4);
@@ -1035,19 +1149,31 @@ fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
             }
         }
         for &cid in &children {
-            if let Some(w) = c.resources.get_window_mut(cid) {
-                let (x, y, width, height, evmask) = (w.x, w.y, w.width, w.height, w.event_mask);
-                w.mapped = true;
-                w.ensure_pixels();
-                if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
-                    c.send(&event::encode_map_notify(seq, cid));
+            let (width, height, evmask) = match c.resources.get_window_mut(cid) {
+                Some(w) => {
+                    let dims = (w.width, w.height, w.event_mask);
+                    w.mapped = true;
+                    w.ensure_pixels();
+                    dims
                 }
-                if evmask & proto::EVENT_MASK_EXPOSURE != 0 {
-                    c.send(&event::encode_expose(seq, cid, x, y, width, height));
-                }
-                crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}+{},{}",
-                    cid, parent, width, height, x, y);
+                None => continue,
+            };
+            // StructureNotify: MapNotify (then ConfigureNotify) fires on the
+            // child's own map regardless of viewability (it is genuinely now
+            // mapped) — the X11 core-protocol map sequence.
+            if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+                c.send(&event::encode_map_notify(seq, cid));
             }
+            configure_notify_if_selected(c, cid, seq);
+            crate::serial_println!("[X11] MapSubwindow {:#x} (parent {:#x}) {}x{}",
+                cid, parent, width, height);
+        }
+        // Exposure: only the children that became viewable get an Expose.  If
+        // the parent is unmapped they are Unviewable and Expose is deferred to
+        // the parent's MapWindow.  Run the subtree pass per mapped child so
+        // grandchildren are covered too.
+        for &cid in &children {
+            expose_viewable_subtree(c, cid, seq);
         }
     });
 }
