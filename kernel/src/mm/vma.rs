@@ -882,6 +882,14 @@ impl VmSpace {
         // Copy VMA list to child.
         let mut child_areas = Vec::with_capacity(self.areas.len());
         for vma in &self.areas {
+            // The child independently maps every VMA the parent had, so a
+            // MAP_SHARED file-backed mapping inherited by the child holds its
+            // OWN inode pin.  This balances the unpin the child's teardown
+            // (free_process_memory / free_vm_space) will perform over its
+            // areas; without it the child's exit would underflow the parent's
+            // pin and free a still-mapped shm inode.  This direct push bypasses
+            // insert_vma, so pin here.  See vfs::vma_pin_if_shared_file.
+            crate::vfs::vma_pin_if_shared_file(vma.flags, &vma.backing);
             child_areas.push(vma.clone());
         }
 
@@ -960,6 +968,13 @@ impl VmSpace {
         // Find insertion point (sorted by base)
         let pos = self.areas.iter().position(|v| v.base > vma.base)
             .unwrap_or(self.areas.len());
+        // A MAP_SHARED file-backed VMA entering the address space holds one
+        // kernel pin on its inode for the duration of its membership in this
+        // list (POSIX mmap(2)'s independent open-file reference).  Pin before
+        // moving `vma` into the Vec so we can read its flags/backing.  See
+        // vfs::vma_pin_if_shared_file.  Balanced in remove_range / on whole-
+        // VmSpace teardown (proc::free_process_memory).
+        crate::vfs::vma_pin_if_shared_file(vma.flags, &vma.backing);
         self.areas.insert(pos, vma);
         // W216 H_5j-B: notify the PFH install loop that the VMA list changed.
         self.generation.fetch_add(1, Ordering::Release);
@@ -995,8 +1010,13 @@ impl VmSpace {
             }
 
             if vma.base >= base && vma.end() <= end {
-                // Completely contained — remove
-                self.areas.remove(i);
+                // Completely contained — remove.  This VMA leaves the address
+                // space entirely, so drop the MAP_SHARED-file pin it held (if
+                // any).  This is the munmap / MAP_FIXED-replacement path that
+                // tears down a shm mapping; when it is the last reference the
+                // pinned, deferred-deleted inode is freed here.
+                let removed = self.areas.remove(i);
+                crate::vfs::vma_unpin_if_shared_file(removed.flags, &removed.backing);
                 continue;
             }
 
@@ -1034,7 +1054,14 @@ impl VmSpace {
                     backing: right_backing,
                     name: vma.name,
                 };
-                self.areas.remove(i);
+                // One MAP_SHARED-file VMA becomes two: drop the original's pin
+                // and place one pin per surviving piece so the inode stays
+                // pinned exactly once per live mapping.  The inserts below
+                // bypass insert_vma, so pin them directly here.
+                let removed = self.areas.remove(i);
+                crate::vfs::vma_unpin_if_shared_file(removed.flags, &removed.backing);
+                crate::vfs::vma_pin_if_shared_file(right.flags, &right.backing);
+                crate::vfs::vma_pin_if_shared_file(left.flags, &left.backing);
                 self.areas.insert(i, right);
                 self.areas.insert(i, left);
                 i += 2;

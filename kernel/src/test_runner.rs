@@ -1299,6 +1299,23 @@ pub fn run() -> ! {
     total += 1;
     if test_umount_removes_mount() { passed += 1; }
 
+    // ── Test 119b: MAP_SHARED-file inode pin survives unlink + last close ──
+    // Cross-subsystem: mm::vma (VMA pin/unpin at insert/teardown) + vfs
+    // (unlink-on-last-close + PINNED_INODES).  Reproduces the POSIX shm idiom
+    // a content/IPC layer uses (shm_open → mmap(MAP_SHARED) → close → unlink)
+    // and asserts the inode's data survives until the mapping is torn down.
+    total += 1;
+    if test_shm_mmap_pin_survives_unlink_close() { passed += 1; }
+
+    // ── Test 119c: mprotect partial-overlap split keeps the inode-pin balance ─
+    // Cross-subsystem: subsys::linux::syscall (sys_mprotect VMA split) + mm::vma
+    // (per-membership pin) + vfs (PINNED_INODES + deferred reaper).  Forces a
+    // 3-way mprotect split of a MAP_SHARED file mapping and asserts the pin
+    // count tracks the surviving-piece count, then frees the address space and
+    // asserts the inode is reclaimed exactly once (no double-free, no leak).
+    total += 1;
+    if test_mprotect_split_inode_pin_balance() { passed += 1; }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -48255,6 +48272,412 @@ fn test_288_scm_memfd_inode_lifecycle() -> bool {
     // Final close of the last reference frees the (unlinked) inode.
     crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
     test_pass!("SCM-passed memfd inode survives sender close (Test 288)");
+    true
+}
+
+// ── Test 119b: MAP_SHARED-file inode pin survives unlink + last close ────────
+//
+// POSIX mmap(2) makes a mapping an independent reference on the backing file:
+// the inode (and its data) must survive a close(2) of the mapping fd, and an
+// unlink(2)/shm_unlink, until the mapping itself is torn down.  This is the
+// POSIX shared-memory idiom an IPC layer uses — memfd_create/shm_open →
+// mmap(MAP_SHARED) → close(fd) — and the exact path that crashed Firefox's
+// main process: it mapped a /dev/shm IPC region MAP_SHARED then close()'d the
+// fd, the inode was freed under it, and the next demand fault on the still-live
+// mapping found a dead inode and SIGSEGV'd.
+//
+// This exercises the kernel invariant directly (no user process needed): a live
+// MAP_SHARED file VMA holds one inode pin (the pin `insert_vma` takes), so the
+// last close must NOT free the inode; once the mapping's pin is dropped (the
+// unpin `remove_range`/teardown takes) and nothing else references it, the
+// inode is freed by the deferred reaper.
+//
+// Cross-subsystem: mm::vma (VMA pin/unpin balance) + vfs (unlink-on-last-close
+// C5 + PINNED_INODES authority + PENDING_INODE_REAP).
+// Refs: mmap(2), munmap(2), memfd_create(2), shm_open(3).
+fn test_shm_mmap_pin_survives_unlink_close() -> bool {
+    use crate::mm::vma::{VmBacking, MAP_SHARED, MAP_PRIVATE};
+    test_header!("MAP_SHARED-file inode pin survives unlink + last close (Test 119b)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // memfd_create gives an already-unlinked (anonymous) inode — exactly the
+    // post-shm_unlink lifetime the bug is about.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("shm_mmap_pin", "memfd_create returned {}", fd);
+        return false;
+    }
+    let surf = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("shm_mmap_pin", "write to memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Snapshot (mount_idx, inode).
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("shm_mmap_pin", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("shm_mmap_pin", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    let shared_backing = VmBacking::File { mount_idx: mnt, inode: ino, offset: 0, elf_load_delta: 0 };
+    test_println!("  memfd inode {} on mount {} ✓", ino, mnt);
+
+    // A MAP_PRIVATE mapping must NOT pin (it copies file pages into anon frames
+    // and does not need the inode to outlive close) — assert the gate first.
+    crate::vfs::vma_pin_if_shared_file(MAP_PRIVATE, &shared_backing);
+    if crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "MAP_PRIVATE wrongly pinned the inode");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  MAP_PRIVATE does not pin ✓");
+
+    // Now the live MAP_SHARED mapping takes its inode pin (as insert_vma does).
+    crate::vfs::vma_pin_if_shared_file(MAP_SHARED, &shared_backing);
+    if !crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "MAP_SHARED did not pin the inode");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // close(2) the only fd.  This is unlink-on-last-close (C5): WITHOUT the pin
+    // the inode would be freed here.  WITH the pin it must survive — this is the
+    // exact moment Firefox crashed.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    // The inode's data must still be readable directly from the filesystem — it
+    // was not freed under the still-live mapping.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        match fs.read(ino, 0, &mut rbuf) {
+            Ok(n) if n == 4 && rbuf == surf => {
+                test_println!("  inode data survives last close while MAP_SHARED-pinned ✓");
+            }
+            other => {
+                test_fail!("shm_mmap_pin",
+                    "inode read after close = {:?} buf={:?} (want Ok(4) {:?}) — freed early",
+                    other, rbuf, surf);
+                crate::vfs::vma_unpin_if_shared_file(MAP_SHARED, &shared_backing);
+                crate::vfs::reap_pending_inodes();
+                return false;
+            }
+        }
+    } else {
+        test_fail!("shm_mmap_pin", "mount {} vanished", mnt);
+        return false;
+    }
+
+    // Tear down the mapping (the unpin remove_range / address-space teardown
+    // performs).  This drops the last pin; the deferred reaper then frees the
+    // now-orphaned (unlinked, no open fd, no pin) inode.
+    crate::vfs::vma_unpin_if_shared_file(MAP_SHARED, &shared_backing);
+    if crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "inode still pinned after the only mapping's unpin");
+        crate::vfs::reap_pending_inodes();
+        return false;
+    }
+    crate::vfs::reap_pending_inodes();
+
+    // The inode must now be gone: a fresh fs read fails (inode freed) and the
+    // deferred-delete record is drained.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        if fs.read(ino, 0, &mut rbuf).is_ok() {
+            test_fail!("shm_mmap_pin",
+                "inode {} still readable after mapping teardown — leaked", ino);
+            return false;
+        }
+    }
+    test_println!("  inode freed once the last MAP_SHARED mapping is torn down ✓");
+
+    test_pass!("MAP_SHARED-file inode pin survives unlink + last close (Test 119b)");
+    true
+}
+
+// ── Test 119c: mprotect partial-overlap split keeps the inode-pin balance ────
+//
+// POSIX mprotect(2) changes the protection of an *interior* sub-range of a
+// mapping by splitting the containing VMA into up to three pieces (a left
+// remnant at the old prot, the middle at the new prot, a right remnant at the
+// old prot).  Each surviving piece is an independent VMA-list membership that
+// still maps the same backing inode, so the kernel's one-pin-per-MAP_SHARED-
+// file-VMA-membership invariant (see vfs::vma_pin_if_shared_file) requires the
+// split to drop the original's single pin and place one pin per piece.
+//
+// Before the fix, sys_mprotect's partial-overlap arm removed the original VMA
+// WITHOUT unpinning and inserted the pieces WITHOUT pinning, so the pin count
+// stayed 1 while 2-3 pieces mapped the inode.  At address-space teardown the
+// first piece's unpin then freed the inode out from under the still-mapped
+// remnants — a demand-fault on a dead inode (the exact UAF Test 119b guards,
+// resurfacing through the split path).  This test forces a 3-way split via the
+// real sys_mprotect and asserts the pin count tracks the membership count, then
+// tears the address space down and asserts the inode is freed exactly once
+// (no double-free, no leak).
+//
+// Cross-subsystem: subsys::linux::syscall (sys_mprotect split) + mm::vma (VMA
+// membership) + vfs (PINNED_INODES authority + deferred reaper).
+// Refs: mprotect(2), mmap(2), munmap(2), memfd_create(2).
+fn test_mprotect_split_inode_pin_balance() -> bool {
+    use crate::mm::vma::{VmArea, VmBacking, VmProt, MAP_SHARED, PROT_READ, PROT_WRITE, PROT_NONE};
+    test_header!("mprotect partial-overlap split keeps MAP_SHARED inode-pin balance (Test 119c)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // 1. An already-unlinked (memfd) inode — the post-shm_unlink lifetime where
+    //    a stale free is fatal.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("mprotect_split_pin", "memfd_create returned {}", fd);
+        return false;
+    }
+    let surf = [0x11u8, 0x22, 0x33, 0x44];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("mprotect_split_pin", "write to memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    let pid_now = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid_now)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("mprotect_split_pin", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("mprotect_split_pin", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // 2. A synthetic process with its own user address space, carrying ONE
+    //    MAP_SHARED file VMA spanning 4 pages.  insert_vma takes exactly one
+    //    inode pin (as the real mmap path does).
+    let test_pid: u64 = 9973;
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => {
+            test_fail!("mprotect_split_pin", "VmSpace::new_user() OOM");
+            crate::subsys::linux::syscall::sys_close_test(fd as u64);
+            return false;
+        }
+    };
+    let cr3 = vm.cr3;
+    let vma_base: u64 = 0x5000_0000;
+    let vma_len:  u64 = 0x4000; // 4 pages
+    {
+        let vma = VmArea {
+            base: vma_base,
+            length: vma_len,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_SHARED,
+            backing: VmBacking::File { mount_idx: mnt, inode: ino, offset: 0, elf_load_delta: 0 },
+            name: "[shm-split-test]",
+        };
+        if vm.insert_vma(vma).is_err() {
+            test_fail!("mprotect_split_pin", "insert_vma failed");
+            crate::subsys::linux::syscall::sys_close_test(fd as u64);
+            crate::proc::free_vm_space(vm);
+            return false;
+        }
+    }
+    // The mapping now holds the inode pin.  Close the fd: this is the POSIX shm
+    // idiom (mmap then close) and exactly the lifetime the bug is about — the
+    // inode must outlive the fd because the mapping references it.  Closing
+    // AFTER insert_vma is essential: closing first would run unlink-on-last-
+    // close with no pin and free the inode before the mapping ever pins it.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+    if crate::vfs::inode_pin_count_pub(mnt, ino) != 1 {
+        test_fail!("mprotect_split_pin",
+            "after insert_vma pin count = {} (want 1)", crate::vfs::inode_pin_count_pub(mnt, ino));
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  single MAP_SHARED VMA → pin count 1 ✓");
+
+    // 3. Register the synthetic process holding this VmSpace.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.push(crate::proc::Process {
+            pid: test_pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8; 64]; n[..9].copy_from_slice(b"mpsplit!\0"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: test_pid as u32, sid: test_pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        });
+    }
+
+    // Synchronous teardown helper: take the VmSpace out and free it (the
+    // address-space teardown path that unpins every surviving piece + reaps).
+    let teardown = || -> Option<crate::mm::vma::VmSpace> {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let old = procs.iter_mut().find(|p| p.pid == test_pid)
+            .and_then(|p| p.vm_space.take());
+        procs.retain(|p| p.pid != test_pid);
+        old
+    };
+
+    // 4. mprotect the MIDDLE two pages to PROT_NONE.  Interior sub-range →
+    //    3-way partial-overlap split (left RW remnant, middle NONE, right RW
+    //    remnant).  Drive the REAL syscall: make the synthetic process current
+    //    so sys_mprotect (keyed on current_pid_lockless) operates on it.
+    let split_base = vma_base + 0x1000;   // page 1
+    let split_len:  u64 = 0x2000;          // pages 1..3
+    let prev_pid = crate::proc::current_pid_lockless();
+    crate::proc::set_current_pid(test_pid);
+    let mp = crate::subsys::linux::syscall::sys_mprotect_test(split_base, split_len, PROT_NONE as u64);
+    crate::proc::set_current_pid(prev_pid);
+    if mp != 0 {
+        test_fail!("mprotect_split_pin", "sys_mprotect returned {} (want 0)", mp);
+        if let Some(s) = teardown() { crate::proc::free_vm_space(s); }
+        return false;
+    }
+
+    // 5. The split must have produced 3 pieces, all still mapping the inode,
+    //    and the pin count must now equal that membership count (one pin per
+    //    piece).  Pre-fix this is the failing assertion: count stayed 1.
+    let (n_areas, n_shared_file_pieces) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let p = procs.iter().find(|p| p.pid == test_pid);
+        let space = p.and_then(|p| p.vm_space.as_ref());
+        match space {
+            Some(s) => {
+                let total = s.areas.len();
+                let pieces = s.areas.iter().filter(|a|
+                    a.flags & MAP_SHARED != 0
+                        && matches!(a.backing,
+                            VmBacking::File { mount_idx, inode, .. } if mount_idx == mnt && inode == ino)
+                ).count();
+                (total, pieces)
+            }
+            None => (0, 0),
+        }
+    };
+    if n_shared_file_pieces != 3 {
+        test_fail!("mprotect_split_pin",
+            "split produced {} MAP_SHARED-file pieces of the inode (want 3); total areas {}",
+            n_shared_file_pieces, n_areas);
+        if let Some(s) = teardown() { crate::proc::free_vm_space(s); }
+        return false;
+    }
+    let pin_after = crate::vfs::inode_pin_count_pub(mnt, ino);
+    if pin_after != 3 {
+        test_fail!("mprotect_split_pin",
+            "after 3-way split pin count = {} (want 3 — one per surviving piece)", pin_after);
+        if let Some(s) = teardown() { crate::proc::free_vm_space(s); }
+        return false;
+    }
+    // The inode is still alive: its data reads correctly.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        match fs.read(ino, 0, &mut rbuf) {
+            Ok(n) if n == 4 && rbuf == surf => {}
+            other => {
+                test_fail!("mprotect_split_pin",
+                    "inode read after split = {:?} buf={:?} (want Ok(4) {:?}) — freed early",
+                    other, rbuf, surf);
+                if let Some(s) = teardown() { crate::proc::free_vm_space(s); }
+                return false;
+            }
+        }
+    }
+    test_println!("  3-way split → 3 pieces, pin count 3, inode alive ✓");
+
+    // Belt-and-braces: the middle piece is now PROT_NONE, the remnants RW.
+    {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(s) = procs.iter().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.as_ref()) {
+            let mid = s.areas.iter().find(|a| a.base == split_base);
+            let none_prot: VmProt = PROT_NONE;
+            if mid.map(|a| a.prot != none_prot).unwrap_or(true) {
+                test_fail!("mprotect_split_pin", "middle piece prot not PROT_NONE after split");
+                if let Some(s) = teardown() { crate::proc::free_vm_space(s); }
+                return false;
+            }
+        }
+    }
+
+    // 6. Tear the address space down — the real exit/exec path that unpins each
+    //    surviving piece exactly once and reaps the now-orphaned inode.  With
+    //    the fix this drops 3 pins (1 per piece) to 0 and frees the inode once.
+    //    Pre-fix it would drop the count-1 pin to 0 on the first piece (freeing
+    //    the inode), then unpin twice more against an absent entry.
+    if let Some(space) = teardown() {
+        crate::proc::free_vm_space(space);
+    } else {
+        test_fail!("mprotect_split_pin", "synthetic process vanished before teardown");
+        return false;
+    }
+    if crate::vfs::inode_pin_count_pub(mnt, ino) != 0 {
+        test_fail!("mprotect_split_pin",
+            "inode still pinned (count {}) after teardown of all pieces",
+            crate::vfs::inode_pin_count_pub(mnt, ino));
+        return false;
+    }
+    crate::vfs::reap_pending_inodes(); // free_vm_space already reaps; harmless re-drain.
+
+    // 7. The inode must now be freed exactly once: a fresh fs read fails.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        if fs.read(ino, 0, &mut rbuf).is_ok() {
+            test_fail!("mprotect_split_pin",
+                "inode {} still readable after all pieces torn down — leaked", ino);
+            return false;
+        }
+    }
+    test_println!("  all pieces torn down → inode freed exactly once (no double-free, no leak) ✓");
+
+    test_pass!("mprotect partial-overlap split keeps MAP_SHARED inode-pin balance (Test 119c)");
     true
 }
 

@@ -1776,6 +1776,18 @@ pub fn free_process_memory(pid: Pid) {
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_PRESENT: u64 = 1;
 
+    // Whole-address-space teardown bypasses VmSpace::remove_range, so drop the
+    // MAP_SHARED-file inode pins this process held directly.  This is the path
+    // an exiting process takes when it still has shm mappings live (the common
+    // case for the POSIX shm idiom: the file was unlinked while mapped, so the
+    // last unpin here frees the deferred-deleted inode).  See
+    // vfs::vma_pin_if_shared_file.  The unpin queues the orphan-check/free; the
+    // reap below runs it (PROCESS_TABLE is not held on this path).
+    for vma in &vm_space.areas {
+        crate::vfs::vma_unpin_if_shared_file(vma.flags, &vma.backing);
+    }
+    crate::vfs::reap_pending_inodes();
+
     for vma in &vm_space.areas {
         // Skip MMIO device VMAs — their "physical addresses" are I/O registers,
         // not PMM-tracked frames; decrementing their refcount would corrupt the
@@ -1868,6 +1880,16 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     // Firefox bringup (W216 audit teardown-leak finding).
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_PRESENT: u64 = 1;
+
+    // Drop MAP_SHARED-file inode pins held by this (consumed) VmSpace — the
+    // execve teardown counterpart of the unpin loop in free_process_memory.
+    // See vfs::vma_pin_if_shared_file.  free_vm_space is, by its caller's
+    // contract (sys_exec), invoked with PROCESS_TABLE released, so the reap
+    // (which takes PROCESS_TABLE) is safe here.
+    for vma in &vm_space.areas {
+        crate::vfs::vma_unpin_if_shared_file(vma.flags, &vma.backing);
+    }
+    crate::vfs::reap_pending_inodes();
 
     for vma in &vm_space.areas {
         if let VmBacking::Device { .. } = &vma.backing { continue; }

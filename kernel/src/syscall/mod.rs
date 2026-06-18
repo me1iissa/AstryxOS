@@ -3400,46 +3400,57 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             pid, base, length, r, w, x, fd as i64, offset, name);
     }
 
-    // Phase 3 — install the new VMA under PROCESS_TABLE.
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3, // ESRCH (process exited between phases)
-    };
-    let space = match proc.vm_space.as_mut() {
-        Some(s) => s,
-        None => return -3,
-    };
+    // Phase 3 — install the new VMA under PROCESS_TABLE.  The block yields the
+    // syscall result rather than returning directly so the reap below always
+    // runs (Phase 2a above may have queued an inode free even on the rare
+    // process-exited-between-phases path).
+    let result = 'phase3: {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => break 'phase3 -3, // ESRCH (process exited between phases)
+        };
+        let space = match proc.vm_space.as_mut() {
+            Some(s) => s,
+            None => break 'phase3 -3,
+        };
 
-    match space.insert_vma(vma) {
-        Ok(()) => {
-            // Lower `mmap_hint` only when this allocation participates in the
-            // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
-            // MAP_STACK kernel-chosen allocation.  See
-            // `VmSpace::note_mmap_placement` for the full rationale; the
-            // critical case is MAP_FIXED at a PIE-biased shared-library load
-            // base, which would otherwise destroy the per-process entropy
-            // seeded by `randomised_mmap_hint()` before any NULL-hint
-            // allocation is ever issued (POSIX mmap(2), CWE-330).
-            let hint_before = space.mmap_hint;
-            space.note_mmap_placement(base, is_fixed, is_stack_alloc);
-            let hint_after = space.mmap_hint;
-            #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
-            crate::serial_println!(
-                "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={}",
-                pid, base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8
-            );
-            let _ = (hint_before, hint_after);
-            base as i64
+        match space.insert_vma(vma) {
+            Ok(()) => {
+                // Lower `mmap_hint` only when this allocation participates in the
+                // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
+                // MAP_STACK kernel-chosen allocation.  See
+                // `VmSpace::note_mmap_placement` for the full rationale; the
+                // critical case is MAP_FIXED at a PIE-biased shared-library load
+                // base, which would otherwise destroy the per-process entropy
+                // seeded by `randomised_mmap_hint()` before any NULL-hint
+                // allocation is ever issued (POSIX mmap(2), CWE-330).
+                let hint_before = space.mmap_hint;
+                space.note_mmap_placement(base, is_fixed, is_stack_alloc);
+                let hint_after = space.mmap_hint;
+                #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
+                crate::serial_println!(
+                    "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={}",
+                    pid, base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8
+                );
+                let _ = (hint_before, hint_after);
+                base as i64
+            }
+            Err(_) => {
+                crate::serial_println!(
+                    "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
+                    pid, base, length, flags, fd as i64
+                );
+                -12 // ENOMEM
+            }
         }
-        Err(_) => {
-            crate::serial_println!(
-                "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
-                pid, base, length, flags, fd as i64
-            );
-            -12 // ENOMEM
-        }
-    }
+    }; // PROCESS_TABLE released here
+
+    // A MAP_FIXED replacement (Phase 2a above) may have dropped the last pin of
+    // an unlinked shm inode under PROCESS_TABLE; free it now that the lock is
+    // released.  No-op when nothing was unpinned.  See vfs::reap_pending_inodes.
+    crate::vfs::reap_pending_inodes();
+    result
 }
 
 /// munmap — Unmap a region of the current process's address space.
@@ -3484,6 +3495,13 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
         let _ = space.remove_range(addr, length);
         cr3
     }; // PROCESS_TABLE released here
+
+    // remove_range above (run under PROCESS_TABLE) may have dropped the last pin
+    // of an unlinked shm inode; free it now that the lock is released.  No-op
+    // when nothing was unpinned.  See vfs::reap_pending_inodes.  This is the
+    // POSIX shm teardown moment: munmap of the final mapping of an already
+    // shm_unlink'd region frees the inode here.
+    crate::vfs::reap_pending_inodes();
 
     // ── Phase 2 (lock-free) — clear PTEs and release backing frames. ──────
     crate::mm::vmm::unmap_and_free_range_in(cr3, addr, length);

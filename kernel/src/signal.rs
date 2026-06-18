@@ -1001,6 +1001,30 @@ pub unsafe fn deliver_sigsegv_from_isr(
     error_code: u64,
     frame: *mut crate::arch::x86_64::idt::InterruptFrame,
 ) -> bool {
+    // SEGV_MAPERR (1, not-present) / SEGV_ACCERR (2, protection) per
+    // POSIX.1-2017 §2.4.2; chosen here from the #PF error-code present bit.
+    let si_code: i32 = if error_code & 1 != 0 { 2 } else { 1 };
+    deliver_fault_signal_from_isr(SIGSEGV, si_code, cr2, error_code, frame)
+}
+
+/// Deliver a synchronous fault signal (SIGSEGV or SIGBUS) to the faulting
+/// Ring-3 thread from the page-fault ISR by synthesising a signal frame on the
+/// user stack and redirecting IRET to the installed handler.  Returns `false`
+/// (and makes no change) if the process has no user handler installed for
+/// `signo` (Default/Ignore) — the caller then kills the process.
+///
+/// `signo` is the signal number (`SIGSEGV` for an unmapped/protection fault,
+/// `SIGBUS` per POSIX `mmap(2)` for a reference to a portion of a file mapping
+/// that has no backing — e.g. a still-live `MAP_SHARED` mapping whose backing
+/// inode was truncated/removed).  `si_code` is the `siginfo_t.si_code` (e.g.
+/// `SEGV_MAPERR`/`SEGV_ACCERR` for SIGSEGV, `BUS_ADRERR`=3 for SIGBUS).
+pub unsafe fn deliver_fault_signal_from_isr(
+    signo: u8,
+    si_code: i32,
+    cr2: u64,
+    error_code: u64,
+    frame: *mut crate::arch::x86_64::idt::InterruptFrame,
+) -> bool {
     let pid = crate::proc::current_pid();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -1026,7 +1050,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
         None => return false,
     };
 
-    let action = sig_state.actions[SIGSEGV as usize];
+    let action = sig_state.actions[signo as usize];
     let (handler_addr, restorer) = match action {
         SigAction::Handler { addr, restorer } => (addr, restorer),
         _ => return false, // Default or Ignore — caller kills the process
@@ -1044,7 +1068,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
         TRAMPOLINE_VADDR
     };
 
-    let action_flags = sig_state.action_flags[SIGSEGV as usize];
+    let action_flags = sig_state.action_flags[signo as usize];
     let want_siginfo = (action_flags & SA_SIGINFO) != 0;
 
     // ── User stack layout (growing downward) ─────────────────────────────────
@@ -1149,7 +1173,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // range-validated via `virt_to_phys_in(cr3, new_rsp)` above.
     let _smap_g = UserGuard::new();
     (*sig_frame_ptr).restorer    = restorer_addr;
-    (*sig_frame_ptr).sig_num     = SIGSEGV as u64;
+    (*sig_frame_ptr).sig_num     = signo as u64;
     (*sig_frame_ptr).saved_mask  = saved_mask;
     (*sig_frame_ptr).saved_rsp   = user_rsp;
     (*sig_frame_ptr).saved_r15   = isr_r15;
@@ -1205,13 +1229,12 @@ pub unsafe fn deliver_sigsegv_from_isr(
     }
 
     // ── Write siginfo_t (Linux x86_64 layout, POSIX.1-2017 §2.4.2) ──────────
-    // offset  0: si_signo (i32) = SIGSEGV
+    // offset  0: si_signo (i32) = signo (SIGSEGV / SIGBUS)
     // offset  4: si_errno (i32) = 0
-    // offset  8: si_code  (i32) = SEGV_MAPERR (1) or SEGV_ACCERR (2)
+    // offset  8: si_code  (i32) = SEGV_MAPERR/ACCERR (SIGSEGV) or BUS_ADRERR (SIGBUS)
     // offset 16: si_addr  (u64) = cr2 (faulting virtual address)
     core::ptr::write_bytes(siginfo_ptr, 0, 128);
-    let si_code: i32 = if error_code & 1 != 0 { 2 } else { 1 }; // present=ACCERR, not-present=MAPERR
-    core::ptr::write(siginfo_ptr.add(0)  as *mut i32, SIGSEGV as i32);
+    core::ptr::write(siginfo_ptr.add(0)  as *mut i32, signo as i32);
     core::ptr::write(siginfo_ptr.add(4)  as *mut i32, 0i32);
     core::ptr::write(siginfo_ptr.add(8)  as *mut i32, si_code);
     core::ptr::write(siginfo_ptr.add(16) as *mut u64, cr2);
@@ -1229,23 +1252,23 @@ pub unsafe fn deliver_sigsegv_from_isr(
     //   RDX at frame[-4] = frame_u64 - 32
     let p_rdi = (frame_u64 - 48) as *mut u64;
     let p_rsi = (frame_u64 - 40) as *mut u64;
-    *p_rdi = SIGSEGV as u64;            // RDI = signo (arg1, always set)
+    *p_rdi = signo as u64;              // RDI = signo (arg1, always set)
     *p_rsi = siginfo_ptr as u64;        // RSI = &siginfo_t (arg2, always set)
     if want_siginfo {
         let p_rdx = (frame_u64 - 32) as *mut u64;
         *p_rdx = ucontext_ptr as u64;   // RDX = &ucontext_t (arg3, SA_SIGINFO only)
     }
 
-    // Block SIGSEGV during handler execution (re-enabled by sigreturn).
-    sig_state.blocked |= 1u64 << SIGSEGV;
+    // Block this signal during handler execution (re-enabled by sigreturn).
+    sig_state.blocked |= 1u64 << signo;
     sig_state.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
 
     // Drop PROCESS_TABLE before the serial writes — COM1 is slow and should
     // never block other CPUs from looking up their own process entry.
     drop(procs);
     crate::serial_println!(
-        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x} siginfo={} r14={:#x} rbp={:#x} rbx={:#x} rsi={:#x}",
-        pid, cr2, user_rip, handler_addr, new_rsp,
+        "[SIGNAL] sig={} ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x} siginfo={} r14={:#x} rbp={:#x} rbx={:#x} rsi={:#x}",
+        signo, pid, cr2, user_rip, handler_addr, new_rsp,
         if want_siginfo { "SA_SIGINFO" } else { "classic" },
         isr_r14, isr_rbp, isr_rbx, isr_rsi
     );

@@ -7713,7 +7713,25 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         // CRITICAL: for file-backed VMAs, each split piece must have its
         // file offset adjusted by (piece.base - original_vma_base) so that
         // demand-paging reads from the correct file position.
-        space.areas.remove(i);
+        //
+        // INODE-PIN BALANCE: one MAP_SHARED file-backed VMA is being replaced
+        // by 2-3 surviving pieces, each a new VMA-list membership carrying the
+        // same backing inode.  The invariant is exactly one kernel inode pin
+        // per MAP_SHARED file VMA-list membership (see vfs::vma_pin_if_shared_file
+        // / vma_unpin_if_shared_file).  So drop the removed original's pin and
+        // place one pin per surviving piece.  Without this the pin count stays 1
+        // while 2-3 pieces map the inode, and the first piece's teardown would
+        // free the inode out from under the others (a demand-fault on a dead
+        // inode).  The inserts below bypass insert_vma, so the pins are placed
+        // directly here, mirroring VmSpace::remove_range's hole-punch split.
+        //
+        // The unpin uses vma_unpin_if_shared_file, which never takes
+        // PROCESS_TABLE (we hold it here) — it queues the orphan free to the
+        // reaper drained after the lock is released (see reap_pending_inodes
+        // below).  vma_pin_if_shared_file only touches PINNED_INODES, so it is
+        // safe under the lock.
+        let removed = space.areas.remove(i);
+        crate::vfs::vma_unpin_if_shared_file(removed.flags, &removed.backing);
         let overlap_start = vma_base.max(base);
         let overlap_end   = vma_end.min(end);
 
@@ -7752,10 +7770,26 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         }
         let n = pieces.len();
         for piece in pieces.into_iter().rev() {
+            // One pin per surviving MAP_SHARED-file piece (balances the
+            // removed original's unpin above; no-op for non-shared/anon/device).
+            crate::vfs::vma_pin_if_shared_file(piece.flags, &piece.backing);
             space.areas.insert(i, piece);
         }
         i += n;
     }
+
+    // Release PROCESS_TABLE before the (lock-free) PTE retag below: the PTE
+    // walk and TLB shootdown use only the copied `cr3`, not the address-space
+    // record, so the lock is no longer needed here.  Dropping it now also lets
+    // the inode reaper run outside the critical section.
+    drop(procs);
+
+    // A partial-overlap split above may have dropped the last pin of an
+    // already-unlinked shm inode (vma_unpin_if_shared_file queues the orphan
+    // free under the lock).  Free it now that PROCESS_TABLE is released — same
+    // wiring as sys_munmap's post-Phase-1 reap.  No-op when nothing was
+    // unpinned.  See vfs::reap_pending_inodes.
+    crate::vfs::reap_pending_inodes();
 
     // Walk every page and retag PTEs.  TLB invalidation is coalesced
     // into a single shootdown over [base, end) after the loop so that
@@ -10344,6 +10378,14 @@ fn sys_memfd_create(_name: u64, flags: u64) -> i64 {
 #[cfg(feature = "test-mode")]
 pub fn sys_memfd_create_test(_name: u64, flags: u64) -> i64 {
     sys_memfd_create(_name, flags)
+}
+
+/// Test shim: call sys_mprotect from in-kernel tests.  Exercises the real
+/// VMA-split + inode-pin-rebalance path against the current process's address
+/// space (Test 119c).  See mprotect(2).
+#[cfg(feature = "test-mode")]
+pub fn sys_mprotect_test(addr: u64, len: u64, prot: u64) -> i64 {
+    sys_mprotect(addr, len, prot)
 }
 
 /// Test shim: call sys_fcntl from in-kernel tests.
