@@ -6966,6 +6966,34 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "(expected on|off|true|false|1|0)"
             )
         return {"op": "futex-set-cluster-wake", "on": val}
+    if op == "trace-pid":
+        # Runtime per-PID [SC]/[SC-RET] trace arming (no recompile).
+        #   kdb <sid> trace-pid            → query current target
+        #   kdb <sid> trace-pid 3          → trace pid 3
+        #   kdb <sid> trace-pid 0          → clear
+        # Carried as {"pid": N} to match the kernel extract_field("pid") parse.
+        # Effective only on a firefox-test-core build WITHOUT the global
+        # syscall-trace firehose (response carries "effective": bool).
+        if not rest:
+            return {"op": "trace-pid"}
+        return {"op": "trace-pid", "pid": int(rest[0], 0)}
+    if op == "trace-contentproc":
+        # Arm/disarm/query auto-capture of the first -contentproc child.
+        #   kdb <sid> trace-contentproc        → query
+        #   kdb <sid> trace-contentproc on     → arm
+        #   kdb <sid> trace-contentproc off    → disarm
+        # When armed, the exec path stores the content-proc PID into the trace
+        # target at exec time, so the trace begins at its first post-exec
+        # syscall with no host-side timing race.
+        if not rest:
+            return {"op": "trace-contentproc"}
+        val = rest[0].strip().lower()
+        if val not in ("on", "off", "true", "false", "1", "0"):
+            raise ValueError(
+                f"trace-contentproc: unrecognised value '{rest[0]}' "
+                "(expected on|off)"
+            )
+        return {"op": "trace-contentproc", "on": val}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
@@ -12727,6 +12755,11 @@ def main():
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
+        # Runtime-armable per-PID [SC]/[SC-RET] trace (no recompile).
+        # `trace-pid <pid>` sets/clears/queries the live target; `trace-contentproc
+        # on|off` auto-arms capture of the first -contentproc child at exec time.
+        # Effective on a firefox-test-core build without the syscall-trace firehose.
+        "trace-pid", "trace-contentproc",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",

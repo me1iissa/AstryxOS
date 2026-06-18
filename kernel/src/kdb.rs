@@ -373,6 +373,13 @@ pub fn dispatch(req: &str, out: &mut String) {
         "mem"            => op_mem(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
+        // Runtime per-PID [SC]/[SC-RET] trace arming (no recompile).  `trace-pid`
+        // sets/clears the live target PID; `trace-contentproc` arms auto-capture
+        // of the first `-contentproc` child.  Both are query-only when their arg
+        // is absent.  Effective only under a `firefox-test-core` build without
+        // the global `syscall-trace` firehose.
+        "trace-pid"        => op_trace_pid(req, out),
+        "trace-contentproc" => op_trace_contentproc(req, out),
         // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
         // drain replacing the old per-op COM1 write). `blk-trace-flush` re-emits
         // the classic `[BLK]` serial lines for the legacy heatmap ingestion.
@@ -999,8 +1006,66 @@ fn op_read_file(req: &str, out: &mut String) {
 
 fn op_trace_status(out: &mut String) {
     use core::fmt::Write;
-    let _ = write!(out, r#"{{"syscall_trace":{},"pf_trace":{},"build":"kdb"}}"#,
-                   cfg!(feature = "syscall-trace"), cfg!(feature = "pf-trace"));
+    // `trace_pid_effective` is true when the runtime per-PID `[SC]` emit block
+    // is actually compiled in (firefox-test-core present, syscall-trace global
+    // firehose absent).  When `syscall_trace` is true the global firehose
+    // already traces every PID, so the per-PID block is intentionally compiled
+    // out and `trace-pid` arming is a no-op (the firehose covers it).
+    let trace_pid_effective =
+        cfg!(feature = "firefox-test-core") && !cfg!(feature = "syscall-trace");
+    let target = crate::syscall::TRACE_PID
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let contentproc = crate::syscall::TRACE_CONTENTPROC
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let _ = write!(out,
+        r#"{{"syscall_trace":{},"pf_trace":{},"trace_pid":{},"trace_contentproc":{},"trace_pid_effective":{},"build":"kdb"}}"#,
+        cfg!(feature = "syscall-trace"), cfg!(feature = "pf-trace"),
+        target, contentproc, trace_pid_effective);
+}
+
+// trace-pid: set / clear / query the runtime per-PID `[SC]`/`[SC-RET]` trace
+// target.  Request shape: {"op":"trace-pid","pid":N}.  pid=0 clears.  When the
+// `pid` field is absent the op is query-only (reports the current target).
+// Cheap one relaxed atomic load on the syscall hot path when unset.
+fn op_trace_pid(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    let prev = crate::syscall::TRACE_PID.load(Ordering::Relaxed);
+    let new = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => { crate::syscall::TRACE_PID.store(p, Ordering::Relaxed); p }
+        None => prev, // query-only
+    };
+    let effective =
+        cfg!(feature = "firefox-test-core") && !cfg!(feature = "syscall-trace");
+    let _ = write!(out,
+        r#"{{"ok":true,"prev":{},"trace_pid":{},"effective":{}}}"#,
+        prev, new, effective);
+}
+
+// trace-contentproc: arm/disarm/query auto-capture of the first `-contentproc`
+// child.  Request shape: {"op":"trace-contentproc","on":"on"|"off"}.  When armed,
+// the exec path stores the content-proc PID into TRACE_PID the moment it execs,
+// so the trace starts at the content-proc's first post-exec syscall (no race).
+fn op_trace_contentproc(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    let prev = crate::syscall::TRACE_CONTENTPROC.load(Ordering::Relaxed);
+    let now = match extract_field(req, "on").unwrap_or_default().as_str() {
+        "on" | "1" | "true" => {
+            crate::syscall::TRACE_CONTENTPROC.store(true, Ordering::Relaxed);
+            true
+        }
+        "off" | "0" | "false" => {
+            crate::syscall::TRACE_CONTENTPROC.store(false, Ordering::Relaxed);
+            false
+        }
+        _ => prev, // query-only
+    };
+    let effective =
+        cfg!(feature = "firefox-test-core") && !cfg!(feature = "syscall-trace");
+    let _ = write!(out,
+        r#"{{"ok":true,"prev":{},"armed":{},"effective":{}}}"#,
+        prev, now, effective);
 }
 
 // ── blk-trace ────────────────────────────────────────────────────────────────
