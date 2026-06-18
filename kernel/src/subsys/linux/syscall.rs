@@ -6874,6 +6874,43 @@ fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {
             return -4; // EINTR
         }
 
+        // ── Inline console-drain (windowed-Firefox first-paint wedge) ─────────
+        //
+        // The read end of the kernel-owned console pipe (a child's stdout/stderr
+        // wired up at launch in `gui::terminal`) is drained ONLY by the
+        // cooperatively-scheduled `gui::terminal::poll_output()` on an in-kernel
+        // poll thread.  Under Firefox's ~70-thread `clone(2)` startup burst that
+        // poll thread is starved long enough for this 4 KiB pipe to fill, at
+        // which point a blocking `writev(fd=2)` would park here and — with no
+        // timely drain — never be woken, wedging the whole thread group before
+        // any frame is painted.
+        //
+        // Because this pipe has NO real peer reader (only the kernel drains it),
+        // it is always safe to discard its buffered bytes from the writer's own
+        // syscall context.  Doing so here makes forward progress independent of
+        // any poll-thread scheduling: drain inline, then re-evaluate space via
+        // `continue` instead of parking.  A normal user<->user pipe is NEVER the
+        // console drain target (`console_drain_pipe_id()` returns 0 unless THIS
+        // pipe is the running child's stdout/stderr), so this path leaves every
+        // ordinary pipe's blocking-write semantics untouched.
+        //
+        // `pipe_drain_console` reads into a kernel buffer and takes/drops
+        // `PIPE_TABLE` internally, so no pipe lock is held across it and it
+        // cannot recurse into this writer.  Refs: write(2), pipe(7).
+        if pipe_id != 0 && pipe_id == crate::gui::terminal::console_drain_pipe_id() {
+            let drained = crate::ipc::pipe::pipe_drain_console(pipe_id);
+            if drained > 0 {
+                // Freed space — retry the write without parking.
+                continue;
+            }
+            // Nothing was buffered (a transient zero-space read can race the
+            // child's own writes); fall through to the normal park so the
+            // writer is still woken by `poll_output`'s `wake_writers_all` if it
+            // does manage to run, and by the close paths on EOF/EPIPE.  This
+            // keeps the inline drain a pure progress *accelerator*, never the
+            // sole liveness mechanism.
+        }
+
         // Park atomically against the reader's `wake_writers_all`.  The lock
         // order PIPE_WRITE_WAITERS -> PIPE_TABLE is taken and released
         // entirely inside `wait_writable`; we hold no pipe lock across the
