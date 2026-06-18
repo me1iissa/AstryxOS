@@ -362,6 +362,10 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_quarantine_lifecycle() { passed += 1; }
 
+    // ── Test 0e4: read(2) userspace-buffer bounce (read-storm regression) ─
+    total += 1;
+    if test_virtio_blk_read_userspace_bounce() { passed += 1; }
+
     // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
@@ -38149,6 +38153,83 @@ fn test_virtio_blk_quarantine_lifecycle() -> bool {
             false
         }
     }
+}
+
+// ── Test 0e4: virtio-blk read(2) userspace-buffer bounce ─────────────────────
+//
+// Regression guard for the read(2) disk-completion stall that wedged the whole
+// guest (WebXO HTTP server: GET / → wait_completion timeout storm → slot
+// exhaustion → device reset → degraded guest).
+//
+// Root cause (GDB-autopsy): a multi-block `read(2)` issued with a *userspace*
+// buffer flowed through ext2's aligned fast path, which DMAs straight into the
+// caller's buffer.  With no IOMMU the device interprets the userspace VA as a
+// physical address far beyond installed RAM, can never service the chain, and
+// the waiter trips its no-progress deadline — quarantining the slot.  The
+// descriptor data field held a userspace VA (e.g. 0x7eff_…); the device's
+// `used.idx` tracked `avail.idx` for every OTHER (kernel-buffer) request,
+// proving the device was healthy and the bug was a non-DMA-able submission.
+//
+// Fix: `do_io` bounces a non-DMA-able buffer through a kernel-physical staging
+// buffer (read into bounce → copy to user; copy user → write bounce).  This
+// test asserts the DMA/bounce classifier is correct (kernel + low-physical =>
+// direct; userspace VA => bounce) and that a real multi-block device read still
+// returns coherent bytes.
+fn test_virtio_blk_read_userspace_bounce() -> bool {
+    test_header!("virtio-blk read(2) userspace-buffer bounce (Test 0e4)");
+
+    // Part 1 — classifier (device-free): the userspace-VA class that the
+    // autopsy caught MUST be flagged non-DMA-able.
+    if let Err(why) = crate::drivers::virtio_blk::test_dma_classification() {
+        test_fail!("virtio_blk_read_bounce", "{}", why);
+        return false;
+    }
+    test_println!("  DMA/bounce classifier: kernel+low-phys=direct, userspace-VA=bounce ✓");
+
+    if !crate::drivers::virtio_blk::is_available() {
+        test_println!("  SKIP device read: no virtio-blk PCI device on bus");
+        test_pass!("virtio-blk read(2) userspace bounce (Test 0e4)");
+        return true;
+    }
+
+    use crate::drivers::block::BlockDevice;
+    let dev = crate::drivers::virtio_blk::VirtioBlkBlockDevice;
+    if dev.sector_count() < 8 {
+        test_println!("  SKIP device read: disk too small");
+        test_pass!("virtio-blk read(2) userspace bounce (Test 0e4)");
+        return true;
+    }
+
+    // Part 2 — a multi-block read must complete and be self-consistent.  Read
+    // an 8-sector (4 KiB) span twice into kernel buffers; the request size is
+    // the same the read(2) page-cache-miss tail uses, and crucially completes
+    // without tripping the no-progress deadline (the pre-fix storm signature).
+    let timeouts_before = crate::drivers::virtio_blk::quarantine_counts().0;
+    let mut buf_a = alloc::vec![0u8; 8 * 512];
+    let mut buf_b = alloc::vec![0u8; 8 * 512];
+    if let Err(e) = dev.read_sectors(1, 8, &mut buf_a) {
+        test_fail!("virtio_blk_read_bounce", "multi-block read_sectors(1,8) failed: {:?}", e);
+        return false;
+    }
+    if let Err(e) = dev.read_sectors(1, 8, &mut buf_b) {
+        test_fail!("virtio_blk_read_bounce", "multi-block re-read failed: {:?}", e);
+        return false;
+    }
+    if buf_a != buf_b {
+        test_fail!("virtio_blk_read_bounce", "two reads of the same span disagree");
+        return false;
+    }
+    let timeouts_after = crate::drivers::virtio_blk::quarantine_counts().0;
+    if timeouts_after != timeouts_before {
+        test_fail!("virtio_blk_read_bounce",
+            "multi-block read tripped {} no-progress timeout(s) on a healthy device",
+            timeouts_after - timeouts_before);
+        return false;
+    }
+    test_println!("  multi-block device read coherent, zero spurious timeouts ✓");
+
+    test_pass!("virtio-blk read(2) userspace bounce (Test 0e4)");
+    true
 }
 
 // ── Test 0f: AHCI per-port mutex topology ───────────────────────────────────
