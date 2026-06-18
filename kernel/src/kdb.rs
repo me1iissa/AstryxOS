@@ -124,6 +124,29 @@ fn pump_thread_entry() {
         // each callee; concurrent calls from the BSP main loop are
         // serialised by those locks (TCP_CONNECTIONS, KDB_SESSIONS).
         crate::net::poll();
+
+        // Drain the running child's stdout/stderr console pipe from THIS
+        // dedicated thread as well as from the BSP main loop.
+        //
+        // Why a second, independent drainer (windowed-Firefox first-paint
+        // wedge, 2026-06-17): the BSP main loop is the primary console drainer,
+        // but under a heavy clone-thread spawn burst (Firefox brings up ~70
+        // threads) the BSP main thread can go long stretches without a slice —
+        // long enough that the child fills its 4 KiB stdout/stderr pipe.  A
+        // blocking `writev(2)` to a full pipe then correctly parks the writer
+        // (POSIX.1-2017 write(2); pipe(7) full-buffer semantics); if nothing
+        // reads the pipe, the writer is never woken and the whole thread group
+        // wedges (observed: Firefox's main thread parked in `writev(fd=2)`,
+        // run queue stalled, scheduler-deadlock watchdog 0xdead0004).  This
+        // PRIORITY_HIGH pump thread is scheduled reliably every ~10 ms, so
+        // calling `poll_output()` here guarantees the console pipe keeps
+        // draining (and parked writers keep being woken via
+        // `pipe_read_and_wake`) regardless of BSP-main-loop scheduling.
+        // `poll_output()` is idempotent and self-gating (no-ops when no child
+        // is running) and takes only the pipe/TERMINAL locks, which are
+        // disjoint from the locks held here.
+        crate::gui::terminal::poll_output();
+
         // Yield for 1 tick.  At the firefox-test BSP cadence of ~100 Hz
         // this gives ~100 kdb-pump opportunities per second, well above
         // the ~5 cycles a single kdb exchange (handshake + req + resp +
