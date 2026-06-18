@@ -307,6 +307,18 @@ pub fn inode_is_pinned_pub(mount_idx: usize, inode: u64) -> bool {
     inode_is_pinned(mount_idx, inode)
 }
 
+/// Exact kernel pin count on `(mount_idx, inode)` (0 when unpinned).  Lets
+/// regression tests assert the one-pin-per-VMA-membership invariant precisely
+/// after an `mprotect` split (Test 119c), not just "pinned vs not".  Test-mode
+/// only.
+#[cfg(feature = "test-mode")]
+pub fn inode_pin_count_pub(mount_idx: usize, inode: u64) -> u32 {
+    PINNED_INODES.lock().iter()
+        .find(|(m, n, _)| *m == mount_idx && *n == inode)
+        .map(|(_, _, c)| *c)
+        .unwrap_or(0)
+}
+
 /// Place one kernel pin on the inode backing a `MAP_SHARED` file-backed VMA.
 ///
 /// POSIX `mmap(2)` makes a mapping an independent reference on the underlying
