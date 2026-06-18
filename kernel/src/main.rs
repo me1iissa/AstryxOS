@@ -1136,9 +1136,17 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 }
             }
 
-            // Create a visible X11 test window BEFORE Firefox launches
-            serial_println!("[X11-VIS] Creating X11 visual test window...");
-            {
+            // Create a visible X11 test window BEFORE Firefox launches.
+            // DECLUTTER (GUI mode): skip this synthetic cyan probe window when
+            // running windowed Firefox (astryx.ff_gui=1).  The probe is a
+            // kernel-owned 300x200 test client that would otherwise sit on the
+            // compositor root and be mistaken for — or obscure — the real
+            // Firefox toplevel.  Mirrors the xeyes-test declutter at the top of
+            // this file: in GUI mode the only visible client must be the app
+            // under observation.  Headless mode keeps the probe (it is never
+            // composited to the framebuffer there) so existing demos are intact.
+            if !boot_config::ff_gui_mode() {
+                serial_println!("[X11-VIS] Creating X11 visual test window...");
                 use crate::net::unix;
                 // Kernel-owned X11 test connection — see unix(7) SO_PEERCRED.
                 let kernel_creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
@@ -1188,7 +1196,15 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     // It will persist until Firefox test ends
                 }
             }
-            gui::desktop::launch_desktop();
+            // DECLUTTER (GUI mode): in windowed Firefox mode do NOT spawn the
+            // Orbit Shell taskbar + the five demo windows (File Explorer,
+            // Terminal, Settings, Text Editor, Calculator).  They would cover
+            // the compositor root and hide the real Firefox toplevel we want to
+            // observe.  Headless mode still launches the desktop so the existing
+            // screenshot demos are unchanged.
+            if !boot_config::ff_gui_mode() {
+                gui::desktop::launch_desktop();
+            }
             hal::enable_interrupts();
 
             // Wait 30 ticks for the desktop to settle before launching Firefox.
