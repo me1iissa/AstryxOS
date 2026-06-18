@@ -967,6 +967,51 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         );
     }
 
+    // ── Runtime per-PID [SC] trace (firefox-test-core, runtime-armable) ──────
+    // The `syscall-trace` block above is the always-on firehose for *every*
+    // PID and is a compile-time feature.  This block is the runtime-armable
+    // per-PID equivalent: it emits the identical `[SC]` line shape but only for
+    // the single PID stored in `crate::syscall::TRACE_PID` (armed at runtime via
+    // the kdb `trace-pid` / `trace-contentproc` ops).  It exists so an agent can
+    // capture the full syscall stream of a late-spawned process (a Firefox
+    // `-contentproc` child that does not exist at boot) without recompiling.
+    //
+    // Compiled only under `firefox-test-core` (the Firefox bring-up profile that
+    // the live demo boots) AND only when `syscall-trace` is NOT already pulling
+    // in the global firehose — so there is never a double emit, and builds
+    // without `firefox-test-core` pay nothing at all.  When `TRACE_PID == 0`
+    // (the default) the cost is a single relaxed atomic load.
+    #[cfg(all(feature = "firefox-test-core", not(feature = "syscall-trace")))]
+    {
+        let trace_pid = crate::syscall::TRACE_PID
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if trace_pid != 0 && crate::proc::current_pid_lockless() == trace_pid {
+            let user_rip = unsafe { crate::syscall::get_user_rip() };
+            let caller_rip = crate::syscall::get_user_caller_rip();
+            let tid_now = crate::proc::current_tid();
+            let rsp_live = crate::proc::current_kernel_rsp_live();
+            let (kstack_base, kstack_size) = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.tid == tid_now)
+                    .map(|t| (t.kernel_stack_base, t.kernel_stack_size))
+                    .unwrap_or((0, 0))
+            };
+            let kdepth = if kstack_base > 0 {
+                kstack_base.wrapping_add(kstack_size).wrapping_sub(rsp_live)
+            } else { 0 };
+            crate::serial_fast_println!(
+                "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ksp={:#x} kdepth={:#x}",
+                trace_pid,
+                tid_now,
+                num,
+                user_rip,
+                caller_rip,
+                arg1, arg2, arg3, arg4, arg5, arg6,
+                rsp_live, kdepth,
+            );
+        }
+    }
+
     // ── Phase 3B: periodic user-stack snapshot on hot syscalls ──────────────
     // Triggered every Nth `clock_gettime` / `gettimeofday` / `futex` call from
     // any user pid (>= 12 to skip kernel init / shell processes).  Emits an
@@ -1184,6 +1229,25 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         num,
         ret as u64,
     );
+
+    // Runtime per-PID return-side counterpart to the global firehose above —
+    // same gating rationale as the `[SC]` entry block: only the single armed
+    // `TRACE_PID`, only under `firefox-test-core` without the global
+    // `syscall-trace` firehose (no double emit).
+    #[cfg(all(feature = "firefox-test-core", not(feature = "syscall-trace")))]
+    {
+        let trace_pid = crate::syscall::TRACE_PID
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if trace_pid != 0 && crate::proc::current_pid_lockless() == trace_pid {
+            crate::serial_fast_println!(
+                "[SC-RET] pid={} tid={} nr={} ret={:#x}",
+                trace_pid,
+                crate::proc::current_tid(),
+                num,
+                ret as u64,
+            );
+        }
+    }
 
     // ── Dead-thread drain (exit_group SMP coherence) ──────────────────────
     //

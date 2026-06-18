@@ -875,6 +875,32 @@ pub fn set_per_cpu_id(cpu_id: u8) {
 pub static DEBUG_TRACE_PID: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Runtime per-PID `[SC]`/`[SC-RET]` trace target, armable at *runtime* via the
+/// kdb `trace-pid` op (no recompile, no boot-time-only `DEBUG_TRACE_PID` edit).
+///
+/// 0 (default) = disabled.  When non-zero, the syscall entry/return path emits
+/// the full firehose `[SC]`/`[SC-RET]` pair for *only* that PID — identical line
+/// format to the `syscall-trace` global firehose, so the existing host-side
+/// post-processors (`qemu-harness.py`, the golden-diff scanners) parse it
+/// unchanged.  Cost when disabled is a single relaxed atomic load on the entry
+/// path; the emit block is compiled only under `firefox-test-core` (the
+/// functional Firefox bring-up profile) and only when the always-on
+/// `syscall-trace` firehose is NOT already compiled in, so there is never a
+/// double emit and production builds pay nothing.
+///
+/// This exists because a Firefox `-contentproc` child forks late in the run
+/// (~tick 5000) and does not exist at boot, so a boot-time-static target is
+/// useless for capturing its complete init syscall trace.
+pub static TRACE_PID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// When true, the first process that `execve`s with `-contentproc` in its argv
+/// auto-arms [`TRACE_PID`] to its own PID — capturing the content process from
+/// its very first post-exec syscall with no host-side timing race.  Set at
+/// runtime via the kdb `trace-contentproc` op; off by default.
+pub static TRACE_CONTENTPROC: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Global Linux syscall counter for the Firefox oracle test.
 /// Incremented on every Linux syscall dispatch from any user-mode PID.
 /// Reset to zero by the test before spawning Firefox, then read after
@@ -1486,6 +1512,23 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 || argv_owned.iter().any(|a| a == "-contentproc");
             if is_content && !CONTENTPROC_GATE_SEEN.swap(true, Ordering::Relaxed) {
                 crate::serial_println!("[GATE] content-procs");
+            }
+
+            // Auto-arm the runtime per-PID syscall trace to the FIRST
+            // `-contentproc` child, when opted in at runtime via the kdb
+            // `trace-contentproc` op.  Captures the content process from its
+            // first post-exec syscall with no host-side timing race.  `pid` is
+            // the PID that will run this new image (execve(2) preserves the PID
+            // per POSIX), so this is the content-proc's own PID.  Fires once;
+            // off (and zero-cost) unless `TRACE_CONTENTPROC` was set.
+            if argv_owned.iter().any(|a| a == "-contentproc")
+                && crate::syscall::TRACE_CONTENTPROC.load(Ordering::Relaxed)
+                && crate::syscall::TRACE_PID.load(Ordering::Relaxed) == 0
+            {
+                let cp_pid = crate::proc::current_pid_lockless();
+                crate::syscall::TRACE_PID.store(cp_pid, Ordering::Relaxed);
+                crate::serial_println!(
+                    "[TRACE-PID] auto-armed contentproc pid={}", cp_pid);
             }
         }
     }
