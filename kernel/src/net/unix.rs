@@ -780,6 +780,7 @@ pub fn writable(id: u64) -> bool {
     if s.state == UnixState::Free { return true; }     // closed: write → EPIPE, no block
     if s.state != UnixState::Connected { return true; } // not connected: never blocks
     if s.shut_wr { return true; }                       // SHUT_WR: write → EPIPE, no block
+    let kind = s.kind;
     let peer = s.peer_id;
     if peer == u64::MAX || (peer as usize) >= MAX_UNIX_SOCKETS { return true; }
     let peer = &t.0[peer as usize];
@@ -787,6 +788,21 @@ pub fn writable(id: u64) -> bool {
     // Genuinely connected, write side open, peer alive: writable iff the peer's
     // recv ring has room for at least one byte — the exact condition under
     // which our STREAM/SEQPACKET `write()` returns >0 rather than -EAGAIN.
+    //
+    // SEQPACKET additionally enforces a per-message slot ring (`seq_lens`,
+    // `SEQ_QUEUE_CAP` slots): `write()` returns -EAGAIN once that ring is full
+    // *even when the byte ring has room*.  The POLLOUT / EPOLLOUT predicate
+    // must mirror BOTH halves of the send-side EAGAIN condition, otherwise a
+    // producer whose peer has drained the byte ring but not the slot ring is
+    // told the socket is writable, retries `sendmsg(2)`, gets -EAGAIN, and
+    // busy-spins poll→sendmsg→EAGAIN — the stuck-producer pattern `poll(2)` /
+    // `epoll(7)` exist to avoid.  A non-full slot ring is freed as the peer
+    // `recvmsg(2)`s each message, at which point the recv-drain write-space
+    // wake re-checks this predicate (`man 7 unix`).
+    if kind == SockKind::SeqPacket {
+        let queued = (peer.seq_tail + SEQ_QUEUE_CAP - peer.seq_head) % SEQ_QUEUE_CAP;
+        if queued >= SEQ_QUEUE_CAP - 1 { return false; }
+    }
     peer.recv_space() > 0
 }
 
