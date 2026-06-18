@@ -271,15 +271,15 @@ pub fn dispatcher_header_mut(entry: &mut DispatcherEntry) -> &mut DispatcherHead
 ///
 /// Woken threads receive a priority boost to improve responsiveness.
 pub fn wake_blocked_waiters(header: &mut DispatcherHeader) {
-    use crate::proc::{THREAD_TABLE, ThreadState, PRIORITY_BOOST_WAIT, PRIORITY_MAX};
+    use crate::proc::{THREAD_TABLE, ThreadState};
 
     let mut threads = THREAD_TABLE.lock();
     for wb in header.wait_list.iter().filter(|wb| wb.satisfied) {
         if let Some(t) = threads.iter_mut().find(|t| t.tid == wb.thread_id) {
             if t.state == ThreadState::Blocked {
                 t.state = ThreadState::Ready;
-                // Apply priority boost (capped at MAX).
-                t.priority = (t.priority + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX);
+                // Apply the shared wake-preemption boost (capped at MAX).
+                crate::proc::apply_wake_boost(t);
             }
         }
     }

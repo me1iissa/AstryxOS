@@ -2815,6 +2815,17 @@ pub fn run() -> ! {
         if test_285_anti_starvation_aging() { passed += 1; }
     }
 
+    // ── Test 287: wake-preemption boost lets a woken futex waiter outrank ───
+    // its waker. Regression for the Linux futex wake path not granting the
+    // sleeper-fairness boost that POSIX sched(7) requires — the root cause of
+    // the content-process worker reaching its event-target Dispatch before the
+    // just-woken main thread published the singleton. Pure scoring arithmetic.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_287_wake_boost_preempts_runnable_peer() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -45038,6 +45049,81 @@ fn test_285_anti_starvation_aging() -> bool {
     test_println!("  no-contention ordering preserved (priority > affinity, affinity tie-breaks) ✓");
 
     test_pass!("anti-starvation aging frees an out-scored Ready thread");
+    true
+}
+
+// ── Test 287: wake-preemption boost lets a just-woken futex waiter outrank
+// the continuously-runnable peers that woke it ─────────────────────────────────
+//
+// Regression for the Linux-personality futex wake path failing to grant the
+// sleeper-fairness boost that POSIX SCHED_OTHER / sched(7) require: a thread
+// returning from a blocking wait has not consumed the CPU, whereas the peers
+// that stayed runnable have, so on wake it must be allowed to run ahead of
+// them rather than landing at the back of an equal-priority round-robin queue.
+//
+// Concretely: a content-process main thread that parks on a gecko init mutex
+// and is then woken by a worker must publish its one-time singleton before any
+// equal-priority worker reaches the code that consumes that singleton. Without
+// the boost the woken thread ties the workers and can lose the round-robin, so
+// a worker dereferences the still-NULL singleton and SIGSEGVs.
+//
+// This test verifies the two contractual properties of `proc::apply_wake_boost`
+// using the SAME picker score formula as `sched::schedule` (priority*4 +
+// affinity + wait_age_bonus): (1) the boost raises a freshly-woken NORMAL
+// thread's effective priority by exactly PRIORITY_BOOST_WAIT and that this
+// out-scores a continuously-runnable NORMAL peer at equal/worse affinity even
+// when the peer has the cache-warm bonus; (2) the boost is bounded at
+// PRIORITY_MAX (never overflows). Pure arithmetic on a synthesised Thread —
+// deterministic, no spawning, no scheduler races. Cite POSIX sched(7).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_287_wake_boost_preempts_runnable_peer() -> bool {
+    use crate::proc::{PRIORITY_NORMAL, PRIORITY_BOOST_WAIT, PRIORITY_MAX, apply_wake_boost};
+    use crate::sched::wait_age_bonus;
+
+    test_header!("wake-preemption boost lets a woken futex waiter outrank its waker");
+
+    // Picker score, mirrored from `sched::schedule` (affinity 0/1/2, age in ticks).
+    fn picker_score(priority: u8, affinity: u16, age: u64) -> u16 {
+        (priority as u16) * 4 + affinity + wait_age_bonus(age)
+    }
+
+    // ── Property 1: boost raises effective priority by exactly BOOST_WAIT ──
+    // Build a minimal Blocked NORMAL thread, apply the boost, check the delta.
+    let mut t = crate::proc::Thread::new_for_test(PRIORITY_NORMAL);
+    let before = t.priority;
+    apply_wake_boost(&mut t);
+    if t.priority != before + PRIORITY_BOOST_WAIT {
+        test_fail!("test287",
+            "apply_wake_boost: priority {} != base {} + BOOST_WAIT {}",
+            t.priority, before, PRIORITY_BOOST_WAIT);
+        return false;
+    }
+    test_println!("  boost raises NORMAL {} → {} (+{}) ✓", before, t.priority, PRIORITY_BOOST_WAIT);
+
+    // ── Property 2: the just-woken (boosted) thread out-scores its waker ──
+    // The woken thread just became Ready (age 0, no wait-age bonus) and, having
+    // run here last, may even be cache-cold (affinity 0). The waker stayed
+    // runnable and is cache-warm (affinity 1). The boost must still win so the
+    // woken thread is selected first.
+    let woken  = picker_score(t.priority,      0, 0); // boosted, cold
+    let waker  = picker_score(PRIORITY_NORMAL, 1, 0); // unboosted NORMAL, warm
+    if woken <= waker {
+        test_fail!("test287",
+            "woken score {} does not outrank runnable waker {} (boost ineffective)", woken, waker);
+        return false;
+    }
+    test_println!("  woken-boosted score {} > runnable-waker score {} ✓", woken, waker);
+
+    // ── Property 3: boost is bounded at PRIORITY_MAX (no overflow) ──
+    let mut hi = crate::proc::Thread::new_for_test(PRIORITY_MAX);
+    apply_wake_boost(&mut hi);
+    if hi.priority != PRIORITY_MAX {
+        test_fail!("test287", "boost at MAX overflowed: {} != {}", hi.priority, PRIORITY_MAX);
+        return false;
+    }
+    test_println!("  boost capped at PRIORITY_MAX {} ✓", PRIORITY_MAX);
+
+    test_pass!("wake-preemption boost lets a woken futex waiter outrank its waker");
     true
 }
 

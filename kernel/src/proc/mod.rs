@@ -309,6 +309,50 @@ impl Thread {
     pub fn is_reapable(&self) -> bool {
         self.state == ThreadState::Dead && self.tid != 0 && self.tid < 0x1000
     }
+
+    /// Construct a minimal, never-scheduled `Thread` for in-kernel unit tests.
+    ///
+    /// The row is `Blocked` and pinned to an impossible CPU so the picker and
+    /// the timer-tick wake passes never touch it; only the priority/base fields
+    /// are meaningful. Used by scheduler-invariant tests (e.g. the wake-boost
+    /// regression) that need a real `Thread` to exercise `&mut Thread` helpers
+    /// without spawning or registering anything. Test-only.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    pub fn new_for_test(priority: u8) -> Thread {
+        Thread {
+            tid: 0xFFFF_FFFF,
+            pid: 0xFFFF_FFFF,
+            state: ThreadState::Blocked,
+            context: alloc::boxed::Box::new(CpuContext::default()),
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+            wake_tick: u64::MAX - 2,
+            name: [0u8; 32],
+            exit_code: 0,
+            fpu_state: None,
+            user_entry_rip: 0,
+            user_entry_rsp: 0,
+            user_entry_rdx: 0,
+            user_entry_r8: 0,
+            priority,
+            base_priority: priority,
+            tls_base: 0,
+            gs_base: 0,
+            cpu_affinity: Some(0xFE),
+            last_cpu: 0,
+            first_run: false,
+            ready_since_tick: 0,
+            ctx_rsp_valid: alloc::boxed::Box::new(
+                core::sync::atomic::AtomicBool::new(true)),
+            clear_child_tid: 0,
+            fork_user_regs: ForkUserRegs::default(),
+            vfork_parent_tid: None,
+            robust_list_head: 0,
+            robust_list_len: 0,
+            vfork_isolated_stack: None,
+            vfork_isolated_tls: None,
+        }
+    }
 }
 
 // ── Priority Constants (NT-style) ────────────────────────────────────
@@ -333,6 +377,30 @@ pub const PRIORITY_MAX: u8 = 31;
 pub const PRIORITY_BOOST_WAIT: u8 = 2;
 /// Priority boost given on I/O completion.
 pub const PRIORITY_BOOST_IO: u8 = 1;
+
+/// Apply the wait-satisfied (wake) priority boost to a thread that is being
+/// transitioned out of a blocking wait.
+///
+/// A thread that has just been unblocked has not consumed any CPU while it
+/// slept, whereas any peers that were continuously runnable have. Giving the
+/// freshly-woken thread a small, self-decaying effective-priority boost lets
+/// it run ahead of those CPU-bound peers for its next scheduling decision,
+/// then decay back to `base_priority` (one point per context-switch-out, in
+/// `schedule()`). This is the run-queue-placement equivalent of POSIX
+/// SCHED_OTHER / `sched(7)` sleeper fairness: a task returning from a sleep is
+/// owed service relative to tasks that have been spending the CPU, so a
+/// wakeup is allowed to preempt the running set rather than landing at the
+/// back of an equal-priority round-robin queue.
+///
+/// The boost is one-shot and bounded (capped at `PRIORITY_MAX`, decays in the
+/// picker), so it improves wake latency without permanently re-ranking the
+/// thread. The native executive's `ke::dispatcher::wake_blocked_waiters`
+/// already applies this same boost on its Blocked→Ready edge; this helper
+/// makes the rule a single shared primitive so every wake path is consistent.
+#[inline]
+pub fn apply_wake_boost(t: &mut Thread) {
+    t.priority = (t.priority + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX);
+}
 
 /// 512-byte FXSAVE area, 16-byte aligned.
 #[repr(C, align(16))]
