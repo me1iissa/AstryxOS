@@ -1237,7 +1237,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 /// - Bit 1: Write (1 = write, 0 = read)
 /// - Bit 2: User (1 = user mode, 0 = kernel mode)
 /// - Bit 4: Instruction fetch
-fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut InterruptFrame) -> bool {
+fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptFrame) -> bool {
     PAGE_FAULT_TOTAL.fetch_add(1, Ordering::Relaxed);
     // Per-process PF counter.  Lockless: takes neither THREAD_TABLE nor
     // PROCESS_TABLE; one bounds-check + one Acquire load + one Relaxed
@@ -1878,7 +1878,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                     cached_phys,
                                     c_mount, c_inode, c_off,
                                     mount_idx, inode, file_page_offset,
-                                    _frame.rip,
+                                    frame.rip,
                                 );
                             }
                         }
@@ -1960,6 +1960,59 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     }
                 }
                 return true;
+            }
+
+            // ── Defensive: dead / truncated backing inode → SIGBUS ───────────
+            //
+            // The page was not in the cache, so its contents (if any) must come
+            // from the backing inode.  If `stat` on that inode fails the inode
+            // no longer exists in the filesystem — e.g. a still-live MAP_SHARED
+            // mapping whose backing tmpfs/shm inode was freed.  POSIX mmap(2)
+            // specifies SIGBUS for "a reference to a portion of [a file] mapping
+            // that does not correspond to the file" (a truncated / removed
+            // backing).  Without this guard the readahead path below would see
+            // `file_size == 0`, map no page, and return an *unserviced* fault
+            // that the caller converts to a silent SIGSEGV (or, worse, a
+            // zero-filled page) — making any residual inode-lifetime bug a
+            // mystery crash instead of a loud, spec-correct SIGBUS.
+            //
+            // Only the faulting page matters here (pure readahead is best-
+            // effort and simply retries), and only Ring-3 faults are eligible
+            // for signal delivery; a kernel-mode fault on a dead inode falls
+            // through to the existing unresolved-fault path.
+            {
+                let inode_alive = {
+                    let fs_for_stat: Option<Arc<dyn crate::vfs::FileSystemOps>> =
+                        crate::vfs::MOUNTS.try_lock()
+                            .and_then(|m| m.get(mount_idx).map(|mt| mt.fs.clone()));
+                    match fs_for_stat {
+                        // Contended MOUNTS: cannot prove the inode is dead, so
+                        // do NOT synthesise SIGBUS — fall through and let the
+                        // normal path (which re-tries the lock) decide.
+                        None => true,
+                        Some(fs) => fs.stat(inode).is_ok(),
+                    }
+                };
+                if !inode_alive {
+                    crate::serial_println!(
+                        "[PF/SIGBUS] dead file-backing inode={} mount={} foff={:#x} cr2={:#x} shared={}",
+                        inode, mount_idx, file_page_offset, faulting_addr, is_shared);
+                    if error_code & 4 != 0 {
+                        // BUS_ADRERR = 3 (physical address valid but no object).
+                        let delivered = unsafe {
+                            crate::signal::deliver_fault_signal_from_isr(
+                                crate::signal::SIGBUS, 3,
+                                faulting_addr, error_code,
+                                frame as *mut InterruptFrame,
+                            )
+                        };
+                        // Delivered → IRET runs the handler (handled).  No
+                        // handler → return false so the caller default-kills
+                        // the process (the correct default action for SIGBUS).
+                        return delivered;
+                    }
+                    return false;
+                }
             }
 
             // 2. Not cached — allocate pages and read from the filesystem.
@@ -2501,7 +2554,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                     phys,
                                     c_mount, c_inode, c_off,
                                     mount_idx, inode, foff,
-                                    _frame.rip,
+                                    frame.rip,
                                 );
                             }
                         }
@@ -2619,7 +2672,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             "[PF] MOUNTS spin exceeded bound at faulting_addr={:#x} \
                              rip={:#x} — leaving page unread (likely same-thread \
                              MOUNTS recursion outside vfs::*; see #82 follow-up)",
-                            faulting_addr, _frame.rip,
+                            faulting_addr, frame.rip,
                         );
                         break None;
                     }
@@ -2878,7 +2931,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                     phys,
                                     c_mount, c_inode, c_off,
                                     mount_idx, inode, file_page_offset,
-                                    _frame.rip,
+                                    frame.rip,
                                 );
                             }
                         }

@@ -1299,6 +1299,14 @@ pub fn run() -> ! {
     total += 1;
     if test_umount_removes_mount() { passed += 1; }
 
+    // ── Test 119b: MAP_SHARED-file inode pin survives unlink + last close ──
+    // Cross-subsystem: mm::vma (VMA pin/unpin at insert/teardown) + vfs
+    // (unlink-on-last-close + PINNED_INODES).  Reproduces the POSIX shm idiom
+    // a content/IPC layer uses (shm_open → mmap(MAP_SHARED) → close → unlink)
+    // and asserts the inode's data survives until the mapping is torn down.
+    total += 1;
+    if test_shm_mmap_pin_survives_unlink_close() { passed += 1; }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -48255,6 +48263,143 @@ fn test_288_scm_memfd_inode_lifecycle() -> bool {
     // Final close of the last reference frees the (unlinked) inode.
     crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
     test_pass!("SCM-passed memfd inode survives sender close (Test 288)");
+    true
+}
+
+// ── Test 119b: MAP_SHARED-file inode pin survives unlink + last close ────────
+//
+// POSIX mmap(2) makes a mapping an independent reference on the backing file:
+// the inode (and its data) must survive a close(2) of the mapping fd, and an
+// unlink(2)/shm_unlink, until the mapping itself is torn down.  This is the
+// POSIX shared-memory idiom an IPC layer uses — memfd_create/shm_open →
+// mmap(MAP_SHARED) → close(fd) — and the exact path that crashed Firefox's
+// main process: it mapped a /dev/shm IPC region MAP_SHARED then close()'d the
+// fd, the inode was freed under it, and the next demand fault on the still-live
+// mapping found a dead inode and SIGSEGV'd.
+//
+// This exercises the kernel invariant directly (no user process needed): a live
+// MAP_SHARED file VMA holds one inode pin (the pin `insert_vma` takes), so the
+// last close must NOT free the inode; once the mapping's pin is dropped (the
+// unpin `remove_range`/teardown takes) and nothing else references it, the
+// inode is freed by the deferred reaper.
+//
+// Cross-subsystem: mm::vma (VMA pin/unpin balance) + vfs (unlink-on-last-close
+// C5 + PINNED_INODES authority + PENDING_INODE_REAP).
+// Refs: mmap(2), munmap(2), memfd_create(2), shm_open(3).
+fn test_shm_mmap_pin_survives_unlink_close() -> bool {
+    use crate::mm::vma::{VmBacking, MAP_SHARED, MAP_PRIVATE};
+    test_header!("MAP_SHARED-file inode pin survives unlink + last close (Test 119b)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // memfd_create gives an already-unlinked (anonymous) inode — exactly the
+    // post-shm_unlink lifetime the bug is about.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("shm_mmap_pin", "memfd_create returned {}", fd);
+        return false;
+    }
+    let surf = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("shm_mmap_pin", "write to memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Snapshot (mount_idx, inode).
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("shm_mmap_pin", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("shm_mmap_pin", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    let shared_backing = VmBacking::File { mount_idx: mnt, inode: ino, offset: 0, elf_load_delta: 0 };
+    test_println!("  memfd inode {} on mount {} ✓", ino, mnt);
+
+    // A MAP_PRIVATE mapping must NOT pin (it copies file pages into anon frames
+    // and does not need the inode to outlive close) — assert the gate first.
+    crate::vfs::vma_pin_if_shared_file(MAP_PRIVATE, &shared_backing);
+    if crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "MAP_PRIVATE wrongly pinned the inode");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  MAP_PRIVATE does not pin ✓");
+
+    // Now the live MAP_SHARED mapping takes its inode pin (as insert_vma does).
+    crate::vfs::vma_pin_if_shared_file(MAP_SHARED, &shared_backing);
+    if !crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "MAP_SHARED did not pin the inode");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // close(2) the only fd.  This is unlink-on-last-close (C5): WITHOUT the pin
+    // the inode would be freed here.  WITH the pin it must survive — this is the
+    // exact moment Firefox crashed.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    // The inode's data must still be readable directly from the filesystem — it
+    // was not freed under the still-live mapping.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        match fs.read(ino, 0, &mut rbuf) {
+            Ok(n) if n == 4 && rbuf == surf => {
+                test_println!("  inode data survives last close while MAP_SHARED-pinned ✓");
+            }
+            other => {
+                test_fail!("shm_mmap_pin",
+                    "inode read after close = {:?} buf={:?} (want Ok(4) {:?}) — freed early",
+                    other, rbuf, surf);
+                crate::vfs::vma_unpin_if_shared_file(MAP_SHARED, &shared_backing);
+                crate::vfs::reap_pending_inodes();
+                return false;
+            }
+        }
+    } else {
+        test_fail!("shm_mmap_pin", "mount {} vanished", mnt);
+        return false;
+    }
+
+    // Tear down the mapping (the unpin remove_range / address-space teardown
+    // performs).  This drops the last pin; the deferred reaper then frees the
+    // now-orphaned (unlinked, no open fd, no pin) inode.
+    crate::vfs::vma_unpin_if_shared_file(MAP_SHARED, &shared_backing);
+    if crate::vfs::inode_is_pinned_pub(mnt, ino) {
+        test_fail!("shm_mmap_pin", "inode still pinned after the only mapping's unpin");
+        crate::vfs::reap_pending_inodes();
+        return false;
+    }
+    crate::vfs::reap_pending_inodes();
+
+    // The inode must now be gone: a fresh fs read fails (inode freed) and the
+    // deferred-delete record is drained.
+    if let Some((fs, _)) = crate::vfs::fs_at(mnt) {
+        let mut rbuf = [0u8; 4];
+        if fs.read(ino, 0, &mut rbuf).is_ok() {
+            test_fail!("shm_mmap_pin",
+                "inode {} still readable after mapping teardown — leaked", ino);
+            return false;
+        }
+    }
+    test_println!("  inode freed once the last MAP_SHARED mapping is torn down ✓");
+
+    test_pass!("MAP_SHARED-file inode pin survives unlink + last close (Test 119b)");
     true
 }
 

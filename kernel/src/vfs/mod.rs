@@ -180,29 +180,47 @@ pub fn pin_inode(mount_idx: usize, inode: u64) {
     }
 }
 
-/// Drop one kernel pin on `(mount_idx, inode)`.  When the pin count reaches
-/// zero AND the inode was deferred-deleted with no remaining open fd, the inode
-/// is freed here (the pin was the last thing keeping it alive).  Returns true
-/// if the inode was actually freed by this call.
-pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
-    if mount_idx == usize::MAX { return false; }
-    let now_unpinned = {
-        let mut p = PINNED_INODES.lock();
-        if let Some(idx) = p.iter().position(|(m, n, _)| *m == mount_idx && *n == inode) {
-            if p[idx].2 > 1 {
-                p[idx].2 -= 1;
-                false
-            } else {
-                p.remove(idx);
-                true
-            }
-        } else {
+/// Inodes whose last kernel pin was dropped by an *under-lock* caller (one that
+/// already holds [`crate::proc::PROCESS_TABLE`]) and which therefore could not
+/// run the orphan check / free inline.  Drained by [`reap_pending_inodes`] after
+/// the caller releases PROCESS_TABLE.  Entries: `(mount_idx, inode_number)`.
+///
+/// This mirrors the fd-close machinery's split between a lock-free fast path and
+/// a deferred free: the VMA-list edit that drops a `MAP_SHARED` mapping's pin
+/// (munmap, `MAP_FIXED` replacement, a hole-punch split) runs inside the
+/// `mmap`/`munmap` PROCESS_TABLE critical section, so the actual inode-free —
+/// which itself must scan PROCESS_TABLE for surviving fd references — is queued
+/// here and reaped once the lock is dropped.  Calling a PROCESS_TABLE-taking
+/// helper while PROCESS_TABLE is held would self-deadlock the non-reentrant
+/// spin lock.
+static PENDING_INODE_REAP: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// Decrement the pin count on `(mount_idx, inode)`.  Returns `true` iff this call
+/// dropped the *last* pin (count reached zero and the entry was removed).  Does
+/// NOT take any lock other than `PINNED_INODES`, so it is safe to call with
+/// `PROCESS_TABLE` held.
+fn dec_pin(mount_idx: usize, inode: u64) -> bool {
+    let mut p = PINNED_INODES.lock();
+    if let Some(idx) = p.iter().position(|(m, n, _)| *m == mount_idx && *n == inode) {
+        if p[idx].2 > 1 {
+            p[idx].2 -= 1;
             false
+        } else {
+            p.remove(idx);
+            true
         }
-    };
-    if !now_unpinned { return false; }
-    // Last pin gone — free the inode iff it was deferred-deleted and no process
-    // fd table still references it.  Mirrors the close()-time last-close test.
+    } else {
+        false
+    }
+}
+
+/// Free `(mount_idx, inode)` iff it was deferred-deleted (unlinked while open or
+/// mapped) and no process fd table still references it.  Returns `true` if the
+/// inode was actually freed.  Takes `PROCESS_TABLE`, so callers MUST NOT already
+/// hold it (use [`unpin_inode_deferred`] + [`reap_pending_inodes`] instead).
+///
+/// Mirrors the close()-time last-close test in [`close`] (its C5 path).
+fn try_free_orphan_inode(mount_idx: usize, inode: u64) -> bool {
     let still_open = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
@@ -210,7 +228,9 @@ pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
                 .unwrap_or(false)
         }))
     };
-    if still_open { return false; }
+    // Another live kernel pin (e.g. an in-flight SCM_RIGHTS descriptor) keeps the
+    // inode alive even after this one was dropped.
+    if still_open || inode_is_pinned(mount_idx, inode) { return false; }
     let was_deleted = {
         let mut dl = DELETED_INODES.lock();
         let before = dl.len();
@@ -226,10 +246,125 @@ pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
     false
 }
 
+/// Drop one kernel pin on `(mount_idx, inode)`.  When the pin count reaches
+/// zero AND the inode was deferred-deleted with no remaining open fd, the inode
+/// is freed here (the pin was the last thing keeping it alive).  Returns true
+/// if the inode was actually freed by this call.
+///
+/// Takes `PROCESS_TABLE`; callers MUST NOT hold it.  The in-flight SCM_RIGHTS
+/// drop path and the no-lock address-space teardown paths use this directly.
+/// Under-lock VMA edits (munmap/mmap-replace/split) must use
+/// [`unpin_inode_deferred`] instead.
+pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
+    if mount_idx == usize::MAX { return false; }
+    if !dec_pin(mount_idx, inode) { return false; }
+    try_free_orphan_inode(mount_idx, inode)
+}
+
+/// Drop one kernel pin on `(mount_idx, inode)` from a context that may already
+/// hold `PROCESS_TABLE` (e.g. `VmSpace::remove_range` running inside the
+/// `mmap`/`munmap` critical section).  This NEVER takes `PROCESS_TABLE`: if the
+/// last pin is dropped, the orphan check + free is queued for
+/// [`reap_pending_inodes`], which the syscall layer runs after releasing the
+/// lock.  See [`PENDING_INODE_REAP`].
+pub fn unpin_inode_deferred(mount_idx: usize, inode: u64) {
+    if mount_idx == usize::MAX { return; }
+    if dec_pin(mount_idx, inode) {
+        PENDING_INODE_REAP.lock().push((mount_idx, inode));
+    }
+}
+
+/// Drain [`PENDING_INODE_REAP`] and free any inode whose last `MAP_SHARED`
+/// mapping pin was dropped under `PROCESS_TABLE` and which is now orphaned
+/// (deferred-deleted, no open fd, no other pin).  MUST be called with
+/// `PROCESS_TABLE` *not* held; the syscall layer invokes it after every
+/// `mmap`/`munmap` that may have unpinned an inode, so a still-mapped shm
+/// inode is freed the moment its last mapping is torn down (the POSIX shm
+/// `shm_open`→`mmap`→`close`→`shm_unlink` idiom).
+pub fn reap_pending_inodes() {
+    // Move the queue out under its own lock so we are not iterating while the
+    // (possibly slow) free path runs, and so a re-entrant push cannot deadlock.
+    let pending: Vec<(usize, u64)> = {
+        let mut q = PENDING_INODE_REAP.lock();
+        if q.is_empty() { return; }
+        core::mem::take(&mut *q)
+    };
+    for (mount_idx, inode) in pending {
+        try_free_orphan_inode(mount_idx, inode);
+    }
+}
+
 /// True if `(mount_idx, inode)` currently has at least one kernel pin
 /// (see [`pin_inode`]).
 fn inode_is_pinned(mount_idx: usize, inode: u64) -> bool {
     PINNED_INODES.lock().iter().any(|(m, n, c)| *m == mount_idx && *n == inode && *c > 0)
+}
+
+/// Public view of [`inode_is_pinned`] for regression tests that assert the
+/// MAP_SHARED-file pin balance (see test_runner Test 119b).  Test-mode only.
+#[cfg(feature = "test-mode")]
+pub fn inode_is_pinned_pub(mount_idx: usize, inode: u64) -> bool {
+    inode_is_pinned(mount_idx, inode)
+}
+
+/// Place one kernel pin on the inode backing a `MAP_SHARED` file-backed VMA.
+///
+/// POSIX `mmap(2)` makes a mapping an independent reference on the underlying
+/// open file description: "The mmap() function adds an extra reference to the
+/// file associated with the file descriptor fildes which is not removed by a
+/// subsequent close() on that file descriptor."  Combined with `unlink(2)`
+/// ("if [the link count] was the last link ... but [a] process has the file
+/// open, the file shall remain in existence until ... the file is no longer
+/// open"), a live `MAP_SHARED` mapping must keep an unlinked file's inode (and
+/// its data) alive until the mapping is torn down.
+///
+/// This is exactly the POSIX shared-memory idiom — `shm_open` → `ftruncate` →
+/// `mmap(MAP_SHARED)` → `close(fd)` → `shm_unlink` — used by, among others,
+/// the cross-process IPC shared buffers of large desktop applications.  Without
+/// this pin the `close(fd)` after `mmap` triggers unlink-on-last-close (see
+/// [`close`]'s C5 path), `remove_inode` frees the ramfs/tmpfs inode, and the
+/// next demand-fault on the still-live mapping reads a now-absent inode →
+/// SIGSEGV.
+///
+/// `MAP_PRIVATE` file mappings (e.g. ELF `PT_LOAD` segments) do NOT pin: a
+/// private mapping copies file pages into anonymous frames and does not require
+/// the inode to survive past `close`.  Anonymous and device mappings have no
+/// inode and are ignored.
+///
+/// Balanced by [`vma_unpin_if_shared_file`]; one pin per VMA-list membership.
+pub fn vma_pin_if_shared_file(
+    flags: crate::mm::vma::VmFlags,
+    backing: &crate::mm::vma::VmBacking,
+) {
+    if flags & crate::mm::vma::MAP_SHARED == 0 {
+        return;
+    }
+    if let crate::mm::vma::VmBacking::File { mount_idx, inode, .. } = backing {
+        pin_inode(*mount_idx, *inode);
+    }
+}
+
+/// Drop the kernel pin placed by [`vma_pin_if_shared_file`] when a `MAP_SHARED`
+/// file-backed VMA leaves a process's address space (munmap, `MAP_FIXED`
+/// replacement, a hole-punch split, or whole-address-space teardown at
+/// exit/exec).
+///
+/// This uses [`unpin_inode_deferred`], which NEVER takes `PROCESS_TABLE`, so it
+/// is safe to call from inside `VmSpace::remove_range` (run under PROCESS_TABLE
+/// by `mmap`/`munmap`) and from the address-space teardown VMA walks.  When this
+/// drops the last pin of an already-unlinked shm inode, the actual free is
+/// queued; the caller frees it by calling [`reap_pending_inodes`] after it
+/// releases PROCESS_TABLE.
+pub fn vma_unpin_if_shared_file(
+    flags: crate::mm::vma::VmFlags,
+    backing: &crate::mm::vma::VmBacking,
+) {
+    if flags & crate::mm::vma::MAP_SHARED == 0 {
+        return;
+    }
+    if let crate::mm::vma::VmBacking::File { mount_idx, inode, .. } = backing {
+        unpin_inode_deferred(*mount_idx, *inode);
+    }
 }
 
 // ───── firefox-test screenshot-write gate ───────────────────────────────────
