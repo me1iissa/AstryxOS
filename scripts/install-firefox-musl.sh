@@ -695,6 +695,44 @@ if [ -n "${MISSING_BASE_LIBS}" ]; then
     exit 1
 fi
 
+# Verify the GUI runtime caches (c1/c3) actually landed in the staging tree.
+# These three BINARY index files are produced here (Alpine ships them only as
+# apk post-install trigger output, never as packaged files), and the kernel's
+# windowed-Firefox launch path points the runtime at them by absolute path
+# (GDK_PIXBUF_MODULE_FILE → loaders.cache; GSettings/GIO → gschemas.compiled;
+# GIO content-type → mime.cache).  If a build ships without them, the GUI
+# (--ff-gui) path degrades silently: GdkPixbuf icon decode and GtkSettings
+# theme/icon-name resolution fall back inconsistently, which has historically
+# masqueraded as a render gate.  This is non-fatal (a headless image still
+# boots), but we emit a single prominent, greppable marker per missing cache so
+# a stale or qemu-user-less build cannot ship a GUI image without it being
+# obvious in the build log.  The marker is "[FF-MUSL][GUI-CACHE]".
+GUI_CACHE_LOADERS="${GDKP_DIR}/loaders.cache"
+GUI_CACHE_GSCHEMA="${DISK_USR_SHARE}/glib-2.0/schemas/gschemas.compiled"
+GUI_CACHE_MIME="${DISK_USR_SHARE}/mime/mime.cache"
+GUI_CACHE_MISSING=0
+for cache_pair in \
+    "loaders.cache|${GUI_CACHE_LOADERS}|GDK_PIXBUF_MODULE_FILE icon decode" \
+    "gschemas.compiled|${GUI_CACHE_GSCHEMA}|GtkSettings/GSettings theme+icon-name" \
+    "mime.cache|${GUI_CACHE_MIME}|GIO content-type queries"; do
+    cache_name="${cache_pair%%|*}"
+    cache_rest="${cache_pair#*|}"
+    cache_path="${cache_rest%%|*}"
+    cache_role="${cache_rest#*|}"
+    if [ -f "${cache_path}" ]; then
+        echo "[FF-MUSL][GUI-CACHE] ok: ${cache_name} ($(stat -c%s "${cache_path}") bytes) — ${cache_role}"
+    else
+        GUI_CACHE_MISSING=$((GUI_CACHE_MISSING + 1))
+        echo "[FF-MUSL][GUI-CACHE] MISSING: ${cache_name} (${cache_role})"
+        echo "[FF-MUSL][GUI-CACHE]   expected at ${cache_path}"
+        echo "[FF-MUSL][GUI-CACHE]   regenerate with: scripts/patch-gui-caches.sh --stage-only"
+        echo "[FF-MUSL][GUI-CACHE]   (needs qemu-x86_64: apt-get install qemu-user)"
+    fi
+done
+if [ "${GUI_CACHE_MISSING}" -gt 0 ]; then
+    echo "[FF-MUSL][GUI-CACHE] WARNING: ${GUI_CACHE_MISSING} GUI cache file(s) absent — the --ff-gui windowed path will degrade. Headless boot is unaffected."
+fi
+
 echo "[FF-MUSL] Staged (${FIREFOX_PKG} ${INSTALLED_VERSION}):"
 echo "[FF-MUSL]   firefox-bin (launcher):       $(stat -c%s "${FIREFOX_BIN}") bytes, musl PT_INTERP"
 echo "[FF-MUSL]   firefox-bin (runpath):        $(stat -c%s "${DISK_FF_TREE}/firefox-bin") bytes"

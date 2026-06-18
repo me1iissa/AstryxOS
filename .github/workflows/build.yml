@@ -124,6 +124,18 @@ jobs:
       # either reaps a HEALTHY/SLOW-ALIVE boot or fails to reap a wedged one.
       - name: health smoke (circle/spin/stall classifier + reap contract)
         run: python3 scripts/health-smoke.py
+      # Boot-free smoke for the GUI-cache image-provisioning tool
+      # (patch-gui-caches.sh).  Exercises arg validation, the built-in-loaders
+      # fallback, and — the load-bearing path — the debugfs injection of the
+      # three windowed-Firefox runtime caches (loaders.cache / gschemas.compiled
+      # / mime.cache) into a scratch ext2 image, asserting byte-identical
+      # readback AND that e2fsck still reports the image clean.
+      # Failure mode this prevents: a regression in the cache-injection path
+      # that silently ships a --ff-gui data image without the GdkPixbuf /
+      # GSettings / MIME caches the kernel's windowed launch path points at, or
+      # one that corrupts the ext2 image while patching it.
+      - name: patch-gui-caches smoke (image cache provisioning + ext2 integrity)
+        run: python3 scripts/patch-gui-caches-smoke.py
 
   kernel-build:
     name: bootloader + kernel builds
