@@ -224,6 +224,13 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
+    // ── Test 0a3: inline console-drain-on-park (FF first-paint wedge) ────
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+    {
+        total += 1;
+        if test_pipe_console_drain_on_park() { passed += 1; }
+    }
+
     // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
@@ -34861,6 +34868,135 @@ fn test_pipe_blocking_write_semantics() -> bool {
     crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
 
     test_pass!("pipe blocking write — EAGAIN / atomicity / EPIPE / reader-wakes-writer");
+    true
+}
+
+// ── Test: inline console-drain-on-park (windowed-Firefox first-paint wedge) ──
+//
+// The kernel-owned console pipe (a child's stdout/stderr, drained only by the
+// cooperatively-scheduled `gui::terminal::poll_output()`) can fill while the
+// drain thread is starved under Firefox's `clone(2)` startup burst.  A blocking
+// `write(2)` to the full pipe would then park forever with no timely wake.  The
+// fix drains the console pipe INLINE from the writer's own syscall context
+// before parking, so progress is independent of any poll-thread scheduling.
+//
+// This test proves (a) `pipe_drain_console` frees a full pipe, and (b) the
+// blocking-write path makes forward progress on a FULL console pipe WITHOUT a
+// concurrent reader — i.e. the writer drains it itself and the write completes
+// rather than parking.  A pipe NOT registered as the console drain must behave
+// exactly as before (no inline drain) — the negative control.
+// Refs: write(2), pipe(7), POSIX.1-2017 §write.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+fn test_pipe_console_drain_on_park() -> bool {
+    test_header!("inline console-drain-on-park (windowed-Firefox first-paint wedge)");
+
+    let me = crate::proc::current_pid() as u64;
+
+    // ── Sub-test 1: pipe_drain_console frees a full pipe ──────────────────────
+    let mut fds = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_console_drain", "pipe2 returned {}", r);
+        return false;
+    }
+    let (rfd, wfd) = (fds[0] as u64, fds[1] as u64);
+    let pipe_id = crate::syscall::get_pipe_id(me, wfd as usize);
+
+    let filler = [0x5Au8; 4096];
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd, filler.as_ptr() as u64, 4096, 0, 0, 0);
+    if n != 4096 {
+        test_fail!("pipe_console_drain", "fill write returned {} (expected 4096)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let drained = crate::ipc::pipe::pipe_drain_console(pipe_id);
+    if drained != 4096 {
+        test_fail!("pipe_console_drain",
+            "pipe_drain_console returned {} (expected 4096)", drained);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_space(pipe_id) != 4096 {
+        test_fail!("pipe_console_drain",
+            "after drain, space={} (expected 4096 — pipe empty)",
+            crate::ipc::pipe::pipe_space(pipe_id));
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  pipe_drain_console empties a full 4 KiB pipe (drained=4096, space=4096) ✓");
+
+    // ── Sub-test 2: blocking write to a FULL console pipe makes progress with
+    //    NO concurrent reader (the writer drains it inline and proceeds) ──────
+    // Re-fill the pipe so the next write would have to park, then register THIS
+    // pipe as the console drain.  A blocking write of a fresh 256-byte chunk
+    // must return 256 (NOT park, NOT EAGAIN) — the inline drain freed the whole
+    // ring on the first park-eligible iteration, then the loop wrote the chunk.
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd, filler.as_ptr() as u64, 4096, 0, 0, 0);
+    if n != 4096 {
+        test_fail!("pipe_console_drain", "re-fill returned {} (expected 4096)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Negative control FIRST: a SEPARATE, non-console O_NONBLOCK pipe full to
+    // the brim must EAGAIN on a further write — proving the inline drain is
+    // gated on the console-drain registration and does NOT touch ordinary
+    // pipes.  (A blocking non-console write would genuinely park forever here
+    // with no reader thread, so the control uses O_NONBLOCK to observe the
+    // "no inline drain" decision synchronously.)
+    let chunk = [0x77u8; 256];
+    let mut ctl_fds = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, ctl_fds.as_mut_ptr() as u64, 0x0800 /*O_NONBLOCK*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_console_drain", "control pipe2(O_NONBLOCK) returned {}", r);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let (ctl_rfd, ctl_wfd) = (ctl_fds[0] as u64, ctl_fds[1] as u64);
+    crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, ctl_wfd, filler.as_ptr() as u64, 4096, 0, 0, 0);
+    let ctrl = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, ctl_wfd, chunk.as_ptr() as u64, 256, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, ctl_rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, ctl_wfd, 0, 0, 0, 0, 0);
+    if ctrl != -11 {
+        test_fail!("pipe_console_drain",
+            "non-console full-pipe O_NONBLOCK write returned {} (expected -11 EAGAIN — no inline drain)", ctrl);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  non-console full pipe: write does NOT inline-drain (EAGAIN) ✓");
+
+    // Now register THIS pipe as the console drain and issue a BLOCKING write to
+    // the still-full pipe.  The inline drain must free space and the write must
+    // complete (256) without ever parking.
+    crate::gui::terminal::test_set_console_drain_pipe(pipe_id);
+    let n = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd, chunk.as_ptr() as u64, 256, 0, 0, 0);
+    crate::gui::terminal::test_set_console_drain_pipe(0); // clear before asserts
+    if n != 256 {
+        test_fail!("pipe_console_drain",
+            "blocking write to FULL console pipe returned {} (expected 256 — inline drain made progress)", n);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  blocking write to FULL console pipe completes inline (256, no park) ✓");
+
+    crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+
+    test_pass!("inline console-drain-on-park — frees full pipe / blocking write proceeds");
     true
 }
 

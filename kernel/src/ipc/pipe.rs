@@ -298,6 +298,57 @@ pub fn pipe_close_reader(pipe_id: u64) {
     }
 }
 
+/// Drain — and DISCARD — all currently buffered bytes from `pipe_id`, mirroring
+/// them to the serial console under the Firefox bring-up feature so the harness
+/// still sees the child's stdout/stderr diagnostics.
+///
+/// This is the *inline* console-drain primitive used by the blocking-write path
+/// to guarantee forward progress when the kernel-owned console drain
+/// (`gui::terminal::poll_output`) is starved under heavy scheduler load: a
+/// writer about to park on a full console pipe drains it here from its OWN
+/// syscall context, freeing buffer space so its `write(2)` can proceed without
+/// depending on any cooperatively-scheduled poll thread (POSIX.1-2017 write(2);
+/// pipe(7)).
+///
+/// Returns the number of bytes drained.
+///
+/// Re-entrancy / locking: reads into a *kernel* buffer (no SMAP bracket, no
+/// recursion into the user-buffer write path) via `pipe_read`, which takes and
+/// DROPS `PIPE_TABLE` before returning — so no pipe lock is held across the
+/// serial mirror, and the drain cannot recurse into the writer.  No reader wait
+/// list is touched (the kernel console drain has no parked peer reader to wake);
+/// the only wakeable party is the writer itself, which is the caller.
+pub fn pipe_drain_console(pipe_id: u64) -> usize {
+    let mut scratch = [0u8; PIPE_BUF_SIZE];
+    let mut total = 0usize;
+    loop {
+        // Bounded by the ring capacity: at most PIPE_BUF_SIZE bytes are ever
+        // buffered, so this loop drains a full pipe in one pass and then sees
+        // a zero-length read and stops.  `pipe_read` returns None only if the
+        // pipe id has vanished (both ends closed) — treat as "nothing more".
+        let n = match pipe_read(pipe_id, &mut scratch) {
+            Some(n) => n,
+            None => break,
+        };
+        if n == 0 {
+            break;
+        }
+        // Mirror to serial so the harness still captures child diagnostics,
+        // exactly as `gui::terminal::poll_output` does for its drained chunks.
+        #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
+        {
+            let text = core::str::from_utf8(&scratch[..n]).unwrap_or("\u{FFFD}");
+            crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
+        }
+        total += n;
+        if n < scratch.len() {
+            // Drained everything that was buffered.
+            break;
+        }
+    }
+    total
+}
+
 /// Check if a pipe has data.
 pub fn pipe_has_data(pipe_id: u64) -> bool {
     let pipes = PIPE_TABLE.lock();

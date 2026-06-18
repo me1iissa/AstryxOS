@@ -1305,6 +1305,31 @@ pub fn exec_pid() -> u64 {
     EXEC_PID.load(Ordering::Acquire)
 }
 
+/// Pipe id of the kernel-owned console drain (the running async child's
+/// stdout/stderr pipe), or 0 when none is attached.
+///
+/// The read end of this pipe is owned by the kernel, not by any Linux process:
+/// `attach_stdout_pipe()` hands the child only the *write* ends at fd 1/2, and
+/// `poll_output()` is the sole reader.  A blocking `write(2)`/`writev(2)` from
+/// the child therefore depends entirely on the cooperatively-scheduled
+/// `poll_output()` drain to free buffer space — and under a heavy `clone(2)`
+/// burst (Firefox's ~70-thread startup) the in-kernel poll thread that runs
+/// `poll_output()` can be starved long enough for the 4 KiB pipe to fill and
+/// the writer to park with no timely wake (POSIX.1-2017 write(2); pipe(7)).
+///
+/// Exposing the drain pipe id lets the blocking-write path recognise this exact
+/// pipe and drain it INLINE from the writer's own syscall context before
+/// parking, so forward progress is independent of any poll-thread scheduling.
+/// Returns 0 when there is no console drain target (the common case: a normal
+/// Linux pipe between two user processes, which must NOT be drained by the
+/// writer — only its real peer reader removes data).
+pub fn console_drain_pipe_id() -> u64 {
+    if !EXEC_RUNNING.load(Ordering::Acquire) {
+        return 0;
+    }
+    EXEC_STDOUT_PIPE.load(Ordering::Acquire)
+}
+
 /// Test-only: install a synthetic EXEC_PID and mark an exec "running" so
 /// `exec_exit_status()` resolves against a hand-built PROCESS_TABLE record.
 /// Clears the latched exit code so step 3 (the Zombie scan) is exercised.
@@ -1313,6 +1338,16 @@ pub fn test_set_exec_pid(pid: u64) {
     LAST_EXEC_EXIT_CODE.store(NO_EXEC_EXIT, Ordering::Release);
     EXEC_PID.store(pid, Ordering::Release);
     EXEC_RUNNING.store(true, Ordering::Release);
+}
+
+/// Test-only: register `pipe_id` as the kernel-owned console drain so the
+/// blocking-write path's inline drain (`console_drain_pipe_id()`) recognises
+/// it, WITHOUT launching a real child.  Mirrors what `launch_process()` /
+/// `spawn_async()` publish at FF launch.  Pass `0` to clear.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_set_console_drain_pipe(pipe_id: u64) {
+    EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
+    EXEC_RUNNING.store(pipe_id != 0, Ordering::Release);
 }
 
 /// Forcibly reset the async-exec tracking so a relaunch starts from a clean
