@@ -36,6 +36,18 @@ const ICR_ASSERT: u32  = 0x0000_4000;
 /// Maximum supported CPUs.
 pub const MAX_CPUS: usize = 16;
 
+/// AP online-report wait budget used by `start_aps()` after the second SIPI.
+///
+/// The loop polls the AP's self-published online flag every
+/// `AP_ONLINE_WAIT_STEP_US` microseconds for up to `AP_ONLINE_WAIT_STEPS`
+/// iterations, breaking the instant the flag appears.  The product
+/// (`500 µs × 2000 = 1 s`) is the worst-case wait for a CPU that never
+/// reports; a healthy AP exits the loop as soon as it has finished its
+/// bringup.  This is generous versus the AP's typical sub-millisecond report
+/// time under KVM, yet bounded so a genuinely-dead AP cannot stall boot.
+const AP_ONLINE_WAIT_STEPS: u32 = 2000;
+const AP_ONLINE_WAIT_STEP_US: u64 = 500;
+
 /// LAPIC base address (MMIO).
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -45,7 +57,18 @@ static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 /// BSP (Boot Strap Processor) APIC ID.
 static BSP_APIC_ID: AtomicU8 = AtomicU8::new(0);
 
-/// Number of active CPUs (starts at 1 for BSP).
+/// Cached number of online CPUs, published by `recount_online_cpus()`.
+///
+/// This is a *cache*, not the source of truth: the authoritative online
+/// state is the per-CPU [`AP_STARTED`] flag that each AP sets for itself
+/// once it has reached its scheduler idle loop (mirroring the way a CPU is
+/// added to the online set by the CPU itself in a standard x86 SMP bringup,
+/// rather than by the boot processor guessing from a fixed-length timeout).
+///
+/// Keeping a cache lets the hot `cpu_count()` reader avoid scanning the flag
+/// array on every call; it is refreshed by the BSP after each AP reports and
+/// can also be recomputed on demand.  It starts at 1 for the BSP, which is
+/// online from the moment this code runs.
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
 /// Whether APIC is available and initialized.
@@ -63,7 +86,16 @@ static APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// completing its own LAPIC init, so this ordering is naturally established.
 static LAPIC_TIMER_PERIOD: AtomicU32 = AtomicU32::new(0);
 
-/// AP started flags.
+/// Per-CPU online flag — the authoritative SMP online state.
+///
+/// `AP_STARTED[i]` is set to `true` by application processor `i` **itself**,
+/// from `ap_rust_entry()`, once it has enabled its local APIC, installed its
+/// per-CPU TSS/syscall MSRs, created its idle thread, and is about to enter
+/// the scheduler.  A CPU therefore counts as online exactly when it has
+/// published this flag, so the user-visible CPU count never races a fixed
+/// boot-time delay: a healthy AP that reports late is still counted.  The BSP
+/// (`AP_STARTED[BSP_APIC_ID]`) does not set this flag — it is unconditionally
+/// online and accounted for separately in [`recount_online_cpus()`].
 static AP_STARTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 use crate::hal::{rdmsr, wrmsr};
@@ -400,9 +432,39 @@ pub fn is_enabled() -> bool {
     APIC_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Get the number of active CPUs.
+/// Get the number of online CPUs (BSP + every AP that has reported online).
+///
+/// Reads the cached value published by [`recount_online_cpus()`].  The cache
+/// is authoritative because the count is recomputed from the per-CPU
+/// [`AP_STARTED`] online flags every time an AP reports during bringup, so a
+/// CPU is reflected here precisely when it has published itself online — never
+/// gated by a fixed boot-time timeout.  This is what feeds the user-visible
+/// `/sys/devices/system/cpu/{online,present,possible}` files and the
+/// `_SC_NPROCESSORS_ONLN` count, so it MUST equal the true number of CPUs
+/// running the scheduler.
 pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Relaxed)
+}
+
+/// Recompute the online-CPU count from the authoritative [`AP_STARTED`]
+/// online flags and republish it into the [`CPU_COUNT`] cache.
+///
+/// Online = the BSP (always online once `init()` has run) plus every AP that
+/// has set its own `AP_STARTED` flag in `ap_rust_entry()`.  Returns the fresh
+/// count.  Called by the BSP after each AP reports during `start_aps()`, and
+/// usable on demand (e.g. from diagnostics) to reconcile the cache with the
+/// real online set.  Cheap: a single pass over the fixed-size flag array.
+pub fn recount_online_cpus() -> u32 {
+    let bsp = BSP_APIC_ID.load(Ordering::Relaxed) as usize;
+    // The BSP is online and never sets its own AP_STARTED flag.
+    let mut n: u32 = 1;
+    for (i, started) in AP_STARTED.iter().enumerate() {
+        if i != bsp && started.load(Ordering::Acquire) {
+            n += 1;
+        }
+    }
+    CPU_COUNT.store(n, Ordering::Relaxed);
+    n
 }
 
 /// Get the bootstrap-processor's APIC ID.  Used by drivers to target the
@@ -646,37 +708,68 @@ pub fn start_aps() {
 
         // Check if AP started
         if AP_STARTED[ap_id as usize].load(Ordering::Acquire) {
-            CPU_COUNT.fetch_add(1, Ordering::Relaxed);
-            crate::serial_println!("[SMP] AP {} started (after SIPI #1)", ap_id);
+            let total = recount_online_cpus();
+            crate::serial_println!(
+                "[SMP] AP {} online (after SIPI #1), {} CPU(s) online", ap_id, total);
             consecutive_fails = 0;
             continue;
         }
 
-        // Send SIPI #2 (retry per Intel spec)
+        // Send SIPI #2 (the BSP issues a second Startup IPI if the AP has not
+        // reported after the first, per the Intel SDM Vol. 3A multiple-
+        // processor (MP) initialization protocol).
         lapic_write(LAPIC_ICR_HI, (ap_id as u32) << 24);
         lapic_write(LAPIC_ICR_LO, ICR_STARTUP | sipi_vector);
         for _ in 0..1000u32 {
             if lapic_read(LAPIC_ICR_LO) & (1 << 12) == 0 { break; }
         }
 
-        // Wait up to ~10 ms for the AP to start (reduced for QEMU TCG)
-        for _ in 0..10 {
-            delay_microseconds(500);
+        // Wait for the AP to publish its online flag.
+        //
+        // The AP marks itself online (`AP_STARTED[ap_id]`) from
+        // `ap_rust_entry()` only after a substantial init sequence: enabling
+        // EFER.NXE/SSE/SMEP/SMAP, reading its LAPIC ID, programming its LAPIC
+        // timer, allocating its idle thread (a heap allocation plus a
+        // `THREAD_TABLE` lock that may be contended), and configuring its
+        // per-CPU syscall MSRs.  Under KVM that work can take far longer than
+        // a handful of milliseconds — and if the host briefly deschedules the
+        // vCPU it is longer still.  The previous ~5 ms ceiling routinely
+        // expired before a perfectly healthy AP reported, so the BSP declared
+        // it absent and the online count under-reported (the AP was running
+        // its scheduler idle loop the whole time).
+        //
+        // Use a generous bounded wait so a healthy AP is always observed.  The
+        // poll is a fast relaxed-load loop that breaks the instant the flag
+        // appears, so the common case costs only as long as the AP actually
+        // needs; the ceiling only bounds the genuinely-absent case.  This
+        // mirrors the standard SMP bringup contract where the boot CPU waits
+        // for the AP's self-published "alive" state rather than guessing from
+        // a fixed delay.
+        for _ in 0..AP_ONLINE_WAIT_STEPS {
+            delay_microseconds(AP_ONLINE_WAIT_STEP_US);
             if AP_STARTED[ap_id as usize].load(Ordering::Acquire) {
                 break;
             }
         }
 
         if AP_STARTED[ap_id as usize].load(Ordering::Acquire) {
-            CPU_COUNT.fetch_add(1, Ordering::Relaxed);
-            crate::serial_println!("[SMP] AP {} started (after SIPI #2)", ap_id);
+            let total = recount_online_cpus();
+            crate::serial_println!(
+                "[SMP] AP {} online (after SIPI #2), {} CPU(s) online", ap_id, total);
             consecutive_fails = 0;
         } else {
+            crate::serial_println!(
+                "[SMP] AP {} did not report online within {} ms — treating as absent",
+                ap_id,
+                (AP_ONLINE_WAIT_STEPS as u64 * AP_ONLINE_WAIT_STEP_US) / 1000);
             consecutive_fails += 1;
         }
     }
 
-    let total = CPU_COUNT.load(Ordering::Relaxed);
+    // Final reconciliation: publish the count from the authoritative online
+    // flags so that even an AP that set its flag between our last poll and
+    // here is reflected.
+    let total = recount_online_cpus();
     crate::serial_println!(
         "[SMP] AP bootstrap complete: {} CPU(s) online (BSP={})",
         total,

@@ -204,6 +204,13 @@ pub fn run() -> ! {
         }
     }
 
+    // ── Test R0c: SMP online-count reflects every onlined AP ─────────────────
+    // Registered early (pure kernel state, no userspace/data.img dependency)
+    // so it always runs regardless of which userspace oracle tests are
+    // present in the data image.  Guards the SMP bringup online-count fix.
+    total += 1;
+    if test_smp_online_count_matches_started_flags() { passed += 1; }
+
     // ── Test 0-heap: Heap free-list validation + canaries — healthy churn ─
     // Runs FIRST (before any test that could itself perturb the heap) so it
     // is a clean no-false-positive assertion for the hardened allocator: the
@@ -30970,6 +30977,83 @@ fn test_pfh_install_arm_anti_alias_backout() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("PFH install-arm anti-aliasing back-out");
+    true
+}
+
+/// Regression test: the online-CPU count reflects every AP that came online.
+///
+/// History: the boot processor used to poll each AP's self-published online
+/// flag (`AP_STARTED[i]`) for only a few milliseconds after SIPI and then
+/// gave up, incrementing a separate counter only if it won that race.  Under
+/// KVM a healthy AP routinely set its flag *after* that window closed, so the
+/// AP ran its scheduler idle loop while `apic::cpu_count()` stayed at 1.  That
+/// under-count cascaded into `/sys/devices/system/cpu/{present,online}` (and
+/// `_SC_NPROCESSORS_ONLN`) reporting a single CPU on a 2-CPU machine.
+///
+/// The fix makes the count derive from the authoritative per-CPU online flags
+/// (`recount_online_cpus()`), so a late-but-healthy AP is always counted.
+///
+/// This test asserts the invariants that hold regardless of how many CPUs
+/// QEMU was launched with:
+///   1. `cpu_count() == recount_online_cpus()` — the cache matches the
+///      authoritative recomputation from the online flags.
+///   2. `1 <= cpu_count() <= MAX_CPUS` — sane bounds.
+///   3. The sysfs `present`/`online` cpulist string matches the count:
+///      `"0\n"` for one CPU, else `"0-{N-1}\n"`.
+/// When launched under `-smp 2` (the harness default) AP 1 sets its online
+/// flag during boot, so the recomputed count is 2 and the present string is
+/// `"0-1\n"` — exactly the regression this guards against.
+fn test_smp_online_count_matches_started_flags() -> bool {
+    test_header!("SMP online-count reflects every onlined AP");
+
+    let cached = crate::arch::x86_64::apic::cpu_count();
+    // Recompute from the authoritative per-CPU online flags.  This both
+    // exercises the new helper and reconciles the cache, so the comparison
+    // below is meaningful even if an AP reported between boot and now.
+    let recomputed = crate::arch::x86_64::apic::recount_online_cpus();
+
+    // Invariant 1: the fast cache equals the authoritative recomputation.
+    if cached != recomputed {
+        test_fail!(
+            "SMP online-count",
+            "cpu_count() cache ({}) != recount_online_cpus() ({})",
+            cached, recomputed
+        );
+        return false;
+    }
+
+    // Invariant 2: sane bounds.
+    let n = recomputed as usize;
+    if n < 1 || n > crate::arch::x86_64::apic::MAX_CPUS {
+        test_fail!(
+            "SMP online-count",
+            "online count {} out of range [1, {}]",
+            n, crate::arch::x86_64::apic::MAX_CPUS
+        );
+        return false;
+    }
+
+    // Invariant 3: the user-visible sysfs cpulist string matches the count.
+    let present = crate::vfs::sysfs::cpu_present_string_for_test();
+    let expected = if n == 1 {
+        alloc::string::String::from("0\n")
+    } else {
+        alloc::format!("0-{}\n", n - 1)
+    };
+    if present != expected {
+        test_fail!(
+            "SMP online-count",
+            "sysfs cpu present {:?} != expected {:?} for {} online CPU(s)",
+            present, expected, n
+        );
+        return false;
+    }
+
+    test_println!(
+        "  online CPUs={} present={:?} (cache==recount, bounds OK, sysfs consistent)",
+        n, present
+    );
+    test_pass!("SMP online-count reflects every onlined AP");
     true
 }
 
