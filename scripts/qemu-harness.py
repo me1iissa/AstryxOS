@@ -397,14 +397,22 @@ class GdbClient:
             raise RuntimeError(f"GDB mem read error: {resp}")
         return bytes.fromhex(resp)
 
-    def set_bp(self, addr: int) -> bool:
-        """Set software breakpoint via Z0 packet."""
-        resp = self.send(f"Z0,{addr:x},1")
+    def set_bp(self, addr: int, hw: bool = False) -> bool:
+        """Set a breakpoint.  Z0 = software (INT3 patch), Z1 = hardware
+        (x86 debug register DR0..DR3).  Under KVM the software (Z0) INT3
+        patch is sometimes silently dropped for kernel .text addresses
+        (the stub acks 'OK' but the guest never traps), so a hardware
+        breakpoint (Z1, which programs DR7) is the reliable choice for
+        catching a kernel symbol.  See Intel SDM Vol. 3B §17.2 (DR0-DR3,
+        DR7) and the GDB Remote Serial Protocol Z/z packet spec."""
+        ztype = 1 if hw else 0
+        resp = self.send(f"Z{ztype},{addr:x},1")
         return resp == "OK"
 
-    def del_bp(self, addr: int) -> bool:
-        """Remove software breakpoint via z0 packet."""
-        resp = self.send(f"z0,{addr:x},1")
+    def del_bp(self, addr: int, hw: bool = False) -> bool:
+        """Remove a software (z0) or hardware (z1) breakpoint."""
+        ztype = 1 if hw else 0
+        resp = self.send(f"z{ztype},{addr:x},1")
         return resp == "OK"
 
     # ── hardware watchpoints (Z2/Z3/Z4 packets) ──────────────────────────────
@@ -6719,7 +6727,7 @@ def cmd_autopsy(args):
     try:
         # Arm all requested breakpoints.
         for b in breaks:
-            ok = gdb.set_bp(b["addr"])
+            ok = gdb.set_bp(b["addr"], hw=bool(getattr(args, "hw_break", False)))
             b["armed"] = bool(ok)
             if ok:
                 armed_addrs.append(b["addr"])
@@ -6730,6 +6738,31 @@ def cmd_autopsy(args):
             once_n = max(1, int(args.once_n))
             timeout_ms = max(100, int(args.timeout_ms))
             wait_budget = timeout_ms / 1000.0
+
+            # ── Parse --match-reg filters (NAME=HEXVAL, AND semantics) ──
+            match_filters: list[tuple[str, int]] = []
+            for spec in (args.match_reg or []):
+                if "=" not in spec:
+                    captured_error = f"bad --match-reg {spec!r} (want NAME=HEXVAL)"
+                    break
+                rn, rv = spec.split("=", 1)
+                try:
+                    match_filters.append((rn.strip().lower(), int(rv, 0)))
+                except ValueError:
+                    captured_error = f"bad --match-reg value in {spec!r}"
+                    break
+            match_scan_max = max(1, int(getattr(args, "match_scan_max", 200000)))
+            scanned_nonmatch = 0  # diagnostic: how many fires we skipped
+
+            def _regs_match(regs_dict: dict) -> bool:
+                for rn, rv in match_filters:
+                    try:
+                        cur = int(regs_dict.get(rn, "0x0"), 16)
+                    except Exception:
+                        return False
+                    if cur != rv:
+                        return False
+                return True
 
             # The breakpoint loop: resume → wait → snapshot → repeat.
             for hit_index in range(once_n):
@@ -6765,6 +6798,56 @@ def cmd_autopsy(args):
                 except Exception as e:
                     regs = {}
                     captured_error = f"read_regs failed: {e}"
+
+                # ── --match-reg filter: skip benign fires ──
+                # On a high-frequency handler (handle_page_fault), keep
+                # resuming until the registers match the requested filter
+                # (e.g. rdi==0xd0 to isolate one CR2).  Skipped fires do
+                # NOT count against --once N.
+                if match_filters and regs and not _regs_match(regs):
+                    skipped = False
+                    while scanned_nonmatch < match_scan_max:
+                        scanned_nonmatch += 1
+                        # renew budget; bail out if exhausted
+                        elapsed = time.time() - started_at
+                        if elapsed >= timeout_ms / 1000.0:
+                            timed_out = True
+                            _qmp_command(qmp_sock, "stop", connect_timeout=2.0)
+                            skipped = True
+                            break
+                        try:
+                            gdb.cont_no_wait()
+                        except Exception as e:
+                            captured_error = f"gdb continue (match-scan) failed: {e}"
+                            skipped = True
+                            break
+                        sr = gdb.wait_for_stop(
+                            max(0.1, timeout_ms / 1000.0 - elapsed))
+                        if sr is None:
+                            timed_out = True
+                            _qmp_command(qmp_sock, "stop", connect_timeout=2.0)
+                            skipped = True
+                            break
+                        try:
+                            regs = gdb.read_regs()
+                        except Exception as e:
+                            regs = {}
+                            captured_error = f"read_regs (match-scan) failed: {e}"
+                            skipped = True
+                            break
+                        stop_reply = sr
+                        if _regs_match(regs):
+                            skipped = False
+                            break
+                    else:
+                        # ran out of scan budget without a match
+                        captured_error = (
+                            f"--match-reg unmatched after "
+                            f"{scanned_nonmatch} fires")
+                        timed_out = True
+                    if skipped or (match_filters and not _regs_match(regs)):
+                        # Could not isolate a matching fire — stop the loop.
+                        break
 
                 rip = 0
                 try:
@@ -6814,11 +6897,20 @@ def cmd_autopsy(args):
                 if not args.continue_after:
                     break
     finally:
+        # When the caller asked to leave the guest paused, freeze it via QMP
+        # FIRST — before detaching GDB.  QEMU's gdbstub RESUMES the guest on
+        # detach ($D packet sent by gdb.close()), which would race the fault
+        # context out of existence (the faulting CR3 gets torn down as the
+        # process exits).  A QMP `stop` issued while still at the breakpoint
+        # keeps the vCPUs halted across the detach so a follow-up physical /
+        # page-table read sees the exact faulting address space.
+        if args.leave_paused:
+            _qmp_command(qmp_sock, "stop", connect_timeout=3.0)
         # Always disarm the breakpoints we set; leaving them armed would
         # surprise the next agent who attaches via `step`/`cont`.
         for addr in armed_addrs:
             try:
-                gdb.del_bp(addr)
+                gdb.del_bp(addr, hw=bool(getattr(args, "hw_break", False)))
             except Exception:
                 pass
         try:
@@ -6851,6 +6943,12 @@ def cmd_autopsy(args):
         "elapsed_s":   round(time.time() - started_at, 3),
         "hits":        hits,
     }
+    try:
+        if args.match_reg:
+            result["match_reg"] = args.match_reg
+            result["scanned_nonmatch"] = scanned_nonmatch
+    except NameError:
+        pass
     if captured_error:
         result["error"] = captured_error
     if "_warning" in bank:
@@ -12705,6 +12803,34 @@ def main():
         "--max-bytes-per-step", type=int, default=512, metavar="N",
         help="Cap per-memory-window read size (default 512, max 4096) to "
              "protect agent context length.",
+    )
+    p_autopsy.add_argument(
+        "--match-reg", dest="match_reg", action="append", default=None,
+        metavar="NAME=HEXVAL",
+        help="Filter hits: only capture a breakpoint fire when register "
+             "NAME == HEXVAL (e.g. --match-reg rdi=0xd0). May be repeated "
+             "(AND semantics). Non-matching fires are silently resumed and "
+             "do NOT count against --once N. Requires the guest to keep "
+             "hitting the breakpoint; combine with a generous --timeout-ms. "
+             "Use this to isolate one fault (e.g. a specific CR2) on a "
+             "high-frequency handler like handle_page_fault, whose 1st arg "
+             "rdi==faulting_addr and 2nd arg rsi==error_code per SysV ABI.",
+    )
+    p_autopsy.add_argument(
+        "--hw-break", dest="hw_break", action="store_true",
+        help="Use a HARDWARE execution breakpoint (x86 DR0-DR3 via the Z1 "
+             "RSP packet) instead of a software INT3 patch (Z0). Required "
+             "under KVM for kernel .text symbols where the INT3 patch is "
+             "silently dropped (stub acks OK but the guest never traps). "
+             "Limited to 4 simultaneous breakpoints (the debug-register "
+             "count).",
+    )
+    p_autopsy.add_argument(
+        "--match-scan-max", dest="match_scan_max", type=int, default=200000,
+        metavar="N",
+        help="With --match-reg, cap the number of non-matching fires "
+             "scanned before giving up (default 200000). Protects against "
+             "an infinite stream of benign faults.",
     )
     p_autopsy.add_argument(
         "--leave-paused", action="store_true",
