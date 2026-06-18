@@ -2791,7 +2791,14 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     // the extension defines no events/errors); see proto.rs for the rationale —
     // clients key their event-dispatch maps on first_event.
     match name {
-        "MIT-SHM"        => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;       b[10]=proto::SHM_FIRST_EVENT;       b[11]=proto::SHM_FIRST_ERROR; }
+        // MIT-SHM is deliberately NOT advertised.  We do not implement the
+        // shared-memory image transport (Attach → CreatePixmap(shmseg) →
+        // CopyArea(shm-pixmap → window)); advertising it would make clients
+        // believe SHM works and route paints through an unsupported arm,
+        // silently dropping them.  Per the MIT-SHM protocol spec, a client that
+        // gets present=0 from QueryExtension falls back to core XPutImage(72),
+        // which `op_put_image` composites correctly.  Falling into the `_` arm
+        // below yields the canonical not-present reply (present=0).
         "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE;    b[10]=0;                            b[11]=0; }
         "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=proto::XKEYBOARD_FIRST_EVENT; b[11]=proto::XKEYBOARD_FIRST_ERROR; }
         "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=proto::SHAPE_FIRST_EVENT;  b[11]=proto::SHAPE_FIRST_ERROR; }
@@ -2814,8 +2821,13 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
 // ── ListExtensions (99) ──────────────────────────────────────────────────────
 
 fn op_list_extensions(fd: u64, seq: u16) {
+    // MIT-SHM is intentionally absent: we do not implement the SHM image
+    // transport, and advertising it would make clients route paints through an
+    // unsupported arm.  Omitting it forces the core XPutImage(72) fallback
+    // (per the MIT-SHM protocol spec), which we composite correctly.  Keep this
+    // list in sync with `op_query_extension`.
     let names: &[&[u8]] = &[
-        b"MIT-SHM", b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
+        b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
         b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
         b"DPMS", b"SYNC", b"COMPOSITE", b"RANDR",
     ];

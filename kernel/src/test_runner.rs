@@ -1316,6 +1316,38 @@ pub fn run() -> ! {
     total += 1;
     if test_mprotect_split_inode_pin_balance() { passed += 1; }
 
+    // ── Test 295: /proc/self/fd/N reopen of an UNLINKED memfd ─────────────
+    // procfs magic-symlink contract (proc(5)): opening /proc/<pid>/fd/<N>
+    // must DUP the underlying open file by its backing inode, not re-resolve
+    // the link target's pathname.  An unlinked memfd (memfd_create(2)) has no
+    // resolvable name, so re-resolving the (removed) path ENOENT'd and broke
+    // Firefox's shared-memory read-only reopen.  Verifies: (a) the reopen
+    // succeeds, (b) the new fd reads the memfd contents from a fresh offset,
+    // (c) a read-only reopen honours O_RDONLY on the new fd.  Placed beside the
+    // inode-pin tests (119b/119c) — same VFS anonymous-inode surface — and
+    // ahead of the heavy Firefox-launch oracle so it runs on every build.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_295_proc_fd_memfd_reopen() { passed += 1; }
+    }
+
+    // ── Test 295b: /proc/self/fd/N reopen of a SENTINEL fd must not UAF ────
+    // Sibling of Test 295.  An eventfd (and every other non-inode-backed
+    // "sentinel" fd: pipe / socket / epoll / timerfd / signalfd / inotify /
+    // PTY) carries a type-specific refcount that the magic-symlink clone path
+    // does not balance.  Cloning one and then closing the clone would free /
+    // underflow the shared backing object under the original fd (eventfd →
+    // outright slot free = UAF).  The reopen must instead decline (the
+    // pre-interception /proc/self/fd → /dev/fd re-resolution yields a benign
+    // ENOENT for a nameless fd, per proc(5)) and leave the original fd fully
+    // usable.  Locks in that the sentinel-fd reopen no longer corrupts state.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_295b_proc_fd_sentinel_reopen_no_uaf() { passed += 1; }
+    }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -27421,9 +27453,15 @@ fn test_x11_big_requests_enable() -> bool {
 // ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ─────────
 
 fn test_x11_query_extension_mit_shm() -> bool {
-    test_header!("X11 MIT-SHM — QueryExtension present + ShmQueryVersion");
+    test_header!("X11 MIT-SHM — QueryExtension NOT present + absent from ListExtensions");
 
-    use crate::x11::proto;
+    // Regression for the SHM-deadvertise paint fix (equivalent to the
+    // purge-lost Test 75b): the server does NOT implement the MIT-SHM image
+    // transport, so it must report the extension as ABSENT.  Per the MIT-SHM
+    // protocol spec, a client that gets present=0 from QueryExtension falls
+    // back to core XPutImage(72), which `op_put_image` composites correctly.
+    // Advertising present=1 would make Firefox route paints through the
+    // unsupported SHM CopyArea arm and silently drop the window contents.
 
     let fd = x11_connect_and_setup("mitshm");
     if fd == u64::MAX {
@@ -27431,7 +27469,7 @@ fn test_x11_query_extension_mit_shm() -> bool {
         return false;
     }
 
-    // ── QueryExtension("MIT-SHM") ─────────────────────────────────────────────
+    // ── QueryExtension("MIT-SHM") → must reply present=0 ─────────────────────
     // Name = 7 bytes → padded to 8; header=8 → total=16 = 4 words.
     let name = b"MIT-SHM"; // 7 bytes
     let nlen = name.len() as u16;
@@ -27450,40 +27488,48 @@ fn test_x11_query_extension_mit_shm() -> bool {
         crate::net::unix::close(fd);
         return false;
     }
-    if rep[8] != 1 {
-        test_fail!("x11_mitshm", "MIT-SHM not present (present={})", rep[8]);
+    if rep[8] != 0 {
+        test_fail!("x11_mitshm", "MIT-SHM advertised as present (present={}), expected 0", rep[8]);
         crate::net::unix::close(fd);
         return false;
     }
-    let major = rep[9];
-    if major == 0 {
-        test_fail!("x11_mitshm", "MIT-SHM major opcode is 0");
-        crate::net::unix::close(fd);
-        return false;
-    }
-    test_println!("  QueryExtension(MIT-SHM): present=1 major={} ✓", major);
+    test_println!("  QueryExtension(MIT-SHM): present=0 ✓");
 
-    // ── ShmQueryVersion (minor 0) ────────────────────────────────────────────
-    let req: [u8; 4] = [proto::SHM_MAJOR_OPCODE, proto::SHM_QUERY_VERSION, 1, 0];
-    crate::net::unix::write(fd, &req);
+    // ── ListExtensions(99) → MIT-SHM must NOT appear ─────────────────────────
+    let le = [99u8, 0, 1, 0]; // OP_LIST_EXTENSIONS, 1 word
+    crate::net::unix::write(fd, &le);
     crate::x11::poll();
-    let mut vrep = [0u8; 32];
-    let n = crate::net::unix::read(fd, &mut vrep);
-    if n < 12 || vrep[0] != 1 {
-        test_fail!("x11_mitshm", "ShmQueryVersion no reply n={}", n);
+    let mut lrep = [0u8; 256];
+    let n = crate::net::unix::read(fd, &mut lrep);
+    if n < 32 || lrep[0] != 1 {
+        test_fail!("x11_mitshm", "ListExtensions no reply n={}", n);
         crate::net::unix::close(fd);
         return false;
     }
-    let shm_major = u16::from_le_bytes([vrep[8], vrep[9]]);
-    if shm_major != 1 {
-        test_fail!("x11_mitshm", "SHM major={} (expected 1)", shm_major);
+    // Reply body is a sequence of length-prefixed names starting at byte 32.
+    // Scan for the literal "MIT-SHM" name; it must be absent.
+    let nbytes = n as usize;
+    let mut p = 32usize;
+    let mut found_mit_shm = false;
+    while p < nbytes {
+        let len = lrep[p] as usize;
+        p += 1;
+        if p + len > nbytes { break; }
+        if &lrep[p..p + len] == &b"MIT-SHM"[..] {
+            found_mit_shm = true;
+            break;
+        }
+        p += len;
+    }
+    if found_mit_shm {
+        test_fail!("x11_mitshm", "MIT-SHM still present in ListExtensions");
         crate::net::unix::close(fd);
         return false;
     }
-    test_println!("  ShmQueryVersion: {}.{} ✓", shm_major, u16::from_le_bytes([vrep[10], vrep[11]]));
+    test_println!("  ListExtensions: MIT-SHM absent ✓");
 
     crate::net::unix::close(fd);
-    test_pass!("X11 MIT-SHM extension");
+    test_pass!("X11 MIT-SHM deadvertised (forces core XPutImage fallback)");
     true
 }
 
@@ -43260,6 +43306,194 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_println!("  E: too-recent push → tick gate withholds (ok)");
 
     test_pass!("switch-generation gate: withhold-until-advanced + escape valve correct");
+    true
+}
+
+// ── Test 295: /proc/self/fd/N reopen of an UNLINKED memfd ────────────────────
+//
+// memfd_create(2) returns an anonymous (unlinked) inode whose only name —
+// the synthesised /tmp/.memfd_NNNN — is removed at creation time.  Firefox's
+// shared-memory layer re-opens that fd read-only via /proc/self/fd/<N> to get
+// an independently-flagged handle on the same backing.  Per proc(5), each
+// /proc/<pid>/fd/<N> entry is a magic symlink to the *open file* — opening it
+// must DUP the underlying inode, not re-resolve the (now non-existent) path.
+//
+// Before the fix, vfs::open followed the procfs symlink to the fd's stored
+// open_path string and re-resolved it; the unlinked memfd's path NotFound'd →
+// ENOENT, breaking the content-process sandbox channel.  This test asserts the
+// reopen succeeds, reads back the memfd's bytes from a fresh offset, and that
+// a read-only reopen records O_RDONLY on the new fd.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_295_proc_fd_memfd_reopen() -> bool {
+    test_header!("/proc/self/fd/N reopen of an unlinked memfd (proc(5) magic symlink)");
+
+    let pid = crate::proc::current_pid_lockless();
+
+    // ── Create an anonymous memfd (O_RDWR, unlinked by sys_memfd_create) ──
+    let memfd = crate::subsys::linux::syscall::sys_memfd_create_test(0, 0);
+    if memfd < 0 {
+        test_fail!("proc_fd_reopen", "memfd_create returned {} (expected fd >= 0)", memfd);
+        return false;
+    }
+    let memfd = memfd as usize;
+
+    // Write a known payload through the RDWR fd; offset advances to len.
+    let payload: &[u8] = b"PAINT-OK-0123456789";
+    let w = crate::vfs::fd_write(pid, memfd, payload.as_ptr(), payload.len());
+    match w {
+        Ok(n) if n == payload.len() => {}
+        other => {
+            test_fail!("proc_fd_reopen", "fd_write returned {:?} (expected {})", other, payload.len());
+            crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+            return false;
+        }
+    }
+
+    // ── Reopen via /proc/self/fd/<N> READ-ONLY — this is the gate ─────────
+    let mut path = alloc::string::String::from("/proc/self/fd/");
+    path.push_str(&alloc::format!("{}", memfd));
+    let reopened = match crate::vfs::open(pid, path.as_str(), crate::vfs::flags::O_RDONLY) {
+        Ok(fd) => fd,
+        Err(e) => {
+            test_fail!("proc_fd_reopen",
+                "open({}) of unlinked memfd FAILED ({:?}) — magic-symlink reopen regressed",
+                path, e);
+            crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+            return false;
+        }
+    };
+    test_println!("  open(/proc/self/fd/{}) → fd {} ✓ (no ENOENT)", memfd, reopened);
+
+    // ── The new fd must alias the SAME inode and read the payload from 0 ──
+    let mut rbuf = [0u8; 32];
+    let r = crate::vfs::fd_read(pid, reopened, rbuf.as_mut_ptr(), rbuf.len());
+    let got = match r {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("proc_fd_reopen", "fd_read on reopened fd failed ({:?})", e);
+            crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+            crate::subsys::linux::syscall::sys_close_test(reopened as u64);
+            return false;
+        }
+    };
+    if got != payload.len() || &rbuf[..got] != payload {
+        test_fail!("proc_fd_reopen",
+            "reopened fd read {} bytes {:?} (expected {} bytes {:?})",
+            got, &rbuf[..got], payload.len(), payload);
+        crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+        crate::subsys::linux::syscall::sys_close_test(reopened as u64);
+        return false;
+    }
+    test_println!("  reopened fd reads memfd payload from fresh offset ✓");
+
+    // ── The read-only reopen must record O_RDONLY (access mode honoured) ──
+    let accmode_ok = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(reopened))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.flags & 0b11) == crate::vfs::flags::O_RDONLY)
+            .unwrap_or(false)
+    };
+    if !accmode_ok {
+        test_fail!("proc_fd_reopen", "reopened fd did not record O_RDONLY access mode");
+        crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+        crate::subsys::linux::syscall::sys_close_test(reopened as u64);
+        return false;
+    }
+    test_println!("  read-only reopen recorded O_RDONLY ✓");
+
+    crate::subsys::linux::syscall::sys_close_test(reopened as u64);
+    crate::subsys::linux::syscall::sys_close_test(memfd as u64);
+    test_pass!("/proc/self/fd/N reopen of an unlinked memfd succeeds + reads contents");
+    true
+}
+
+/// Test 295b — reopening /proc/self/fd/<N> for a SENTINEL fd (eventfd) must
+/// NOT clone the slot (that would underflow the eventfd's type-specific
+/// refcount and free it under the original fd = UAF).  The reopen must decline
+/// cleanly and leave the original eventfd fully functional.  Uses the real
+/// syscall dispatch so the eventfd-aware close path (sys_close → eventfd::close)
+/// is exercised exactly as Firefox's AudioIPC/IPC fds hit it.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_295b_proc_fd_sentinel_reopen_no_uaf() -> bool {
+    test_header!("/proc/self/fd/N reopen of a sentinel (eventfd) declines, no UAF (proc(5))");
+
+    let pid = crate::proc::current_pid_lockless();
+    const EFD_NONBLOCK: u64 = 0x0800;
+
+    // ── Create an eventfd (sentinel fd: mount_idx == usize::MAX, EventFd) ──
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 7, EFD_NONBLOCK, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("sentinel_reopen", "eventfd2(7) failed ({})", efd);
+        return false;
+    }
+    let efd = efd as usize;
+    test_println!("  eventfd2(7, EFD_NONBLOCK) → fd {} ✓", efd);
+
+    // ── Reopen via /proc/self/fd/<N> — must DECLINE (not clone the slot) ──
+    // With the sentinel-fd gate, reopen_proc_fd returns NotFound and open()
+    // falls through to the /proc/self/fd → /dev/fd re-resolution, which has no
+    // name to resolve → a benign error (ENOENT).  A SUCCESS here would mean the
+    // dangerous clone path ran and the eventfd refcount is now unbalanced.
+    let mut path = alloc::string::String::from("/proc/self/fd/");
+    path.push_str(&alloc::format!("{}", efd));
+    match crate::vfs::open(pid, path.as_str(), crate::vfs::flags::O_RDONLY) {
+        Err(_) => {
+            test_println!("  open({}) declined cleanly (no sentinel clone) ✓", path);
+        }
+        Ok(clone_fd) => {
+            // Regression: the clone path ran.  Closing it via the real syscall
+            // would free the shared eventfd slot under `efd` (UAF).  Do NOT
+            // close it through that path; just fail loudly.
+            test_fail!("sentinel_reopen",
+                "open({}) of an eventfd SUCCEEDED (fd {}) — sentinel clone path ran (UAF risk)",
+                path, clone_fd);
+            crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+            return false;
+        }
+    }
+
+    // ── The ORIGINAL eventfd must still be fully functional ───────────────
+    // read → 7 (initval), counter clears → EAGAIN, write 5 → read 5.
+    let mut rbuf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 || u64::from_le_bytes(rbuf) != 7 {
+        test_fail!("sentinel_reopen",
+            "original eventfd read after reopen returned n={} val={} (expected 8 / 7) — slot corrupted",
+            n, u64::from_le_bytes(rbuf));
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  original eventfd read → 7 (initval intact) ✓");
+
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("sentinel_reopen",
+            "original eventfd re-read returned {} (expected -11 EAGAIN) — slot corrupted", n);
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    let wbuf = 5u64.to_le_bytes();
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    let n2 = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 || n2 != 8 || u64::from_le_bytes(rbuf) != 5 {
+        test_fail!("sentinel_reopen",
+            "original eventfd write/read roundtrip failed (w={} r={} val={}) — slot corrupted",
+            n, n2, u64::from_le_bytes(rbuf));
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  original eventfd write 5 → read 5 (fully functional) ✓");
+
+    // ── Close the original via the real eventfd-aware close path ──────────
+    let r = crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("sentinel_reopen", "close(eventfd) failed ({})", r);
+        return false;
+    }
+    test_pass!("/proc/self/fd/N reopen of a sentinel fd declines + original stays usable (no UAF)");
     true
 }
 

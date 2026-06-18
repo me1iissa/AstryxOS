@@ -2168,6 +2168,140 @@ fn proc_target_pid(open_path: &str) -> Option<u64> {
     pid_str.parse::<u64>().ok()
 }
 
+/// If `path` is exactly `/proc/{self|<pid>}/fd/<N>` (no trailing components),
+/// return `(target_pid, fd_num)` where `target_pid` is `caller_pid` for the
+/// `self` form and the parsed numeric pid otherwise.  Returns `None` for any
+/// other path (including `/proc/self/fd` directory listing or
+/// `/proc/self/fd/<N>/something`).
+///
+/// Used by `open()` to honour the procfs magic-symlink contract: opening
+/// `/proc/<pid>/fd/<N>` must DUP the underlying open file by its backing inode
+/// (per proc(5) — each entry is a symbolic link "to the actual file"), NOT
+/// re-resolve the link target's pathname.  An unlinked memfd / O_TMPFILE inode
+/// has no resolvable name, so re-resolving the pathname would ENOENT even
+/// though the file is fully alive (held open by the target fd).
+fn parse_proc_fd_path(path: &str, caller_pid: crate::proc::Pid) -> Option<(crate::proc::Pid, usize)> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_part, after_pid) = rest.split_once('/')?;
+    let target_pid: crate::proc::Pid = if pid_part == "self" {
+        caller_pid
+    } else if !pid_part.is_empty() && pid_part.bytes().all(|b| b.is_ascii_digit()) {
+        pid_part.parse::<crate::proc::Pid>().ok()?
+    } else {
+        return None;
+    };
+    let fd_part = after_pid.strip_prefix("fd/")?;
+    // Reject nested components: the fd number must be the final path element.
+    if fd_part.is_empty() || fd_part.contains('/') {
+        return None;
+    }
+    let fd_num = fd_part.parse::<usize>().ok()?;
+    Some((target_pid, fd_num))
+}
+
+/// Honour the procfs `/proc/<pid>/fd/<N>` magic-symlink open by DUPing the
+/// underlying open file: clone the target fd's backing inode handle into a
+/// fresh fd in `caller_pid`'s table, with a new (zeroed) offset and the
+/// caller's requested access mode (`open_flags`).  This is the flat-fd-model
+/// equivalent of a real kernel sharing the target file's `f_path` via
+/// `nd_jump_link()` — it never re-resolves the link target's pathname, so it
+/// works for unlinked memfd / anonymous tmpfs inodes that have no name.
+///
+/// Returns `Err(NotFound)` (→ ENOENT) if the target process or fd does not
+/// exist, matching `open(/proc/<pid>/fd/<N>)` for a closed fd.
+///
+/// `O_CREAT`/`O_TRUNC` are meaningless against an existing open file and are
+/// ignored here (a real kernel applies neither when jumping the link to an
+/// already-open file).  The access mode (O_RDONLY/O_WRONLY/O_RDWR) is taken
+/// from `open_flags`; widening beyond the original fd's mode is permitted here
+/// (we do not yet enforce per-fd mode narrowing on read/write), but the common
+/// case is Mozilla re-opening an `O_RDWR` memfd as `O_RDONLY`, which is honoured.
+fn reopen_proc_fd(
+    caller_pid: crate::proc::Pid,
+    target_pid: crate::proc::Pid,
+    fd_num: usize,
+    open_flags: u32,
+) -> VfsResult<usize> {
+    // Snapshot the backing fields of the target fd and install the new fd in a
+    // single PROCESS_TABLE acquisition so the clone is atomic w.r.t. a
+    // concurrent close()/dup() of the target.
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+
+    // Read the target fd's backing.  The borrow ends before we mutate the
+    // caller's table below.
+    let backing = {
+        let tproc = procs.iter().find(|p| p.pid == target_pid)
+            .ok_or(VfsError::NotFound)?;
+        let f = tproc.file_descriptors.get(fd_num)
+            .and_then(|slot| slot.as_ref())
+            .ok_or(VfsError::NotFound)?;
+        (f.inode, f.mount_idx, f.file_type, f.is_console, f.open_path.clone())
+    };
+    let (inode, mount_idx, file_type, is_console, open_path) = backing;
+
+    // Only inode-backed files reopen safely by cloning the (mount_idx, inode)
+    // slot — their liveness is the fd-table scan for (mount_idx, inode), so the
+    // freshly-installed slot is self-counting.  Sentinel fds (pipe / socket /
+    // eventfd / epoll / timerfd / signalfd / inotify / PTY / a console fd)
+    // carry a type-specific refcount this clone path does not balance; copying
+    // their backing into a new slot would underflow that count when the clone
+    // is closed (eventfd → outright slot free = UAF; socket → ref_count
+    // underflow tripping its close-path debug_assert; pipe → reader/writer
+    // undercount → phantom EOF/EPIPE).  Until this path replicates sys_dup's
+    // per-type inc_ref, return NotFound for them so open() falls back to the
+    // normal /proc/self/fd → /dev/fd re-resolution (which yields a benign
+    // ENOENT for a nameless sentinel fd — the exact pre-PR semantics, per
+    // proc(5)).
+    if mount_idx == usize::MAX
+        || is_console
+        || !matches!(
+            file_type,
+            FileType::RegularFile | FileType::Directory | FileType::SymLink
+        )
+    {
+        return Err(VfsError::NotFound);
+    }
+
+    // Build the new fd: same backing inode, fresh offset, caller's access mode.
+    // O_CLOEXEC (0x80000) is honoured per the requested flags; O_CREAT/O_TRUNC
+    // are stripped (they do not apply to an existing open file).
+    let cloexec = (open_flags & 0x0008_0000) != 0;
+    let new_flags = open_flags & !(flags::O_CREAT | flags::O_TRUNC);
+    let new_fd = FileDescriptor {
+        inode,
+        mount_idx,
+        offset: 0,
+        flags: new_flags,
+        file_type,
+        is_console,
+        cloexec,
+        // Preserve the TARGET's open_path (the real backing path, e.g. an
+        // unlinked memfd's synthesized name or empty for anon fds) — NOT the
+        // /proc/self/fd/N magic path — so /proc introspection and the
+        // unlink-on-last-close bookkeeping stay consistent with the original fd.
+        open_path,
+    };
+
+    let cproc = procs.iter_mut().find(|p| p.pid == caller_pid)
+        .ok_or(VfsError::InvalidArg)?;
+    let free_idx = cproc.file_descriptors.iter().position(|f| f.is_none());
+    let fd_idx = if let Some(i) = free_idx {
+        cproc.file_descriptors[i] = Some(new_fd);
+        i
+    } else {
+        let nofile_limit = cproc.rlimits_soft[7]
+            .min(MAX_FDS_PER_PROCESS as u64) as usize;
+        if cproc.file_descriptors.len() < nofile_limit {
+            let idx = cproc.file_descriptors.len();
+            cproc.file_descriptors.push(Some(new_fd));
+            idx
+        } else {
+            return Err(VfsError::TooManyOpenFiles);
+        }
+    };
+    Ok(fd_idx)
+}
+
 /// If `open_path` matches `/proc/{pid-or-self}/task/<tid>/stat`, return the TID.
 /// Returns `None` for all other paths.
 fn proc_task_tid_from_stat_path(open_path: &str) -> Option<u64> {
@@ -2188,6 +2322,26 @@ fn proc_task_tid_from_stat_path(open_path: &str) -> Option<u64> {
 
 /// Open a file for a process, returning the fd number.
 pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usize> {
+    // procfs magic-symlink open: `/proc/{self|<pid>}/fd/<N>` must DUP the
+    // underlying open file by its backing inode, NOT re-resolve the link
+    // target's pathname (per proc(5)).  Intercept BEFORE path resolution so an
+    // unlinked memfd / anonymous tmpfs inode — which has no resolvable name —
+    // reopens correctly instead of returning ENOENT.  Mozilla's shared-memory
+    // layer re-opens an O_RDWR memfd read-only this way; re-resolving the
+    // (removed) name was breaking the content-process sandbox channel.
+    if let Some((target_pid, fd_num)) = parse_proc_fd_path(path, pid) {
+        match reopen_proc_fd(pid, target_pid, fd_num, open_flags) {
+            // NotFound means either the target fd is gone or it is a sentinel fd
+            // this clone path declines to dup (see reopen_proc_fd).  Fall through
+            // to normal /proc/self/fd → /dev/fd re-resolution so the outcome
+            // matches the pre-interception behaviour (a benign ENOENT for a
+            // nameless sentinel fd).  Any other result (success or a hard error)
+            // is returned directly.
+            Err(VfsError::NotFound) => {}
+            other => return other,
+        }
+    }
+
     // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
     // while preserving the original path in the fd for target-PID detection.
     //
