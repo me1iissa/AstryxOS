@@ -191,6 +191,15 @@ fn cpulist_range() -> String {
     if n == 1 { String::from("0\n") } else { format!("0-{}\n", n - 1) }
 }
 
+/// Test-only accessor for the cpulist string served by
+/// `/sys/devices/system/cpu/{present,online,possible}`.  Lets the in-kernel
+/// regression test assert that the user-visible CPU range stays consistent
+/// with `apic::cpu_count()` without going through the full VFS read path.
+#[cfg(feature = "test-mode")]
+pub(crate) fn cpu_present_string_for_test() -> String {
+    cpulist_range()
+}
+
 // ── SysFs filesystem ─────────────────────────────────────────────────────────
 
 pub struct SysFs;
