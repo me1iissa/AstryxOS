@@ -3451,6 +3451,42 @@ def cmd_start(args):
     # Fix: (1) auto-symlink from the source-of-truth if reachable, (2) emit a
     # visible banner regardless so the operator always knows the state.
     _data_img_path = Path(wt.DATA_IMG)
+
+    # --data-img OVERRIDE: point the worktree's build/data.img at an explicit
+    # prebuilt image (e.g. /home/ubuntu/gui-complete.img) by replacing the
+    # worktree symlink target.  A prebuilt complete image is authoritative — we
+    # do NOT want the staleness check to regenerate it from build/disk/, so this
+    # implies --no-regen-data-img.  Additive: when --data-img is absent the
+    # behaviour is byte-identical to before.
+    _data_img_override = getattr(args, "data_img_override", None)
+    if _data_img_override:
+        _ovr = Path(_data_img_override)
+        if not _ovr.exists():
+            print(json.dumps({"ok": False, "error": f"--data-img not found: {_ovr}"}))
+            sys.exit(2)
+        # Force no-regen for an explicit prebuilt image.
+        try:
+            setattr(args, "no_regen_data_img", True)
+        except Exception:
+            pass
+        # Replace the worktree symlink/file so all downstream machinery
+        # (build_qemu_cmd, snap topology) uses the override transparently.
+        _data_img_path.parent.mkdir(parents=True, exist_ok=True)
+        if _data_img_path.is_symlink() or _data_img_path.exists():
+            try:
+                _data_img_path.unlink()
+            except Exception:
+                pass
+        _data_img_path.symlink_to(_ovr.resolve())
+        print(
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  --data-img OVERRIDE (no-regen forced)                       ║\n"
+            f"║  {str(_data_img_path)[:60]:<60}  ║\n"
+            f"║  -> {str(_ovr.resolve())[:57]:<57}  ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            file=sys.stderr,
+        )
+
     _data_img_missing = not _data_img_path.exists()
     if _data_img_missing:
         _CANONICAL_DATA_IMG = Path("/home/ubuntu/AstryxOS/build/data.img")
@@ -12381,6 +12417,14 @@ def main():
                                "still prints to stderr so the situation is "
                                "never hidden. Use when reproducing a bug that "
                                "depends on the existing data.img contents.")
+    p_start.add_argument("--data-img", dest="data_img_override", default=None,
+                          metavar="PATH",
+                          help="Boot against an explicit prebuilt data image "
+                               "(e.g. /home/ubuntu/gui-complete.img) by "
+                               "repointing the worktree build/data.img symlink. "
+                               "Implies --no-regen-data-img (a prebuilt complete "
+                               "image is authoritative and must not be "
+                               "regenerated). Additive; absent => unchanged.")
     p_start.add_argument("--firefox-variant", dest="firefox_variant",
                           choices=("musl", "glibc"), default="musl",
                           help="Pin which Firefox userspace layout the data "
