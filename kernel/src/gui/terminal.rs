@@ -35,6 +35,25 @@ pub static FF_GUI_MODE: AtomicBool = AtomicBool::new(false);
 /// therefore the earliest possible signal of process termination.
 static EXEC_PID: AtomicU64 = AtomicU64::new(0);
 
+/// Pipe id of the running async child's stdout/stderr console pipe, or 0 when
+/// none is attached.  `poll_output()` drains this pipe id DIRECTLY — i.e.
+/// independently of the `TERMINAL.running_exec` field.
+///
+/// Rationale (windowed-Firefox first-paint wedge, 2026-06-17): the GUI desktop
+/// re-`init()`s the `TERMINAL` state when its window is (re)created, which
+/// resets `running_exec` to `None`.  When that reset lands AFTER a child has
+/// been launched, `poll_output()` — which gated its drain solely on
+/// `running_exec` — silently stopped reading the child's stdout/stderr pipe,
+/// even though `EXEC_RUNNING`/`EXEC_PID` still reported a live child.  The
+/// child (Firefox) then filled its 4 KiB console pipe with a log line, the
+/// blocking `write(2)`/`writev(2)` parked the writer on the full pipe
+/// (POSIX.1-2017 write(2); pipe(7) full-buffer semantics), and with nobody
+/// draining the read end the writer was never woken — wedging the whole
+/// thread group until the scheduler-deadlock watchdog fired.  Tracking the
+/// drain target in an atomic that is set at attach time and cleared at reap
+/// time makes the console drain robust against any `TERMINAL` re-init.
+static EXEC_STDOUT_PIPE: AtomicU64 = AtomicU64::new(0);
+
 /// Sentinel for "no exec exit code latched yet".  A live exec has not
 /// recorded a code; any value other than this is a real, observed exit
 /// status (including 0 for a clean exit).
@@ -320,6 +339,7 @@ pub fn handle_key(msg: u32, wparam: u64, _lparam: u64) {
                     match spawn_async(trimmed) {
                         Ok((pid, pipe_id)) => {
                             state.running_exec = Some((pid, pipe_id));
+                            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
                             EXEC_PID.store(pid, Ordering::Release);
                             EXEC_RUNNING.store(true, Ordering::Release);
                             // Don't draw prompt yet — poll_output() will do it on exit.
@@ -1137,11 +1157,16 @@ pub fn launch_process(path: &str) {
 
     match spawn_async(path) {
         Ok((pid, pipe_id)) => {
+            // Publish the drain handle FIRST, unconditionally — `poll_output()`
+            // drains `EXEC_STDOUT_PIPE` regardless of whether `TERMINAL` is
+            // currently `Some` or gets re-`init()`d later (which would reset
+            // `running_exec`).  This is the authoritative console-pipe handle.
+            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
+            EXEC_PID.store(pid, Ordering::Release);
+            EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
             let mut guard = TERMINAL.lock();
             if let Some(ref mut state) = *guard {
                 state.running_exec = Some((pid, pipe_id));
-                EXEC_PID.store(pid, Ordering::Release);
-                EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
             }
         }
         Err(msg) => {
@@ -1301,11 +1326,16 @@ pub fn test_set_exec_pid(pid: u64) {
 /// for `poll_output()` to clear, which is harmless because the next
 /// `launch_process()` overwrites it).
 pub fn reset_exec_tracking() {
+    // Close the console pipe read end via the authoritative atomic handle so
+    // the reader is dropped even when `TERMINAL` is `None` / `running_exec`
+    // was cleared by a re-`init()` (see EXEC_STDOUT_PIPE).
+    let pipe_id = EXEC_STDOUT_PIPE.swap(0, Ordering::AcqRel);
+    if pipe_id != 0 {
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+    }
     if let Some(mut guard) = TERMINAL.try_lock() {
         if let Some(ref mut state) = *guard {
-            if let Some((_pid, pipe_id)) = state.running_exec.take() {
-                crate::ipc::pipe::pipe_close_reader(pipe_id);
-            }
+            state.running_exec = None;
         }
     }
     EXEC_PID.store(0, Ordering::Release);
@@ -1324,20 +1354,21 @@ pub fn reset_exec_tracking() {
 /// other child) is running.  Must NOT hold the TERMINAL lock while calling
 /// into the process or pipe tables (ABBA deadlock risk).
 pub fn poll_output() {
-    // Fast path: no exec is running — skip acquiring the TERMINAL mutex.
+    // Fast path: no exec is running — skip all table work.
     if !EXEC_RUNNING.load(Ordering::Acquire) { return; }
 
-    // Snapshot the running-exec handle without holding TERMINAL across
-    // the waitpid / pipe_read calls below.
-    let running = {
-        let guard = TERMINAL.lock();
-        guard.as_ref().and_then(|s| s.running_exec)
-    };
-
-    let (pid, pipe_id) = match running {
-        Some(r) => r,
-        None => return,
-    };
+    // The drain target and child pid come from atomics, NOT from
+    // `TERMINAL.running_exec`.  The console pipe MUST be drained on every tick
+    // a child is running — even if `TERMINAL` is `None` or has been re-`init()`d
+    // (which resets `running_exec`) — otherwise a child that fills its 4 KiB
+    // stdout/stderr pipe parks its blocking `write(2)`/`writev(2)` on the full
+    // buffer (POSIX.1-2017 write(2); pipe(7)) and, with nobody reading the
+    // pipe, is never woken — wedging the whole thread group.  Keeping the drain
+    // independent of `TERMINAL` is the fix for the windowed-Firefox first-paint
+    // wedge (2026-06-17); see EXEC_STDOUT_PIPE.
+    let pid = EXEC_PID.load(Ordering::Acquire);
+    let pipe_id = EXEC_STDOUT_PIPE.load(Ordering::Acquire);
+    if pid == 0 || pipe_id == 0 { return; }
 
     // Drain ALL available pipe bytes in a loop (non-blocking).
     // Larger buffer (4096) + loop drains the entire pipe in one poll_output() call,
@@ -1362,63 +1393,77 @@ pub fn poll_output() {
     // Non-blocking waitpid: did the child become a zombie?
     let exit_status = crate::proc::waitpid(0, pid as i64);
 
-    // Now re-lock TERMINAL to push output + update state.
-    let mut guard = TERMINAL.lock();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return,
-    };
-
-    // Append ALL stdout bytes to the terminal grid, then render ONCE.
+    // Mirror child stdout/stderr to the serial console under the GUI test
+    // features so the harness can see dynamic-linker / client diagnostics
+    // (e.g. ld-musl "Error relocating …" → exit 127).  This is done from the
+    // drained `chunks` BEFORE touching TERMINAL so it happens even when no
+    // terminal window exists (windowed-Firefox runs with `TERMINAL == None`).
+    #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
     for chunk in &chunks {
         let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
-        // Mirror child stdout/stderr to the serial console under the GUI test
-        // features so the harness can see dynamic-linker / client diagnostics
-        // (e.g. ld-musl "Error relocating …" → exit 127) that otherwise land
-        // only on the invisible terminal grid.
-        #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
         crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
-        state.write_ansi_str(text);
     }
-    if any_data {
-        state.render_to_surface();
+
+    // Best-effort: push the drained bytes into the terminal grid for display.
+    // If there is no terminal window (`TERMINAL == None`, the windowed-Firefox
+    // case), the drain above has already done the load-bearing work (freeing
+    // pipe space + waking the parked writer); skipping the grid update here is
+    // purely cosmetic and must NOT skip the exit handling below.
+    if let Some(state) = TERMINAL.lock().as_mut() {
+        for chunk in &chunks {
+            let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
+            state.write_ansi_str(text);
+        }
+        if any_data {
+            state.render_to_surface();
+        }
     }
 
     if let Some((_reaped, code)) = exit_status {
-        // Drain any final bytes the child wrote before exiting.
-        drop(guard); // release TERMINAL before pipe_read
+        // Drain any final bytes the child wrote before exiting, then close the
+        // read end.  These do not need TERMINAL.
         let mut tail = [0u8; 4096];
         let tn = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut tail).unwrap_or(0);
         crate::ipc::pipe::pipe_close_reader(pipe_id);
 
-        let mut guard2 = TERMINAL.lock();
-        let state2 = match guard2.as_mut() { Some(s) => s, None => return };
-
+        #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
         if tn > 0 {
             let text = core::str::from_utf8(&tail[..tn]).unwrap_or("\u{FFFD}");
-            #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
             crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
-            state2.write_ansi_str(text);
         }
-        if code != 0 {
-            state2.write_str_colored(
-                &alloc::format!("\r\n[exited: code {}]\r\n", code),
-                ANSI_COLORS[9],
-            );
-        } else {
-            state2.write_str_colored("\r\n", DEFAULT_FG);
-        }
-        state2.running_exec = None;
+
+        // Tear down the exec-tracking atomics UNCONDITIONALLY (even with no
+        // terminal window): the child is gone, so the next launch must start
+        // clean and `poll_output()` must stop draining a closed pipe.
+        //
         // Latch the reaped child's exit code BEFORE clearing EXEC_PID so a
         // crash-recovery supervisor can read it after the zombie is gone.
-        // `code` here is the value `exit_group(2)` recorded — 0 for a clean
-        // exit, a negative signal number (e.g. -11 / -SIGSEGV) for a
-        // fatal-signal teardown.  See `LAST_EXEC_EXIT_CODE`.
+        // `code` is the value `exit_group(2)` recorded — 0 for a clean exit, a
+        // negative signal number (e.g. -11 / -SIGSEGV) for a fatal-signal
+        // teardown.  See `LAST_EXEC_EXIT_CODE`.
         LAST_EXEC_EXIT_CODE.store(code as i64, Ordering::Release);
+        EXEC_STDOUT_PIPE.store(0, Ordering::Release);
         EXEC_PID.store(0, Ordering::Release);
         EXEC_RUNNING.store(false, Ordering::Release);
-        state2.draw_prompt();
-        state2.scroll_offset = 0;
-        state2.render_to_surface();
+
+        // Best-effort grid update + prompt (cosmetic; skipped if no window).
+        if let Some(state2) = TERMINAL.lock().as_mut() {
+            if tn > 0 {
+                let text = core::str::from_utf8(&tail[..tn]).unwrap_or("\u{FFFD}");
+                state2.write_ansi_str(text);
+            }
+            if code != 0 {
+                state2.write_str_colored(
+                    &alloc::format!("\r\n[exited: code {}]\r\n", code),
+                    ANSI_COLORS[9],
+                );
+            } else {
+                state2.write_str_colored("\r\n", DEFAULT_FG);
+            }
+            state2.running_exec = None;
+            state2.draw_prompt();
+            state2.scroll_offset = 0;
+            state2.render_to_surface();
+        }
     }
 }
