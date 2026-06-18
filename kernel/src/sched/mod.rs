@@ -551,6 +551,28 @@ fn drain_due_wakes_if_pending(threads: &mut alloc::vec::Vec<proc::Thread>) {
 }
 
 
+/// Request that the calling CPU reschedule at its next preemption point.
+///
+/// Sets the per-CPU `NEED_RESCHEDULE` flag so that the deferred-preemption
+/// check at syscall return (`check_reschedule`) — and the post-IRQ check —
+/// will invoke `schedule()` and re-select the highest-priority Ready thread.
+///
+/// This is the AstryxOS analogue of `resched_curr()`: a wakeup path that has
+/// just made a higher-priority thread runnable uses it to let that thread
+/// preempt the current (lower-priority) thread, rather than waiting out the
+/// running thread's whole time slice. Cheap and lock-free; the actual switch
+/// happens later at a safe point where no syscall lock is held.
+#[inline]
+pub fn request_reschedule() {
+    if !is_active() {
+        return;
+    }
+    let cpu = cpu_index();
+    if cpu < MAX_CPUS {
+        NEED_RESCHEDULE[cpu].store(true, Ordering::Relaxed);
+    }
+}
+
 /// Check if a reschedule is pending (called after returning from interrupt).
 ///
 /// Returns immediately if the scheduler is not yet active — this avoids

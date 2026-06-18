@@ -9606,13 +9606,37 @@ pub fn sys_futex_linux(
 
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
+                let cur_tid = crate::proc::current_tid();
+                let cur_prio = threads
+                    .iter()
+                    .find(|th| th.tid == cur_tid)
+                    .map(|th| th.priority)
+                    .unwrap_or(0);
+                let mut max_woken_prio = 0u8;
                 for &t in &tids_to_wake {
                     if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
                         if th.state == crate::proc::ThreadState::Blocked {
                             th.state = crate::proc::ThreadState::Ready;
                             th.wake_tick = 0;
+                            // Wake-preemption: a futex waiter returning from a
+                            // sleep has not spent the CPU; boost it so it runs
+                            // ahead of continuously-runnable peers for its next
+                            // scheduling decision. See `proc::apply_wake_boost`.
+                            crate::proc::apply_wake_boost(th);
+                            max_woken_prio = max_woken_prio.max(th.priority);
                         }
                     }
+                }
+                drop(threads);
+                // resched_curr equivalent: if a woken thread now out-ranks the
+                // waker, request a reschedule so it preempts at syscall return
+                // rather than waiting out the waker's whole time slice. Without
+                // this the boost only changes *which* thread the picker prefers
+                // at the next natural switch — the waker can still run all the
+                // way to its own next block first. (POSIX sched(7): a wakeup may
+                // preempt the running task.)
+                if max_woken_prio > cur_prio {
+                    crate::sched::request_reschedule();
                 }
             }
 
@@ -9861,13 +9885,27 @@ pub fn sys_futex_linux(
 
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
+                let cur_tid = crate::proc::current_tid();
+                let cur_prio = threads
+                    .iter()
+                    .find(|th| th.tid == cur_tid)
+                    .map(|th| th.priority)
+                    .unwrap_or(0);
+                let mut max_woken_prio = 0u8;
                 for &t in &tids_to_wake {
                     if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
                         if th.state == crate::proc::ThreadState::Blocked {
                             th.state = crate::proc::ThreadState::Ready;
                             th.wake_tick = 0;
+                            // Wake-preemption boost (see `proc::apply_wake_boost`).
+                            crate::proc::apply_wake_boost(th);
+                            max_woken_prio = max_woken_prio.max(th.priority);
                         }
                     }
+                }
+                drop(threads);
+                if max_woken_prio > cur_prio {
+                    crate::sched::request_reschedule();
                 }
             }
 
@@ -9982,13 +10020,27 @@ pub fn sys_futex_linux(
             // acquisition (same post-drain pattern as FUTEX_WAKE).
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
+                let cur_tid = crate::proc::current_tid();
+                let cur_prio = threads
+                    .iter()
+                    .find(|th| th.tid == cur_tid)
+                    .map(|th| th.priority)
+                    .unwrap_or(0);
+                let mut max_woken_prio = 0u8;
                 for &t in &tids_to_wake {
                     if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
                         if th.state == crate::proc::ThreadState::Blocked {
                             th.state = crate::proc::ThreadState::Ready;
                             th.wake_tick = 0;
+                            // Wake-preemption boost (see `proc::apply_wake_boost`).
+                            crate::proc::apply_wake_boost(th);
+                            max_woken_prio = max_woken_prio.max(th.priority);
                         }
                     }
+                }
+                drop(threads);
+                if max_woken_prio > cur_prio {
+                    crate::sched::request_reschedule();
                 }
             }
 
