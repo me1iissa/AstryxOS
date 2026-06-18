@@ -1332,6 +1332,22 @@ pub fn run() -> ! {
         if test_295_proc_fd_memfd_reopen() { passed += 1; }
     }
 
+    // ── Test 295b: /proc/self/fd/N reopen of a SENTINEL fd must not UAF ────
+    // Sibling of Test 295.  An eventfd (and every other non-inode-backed
+    // "sentinel" fd: pipe / socket / epoll / timerfd / signalfd / inotify /
+    // PTY) carries a type-specific refcount that the magic-symlink clone path
+    // does not balance.  Cloning one and then closing the clone would free /
+    // underflow the shared backing object under the original fd (eventfd →
+    // outright slot free = UAF).  The reopen must instead decline (the
+    // pre-interception /proc/self/fd → /dev/fd re-resolution yields a benign
+    // ENOENT for a nameless fd, per proc(5)) and leave the original fd fully
+    // usable.  Locks in that the sentinel-fd reopen no longer corrupts state.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_295b_proc_fd_sentinel_reopen_no_uaf() { passed += 1; }
+    }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -43390,6 +43406,94 @@ fn test_295_proc_fd_memfd_reopen() -> bool {
     crate::subsys::linux::syscall::sys_close_test(reopened as u64);
     crate::subsys::linux::syscall::sys_close_test(memfd as u64);
     test_pass!("/proc/self/fd/N reopen of an unlinked memfd succeeds + reads contents");
+    true
+}
+
+/// Test 295b — reopening /proc/self/fd/<N> for a SENTINEL fd (eventfd) must
+/// NOT clone the slot (that would underflow the eventfd's type-specific
+/// refcount and free it under the original fd = UAF).  The reopen must decline
+/// cleanly and leave the original eventfd fully functional.  Uses the real
+/// syscall dispatch so the eventfd-aware close path (sys_close → eventfd::close)
+/// is exercised exactly as Firefox's AudioIPC/IPC fds hit it.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_295b_proc_fd_sentinel_reopen_no_uaf() -> bool {
+    test_header!("/proc/self/fd/N reopen of a sentinel (eventfd) declines, no UAF (proc(5))");
+
+    let pid = crate::proc::current_pid_lockless();
+    const EFD_NONBLOCK: u64 = 0x0800;
+
+    // ── Create an eventfd (sentinel fd: mount_idx == usize::MAX, EventFd) ──
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 7, EFD_NONBLOCK, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("sentinel_reopen", "eventfd2(7) failed ({})", efd);
+        return false;
+    }
+    let efd = efd as usize;
+    test_println!("  eventfd2(7, EFD_NONBLOCK) → fd {} ✓", efd);
+
+    // ── Reopen via /proc/self/fd/<N> — must DECLINE (not clone the slot) ──
+    // With the sentinel-fd gate, reopen_proc_fd returns NotFound and open()
+    // falls through to the /proc/self/fd → /dev/fd re-resolution, which has no
+    // name to resolve → a benign error (ENOENT).  A SUCCESS here would mean the
+    // dangerous clone path ran and the eventfd refcount is now unbalanced.
+    let mut path = alloc::string::String::from("/proc/self/fd/");
+    path.push_str(&alloc::format!("{}", efd));
+    match crate::vfs::open(pid, path.as_str(), crate::vfs::flags::O_RDONLY) {
+        Err(_) => {
+            test_println!("  open({}) declined cleanly (no sentinel clone) ✓", path);
+        }
+        Ok(clone_fd) => {
+            // Regression: the clone path ran.  Closing it via the real syscall
+            // would free the shared eventfd slot under `efd` (UAF).  Do NOT
+            // close it through that path; just fail loudly.
+            test_fail!("sentinel_reopen",
+                "open({}) of an eventfd SUCCEEDED (fd {}) — sentinel clone path ran (UAF risk)",
+                path, clone_fd);
+            crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+            return false;
+        }
+    }
+
+    // ── The ORIGINAL eventfd must still be fully functional ───────────────
+    // read → 7 (initval), counter clears → EAGAIN, write 5 → read 5.
+    let mut rbuf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 || u64::from_le_bytes(rbuf) != 7 {
+        test_fail!("sentinel_reopen",
+            "original eventfd read after reopen returned n={} val={} (expected 8 / 7) — slot corrupted",
+            n, u64::from_le_bytes(rbuf));
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  original eventfd read → 7 (initval intact) ✓");
+
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("sentinel_reopen",
+            "original eventfd re-read returned {} (expected -11 EAGAIN) — slot corrupted", n);
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    let wbuf = 5u64.to_le_bytes();
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    let n2 = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 || n2 != 8 || u64::from_le_bytes(rbuf) != 5 {
+        test_fail!("sentinel_reopen",
+            "original eventfd write/read roundtrip failed (w={} r={} val={}) — slot corrupted",
+            n, n2, u64::from_le_bytes(rbuf));
+        crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  original eventfd write 5 → read 5 (fully functional) ✓");
+
+    // ── Close the original via the real eventfd-aware close path ──────────
+    let r = crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("sentinel_reopen", "close(eventfd) failed ({})", r);
+        return false;
+    }
+    test_pass!("/proc/self/fd/N reopen of a sentinel fd declines + original stays usable (no UAF)");
     true
 }
 

@@ -2239,6 +2239,29 @@ fn reopen_proc_fd(
     };
     let (inode, mount_idx, file_type, is_console, open_path) = backing;
 
+    // Only inode-backed files reopen safely by cloning the (mount_idx, inode)
+    // slot — their liveness is the fd-table scan for (mount_idx, inode), so the
+    // freshly-installed slot is self-counting.  Sentinel fds (pipe / socket /
+    // eventfd / epoll / timerfd / signalfd / inotify / PTY / a console fd)
+    // carry a type-specific refcount this clone path does not balance; copying
+    // their backing into a new slot would underflow that count when the clone
+    // is closed (eventfd → outright slot free = UAF; socket → ref_count
+    // underflow tripping its close-path debug_assert; pipe → reader/writer
+    // undercount → phantom EOF/EPIPE).  Until this path replicates sys_dup's
+    // per-type inc_ref, return NotFound for them so open() falls back to the
+    // normal /proc/self/fd → /dev/fd re-resolution (which yields a benign
+    // ENOENT for a nameless sentinel fd — the exact pre-PR semantics, per
+    // proc(5)).
+    if mount_idx == usize::MAX
+        || is_console
+        || !matches!(
+            file_type,
+            FileType::RegularFile | FileType::Directory | FileType::SymLink
+        )
+    {
+        return Err(VfsError::NotFound);
+    }
+
     // Build the new fd: same backing inode, fresh offset, caller's access mode.
     // O_CLOEXEC (0x80000) is honoured per the requested flags; O_CREAT/O_TRUNC
     // are stripped (they do not apply to an existing open file).
@@ -2307,7 +2330,16 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
     // layer re-opens an O_RDWR memfd read-only this way; re-resolving the
     // (removed) name was breaking the content-process sandbox channel.
     if let Some((target_pid, fd_num)) = parse_proc_fd_path(path, pid) {
-        return reopen_proc_fd(pid, target_pid, fd_num, open_flags);
+        match reopen_proc_fd(pid, target_pid, fd_num, open_flags) {
+            // NotFound means either the target fd is gone or it is a sentinel fd
+            // this clone path declines to dup (see reopen_proc_fd).  Fall through
+            // to normal /proc/self/fd → /dev/fd re-resolution so the outcome
+            // matches the pre-interception behaviour (a benign ENOENT for a
+            // nameless sentinel fd).  Any other result (success or a hard error)
+            // is returned directly.
+            Err(VfsError::NotFound) => {}
+            other => return other,
+        }
     }
 
     // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
