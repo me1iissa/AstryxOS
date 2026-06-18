@@ -2815,6 +2815,18 @@ pub fn run() -> ! {
         if test_285_anti_starvation_aging() { passed += 1; }
     }
 
+    // ── Test 286: clone-creator scheduling-ordering boost ───────────────────
+    // A thread that spawns a sibling (clone(CLONE_VM|CLONE_THREAD)) must not be
+    // out-run by the child it just created during a spawn burst, so a process
+    // main thread can finish publishing its global singletons before a worker
+    // dereferences them.  Exercises the real `boost_current_thread_after_clone`
+    // path and the picker score it produces.  Cite POSIX clone(2)/sched(7).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_286_clone_creator_ordering_boost() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -45038,6 +45050,124 @@ fn test_285_anti_starvation_aging() -> bool {
     test_println!("  no-contention ordering preserved (priority > affinity, affinity tie-breaks) ✓");
 
     test_pass!("anti-starvation aging frees an out-scored Ready thread");
+    true
+}
+
+// ── Test 286: clone-creator scheduling-ordering boost ────────────────────────
+//
+// Regression guard for the FF content-process ordering crash: a worker thread
+// (clone(CLONE_VM|CLONE_THREAD) child of the content process's main thread) ran
+// ahead of the main thread's one-time global init and dereferenced a singleton
+// pointer the main thread had not yet published — a NULL-deref crash.  Because
+// all sibling threads share one CR3 the field was genuinely still NULL (the
+// publishing store had not executed); this is a *temporal ordering* hazard, not
+// a store-visibility/aliasing one.
+//
+// The fix (`proc::boost_current_thread_after_clone`, called from
+// `usermode::create_user_thread`) gives the *creating* thread a self-decaying
+// `PRIORITY_BOOST_WAIT` boost so it stays scheduled ahead of the children it
+// spawns during a burst.  This test exercises the real boost on the running
+// test thread and asserts the three contractual properties, then restores the
+// thread's priority so later tests run unperturbed.  Cite POSIX clone(2): the
+// new thread does not preempt its creator; sched(7): SCHED_OTHER fairness.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_286_clone_creator_ordering_boost() -> bool {
+    use crate::proc::{
+        self, THREAD_TABLE, PRIORITY_NORMAL, PRIORITY_BOOST_WAIT, PRIORITY_MAX, current_tid,
+    };
+    use crate::sched::wait_age_bonus;
+
+    test_header!("clone creator stays scheduled ahead of its fresh child");
+
+    // The picker's exact score formula (see `sched::schedule`).
+    fn picker_score(priority: u8, affinity: u16, age: u64) -> u16 {
+        (priority as u16) * 4 + affinity + wait_age_bonus(age)
+    }
+
+    let tid = current_tid();
+
+    // Snapshot the running thread's current priority/base so we can restore it.
+    let (saved_priority, base) = {
+        let threads = THREAD_TABLE.lock();
+        match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => (t.priority, t.base_priority),
+            None => {
+                test_fail!("test286", "running test thread tid={} not in THREAD_TABLE", tid);
+                return false;
+            }
+        }
+    };
+
+    // Normalise to base so the assertions are independent of any inherited
+    // boost the test thread happens to be carrying when this test runs.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.priority = t.base_priority;
+        }
+    }
+
+    // ── Property 1: the boost actually raises the creator above its base ─────
+    proc::boost_current_thread_after_clone();
+    let after_one = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == tid).map(|t| t.priority).unwrap_or(0)
+    };
+    if after_one != (base + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX) {
+        test_fail!("test286",
+            "boost did not raise priority by PRIORITY_BOOST_WAIT: base={} after={}",
+            base, after_one);
+        // restore before bailing
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) { t.priority = saved_priority; }
+        return false;
+    }
+    test_println!("  boost raises creator {} -> {} (base + PRIORITY_BOOST_WAIT) ✓", base, after_one);
+
+    // ── Property 2: re-arming is idempotent (clamped, never runaway) ─────────
+    // A long spawn burst re-boosts on every clone; the boost must clamp so it
+    // never escalates without bound (which would invert steady-state fairness).
+    for _ in 0..16 { proc::boost_current_thread_after_clone(); }
+    let after_burst = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == tid).map(|t| t.priority).unwrap_or(0)
+    };
+    if after_burst > PRIORITY_MAX {
+        test_fail!("test286", "re-armed boost exceeded PRIORITY_MAX: {}", after_burst);
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) { t.priority = saved_priority; }
+        return false;
+    }
+    test_println!("  burst re-arm clamps at {} (<= PRIORITY_MAX {}) ✓", after_burst, PRIORITY_MAX);
+
+    // ── Property 3: the boosted creator out-scores a fresh child ────────────
+    // The hazard window: a brand-new child enters Ready at PRIORITY_NORMAL with
+    // zero wait-age.  Give the child the best possible position (pinned, +2) and
+    // the creator the worst (cache-cold, +0); the creator must STILL win so it
+    // keeps the CPU and finishes its init before the child runs.
+    let creator_score = picker_score(after_one, 0, 0);
+    let fresh_child_score = picker_score(PRIORITY_NORMAL, 2, 0);
+    if creator_score <= fresh_child_score {
+        test_fail!("test286",
+            "boosted creator does not out-score a fresh child: creator(cold)={} child(pinned)={}",
+            creator_score, fresh_child_score);
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) { t.priority = saved_priority; }
+        return false;
+    }
+    test_println!(
+        "  boosted creator(cold) score {} > fresh child(pinned) score {} ✓",
+        creator_score, fresh_child_score);
+
+    // ── Restore the test thread's original priority ──────────────────────────
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.priority = saved_priority;
+        }
+    }
+
+    test_pass!("clone creator stays scheduled ahead of its fresh child");
     true
 }
 

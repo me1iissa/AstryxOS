@@ -1370,6 +1370,49 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
     note_kstack_alloc(pid, tid, stack_base, kstack_span);
     Some(tid)
 }
+
+/// Give the thread that is *currently running* a short, self-decaying priority
+/// boost because it has just created a sibling thread (clone(CLONE_VM |
+/// CLONE_THREAD) / pthread_create).
+///
+/// # Why this exists
+/// POSIX clone(2)/pthread_create(3) place no ordering requirement between the
+/// creating thread and the newly-created one — either may run first — but they
+/// also do not make the *new* thread preempt the creator.  On a multiprocessor
+/// the new thread is simply made runnable; the creator keeps its CPU and
+/// continues executing the instructions after the syscall (Linux's
+/// `sched_child_runs_first` is 0 by default and the wake-up of a new task is
+/// placed so it does not preempt the parent — see sched(7)).
+///
+/// AstryxOS's picker scores a Ready peer purely on `priority*4 + affinity +
+/// wait-age`.  A freshly-created child enters at `PRIORITY_NORMAL` with the
+/// same base score as its creator and **zero** wait-age penalty, so when a
+/// thread spawns a *burst* of children (e.g. a libc/runtime thread pool) those
+/// children can out-compete the creator for the second CPU and run far ahead of
+/// it.  When the creator is a process's main thread still completing one-time
+/// global initialisation, an early-running child can observe a global singleton
+/// that the main thread has not yet published (an unwritten pointer field),
+/// dereference NULL, and crash.  This is an *ordering* hazard, not a memory
+/// store-visibility one: all sibling threads share a single CR3, so there is no
+/// aliasing — the field is genuinely still NULL because the publishing store
+/// has not executed yet.
+///
+/// Boosting the *creator* by `PRIORITY_BOOST_WAIT` keeps it ahead of the
+/// children it just spawned for the duration of a spawn burst.  The boost is
+/// the same decaying mechanism used for wait-satisfaction wakeups: `schedule()`
+/// decrements any priority above `base_priority` by one each time the thread is
+/// switched out, so the boost evaporates within a few quanta once the burst
+/// ends, leaving steady-state fairness unchanged.  Re-arming it on every
+/// clone keeps the creator ahead across an arbitrarily long burst without ever
+/// pinning it above its base priority once spawning stops.
+pub fn boost_current_thread_after_clone() {
+    let tid = current_tid();
+    let mut threads = THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+        t.priority = (t.priority + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX);
+    }
+}
+
 pub fn exit_thread(exit_code: i64) {
     let tid = recover_current_tid();
     let pid;

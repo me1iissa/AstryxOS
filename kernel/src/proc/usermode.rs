@@ -64,6 +64,24 @@ pub fn create_user_thread(
         }
     }
 
+    // Ordering guard for thread-creation bursts: keep the *creating* thread
+    // (the one running this clone) scheduled ahead of the child it just spawned.
+    //
+    // POSIX clone(2)/pthread_create(3) do not let the new thread preempt its
+    // creator, and on Linux a newly-woken task is placed so it does not jump
+    // ahead of the parent (sched(7); sched_child_runs_first defaults to 0).
+    // Our picker, by contrast, scores a fresh child identically to its creator
+    // (same PRIORITY_NORMAL, zero wait-age), so on the second CPU a burst of
+    // children can out-run the creator.  When the creator is a process main
+    // thread still publishing process-global singletons, an early child can
+    // read a not-yet-written pointer and NULL-deref.  All sibling threads share
+    // one CR3, so this is a temporal ordering hazard, not a store-visibility
+    // (aliasing) one.  The boost is self-decaying — schedule() bleeds any
+    // above-base priority off within a few quanta once the burst ends — so it
+    // only affects the burst window and leaves steady-state fairness untouched.
+    // See `proc::boost_current_thread_after_clone`.
+    proc::boost_current_thread_after_clone();
+
     crate::serial_println!(
         "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x} RDX={:#x} R8={:#x} R9={:#x}",
         tid, pid, user_rip, user_rsp, tls, entry_rdx, entry_r8, parent_regs.r9
