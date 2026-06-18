@@ -2431,6 +2431,49 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Blocking recvmsg(2) on AF_UNIX: an empty receive queue on a
+                // *blocking* socket must wait for a message, never return
+                // -EAGAIN.  Per IEEE 1003.1 §recvmsg, EAGAIN/EWOULDBLOCK is
+                // reserved for non-blocking operation (the fd's O_NONBLOCK or
+                // this call's MSG_DONTWAIT, 0x40).  The datagram/stream
+                // recv path above already gates on this for AF_INET; the
+                // AF_UNIX recvmsg arm did not, so a peer that does a bare
+                // blocking recvmsg (e.g. a request/response broker over a
+                // SOCK_SEQPACKET socketpair) saw a spurious -EAGAIN the moment
+                // it raced ahead of the writer and mis-read it as a fatal
+                // protocol error, tearing the channel down before the first
+                // message ever arrived.  Wait until a data message OR a
+                // control-only SCM_RIGHTS frame is deliverable, or the read
+                // side reaches orderly EOF (peer SHUT_WR / close → 0), or a
+                // signal is pending (EINTR), or the deadline fires.
+                let msg_dontwait = (arg3 & 0x40) != 0;
+                let fd_nonblock = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid)
+                        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+                        .map(|f| (f.flags & 0x0800) != 0)
+                        .unwrap_or(false)
+                };
+                if !(msg_dontwait || fd_nonblock) {
+                    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
+                    loop {
+                        let consumed = crate::net::unix::recv_consumed(unix_id);
+                        if crate::net::unix::has_data(unix_id)
+                            || crate::syscall::has_scm_deliverable(unix_id, consumed)
+                            || crate::net::unix::read_shutdown(unix_id)
+                            || crate::net::unix::fully_hung_up(unix_id)
+                        {
+                            break;
+                        }
+                        if signal_pending(pid) { return -4; } // EINTR
+                        crate::net::poll();
+                        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                            return -11; // EAGAIN — bounded so a wedged peer
+                                        // cannot pin the runner forever.
+                        }
+                        crate::sched::yield_cpu();
+                    }
+                }
                 // Cap the STREAM drain at the next pending SCM_RIGHTS batch
                 // boundary so this recvmsg does not consume bytes PAST the
                 // stream position where the next fd batch becomes deliverable.

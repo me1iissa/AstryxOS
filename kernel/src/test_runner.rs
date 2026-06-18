@@ -1916,6 +1916,14 @@ pub fn run() -> ! {
     total += 1;
     if test_recvmsg_msg_flags_overwrite() { passed += 1; }
 
+    // ── Test 202b: recvmsg AF_UNIX blocking semantics ─────────────────────
+    // A blocking recvmsg on AF_UNIX must wait for a message, not spuriously
+    // return -EAGAIN (which a SOCK_SEQPACKET request/response broker mis-reads
+    // as a fatal protocol error).  O_NONBLOCK must still EAGAIN; peer hang-up
+    // must return 0 (EOF), not hang.  Refs: recvmsg(2), unix(7), POSIX.1-2017.
+    total += 1;
+    if test_unix_recvmsg_blocking_semantics() { passed += 1; }
+
     // ── Test 203: AF_INET socket(2) SOCK_CLOEXEC + SOCK_NONBLOCK (PR #129) ─
     // Verifies that SOCK_CLOEXEC and SOCK_NONBLOCK in the type argument of
     // socket(2) are applied to AF_INET fds, matching the AF_UNIX behaviour.
@@ -37530,6 +37538,129 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
         returned_flags);
 
     test_pass!("recvmsg msg_flags overwrite — sentinel must not survive (PR #129 caveat)");
+    true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 202b — recvmsg(2) on a BLOCKING AF_UNIX socket must not spuriously EAGAIN
+//
+// Per IEEE 1003.1 §recvmsg, -EAGAIN/-EWOULDBLOCK is reserved for non-blocking
+// operation (the fd's O_NONBLOCK, or this call's MSG_DONTWAIT).  A blocking
+// recvmsg on an empty queue must wait for a message; once a message is present
+// it must be returned.  This guards the AF_UNIX recvmsg blocking-wait: before
+// the fix, the AF_UNIX arm of nr=47 returned read_msg()'s raw -EAGAIN on an
+// empty SEQPACKET queue regardless of blocking mode, so a peer that issued a
+// bare blocking recvmsg (e.g. a SOCK_SEQPACKET request/response broker) mis-read
+// the spurious EAGAIN as a fatal protocol error.
+//
+// The single-threaded test runner cannot prove "blocks forever on empty", but it
+// proves the three deterministic break conditions of the wait loop:
+//   (1) blocking recvmsg with a message already queued returns it (no EAGAIN);
+//   (2) NON-blocking (O_NONBLOCK) recvmsg on an empty queue returns -EAGAIN;
+//   (3) blocking recvmsg after peer hang-up returns 0 (orderly EOF), not a hang.
+// Refs: recvmsg(2), unix(7) §SOCK_SEQPACKET, IEEE 1003.1-2017.
+// ──────────────────────────────────────────────────────────────────────────────
+fn test_unix_recvmsg_blocking_semantics() -> bool {
+    test_header!("recvmsg AF_UNIX blocking — no spurious EAGAIN; O_NONBLOCK still EAGAIN; EOF→0");
+
+    let pid = crate::proc::current_pid_lockless();
+
+    // Helper: build a flat msghdr with one iovec into `rxbuf`.
+    // Linux x86_64 struct msghdr: off16 msg_iov, off24 msg_iovlen.
+    // (declared inline at each call site to keep the borrow of rxbuf local.)
+
+    // ── (1) Blocking recvmsg with a message already present → returns it ──
+    {
+        let (id_a, id_b) = crate::net::unix::socketpair(
+            crate::net::unix::SockKind::SeqPacket,
+            crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+        if id_a == u64::MAX || id_b == u64::MAX {
+            test_fail!("recvmsg_block", "socketpair(SEQPACKET) failed"); return false;
+        }
+        // fd_b BLOCKING (nonblock=false).
+        let fd_b = crate::syscall::alloc_unix_socket_fd(pid, id_b, false, false);
+        if fd_b < 0 { test_fail!("recvmsg_block", "alloc fd_b failed: {}", fd_b); return false; }
+        // Pre-queue a message on the peer (id_a) so id_b is immediately readable.
+        let msg = [0x5Au8; 8];
+        if crate::net::unix::write(id_a, &msg) != 8 {
+            test_fail!("recvmsg_block", "pre-queue write failed"); return false;
+        }
+        let mut rxbuf = [0u8; 16];
+        let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, 16];
+        let mut hdr = [0u64; 7];
+        hdr[2] = iov.as_mut_ptr() as u64; // msg_iov
+        hdr[3] = 1u64;                    // msg_iovlen
+        let ret = crate::syscall::dispatch_linux_kernel(
+            47, fd_b as u64, hdr.as_mut_ptr() as u64, 0 /*flags=blocking*/, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        crate::net::unix::close(id_a);
+        if ret != 8 {
+            test_fail!("recvmsg_block",
+                "blocking recvmsg with data queued returned {} (want 8 — spurious EAGAIN?)", ret);
+            return false;
+        }
+        test_println!("  (1) blocking recvmsg, data present → {} bytes (no EAGAIN) ✓", ret);
+    }
+
+    // ── (2) Non-blocking recvmsg on an empty queue → -EAGAIN (regression) ──
+    {
+        let (id_a, id_b) = crate::net::unix::socketpair(
+            crate::net::unix::SockKind::SeqPacket,
+            crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+        if id_a == u64::MAX || id_b == u64::MAX {
+            test_fail!("recvmsg_block", "socketpair(2) failed"); return false;
+        }
+        // fd_b NON-BLOCKING (nonblock=true → flags |= O_NONBLOCK 0x800).
+        let fd_b = crate::syscall::alloc_unix_socket_fd(pid, id_b, false, true);
+        if fd_b < 0 { test_fail!("recvmsg_block", "alloc fd_b(nb) failed: {}", fd_b); return false; }
+        let mut rxbuf = [0u8; 16];
+        let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, 16];
+        let mut hdr = [0u64; 7];
+        hdr[2] = iov.as_mut_ptr() as u64;
+        hdr[3] = 1u64;
+        let ret = crate::syscall::dispatch_linux_kernel(
+            47, fd_b as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        crate::net::unix::close(id_a);
+        if ret != -11 {
+            test_fail!("recvmsg_block",
+                "non-blocking recvmsg on empty queue returned {} (want -11 EAGAIN)", ret);
+            return false;
+        }
+        test_println!("  (2) O_NONBLOCK recvmsg, empty → -EAGAIN ✓");
+    }
+
+    // ── (3) Blocking recvmsg after peer hang-up → 0 (orderly EOF), no hang ──
+    {
+        let (id_a, id_b) = crate::net::unix::socketpair(
+            crate::net::unix::SockKind::SeqPacket,
+            crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+        if id_a == u64::MAX || id_b == u64::MAX {
+            test_fail!("recvmsg_block", "socketpair(3) failed"); return false;
+        }
+        let fd_b = crate::syscall::alloc_unix_socket_fd(pid, id_b, false, false);
+        if fd_b < 0 { test_fail!("recvmsg_block", "alloc fd_b(eof) failed: {}", fd_b); return false; }
+        // Peer fully closes → fully_hung_up(id_b) becomes true, so the blocking
+        // wait must break on EOF and the recvmsg returns 0 (no message), never
+        // spinning to the deadline.
+        crate::net::unix::close(id_a);
+        let mut rxbuf = [0u8; 16];
+        let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, 16];
+        let mut hdr = [0u64; 7];
+        hdr[2] = iov.as_mut_ptr() as u64;
+        hdr[3] = 1u64;
+        let ret = crate::syscall::dispatch_linux_kernel(
+            47, fd_b as u64, hdr.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        if ret != 0 {
+            test_fail!("recvmsg_block",
+                "blocking recvmsg after peer close returned {} (want 0 EOF)", ret);
+            return false;
+        }
+        test_println!("  (3) blocking recvmsg, peer hung up → 0 (EOF) ✓");
+    }
+
+    test_pass!("recvmsg AF_UNIX blocking semantics");
     true
 }
 
