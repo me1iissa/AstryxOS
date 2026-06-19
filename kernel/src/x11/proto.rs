@@ -287,6 +287,7 @@ pub const DPMS_MAJOR_OPCODE:      u8 = 145; // DPMS
 pub const XINPUT_MAJOR_OPCODE:    u8 = 131; // XInputExtension (XI2)
 pub const SHM_MAJOR_OPCODE:       u8 = 130; // MIT-SHM
 pub const RANDR_MAJOR_OPCODE:     u8 = 143; // RANDR (RandR)
+pub const GLX_MAJOR_OPCODE:       u8 = 146; // GLX
 
 // QueryExtension event/error bases.  Per the X11 core protocol §QueryExtension,
 // an extension that defines events reports its first_event (the event-code base
@@ -310,6 +311,11 @@ pub const DAMAGE_FIRST_EVENT:    u8 = 91;  pub const DAMAGE_FIRST_ERROR:    u8 =
 pub const SYNC_FIRST_EVENT:      u8 = 92;  pub const SYNC_FIRST_ERROR:      u8 = 153;
 pub const RENDER_FIRST_EVENT:    u8 = 0;   pub const RENDER_FIRST_ERROR:    u8 = 142;
 pub const SHM_FIRST_EVENT:       u8 = 65;  pub const SHM_FIRST_ERROR:       u8 = 128;
+// GLX defines 14 errors (GLXBadContext..GLXBadProfileARB) and 0 events; per the
+// GLX X-protocol encoding (OpenGL GLX extension §Protocol Encoding) first_event
+// is 0 for an extension with no events.  We allocate the 14-error block at 156..
+// (SYNC ends at 154, leaving 155 free; start at 156 for a one-code margin).
+pub const GLX_FIRST_EVENT:       u8 = 0;   pub const GLX_FIRST_ERROR:       u8 = 156;
 
 // ── MIT-SHM minor opcodes ──────────────────────────────────────────────────────
 pub const SHM_QUERY_VERSION:  u8 = 0;
@@ -382,3 +388,94 @@ pub const COMPOSITE_CREATE_REGION_FROM_BORDER_CLIP: u8 = 5;
 pub const COMPOSITE_NAME_WINDOW_PIXMAP:       u8 = 6;
 pub const COMPOSITE_GET_OVERLAY_WINDOW:       u8 = 7;
 pub const COMPOSITE_RELEASE_OVERLAY_WINDOW:   u8 = 8;
+
+// ── GLX extension (major opcode 146) ──────────────────────────────────────────
+//
+// Public reference: "OpenGL Graphics System: A Specification — GLX Extension"
+// and the GLX Protocol Encoding.  The X server only performs the GLX *handshake*;
+// with Mesa's software path the OpenGL rendering happens client-side in the
+// application's own address space (direct rendering), so the server never sees a
+// GL command stream — it only answers the metadata/bookkeeping requests below.
+//
+// GLX single-command request opcodes (the request's data[1] minor opcode).
+pub const GLX_RENDER:                   u8 = 1;
+pub const GLX_RENDER_LARGE:             u8 = 2;
+pub const GLX_CREATE_CONTEXT:           u8 = 3;
+pub const GLX_DESTROY_CONTEXT:          u8 = 4;
+pub const GLX_MAKE_CURRENT:             u8 = 5;
+pub const GLX_IS_DIRECT:                u8 = 6;
+pub const GLX_QUERY_VERSION:            u8 = 7;
+pub const GLX_WAIT_GL:                  u8 = 8;
+pub const GLX_WAIT_X:                   u8 = 9;
+pub const GLX_COPY_CONTEXT:             u8 = 10;
+pub const GLX_SWAP_BUFFERS:             u8 = 11;
+pub const GLX_USE_X_FONT:               u8 = 12;
+pub const GLX_CREATE_GLX_PIXMAP:        u8 = 13;
+pub const GLX_GET_VISUAL_CONFIGS:       u8 = 14;
+pub const GLX_DESTROY_GLX_PIXMAP:       u8 = 15;
+pub const GLX_VENDOR_PRIVATE:           u8 = 16;
+pub const GLX_VENDOR_PRIVATE_WITH_REPLY:u8 = 17;
+pub const GLX_QUERY_EXTENSIONS_STRING:  u8 = 18;
+pub const GLX_QUERY_SERVER_STRING:      u8 = 19;
+pub const GLX_CLIENT_INFO:              u8 = 20;
+pub const GLX_GET_FB_CONFIGS:           u8 = 21;
+pub const GLX_CREATE_PIXMAP:            u8 = 22;
+pub const GLX_DESTROY_PIXMAP:           u8 = 23;
+pub const GLX_CREATE_NEW_CONTEXT:       u8 = 24;
+pub const GLX_QUERY_CONTEXT:            u8 = 25;
+pub const GLX_MAKE_CONTEXT_CURRENT:     u8 = 26;
+pub const GLX_CREATE_PBUFFER:           u8 = 27;
+pub const GLX_DESTROY_PBUFFER:          u8 = 28;
+pub const GLX_GET_DRAWABLE_ATTRIBUTES:  u8 = 29;
+pub const GLX_CHANGE_DRAWABLE_ATTRIBUTES: u8 = 30;
+pub const GLX_CREATE_WINDOW:            u8 = 31;
+pub const GLX_DESTROY_WINDOW:           u8 = 32;
+// GLX 1.4 ARB client-info variants (no reply): SetClientInfoARB=33,
+// CreateContextAttribsARB=34, SetClientInfo2ARB=35.
+pub const GLX_SET_CLIENT_INFO_ARB:           u8 = 33;
+pub const GLX_CREATE_CONTEXT_ATTRIBS_ARB:    u8 = 34;
+pub const GLX_SET_CLIENT_INFO_2ARB:          u8 = 35;
+
+// GLX QueryServerString / QueryExtensionsString name tokens.
+pub const GLX_STRING_VENDOR:     u32 = 1;
+pub const GLX_STRING_VERSION:    u32 = 2;
+pub const GLX_STRING_EXTENSIONS: u32 = 3;
+
+// GLX config/visual attribute tokens (GLX Protocol Encoding, property arrays).
+pub const GLX_TOK_USE_GL:         u32 = 1;
+pub const GLX_TOK_BUFFER_SIZE:    u32 = 2;
+pub const GLX_TOK_LEVEL:          u32 = 3;
+pub const GLX_TOK_RGBA:           u32 = 4;
+pub const GLX_TOK_DOUBLEBUFFER:   u32 = 5;
+pub const GLX_TOK_STEREO:         u32 = 6;
+pub const GLX_TOK_AUX_BUFFERS:    u32 = 7;
+pub const GLX_TOK_RED_SIZE:       u32 = 8;
+pub const GLX_TOK_GREEN_SIZE:     u32 = 9;
+pub const GLX_TOK_BLUE_SIZE:      u32 = 10;
+pub const GLX_TOK_ALPHA_SIZE:     u32 = 11;
+pub const GLX_TOK_DEPTH_SIZE:     u32 = 12;
+pub const GLX_TOK_STENCIL_SIZE:   u32 = 13;
+pub const GLX_TOK_ACCUM_RED:      u32 = 14;
+pub const GLX_TOK_ACCUM_GREEN:    u32 = 15;
+pub const GLX_TOK_ACCUM_BLUE:     u32 = 16;
+pub const GLX_TOK_ACCUM_ALPHA:    u32 = 17;
+// FBConfig-only tokens (GLX 1.3).
+pub const GLX_TOK_CONFIG_CAVEAT:  u32 = 0x20;
+pub const GLX_TOK_X_VISUAL_TYPE:  u32 = 0x22;
+pub const GLX_TOK_TRANSPARENT_TYPE: u32 = 0x23;
+pub const GLX_TOK_VISUAL_ID:      u32 = 0x800B;
+pub const GLX_TOK_DRAWABLE_TYPE:  u32 = 0x8010;
+pub const GLX_TOK_RENDER_TYPE:    u32 = 0x8011;
+pub const GLX_TOK_X_RENDERABLE:   u32 = 0x8012;
+pub const GLX_TOK_FBCONFIG_ID:    u32 = 0x8013;
+pub const GLX_TOK_MAX_PBUFFER_WIDTH:  u32 = 0x8016;
+pub const GLX_TOK_MAX_PBUFFER_HEIGHT: u32 = 0x8017;
+pub const GLX_TOK_MAX_PBUFFER_PIXELS: u32 = 0x8018;
+// Token values.
+pub const GLX_VAL_NONE:        u32 = 0x8000;
+pub const GLX_VAL_TRUE_COLOR:  u32 = 0x8002;
+pub const GLX_VAL_DIRECT_COLOR:u32 = 0x8003;
+pub const GLX_VAL_RGBA_BIT:    u32 = 0x0000_0001;
+pub const GLX_VAL_WINDOW_BIT:  u32 = 0x0000_0001;
+pub const GLX_VAL_PIXMAP_BIT:  u32 = 0x0000_0002;
+pub const GLX_VAL_PBUFFER_BIT: u32 = 0x0000_0004;

@@ -288,6 +288,21 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) -> i64 {
     }
 }
 
+/// Look up a segment by its shmid and return its `(phys_base, size)`.
+///
+/// The backing pages are physically contiguous and reside in the kernel's
+/// identity-mapped low memory, so the returned `phys_base` is directly readable
+/// by the kernel (the same property `shmget`'s `write_bytes(phys_base ...)` zero
+/// relies on).  Used by the X server's MIT-SHM ShmPutImage to read client pixel
+/// data straight from the segment without a per-frame copy through the request
+/// body.  Returns `None` if no in-use segment has that id.
+pub fn segment_phys(shmid: u32) -> Option<(u64, u64)> {
+    let segs = SEGMENTS.lock();
+    segs.iter()
+        .find(|s| s.in_use && s.id == shmid)
+        .map(|s| (s.phys_base, s.size))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn get_cr3(pid: u64) -> u64 {
