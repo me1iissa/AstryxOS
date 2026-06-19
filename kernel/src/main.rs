@@ -1300,6 +1300,79 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 Err(e) => serial_println!("[FFTEST] WARNING: could not write /tmp/hello.html: {:?}", e),
             }
 
+            // Seed the Firefox profile prefs into the VFS ramdisk.  The cmdlines
+            // launch with `--profile /tmp/ff-profile`, which Firefox creates
+            // fresh (empty) — so the prefs staged on the data image at
+            // /opt/firefox/profile never apply, leaving telemetry, safebrowsing,
+            // update, captive-portal and the GMP/OpenH264 auto-download at their
+            // network-touching defaults.  Under MOZ_DISABLE_NONLOCAL_CONNECTIONS
+            // (set for the in-process / no-network GUI run) the FIRST such
+            // background connection is FATAL — Firefox aborts with
+            //   "Non-local network connections are disabled and a connection
+            //    attempt to ciscobinary.openh264.org was made"
+            // (the OpenH264 GMP fetch) and crashes before painting.  Seed a
+            // prefs.js that disables every background-network feature so no
+            // non-local connection is ever attempted.  Ref: Firefox profile
+            // user_pref(3) prefs (media.gmp-*, app.update, toolkit.telemetry,
+            // browser.safebrowsing, network.captive-portal-service).
+            const FF_PREFS: &[u8] = br#"user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("app.update.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("app.update.service.enabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.unified", false);
+user_pref("toolkit.telemetry.server", "");
+user_pref("datareporting.healthreport.service.enabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);
+user_pref("browser.safebrowsing.downloads.enabled", false);
+user_pref("browser.safebrowsing.update.enabled", false);
+user_pref("browser.safebrowsing.provider.google4.updateURL", "");
+user_pref("browser.safebrowsing.provider.mozilla.updateURL", "");
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("network.prefetch-next", false);
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchFromHTTPS", true);
+user_pref("extensions.update.enabled", false);
+user_pref("extensions.update.autoUpdateDefault", false);
+user_pref("extensions.getAddons.cache.enabled", false);
+user_pref("extensions.systemAddon.update.enabled", false);
+user_pref("extensions.blocklist.enabled", false);
+user_pref("geo.enabled", false);
+user_pref("browser.region.network.url", "");
+user_pref("browser.region.update.enabled", false);
+user_pref("app.normandy.enabled", false);
+user_pref("app.normandy.api_url", "");
+user_pref("app.shield.optoutstudies.enabled", false);
+user_pref("services.settings.server", "");
+user_pref("browser.discovery.enabled", false);
+user_pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+user_pref("browser.crashReports.unsubmittedCheck.enabled", false);
+user_pref("breakpad.reportURL", "");
+user_pref("media.gmp-manager.updateEnabled", false);
+user_pref("media.gmp-manager.url", "data:text/plain,");
+user_pref("media.gmp-manager.url.override", "data:text/plain,");
+user_pref("media.gmp-provider.enabled", false);
+user_pref("media.gmp-gmpopenh264.enabled", false);
+user_pref("media.gmp-gmpopenh264.autoupdate", false);
+user_pref("media.gmp.decoder.enabled", false);
+user_pref("media.peerconnection.enabled", false);
+"#;
+            let _ = crate::vfs::mkdir("/tmp/ff-profile");
+            let _ = crate::vfs::create_file("/tmp/ff-profile/prefs.js");
+            match crate::vfs::write_file("/tmp/ff-profile/prefs.js", FF_PREFS) {
+                Ok(_)  => serial_println!("[FFTEST] Wrote /tmp/ff-profile/prefs.js ({} bytes) — background network disabled", FF_PREFS.len()),
+                Err(e) => serial_println!("[FFTEST] WARNING: could not write /tmp/ff-profile/prefs.js: {:?}", e),
+            }
+
             // The Mozilla launcher (firefox-bin) reads its dependentlibs.list,
             // application.ini, omni.ja, defaults/, browser/, etc. via
             // readlink("/proc/self/exe") + dirname, then opens those files
