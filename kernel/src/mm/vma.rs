@@ -1164,12 +1164,30 @@ impl VmSpace {
     pub fn find_free_range(&self, size: u64) -> Option<u64> {
         let size = page_align_up(size);
 
-        // Try the hint first
-        let mut candidate = self.mmap_hint;
+        // Top-down search for the highest free gap >= size, starting from the
+        // fixed MMAP_BASE ceiling (NOT the running `mmap_hint`).
+        //
+        // `mmap_hint` is lowered monotonically as mappings are placed below it
+        // (see insert_vma) and is never raised on munmap.  Starting the walk at
+        // `mmap_hint` therefore only ever searched the shrinking window *below*
+        // the lowest mapping ever made, so address space freed by munmap (which
+        // sits above the lowered hint) was never reused.  Under heavy
+        // mmap/munmap churn — e.g. a malloc that grows via mremap(MREMAP_MAYMOVE)
+        // (mmap a new region, copy, munmap the old) — the window below the hint
+        // eventually exhausts while plenty of freed space remains above it, so
+        // mmap(NULL,...) returns None and mremap fails with -ENOMEM in a retry
+        // storm.  Searching top-down from the fixed ceiling reuses freed gaps,
+        // matching the top-down unmapped-area search every POSIX mmap relies on
+        // (man 2 mmap / man 2 mremap MREMAP_MAYMOVE).
+        let mut candidate = MMAP_BASE;
 
-        // Simple strategy: walk down from the hint, checking each candidate
-        // against existing VMAs.
-        for _ in 0..1000 {
+        // Walk down, jumping past each overlapping VMA.  Bound the iteration by
+        // the VMA count (+slack) rather than a fixed 1000: each step skips at
+        // least one VMA, so this visits every mapping at most once and never
+        // gives up spuriously while a usable gap still exists (the old 1000 cap
+        // could ENOMEM a process holding >1000 mappings — common for a browser).
+        let max_steps = self.areas.len() + 8;
+        for _ in 0..max_steps {
             if candidate < size {
                 return None; // Ran out of address space
             }
