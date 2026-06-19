@@ -1927,6 +1927,19 @@ pub(crate) fn emit_fault_phys_diagnostic(
                         // reveals which other operations touched it in that
                         // window.
                         crate::mm::w215_diag::dump_prov_for_phys(rip_phys);
+                        // W215 cache-catch (H-cache-a): the faulting frame is
+                        // STILL the live resident of its (mount,inode,offset)
+                        // key, yet wrong content was observed.  Recompute the
+                        // non-displacing per-phys content fingerprint and
+                        // compare it to the one recorded at insert/validate:
+                        // a mismatch is the same-key in-place clobber, and the
+                        // recorded last-writer RIP/CPU names the writer.  Per
+                        // Intel SDM Vol. 3A §4.10.5 a validated read-only
+                        // file-backed frame must keep its content while it is
+                        // the live resident of its key.
+                        crate::mm::w215_diag::cache_prov_fault_bucket_a(
+                            rip_phys, actual_key.0, actual_key.1, actual_key.2,
+                        );
                     }
                     Some(actual_key) => {
                         FAULT_CACHE_KEY_BUCKET_B.fetch_add(1, Ordering::Relaxed);

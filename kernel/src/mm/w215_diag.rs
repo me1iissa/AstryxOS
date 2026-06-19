@@ -995,6 +995,39 @@ pub fn pte_change_record(
     caller_rip: u64,
     cr3: u64,
 ) {
+    // H1 catch (2026-06-19): feed the anonymous-heap-band two-frame-alias
+    // detector.  This is independent of the PTE-change ring window below — an
+    // install/unmap in the band is recorded even though the band is a strict
+    // subset of the ring window — so it is driven from the same callers (all
+    // four leaf-PTE primitives) with no extra call-site edits.  MAP/WRITE
+    // events that publish a present leaf PTE arm H1a + H1b; UNMAP/BULK_UNMAP
+    // clear them.  WRITE here covers the CoW in-place bit-flip and NX fixup,
+    // which keep the same frame, so the `prev_phys != new_phys` guard inside
+    // `band_install_record` makes those a no-op (same frame ⇒ not an alias).
+    if in_band(va) {
+        match kind {
+            // A MAP/WRITE/FORK_CLONE event with a ZERO new_phys is a PTE
+            // *clear*, not an install (e.g. `write_pte(cr3, page, 0)` on the
+            // madvise(MADV_DONTNEED) path) — it tears the mapping down.  Treat
+            // it as an unmap so the slot is disarmed; otherwise the subsequent
+            // re-fault re-install at the same VA would false-fire as a
+            // double-install (the original frame having been legitimately
+            // dropped in between).  Only a MAP/WRITE that publishes a non-zero
+            // frame is a real install.
+            PTE_KIND_MAP | PTE_KIND_WRITE | PTE_KIND_FORK_CLONE => {
+                if new_phys & !0xFFFu64 == 0 {
+                    band_unmap_record(va);
+                } else {
+                    band_install_record(va, new_phys, old_phys, caller_rip, cr3);
+                }
+            }
+            PTE_KIND_UNMAP | PTE_KIND_BULK_UNMAP => {
+                band_unmap_record(va);
+            }
+            _ => {}
+        }
+    }
+
     let slot = match pte_ring_slot(va) {
         Some(s) => s,
         None => return,
@@ -1248,3 +1281,888 @@ pub fn alloc_shadow_recorded_count() -> u64 {
 pub fn alloc_shadow_displaced_count() -> u64 {
     ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
+
+// ── H1 catch (2026-06-19): two-frame alias / freed-under-live-mapping ────────
+//
+// Pass-1 refuted the munmap-teardown reuse window (the find_free_range
+// present-PTE catch fired 0× while corruption persisted).  The remaining
+// strongest hypothesis (H1) is a two-frame alias: page tables and refcounts
+// stay internally consistent, but a single anonymous-heap VA-page ends up
+// associated with TWO distinct physical frames (concurrent double-install on a
+// shared address space), and/or a CPU keeps a STALE TLB entry for a frame that
+// has already been freed and reused as a mallocng heap group.  This is the same
+// class as the prior W215 roots that were caught by physical-provenance autopsy
+// (the shared-CR3 anonymous demand-fault double-install and the copy-on-write
+// double-install), where the loser CPU's local invalidation fired before the
+// winner overwrote the leaf PTE, leaving one VA backed by two frames.
+//
+// ## Why this catch is correct where the present-PTE catch was blind
+//
+// The present-PTE catch only saw a VMA-free range that still had a live PTE.
+// It could not see a VA whose PTE is perfectly correct but was, for a window,
+// pointed at a *different* frame by a racing installer, nor a frame freed while
+// a VA-page record still names it as resident.  This catch observes the leaf
+// PTE *history* per VA-page directly: every install and every unmap in the
+// anonymous-heap band funnels through `pte_change_record` / the unmap recorders
+// already wired into all four leaf-PTE primitives, so no call-site edits are
+// needed.  Two structurally-distinct fires:
+//
+//   * **[W215/DOUBLE-INSTALL] (H1a)** — a band VA-page is (re)installed with a
+//     *different non-zero* physical frame while the previous install is still
+//     live (no intervening unmap recorded for that VA).  That is one VA, two
+//     frames: the smoking gun for the concurrent double-install class.  Both
+//     physical frames, both installer return-addresses, and both installing
+//     CPUs are logged so the racing install paths can be named.
+//
+//   * **[W215/STALE-TLB] (H1b)** — `pmm::free_page` is about to return a frame
+//     to the allocator while this catch still records that frame as the live
+//     resident of a band VA-page with NO intervening unmap.  A remote CPU may
+//     still hold the old translation, so reusing the frame as a heap group is a
+//     use-after-free behind a stale TLB entry.  The VA, the installer
+//     return-address, and the free return-address are logged.
+//
+// ## Structures (non-displacing, anonymous-heap band only)
+//
+// The existing alloc/free shadows are ~68 % displaced under the Firefox-musl
+// anonymous-mmap churn, so their per-phys verdict is not authoritative.  This
+// catch therefore uses TWO direct-addressed tables scoped to the band, each
+// sized to the band's page count, with an explicit displacement counter so a
+// non-zero alias rate is visible rather than silent:
+//
+//   * `BAND_VA_MAP[(va>>12) & MASK]` — keyed by band VA-page; answers
+//     "what frame, installed by which RIP/CPU, is live at this VA?"  Drives
+//     H1a (compare-on-install) and is set CLEARED on unmap.
+//   * `BAND_PHYS_MAP[(phys>>12) & MASK]` — keyed by frame; answers in O(1) at
+//     free time "is this frame still recorded as the live resident of a band
+//     VA with no intervening unmap?"  Drives H1b.
+//
+// Per Intel SDM Vol. 3A §4.10.4.3 ("Optional Invalidation") and §4.10.5
+// (paging-structure caches must be made coherent before a frame is repurposed),
+// a single linear address must resolve to exactly one frame across all logical
+// processors, and a frame must not be recycled while any processor can still
+// translate a linear address to it.  Either fire is a direct violation.
+//
+// Atomic-only, no locks; safe from the page-fault handler, the syscall path,
+// and the PMM free path.  Gated under `firefox-test-core`; default builds are
+// byte-identical.
+
+/// Anonymous-heap band lower bound (inclusive).  The Firefox-musl mallocng
+/// group churn — and the repro's faulting heap chunk — live in this 16 GiB
+/// window.  Chosen to exclude the higher shared-library code bands (which are
+/// faithful refcounted code, not corruption loci) and the main-thread stack.
+pub const BAND_LO: u64 = 0x0000_7eff_0000_0000;
+/// Anonymous-heap band upper bound (exclusive).
+pub const BAND_HI: u64 = 0x0000_7f00_0000_0000;
+
+/// Direct-map size for both band tables.  The band spans
+/// `(BAND_HI - BAND_LO) / 4 KiB = 16 GiB / 4 KiB = 4 Mi` pages, but the live
+/// working set of distinct anonymous-heap pages at any instant is far smaller,
+/// so a full 1:1 table is unnecessary and — more importantly — impossible: the
+/// kernel image (`.text`+`.data`+`.bss`) must fit in `[0x10_0000, 0x100_0000)`
+/// (the BootInfo struct lives at the 16 MiB physical mark, see
+/// `main.rs::_start`), so a 10 MiB-per-table `.bss` would push `.bss` over the
+/// BootInfo and zero its magic at load.
+///
+/// 32 Ki slots keeps each table at `32 Ki × 40 B = 1.25 MiB` (2.5 MiB total),
+/// well within the budget.  Detection fidelity is preserved:
+///   * H1a (double-install) is *exact* regardless of table size — the two
+///     racing installs target the SAME VA, which always hashes to the SAME
+///     slot, and the race window is microseconds, far too short for an
+///     unrelated VA to evict the record between the two installs.
+///   * H1b (freed-under-live-mapping) needs the phys record to survive from
+///     install to free; 32 Ki slots cover `32 Ki × 4 KiB = 128 MiB` of
+///     physical address space collision-free, and the FF anonymous working set
+///     churns in the low few hundred MiB (≤ 4:1 aliasing in this config).
+/// Both tables expose a displacement counter so any alias pressure is visible
+/// rather than producing a false verdict.  Gated on `firefox-test-core` so
+/// default builds are byte-identical.
+const BAND_MAP_SIZE: usize = 32_768;
+const BAND_MAP_MASK: usize = BAND_MAP_SIZE - 1;
+
+/// Slot lifecycle state, stored in the low byte of `meta`.
+const BAND_STATE_INSTALLED: u64 = 1;
+const BAND_STATE_CLEARED: u64   = 2;
+
+#[inline]
+pub fn in_band(va: u64) -> bool {
+    va >= BAND_LO && va < BAND_HI
+}
+
+// ── VA-keyed table (drives H1a) ─────────────────────────────────────────────
+
+#[repr(C)]
+struct BandVaEntry {
+    /// Band VA-page (4 KiB-aligned).  `0` = never written.
+    va: AtomicU64,
+    /// Frame currently recorded live at this VA-page (`0` if cleared).
+    phys: AtomicU64,
+    /// Return-address of the install that recorded `phys`.
+    install_rip: AtomicU64,
+    /// Tick of the recorded install.
+    tick: AtomicU64,
+    /// Packed: [63:16] cr3 page-frame number (cr3 >> 12), [15:8] cpu,
+    /// [7:0] state (BAND_STATE_*).  The cr3 is part of the slot identity: a
+    /// double-install is only a real two-frame alias when BOTH installs are in
+    /// the SAME address space.  Two different CR3s (e.g. a fork parent and
+    /// child, or two unrelated processes) legitimately map the same VA to
+    /// different frames; conflating them would be a false positive.
+    meta: AtomicU64,
+}
+
+impl BandVaEntry {
+    const fn new() -> Self {
+        Self {
+            va: AtomicU64::new(0),
+            phys: AtomicU64::new(0),
+            install_rip: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            meta: AtomicU64::new(0),
+        }
+    }
+}
+
+struct BandVaMap {
+    slots: [BandVaEntry; BAND_MAP_SIZE],
+}
+
+impl BandVaMap {
+    const fn new() -> Self {
+        const E: BandVaEntry = BandVaEntry::new();
+        Self { slots: [E; BAND_MAP_SIZE] }
+    }
+}
+
+static BAND_VA_MAP: BandVaMap = BandVaMap::new();
+
+// ── phys-keyed table (drives H1b) ───────────────────────────────────────────
+
+#[repr(C)]
+struct BandPhysEntry {
+    /// Frame (4 KiB-aligned).  `0` = never written.
+    phys: AtomicU64,
+    /// Band VA-page this frame was installed at.
+    va: AtomicU64,
+    /// Return-address of the install.
+    install_rip: AtomicU64,
+    /// Tick of the install.
+    tick: AtomicU64,
+    /// Packed: [15:8] cpu, [7:0] state (BAND_STATE_*).
+    meta: AtomicU64,
+}
+
+impl BandPhysEntry {
+    const fn new() -> Self {
+        Self {
+            phys: AtomicU64::new(0),
+            va: AtomicU64::new(0),
+            install_rip: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            meta: AtomicU64::new(0),
+        }
+    }
+}
+
+struct BandPhysMap {
+    slots: [BandPhysEntry; BAND_MAP_SIZE],
+}
+
+impl BandPhysMap {
+    const fn new() -> Self {
+        const E: BandPhysEntry = BandPhysEntry::new();
+        Self { slots: [E; BAND_MAP_SIZE] }
+    }
+}
+
+static BAND_PHYS_MAP: BandPhysMap = BandPhysMap::new();
+
+// ── Counters (kdb-readable) ─────────────────────────────────────────────────
+
+/// Number of [W215/DOUBLE-INSTALL] catches (H1a).  Non-zero = caught the
+/// two-frame alias at install.
+static BAND_DOUBLE_INSTALL: AtomicU64 = AtomicU64::new(0);
+/// Number of [W215/STALE-TLB] catches (H1b).  Non-zero = caught a frame freed
+/// while still recorded live at a band VA.
+static BAND_STALE_TLB: AtomicU64 = AtomicU64::new(0);
+/// Total band install events recorded.
+static BAND_INSTALLS: AtomicU64 = AtomicU64::new(0);
+/// Total band unmap events recorded.
+static BAND_UNMAPS: AtomicU64 = AtomicU64::new(0);
+/// VA-table slot displacements (a different VA-page aliased the same slot).
+static BAND_VA_DISPLACED: AtomicU64 = AtomicU64::new(0);
+/// phys-table slot displacements.
+static BAND_PHYS_DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn band_va_slot(va: u64) -> &'static BandVaEntry {
+    let pfn = (va >> 12) as usize;
+    &BAND_VA_MAP.slots[pfn & BAND_MAP_MASK]
+}
+
+#[inline]
+fn band_phys_slot(phys: u64) -> &'static BandPhysEntry {
+    let pfn = (phys >> 12) as usize;
+    &BAND_PHYS_MAP.slots[pfn & BAND_MAP_MASK]
+}
+
+#[inline]
+fn pack_band_meta(cr3: u64, cpu: u8, state: u64) -> u64 {
+    // [63:16] cr3 page-frame number (cr3 >> 12), [15:8] cpu, [7:0] state.
+    ((cr3 >> 12) << 16) | ((cpu as u64) << 8) | (state & 0xFF)
+}
+
+#[inline]
+fn meta_cr3_pfn(meta: u64) -> u64 {
+    meta >> 16
+}
+
+/// Record a leaf-PTE install for a band VA-page.  Called from
+/// `pte_change_record` for `PTE_KIND_MAP` / `PTE_KIND_WRITE` events whose VA is
+/// in the anonymous-heap band.  `new_phys` is the just-installed frame;
+/// `old_phys` is the frame the installer believed it was replacing (`0` if the
+/// installer thought the slot was empty — the `map_page_in_if_absent` arm).
+///
+/// **H1a fire**: a genuine two-frame alias is when the VA-table slot already
+/// holds THIS va_page with a DIFFERENT non-zero frame (state INSTALLED, same
+/// CR3) AND the installer did NOT replace that recorded frame — i.e.
+/// `old_phys != prev_phys`.  A legitimate in-place frame replacement (a CoW
+/// break via `map_page_in_cow_if_unchanged`, or `map_page_in`/`write_pte` over
+/// a known prior frame) always passes `old_phys == <the frame it replaced>`,
+/// which equals the recorded `prev_phys` — that is a clean handoff (the old
+/// frame's reference is dropped, one frame remains), NOT an alias, so it must
+/// NOT fire.  The dangerous case is `old_phys == 0 && prev_phys != 0`: the
+/// installer (the `map_page_in_if_absent` not-present arm) believed the page
+/// was unmapped and installed a fresh frame while a different frame was still
+/// live at that VA — one VA, two frames, the W215 smoking gun.
+#[inline]
+pub fn band_install_record(va: u64, new_phys: u64, old_phys: u64, install_rip: u64, cr3: u64) {
+    if new_phys == 0 || !in_band(va) {
+        return;
+    }
+    let va_page = va & !0xFFFu64;
+    let new_phys = new_phys & !0xFFFu64;
+    let old_phys = old_phys & !0xFFFu64;
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u8;
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    BAND_INSTALLS.fetch_add(1, Ordering::Relaxed);
+
+    // ── VA table: H1a compare-on-install ────────────────────────────────────
+    let vslot = band_va_slot(va_page);
+    let prev_va = vslot.va.load(Ordering::Relaxed);
+    if prev_va != 0 && prev_va != va_page {
+        // A different VA aliases this slot — record displacement, then take it.
+        BAND_VA_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    } else if prev_va == va_page {
+        let prev_phys = vslot.phys.load(Ordering::Relaxed);
+        let prev_meta = vslot.meta.load(Ordering::Relaxed);
+        let prev_state = prev_meta & 0xFF;
+        let prev_cr3_pfn = meta_cr3_pfn(prev_meta);
+        if prev_phys != 0
+            && prev_phys != new_phys
+            && prev_state == BAND_STATE_INSTALLED
+            // SAME address space only — a different CR3 mapping the same VA to a
+            // different frame is legitimate (fork parent/child, two processes).
+            && prev_cr3_pfn == (cr3 >> 12)
+            // NOT an in-place replacement: a clean handoff replaces the exact
+            // frame we recorded (old_phys == prev_phys).  Only an installer
+            // that thought the slot was empty (old_phys == 0) while a different
+            // frame was still live is a true two-frame alias.
+            && old_phys != prev_phys
+        {
+            // SMOKING GUN: same CR3, same VA, two distinct frames, no
+            // intervening unmap, and the second installer did NOT replace the
+            // first frame.
+            let n = BAND_DOUBLE_INSTALL.fetch_add(1, Ordering::Relaxed) + 1;
+            let prev_rip = vslot.install_rip.load(Ordering::Relaxed);
+            let prev_cpu = ((prev_meta >> 8) & 0xFF) as u8;
+            let prev_tick = vslot.tick.load(Ordering::Relaxed);
+            // Log first 64 then every 64th — the early fires are closest to the
+            // first corruption.
+            if n <= 64 || n % 64 == 0 {
+                crate::serial_println!(
+                    "[W215/DOUBLE-INSTALL] #{} va={:#x} cr3={:#x} \
+                     frame_A=(phys={:#x} install_rip={:#x} cpu={} tick={}) \
+                     frame_B=(phys={:#x} install_rip={:#x} cpu={} tick={} old_phys={:#x}) \
+                     age_ticks={}",
+                    n, va_page, cr3,
+                    prev_phys, prev_rip, prev_cpu, prev_tick,
+                    new_phys, install_rip, cpu, tick, old_phys,
+                    tick.saturating_sub(prev_tick),
+                );
+                // Cross-reference the shadows for both frames so the alloc/free
+                // provenance of each aliased frame is on the record.
+                dump_band_frame_prov("A", prev_phys);
+                dump_band_frame_prov("B", new_phys);
+            }
+        }
+    }
+    // Adopt the new frame as the live record for this VA.
+    vslot.va.store(va_page, Ordering::Relaxed);
+    vslot.phys.store(new_phys, Ordering::Relaxed);
+    vslot.install_rip.store(install_rip, Ordering::Relaxed);
+    vslot.tick.store(tick, Ordering::Relaxed);
+    vslot.meta.store(pack_band_meta(cr3, cpu, BAND_STATE_INSTALLED), Ordering::Relaxed);
+
+    // ── phys table: arm H1b ─────────────────────────────────────────────────
+    let pslot = band_phys_slot(new_phys);
+    let prev_pphys = pslot.phys.load(Ordering::Relaxed);
+    if prev_pphys != 0 && prev_pphys != new_phys {
+        BAND_PHYS_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    pslot.phys.store(new_phys, Ordering::Relaxed);
+    pslot.va.store(va_page, Ordering::Relaxed);
+    pslot.install_rip.store(install_rip, Ordering::Relaxed);
+    pslot.tick.store(tick, Ordering::Relaxed);
+    pslot.meta.store(pack_band_meta(cr3, cpu, BAND_STATE_INSTALLED), Ordering::Relaxed);
+}
+
+/// Record a leaf-PTE unmap for a band VA-page.  Called from `pte_change_record`
+/// for `PTE_KIND_UNMAP` / `PTE_KIND_BULK_UNMAP` events whose VA is in the band.
+/// Sets both tables' state to CLEARED for the frame that was live at this VA, so
+/// a legitimate unmap-then-remap is NOT flagged as a double-install and the
+/// frame's subsequent free is NOT flagged as freed-under-live-mapping.
+#[inline]
+pub fn band_unmap_record(va: u64) {
+    if !in_band(va) {
+        return;
+    }
+    let va_page = va & !0xFFFu64;
+    BAND_UNMAPS.fetch_add(1, Ordering::Relaxed);
+
+    let vslot = band_va_slot(va_page);
+    if vslot.va.load(Ordering::Relaxed) == va_page {
+        let live_phys = vslot.phys.load(Ordering::Relaxed);
+        // Preserve cr3/cpu, flip state → CLEARED.
+        let m = vslot.meta.load(Ordering::Relaxed);
+        vslot.meta.store((m & !0xFFu64) | BAND_STATE_CLEARED, Ordering::Relaxed);
+        // Disarm H1b for the frame that was live here — its free is now legit.
+        if live_phys != 0 {
+            let pslot = band_phys_slot(live_phys);
+            if pslot.phys.load(Ordering::Relaxed) == live_phys
+                && pslot.va.load(Ordering::Relaxed) == va_page
+            {
+                let pm = pslot.meta.load(Ordering::Relaxed);
+                pslot.meta.store((pm & !0xFFu64) | BAND_STATE_CLEARED, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// H1b check: called from `pmm::free_page` immediately before the frame returns
+/// to the allocator pool.  If `phys` is still recorded INSTALLED for a band VA
+/// (no intervening unmap), the frame is being freed out from under a live
+/// mapping — a remote CPU may still translate that VA to this frame through a
+/// stale TLB entry.  Emit `[W215/STALE-TLB]`.
+#[inline]
+pub fn band_check_free(phys: u64, free_rip: u64) {
+    let phys = phys & !0xFFFu64;
+    if phys == 0 {
+        return;
+    }
+    let pslot = band_phys_slot(phys);
+    if pslot.phys.load(Ordering::Relaxed) != phys {
+        return;
+    }
+    let state = pslot.meta.load(Ordering::Relaxed) & 0xFF;
+    if state != BAND_STATE_INSTALLED {
+        return;
+    }
+    // Confirm the VA-table still agrees this frame is the live resident — guards
+    // against a phys-slot alias from a different frame that shared the slot.
+    let va = pslot.va.load(Ordering::Relaxed);
+    let vslot = band_va_slot(va);
+    if vslot.va.load(Ordering::Relaxed) != va
+        || vslot.phys.load(Ordering::Relaxed) != phys
+        || (vslot.meta.load(Ordering::Relaxed) & 0xFF) != BAND_STATE_INSTALLED
+    {
+        return;
+    }
+
+    let n = BAND_STALE_TLB.fetch_add(1, Ordering::Relaxed) + 1;
+    let install_rip = pslot.install_rip.load(Ordering::Relaxed);
+    let install_tick = pslot.tick.load(Ordering::Relaxed);
+    let install_cpu = ((pslot.meta.load(Ordering::Relaxed) >> 8) & 0xFF) as u8;
+    let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let here_cpu = crate::arch::x86_64::apic::cpu_index() as u8;
+    if n <= 64 || n % 64 == 0 {
+        crate::serial_println!(
+            "[W215/STALE-TLB] #{} freeing phys={:#x} STILL INSTALLED at va={:#x} \
+             install_rip={:#x} install_cpu={} install_tick={} \
+             free_rip={:#x} free_cpu={} age_ticks={}",
+            n, phys, va, install_rip, install_cpu, install_tick,
+            free_rip, here_cpu, now.saturating_sub(install_tick),
+        );
+        dump_band_frame_prov("freed", phys);
+    }
+    // Mark cleared so a re-free of the same frame in this run does not re-fire.
+    let pm = pslot.meta.load(Ordering::Relaxed);
+    pslot.meta.store((pm & !0xFFu64) | BAND_STATE_CLEARED, Ordering::Relaxed);
+}
+
+/// Emit the alloc/free shadow provenance for a band frame as a `[W215/BAND-PROV]`
+/// line.  Best-effort: the shadows are ~68 % displaced under the FF workload, so
+/// a `hit=0` is not authoritative, but a hit names the upstream alloc/free RIP.
+fn dump_band_frame_prov(tag: &str, phys: u64) {
+    match alloc_shadow_lookup(phys) {
+        Some((t, rip)) => crate::serial_println!(
+            "[W215/BAND-PROV] {} phys={:#x} last_alloc_tick={} alloc_rip={:#x}",
+            tag, phys, t, rip,
+        ),
+        None => crate::serial_println!(
+            "[W215/BAND-PROV] {} phys={:#x} last_alloc=none", tag, phys,
+        ),
+    }
+    if let Some((t, rip)) = free_shadow_lookup(phys) {
+        crate::serial_println!(
+            "[W215/BAND-PROV] {} phys={:#x} last_free_tick={} free_rip={:#x}",
+            tag, phys, t, rip,
+        );
+    }
+}
+
+/// Read H1-catch counters for kdb introspection.
+pub fn band_counts() -> [(&'static str, u64); 6] {
+    [
+        ("double_install", BAND_DOUBLE_INSTALL.load(Ordering::Relaxed)),
+        ("stale_tlb",      BAND_STALE_TLB.load(Ordering::Relaxed)),
+        ("installs",       BAND_INSTALLS.load(Ordering::Relaxed)),
+        ("unmaps",         BAND_UNMAPS.load(Ordering::Relaxed)),
+        ("va_displaced",   BAND_VA_DISPLACED.load(Ordering::Relaxed)),
+        ("phys_displaced", BAND_PHYS_DISPLACED.load(Ordering::Relaxed)),
+    ]
+}
+
+pub fn band_double_install_count() -> u64 { BAND_DOUBLE_INSTALL.load(Ordering::Relaxed) }
+pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
+
+// ── Cache-catch (2026-06-19): non-displacing per-phys page-cache provenance ──
+//
+// The retained anon catches (BAND_VA_MAP / BAND_PHYS_MAP above) cover the
+// anonymous-heap locus.  This catch covers the STRUCTURALLY-ORTHOGONAL
+// file-backed page-cache locus — the documented W215 bucket-A REFDEC class:
+//
+//   [FAULT/CACHE-KEY] bucket=A (same-key in-place corruption)
+//     rip_phys=0x17801000 key=(mount=4,inode=0x129,off=0x25000)
+//
+// A cache frame whose 16-bit content changed while its (mount,inode,offset)
+// key is UNCHANGED.  Two mechanisms produce that fingerprint:
+//
+//   * **same-key changed-content (CACHE-CLOBBER, H-cache-a)** — a writer
+//     mutates a cache-resident frame in place after `cache::insert` validated
+//     its content against the source-file bytes, while the frame is still the
+//     live resident of the SAME (mount,inode,offset) key.  Under POSIX read(2)
+//     + the install-path contract there is no legitimate kernel writer in that
+//     window for a read-only code page; any change is the corruption.
+//
+//   * **freed-cache-frame reused-while-old-ref-writes (CACHE-REFDEC,
+//     H-cache-b)** — the cache's own reference is dropped (REFDEC at evict /
+//     truncate / collision), the frame's refcount reaches 0 and it is freed
+//     and recycled for a NEW key (or a new anon allocation), yet a stale
+//     reference still believes it owns the OLD key and writes the OLD content
+//     into the now-foreign frame — or, symmetrically, a stale writer of the
+//     OLD content lands on the frame after it was handed to a NEW cache key.
+//
+// ## Why a dedicated NON-DISPLACING table (not the existing shadows)
+//
+// The existing ALLOC_SHADOW / FREE_SHADOW are ~68 % displaced under the FF
+// anonymous-mmap churn (`alloc_shadow_displaced_count`), so their per-phys
+// verdict is NOT authoritative — a `hit=0` there means "overwritten by an
+// aliasing pfn", not "no event".  This catch therefore keeps a DEDICATED
+// direct-addressed table whose working set is the file-backed cache cluster
+// (which churns far less than the anon heap), plus an explicit displacement
+// counter so any alias pressure is visible rather than silent.  A future
+// 0-fire while corruption reproduces is then a true REFUTATION of this
+// mechanism, not a dead/overwritten catch — provided `CACHE_PROV_VALIDATED`
+// is non-zero (the install/validate hook was reached on real cache traffic).
+//
+// ## Fingerprint
+//
+// Per-frame we record a 64-bit content fingerprint (FNV-1a over the first 256
+// bytes of the frame, sampled through the kernel higher-half identity map at
+// insert/validate time).  256 bytes covers the ELF entry stub + the first few
+// code lines of a libxul page, which is where the observed bucket-A 16-bit
+// flips landed; FNV-1a detects single-bit changes.  At fault bucket-A time the
+// fingerprint is recomputed from the live frame and compared: a mismatch with
+// the SAME key recorded is the smoking gun, and the recorded last-writer
+// RIP/CPU/tick (captured by the per-write `cache_prov_write` hook) names the
+// writer.
+//
+// Per Intel SDM Vol. 3A §4.10.5 (paging-structure / page-level coherence) and
+// POSIX read(2) + mmap(2) MAP_SHARED visibility semantics, a read-only
+// file-backed frame validated at insert must keep its content for as long as
+// it is the live resident of its key across all logical processors.  Either
+// fire is a direct violation.
+//
+// Atomic-only, no locks; safe from the page-fault handler, the syscall path,
+// the cache lock interior, and the PMM free path.  Gated under
+// `firefox-test-core`; default builds are byte-identical.
+
+/// Direct-map size for the cache-provenance table.  `64 Ki slots × 48 B =
+/// 3 MiB BSS` (gated on `firefox-test-core`).  Direct addressing
+/// `pfn % CACHE_PROV_SIZE` aliases frames spaced by `64 Ki × 4 KiB = 256 MiB`;
+/// the file-backed cache cluster's live working set is dominated by the
+/// libxul/satellite-library band well under 256 MiB, so aliasing is rare and
+/// surfaced via `CACHE_PROV_DISPLACED` rather than silently corrupting a
+/// verdict.  Same sizing rationale as FREE_SHADOW / ALLOC_SHADOW.
+const CACHE_PROV_SIZE: usize = 65536;
+const CACHE_PROV_MASK: usize = CACHE_PROV_SIZE - 1;
+
+/// PHYS → kernel-higher-half identity-map offset.  Same constant as
+/// `mm/pmm.rs` / `mm/cache.rs`; the fingerprint sampler reads cache frames
+/// through this map.  Per Intel SDM Vol. 3A §4.10.5 the higher-half map covers
+/// every PMM frame.
+const CACHE_PROV_PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+/// Slot lifecycle.  INSTALLED = a cache::insert validated this frame for its
+/// key and the cache holds a reference.  RECLAIMED = the cache's reference was
+/// dropped to zero and the frame was freed/recycled (REFDEC class arm).
+const CACHE_STATE_EMPTY: u8     = 0;
+const CACHE_STATE_INSTALLED: u8 = 1;
+const CACHE_STATE_RECLAIMED: u8 = 2;
+
+#[repr(C)]
+struct CacheProvEntry {
+    /// Frame (4 KiB-aligned).  `0` = never written.
+    phys: AtomicU64,
+    /// Cache key packed: `(mount_low8 << 56) | (inode_low24 << 32) |
+    /// (file_page_index_low32)`.  Identifies the (mount,inode,offset) the
+    /// frame was last INSTALLED for.
+    key: AtomicU64,
+    /// FNV-1a fingerprint of the first 256 bytes at insert/validate time.
+    fp: AtomicU64,
+    /// Last writer return-address recorded by `cache_prov_write` while the
+    /// frame was INSTALLED for its key.  `0` if no in-window write recorded.
+    last_write_rip: AtomicU64,
+    /// Tick of the most recent install/validate.
+    tick: AtomicU64,
+    /// Packed: [31:24] state (CACHE_STATE_*), [23:16] install_cpu,
+    /// [15:8] last_write_cpu, [7:0] reclaim generation (saturating).
+    meta: AtomicU64,
+}
+
+impl CacheProvEntry {
+    const fn new() -> Self {
+        Self {
+            phys: AtomicU64::new(0),
+            key: AtomicU64::new(0),
+            fp: AtomicU64::new(0),
+            last_write_rip: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            meta: AtomicU64::new(0),
+        }
+    }
+}
+
+struct CacheProvTable {
+    slots: [CacheProvEntry; CACHE_PROV_SIZE],
+}
+
+impl CacheProvTable {
+    const fn new() -> Self {
+        const E: CacheProvEntry = CacheProvEntry::new();
+        Self { slots: [E; CACHE_PROV_SIZE] }
+    }
+}
+
+static CACHE_PROV: CacheProvTable = CacheProvTable::new();
+
+// ── Cache-catch counters (kdb-readable) ─────────────────────────────────────
+
+/// [W215/CACHE-CLOBBER] catches (H-cache-a): a same-key cache frame's content
+/// fingerprint changed in place while still INSTALLED for its key.
+static CACHE_CLOBBER: AtomicU64 = AtomicU64::new(0);
+/// [W215/CACHE-REFDEC] catches (H-cache-b): a write or stale-ref landed on a
+/// cache frame after it was reclaimed (refcount→0, freed/recycled) for a new
+/// owner.
+static CACHE_REFDEC_REUSE: AtomicU64 = AtomicU64::new(0);
+/// Total insert/validate records (the LIVE-CATCH witness — a non-zero value
+/// proves the install/validate hook is reached on real cache traffic, so a
+/// future 0-fire is no-corruption, not a dead catch).
+static CACHE_PROV_VALIDATED: AtomicU64 = AtomicU64::new(0);
+/// Total in-window write records (the per-write last-writer hook fired).
+static CACHE_PROV_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Total reclaim records (REFDEC→0 arm).
+static CACHE_PROV_RECLAIMS: AtomicU64 = AtomicU64::new(0);
+/// Slot displacements (a different frame aliased the same direct-mapped slot).
+/// Non-zero degrades the per-phys verdict's authority; should stay ~0 for the
+/// file-backed cluster.
+static CACHE_PROV_DISPLACED: AtomicU64 = AtomicU64::new(0);
+/// Fault-site bucket-A probes that found a recorded slot with MATCHING
+/// fingerprint (no corruption on that frame — the negative control).
+static CACHE_PROV_FP_MATCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn cache_prov_slot(phys: u64) -> &'static CacheProvEntry {
+    let pfn = (phys >> 12) as usize;
+    &CACHE_PROV.slots[pfn & CACHE_PROV_MASK]
+}
+
+/// Pack a cache key (mount, inode, file_offset) into 64 bits.
+#[inline]
+fn pack_cache_prov_key(mount_idx: usize, inode: u64, file_offset: u64) -> u64 {
+    let mount_low = (mount_idx as u64) & 0xFF;
+    let inode_low = inode & 0xFF_FFFF;                 // 24 bits
+    let page_idx  = (file_offset >> 12) & 0xFFFF_FFFF; // 32-bit page index
+    (mount_low << 56) | (inode_low << 32) | page_idx
+}
+
+#[inline]
+fn cache_prov_pack_meta(state: u8, install_cpu: u8, last_write_cpu: u8, generation: u8) -> u64 {
+    ((state as u64) << 24)
+        | ((install_cpu as u64) << 16)
+        | ((last_write_cpu as u64) << 8)
+        | (generation as u64)
+}
+
+#[inline]
+fn cache_prov_state(meta: u64) -> u8 { ((meta >> 24) & 0xFF) as u8 }
+#[inline]
+fn cache_prov_generation(meta: u64) -> u8 { (meta & 0xFF) as u8 }
+
+/// FNV-1a over the first `N` bytes of the frame at `PHYS_OFF + phys`.
+///
+/// SAFETY contract: `phys` must be a live PMM frame (the caller holds a cache
+/// reference or is in the fault handler with the frame still mapped); the
+/// kernel higher-half identity map covers every PMM frame per Intel SDM
+/// Vol. 3A §4.10.5.  Volatile reads prevent the compiler from hoisting the
+/// sample across a concurrent install.
+#[inline]
+fn cache_prov_fingerprint(phys: u64) -> u64 {
+    const N: usize = 256;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME:  u64 = 0x0000_0100_0000_01b3;
+    let base = (CACHE_PROV_PHYS_OFF + (phys & !0xFFFu64)) as *const u8;
+    let mut h = FNV_OFFSET;
+    let mut i = 0usize;
+    while i < N {
+        let b = unsafe { core::ptr::read_volatile(base.add(i)) };
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    h
+}
+
+/// Record a cache install/validate for `phys` ↔ key.  Called from
+/// `cache::insert_with_expected` AFTER the frame's content has been validated
+/// against the source-file bytes (or the install completed) — i.e. the
+/// fingerprint captured here is the AUTHORITATIVE post-install content.
+///
+/// This is the LIVE-CATCH witness hook: every steady-state cache::insert ticks
+/// `CACHE_PROV_VALIDATED`, so `kdb w215-all` confirms the catch is reached on
+/// real cache traffic.  A future 0-fire with a non-zero validated count is a
+/// true refutation (no corruption), not a dead catch.
+#[inline]
+pub fn cache_prov_install(phys: u64, mount_idx: usize, inode: u64, file_offset: u64) {
+    let phys = phys & !0xFFFu64;
+    if phys == 0 { return; }
+    let slot = cache_prov_slot(phys);
+    let prev_phys = slot.phys.load(Ordering::Relaxed);
+    if prev_phys != 0 && prev_phys != phys {
+        CACHE_PROV_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    let key = pack_cache_prov_key(mount_idx, inode, file_offset);
+    let fp = cache_prov_fingerprint(phys);
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u8;
+    // Preserve the reclaim generation if this is the same frame being
+    // re-installed (it climbs across the REFDEC→reuse cycle); reset it to 0
+    // for a fresh frame.
+    let gen = if prev_phys == phys {
+        cache_prov_generation(slot.meta.load(Ordering::Relaxed))
+    } else {
+        0
+    };
+    slot.phys.store(phys, Ordering::Relaxed);
+    slot.key.store(key, Ordering::Relaxed);
+    slot.fp.store(fp, Ordering::Relaxed);
+    slot.last_write_rip.store(0, Ordering::Relaxed);
+    slot.tick.store(tick, Ordering::Relaxed);
+    slot.meta.store(
+        cache_prov_pack_meta(CACHE_STATE_INSTALLED, cpu, 0, gen),
+        Ordering::Relaxed,
+    );
+    CACHE_PROV_VALIDATED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a reclaim (the cache's reference reached 0 and the frame was
+/// freed/recycled for a new owner).  Called from the cache REFDEC sites
+/// (`insert` collision, `evict`, `truncate_range`) when `page_ref_dec`
+/// returned 0 for a frame this table recorded INSTALLED.  Flips the slot to
+/// RECLAIMED and bumps the reclaim generation so a subsequent stale-ref write
+/// (`cache_prov_write`) fires H-cache-b.
+#[inline]
+pub fn cache_prov_reclaim(phys: u64) {
+    let phys = phys & !0xFFFu64;
+    if phys == 0 { return; }
+    let slot = cache_prov_slot(phys);
+    if slot.phys.load(Ordering::Relaxed) != phys {
+        return;
+    }
+    let meta = slot.meta.load(Ordering::Relaxed);
+    if cache_prov_state(meta) != CACHE_STATE_INSTALLED {
+        return;
+    }
+    let gen = cache_prov_generation(meta);
+    let next_gen = if gen == 0xFF { 0xFF } else { gen + 1 };
+    let install_cpu = ((meta >> 16) & 0xFF) as u8;
+    slot.meta.store(
+        cache_prov_pack_meta(CACHE_STATE_RECLAIMED, install_cpu, 0, next_gen),
+        Ordering::Relaxed,
+    );
+    CACHE_PROV_RECLAIMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an in-window write to a cache frame, naming the writer.  Called from
+/// the cache write-through path (`cache::update_range`) for each touched
+/// cache frame, and is the hook that captures the last-writer RIP for the
+/// H-cache-a clobber dump.
+///
+/// **H-cache-b fire**: if the slot is RECLAIMED (the frame was already freed
+/// out from under its old key and recycled), a write that still believes it
+/// owns the old cache frame is landing on a foreign frame — the
+/// freed-cache-frame-reused-while-old-ref-writes class.  Emit
+/// `[W215/CACHE-REFDEC]` with the install/free generation and the writer RIP.
+#[inline]
+pub fn cache_prov_write(phys: u64, writer_rip: u64) {
+    let phys = phys & !0xFFFu64;
+    if phys == 0 { return; }
+    let slot = cache_prov_slot(phys);
+    if slot.phys.load(Ordering::Relaxed) != phys {
+        return;
+    }
+    CACHE_PROV_WRITES.fetch_add(1, Ordering::Relaxed);
+    let meta = slot.meta.load(Ordering::Relaxed);
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u8;
+    let state = cache_prov_state(meta);
+    if state == CACHE_STATE_RECLAIMED {
+        // The frame was reclaimed (refcount→0, freed/recycled) yet a writer
+        // still references it through the old cache key — H-cache-b.
+        let n = CACHE_REFDEC_REUSE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 64 || n % 64 == 0 {
+            let key = slot.key.load(Ordering::Relaxed);
+            let gen = cache_prov_generation(meta);
+            let install_tick = slot.tick.load(Ordering::Relaxed);
+            let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+            crate::serial_println!(
+                "[W215/CACHE-REFDEC] #{} writer landed on RECLAIMED frame \
+                 phys={:#x} old_key=(mount={},inode={:#x},pageidx={:#x}) \
+                 reclaim_gen={} writer_rip={:#x} writer_cpu={} \
+                 age_since_install_ticks={}",
+                n, phys,
+                (key >> 56) & 0xFF, (key >> 32) & 0xFF_FFFF, key & 0xFFFF_FFFF,
+                gen, writer_rip, cpu, now.saturating_sub(install_tick),
+            );
+            dump_band_frame_prov("cache-refdec", phys);
+        }
+        return;
+    }
+    // INSTALLED (or EMPTY) — record this as the last in-window writer so the
+    // bucket-A clobber dump can name it.  Refresh the fingerprint so a
+    // *legitimate* write-through (POSIX write(2) MAP_SHARED visibility) does
+    // not later false-fire as a content change at fault time.
+    let last_write_cpu = cpu;
+    let install_cpu = ((meta >> 16) & 0xFF) as u8;
+    let gen = cache_prov_generation(meta);
+    slot.last_write_rip.store(writer_rip, Ordering::Relaxed);
+    slot.fp.store(cache_prov_fingerprint(phys), Ordering::Relaxed);
+    slot.meta.store(
+        cache_prov_pack_meta(state, install_cpu, last_write_cpu, gen),
+        Ordering::Relaxed,
+    );
+}
+
+/// Arm the H-cache-a clobber check at the fault-site bucket-A classifier.
+///
+/// Called from `signal.rs` when `[FAULT/CACHE-KEY] bucket=A` fires — i.e. the
+/// faulting frame is STILL the live resident of its (mount,inode,offset) key,
+/// yet the faulting code observed wrong content.  This recomputes the live
+/// fingerprint and compares it to the one recorded at insert/validate:
+///
+///   * fingerprint DIFFERS → the frame's content changed in place while its
+///     key was unchanged — the W215 bucket-A clobber.  Emit
+///     `[W215/CACHE-CLOBBER]` naming the recorded last-writer RIP/CPU and the
+///     install→fault generation; cross-reference the alloc/free shadows.
+///   * fingerprint MATCHES → the corruption is NOT in the first 256 bytes
+///     this catch fingerprints (or the recorded slot was displaced); tick the
+///     negative-control counter so the operator can tell "catch ran, no fp
+///     change" from "catch never ran".
+///
+/// `expected_key` is the (mount,inode,offset) the fault classifier resolved;
+/// it must match the slot's recorded key for the verdict to be authoritative.
+pub fn cache_prov_fault_bucket_a(
+    phys: u64,
+    mount_idx: usize,
+    inode: u64,
+    file_offset: u64,
+) {
+    let phys = phys & !0xFFFu64;
+    if phys == 0 { return; }
+    let slot = cache_prov_slot(phys);
+    if slot.phys.load(Ordering::Relaxed) != phys {
+        crate::serial_println!(
+            "[W215/CACHE-CLOBBER] phys={:#x} probe=miss (slot holds different \
+             frame or never recorded — displaced={})",
+            phys, CACHE_PROV_DISPLACED.load(Ordering::Relaxed),
+        );
+        return;
+    }
+    let recorded_key = slot.key.load(Ordering::Relaxed);
+    let expected_key = pack_cache_prov_key(mount_idx, inode, file_offset);
+    let recorded_fp = slot.fp.load(Ordering::Relaxed);
+    let live_fp = cache_prov_fingerprint(phys);
+    let meta = slot.meta.load(Ordering::Relaxed);
+    let key_matches = recorded_key == expected_key;
+    if key_matches && live_fp != recorded_fp {
+        let n = CACHE_CLOBBER.fetch_add(1, Ordering::Relaxed) + 1;
+        let last_rip = slot.last_write_rip.load(Ordering::Relaxed);
+        let last_write_cpu = ((meta >> 8) & 0xFF) as u8;
+        let install_cpu = ((meta >> 16) & 0xFF) as u8;
+        let gen = cache_prov_generation(meta);
+        let install_tick = slot.tick.load(Ordering::Relaxed);
+        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        crate::serial_println!(
+            "[W215/CACHE-CLOBBER] #{} SAME-KEY CONTENT CHANGED \
+             phys={:#x} key=(mount={},inode={:#x},pageidx={:#x}) \
+             recorded_fp={:#x} live_fp={:#x} reclaim_gen={} \
+             last_write_rip={:#x} last_write_cpu={} install_cpu={} \
+             age_since_install_ticks={}",
+            n, phys,
+            mount_idx, inode, (file_offset >> 12),
+            recorded_fp, live_fp, gen,
+            last_rip, last_write_cpu, install_cpu,
+            now.saturating_sub(install_tick),
+        );
+        dump_band_frame_prov("cache-clobber", phys);
+    } else if key_matches {
+        CACHE_PROV_FP_MATCH.fetch_add(1, Ordering::Relaxed);
+        crate::serial_println!(
+            "[W215/CACHE-CLOBBER] phys={:#x} probe=fp_match \
+             (key matched, first-256B fingerprint unchanged — corruption is \
+             outside the fingerprint window or not in this frame) state={}",
+            phys, cache_prov_state(meta),
+        );
+    } else {
+        crate::serial_println!(
+            "[W215/CACHE-CLOBBER] phys={:#x} probe=key_mismatch \
+             recorded_key={:#x} expected_key={:#x} state={}",
+            phys, recorded_key, expected_key, cache_prov_state(meta),
+        );
+    }
+}
+
+/// Read cache-catch counters for kdb introspection.
+pub fn cache_prov_counts() -> [(&'static str, u64); 7] {
+    [
+        ("cache_clobber",     CACHE_CLOBBER.load(Ordering::Relaxed)),
+        ("cache_refdec_reuse",CACHE_REFDEC_REUSE.load(Ordering::Relaxed)),
+        ("validated",         CACHE_PROV_VALIDATED.load(Ordering::Relaxed)),
+        ("writes",            CACHE_PROV_WRITES.load(Ordering::Relaxed)),
+        ("reclaims",          CACHE_PROV_RECLAIMS.load(Ordering::Relaxed)),
+        ("displaced",         CACHE_PROV_DISPLACED.load(Ordering::Relaxed)),
+        ("fp_match_negctrl",  CACHE_PROV_FP_MATCH.load(Ordering::Relaxed)),
+    ]
+}
+
+pub fn cache_prov_validated_count() -> u64 { CACHE_PROV_VALIDATED.load(Ordering::Relaxed) }
+pub fn cache_clobber_count() -> u64 { CACHE_CLOBBER.load(Ordering::Relaxed) }
+pub fn cache_refdec_reuse_count() -> u64 { CACHE_REFDEC_REUSE.load(Ordering::Relaxed) }

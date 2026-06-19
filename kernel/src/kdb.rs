@@ -394,6 +394,9 @@ pub fn dispatch(req: &str, out: &mut String) {
         "tlb-stats"        => op_tlb_stats(out),
         "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
+        "w215-h1"          => op_w215_h1(out),
+        "w215-cache"       => op_w215_cache(out),
+        "w215-all"         => op_w215_all(out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
@@ -1239,6 +1242,128 @@ fn op_fault_cache_keys(out: &mut String) {
     #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"fault-cache-keys requires firefox-test feature"}"#);
+    }
+}
+
+// ── w215-h1 ──────────────────────────────────────────────────────────────────
+//
+// W215 H1-catch readout (anonymous-heap two-frame alias / freed-under-live-
+// mapping).  Returns:
+//   { double_install, stale_tlb, installs, unmaps, va_displaced, phys_displaced }
+//
+// double_install > 0 → H1a CONFIRMED: a band VA resolved to two distinct frames
+//                      with no intervening unmap (the smoking gun); see the
+//                      [W215/DOUBLE-INSTALL] serial lines for the install RIPs.
+// stale_tlb > 0      → H1b CONFIRMED: a frame was freed while still recorded
+//                      live at a band VA; see [W215/STALE-TLB] serial lines.
+// Both 0 with corruption persisting → anon H1 refuted; pivot to the cache catch.
+//
+// Requires: --features firefox-test-core.
+fn op_w215_h1(out: &mut String) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::fmt::Write;
+        let c = crate::mm::w215_diag::band_counts();
+        out.push('{');
+        for (i, (name, val)) in c.iter().enumerate() {
+            if i != 0 { out.push(','); }
+            let _ = write!(out, r#""{name}":{val}"#);
+        }
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        out.push_str(r#"{"error":"w215-h1 requires firefox-test-core feature"}"#);
+    }
+}
+
+// ── w215-cache ────────────────────────────────────────────────────────────────
+//
+// W215 cache-catch readout (file-backed page-cache bucket-A REFDEC class).
+// Returns:
+//   { cache_clobber, cache_refdec_reuse, validated, writes, reclaims,
+//     displaced, fp_match_negctrl }
+//
+// LIVE-CATCH CHECK: `validated` MUST be non-zero on any normal boot that
+//   touches the page cache — it counts every cache::insert install/validate
+//   that recorded the non-displacing per-phys provenance + fingerprint.  A
+//   non-zero `validated` proves the catch is reached on real cache traffic, so
+//   a future `cache_clobber == 0 && cache_refdec_reuse == 0` while corruption
+//   reproduces is a TRUE REFUTATION of this mechanism, not a dead catch.
+//
+// cache_clobber > 0      → H-cache-a CONFIRMED: a same-(mount,inode,offset)
+//                          cache frame's content fingerprint changed in place
+//                          while still INSTALLED; see [W215/CACHE-CLOBBER]
+//                          serial lines for the last-writer RIP.
+// cache_refdec_reuse > 0 → H-cache-b CONFIRMED: a write landed on a frame after
+//                          its cache reference was dropped to 0 and it was
+//                          freed/recycled; see [W215/CACHE-REFDEC] serial lines.
+// displaced > 0          → per-phys verdict authority degraded by that many
+//                          aliasing frames (should stay ~0 for the file-backed
+//                          cluster — non-zero is a yellow flag on a 0-fire).
+//
+// Requires: --features firefox-test-core.
+fn op_w215_cache(out: &mut String) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::fmt::Write;
+        let c = crate::mm::w215_diag::cache_prov_counts();
+        out.push('{');
+        for (i, (name, val)) in c.iter().enumerate() {
+            if i != 0 { out.push(','); }
+            let _ = write!(out, r#""{name}":{val}"#);
+        }
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        out.push_str(r#"{"error":"w215-cache requires firefox-test-core feature"}"#);
+    }
+}
+
+// ── w215-all ──────────────────────────────────────────────────────────────────
+//
+// Unified W215 multi-locus catch readout.  Dumps every catch's counters in one
+// JSON object so a Hunt-phase boot can confirm in a single call (a) the
+// fault-site bucket classifier, (b) the anonymous-heap H1 catch, and (c) the
+// file-backed page-cache catch — and crucially that each catch is LIVE
+// (`cache.validated` and `h1.installs` non-zero) before trusting any 0-fire as
+// a refutation.
+//
+//   { buckets: {bucket_a_same_key_inplace, bucket_b_cross_key_aliased,
+//               bucket_c_post_evict_stale_pte},
+//     h1:      {double_install, stale_tlb, installs, unmaps,
+//               va_displaced, phys_displaced},
+//     cache:   {cache_clobber, cache_refdec_reuse, validated, writes,
+//               reclaims, displaced, fp_match_negctrl} }
+//
+// Requires: --features firefox-test-core.
+fn op_w215_all(out: &mut String) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::fmt::Write;
+        let (ba, bb, bc) = crate::signal::fault_cache_key_bucket_counts();
+        out.push_str(r#"{"buckets":{"#);
+        let _ = write!(out,
+            r#""bucket_a_same_key_inplace":{ba},"bucket_b_cross_key_aliased":{bb},"bucket_c_post_evict_stale_pte":{bc}"#,
+        );
+        out.push_str(r#"},"h1":{"#);
+        let h1 = crate::mm::w215_diag::band_counts();
+        for (i, (name, val)) in h1.iter().enumerate() {
+            if i != 0 { out.push(','); }
+            let _ = write!(out, r#""{name}":{val}"#);
+        }
+        out.push_str(r#"},"cache":{"#);
+        let cc = crate::mm::w215_diag::cache_prov_counts();
+        for (i, (name, val)) in cc.iter().enumerate() {
+            if i != 0 { out.push(','); }
+            let _ = write!(out, r#""{name}":{val}"#);
+        }
+        out.push_str("}}");
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        out.push_str(r#"{"error":"w215-all requires firefox-test-core feature"}"#);
     }
 }
 

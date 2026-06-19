@@ -672,6 +672,14 @@ pub fn free_page(phys_addr: u64) {
         let rip = caller_rip();
         crate::mm::w215_diag::prov_record_free(phys_addr, rip);
         crate::mm::w215_diag::free_shadow_record(phys_addr, rip);
+        // W215 H1b catch: this frame passed the residual-pte_share_count check
+        // and is about to return to the allocator pool.  If it is still
+        // recorded as the live resident of an anonymous-heap-band VA with no
+        // intervening unmap, a remote CPU may still translate that VA to this
+        // frame through a stale TLB entry — emit [W215/STALE-TLB].  Per Intel
+        // SDM Vol. 3A §4.10.5 a frame must not be recycled while any processor
+        // can still translate a linear address to it.
+        crate::mm::w215_diag::band_check_free(phys_addr, rip);
     }
 
     let _lock = PMM_LOCK.lock();

@@ -1799,6 +1799,14 @@ pub fn free_process_memory(pid: Pid) {
             let pte = vmm::read_pte(cr3, addr);
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
+                // W215 H1 catch: this whole-address-space teardown bypasses
+                // `unmap_page_in`, so it never records a per-page UNMAP.  The
+                // page IS being torn down (the full-user TLB shootdown above
+                // already retired every translation), so tell the catch the
+                // band mapping is gone — otherwise the subsequent free would
+                // false-fire [W215/STALE-TLB].  No-op outside the band.
+                #[cfg(feature = "firefox-test-core")]
+                crate::mm::w215_diag::band_unmap_record(addr);
                 if refcount::page_ref_dec(phys) == 0 {
                     // If the shootdown did not receive all ACKs, defer the
                     // PMM release until every CPU has passed through a
@@ -1899,6 +1907,11 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
             let pte = vmm::read_pte(cr3, addr);
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
+                // W215 H1 catch: see free_process_memory — record the band
+                // unmap so the execve teardown free does not false-fire
+                // [W215/STALE-TLB].  No-op outside the band.
+                #[cfg(feature = "firefox-test-core")]
+                crate::mm::w215_diag::band_unmap_record(addr);
                 if refcount::page_ref_dec(phys) == 0 {
                     if shootdown_clean {
                         pmm::free_page(phys);

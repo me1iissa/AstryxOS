@@ -279,6 +279,14 @@ pub fn insert_with_expected(
             evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
             #[cfg(feature = "firefox-test-core")]
             {
+                // W215 cache-catch (H-cache-b arm): if this collision drove the
+                // evicted frame's refcount to 0, the frame is about to be freed
+                // and recycled for a new owner — flip its cache-provenance slot
+                // to RECLAIMED so a subsequent stale-ref write fires
+                // [W215/CACHE-REFDEC].
+                if new_rc == 0 {
+                    crate::mm::w215_diag::cache_prov_reclaim(old_entry.phys);
+                }
                 crate::mm::w215_diag::prov_record(
                     old_entry.phys,
                     crate::mm::w215_diag::KIND_EVICT,
@@ -301,6 +309,15 @@ pub fn insert_with_expected(
             crate::mm::w215_diag::KIND_INSERT,
             crate::mm::w215_diag::pack_cache_key(inode, page_offset),
         );
+        // W215 cache-catch (H-cache-a witness): record the non-displacing
+        // per-phys provenance + content fingerprint for this (mount,inode,
+        // offset) key.  This is the LIVE-CATCH hook — every steady-state
+        // cache::insert ticks `CACHE_PROV_VALIDATED`, so a future 0-fire with
+        // a non-zero validated count is no-corruption, not a dead catch.  The
+        // fingerprint is captured here (post-install, content authoritative);
+        // the bucket-A fault classifier recomputes and compares it to name a
+        // same-key in-place clobber and its last writer.
+        crate::mm::w215_diag::cache_prov_install(phys, mount_idx, inode, page_offset);
         let _ = crate::mm::w215_diag::preins_clear_on_insert(phys);
         // Arm-1 CRC walker shadow-table snapshot.  Done AFTER the cache
         // lock is released so we do not hold two locks at once; the
@@ -580,10 +597,35 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
             unsafe {
                 core::ptr::copy_nonoverlapping(src, dst, n);
             }
+            // W215 cache-catch: record this legitimate write-through as the
+            // last in-window writer (so the bucket-A clobber dump can name it)
+            // AND let the cache-provenance refresh its fingerprint so a POSIX
+            // write(2) MAP_SHARED visibility update does not later false-fire
+            // as a same-key content change.  If the slot is RECLAIMED, this
+            // fires [W215/CACHE-REFDEC] (a writer landed on a freed/recycled
+            // frame through a stale cache reference).
+            #[cfg(feature = "firefox-test-core")]
+            crate::mm::w215_diag::cache_prov_write(entry.phys, w215_update_caller_rip());
             entry.dirty = true;
         }
         page += PAGE;
     }
+}
+
+/// Best-effort caller-RIP capture for the cache write-through path.  Reads the
+/// saved return address via the frame pointer; returns 0 if RBP was not saved
+/// (LTO / `-fomit-frame-pointer`).  Diagnostic-only; gated on the demo build.
+#[cfg(feature = "firefox-test-core")]
+#[inline(never)]
+fn w215_update_caller_rip() -> u64 {
+    let rbp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    if rbp == 0 || (rbp & 7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
 }
 
 /// Bring the page cache into coherence with a file that has just been
@@ -696,6 +738,11 @@ pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64
                 // W215 diagnostic provenance, mirroring `evict`.
                 #[cfg(feature = "firefox-test-core")]
                 {
+                    // W215 cache-catch (H-cache-b arm): truncate dropped the
+                    // cache's last reference — mark the frame RECLAIMED.
+                    if new_rc == 0 {
+                        crate::mm::w215_diag::cache_prov_reclaim(entry.phys);
+                    }
                     crate::mm::w215_diag::prov_record(
                         entry.phys,
                         crate::mm::w215_diag::KIND_EVICT,
@@ -725,11 +772,20 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
     if let Some(entry) = cache.remove(&(mount_idx, inode, page_offset)) {
         // Caller takes ownership of the phys frame; freeing it (with proper
         // shootdown) is the caller's responsibility.  Here we only release
-        // the cache's reference.
-        let _ = crate::mm::refcount::page_ref_dec(entry.phys);
+        // the cache's reference.  `new_rc` is consumed only by the
+        // firefox-test-core cache-catch arm below; suppress the unused-binding
+        // warning on default builds.
+        #[allow(unused_variables)]
+        let new_rc = crate::mm::refcount::page_ref_dec(entry.phys);
         // W215 diagnostic Arm-1 / Arm-2.
         #[cfg(feature = "firefox-test-core")]
         {
+            // W215 cache-catch (H-cache-b arm): the cache's reference is gone;
+            // if it was the last one the caller will free/recycle the frame, so
+            // mark it RECLAIMED.
+            if new_rc == 0 {
+                crate::mm::w215_diag::cache_prov_reclaim(entry.phys);
+            }
             crate::mm::w215_diag::prov_record(
                 entry.phys,
                 crate::mm::w215_diag::KIND_EVICT,
@@ -1017,10 +1073,16 @@ pub fn evict_if_phys(
         .unwrap_or(false);
     if matches {
         cache.remove(&key);
-        // Release the cache's reference to the evicted frame.
-        let _ = crate::mm::refcount::page_ref_dec(expected_phys);
+        // Release the cache's reference to the evicted frame.  `new_rc` is
+        // consumed only by the firefox-test-core cache-catch arm below.
+        #[allow(unused_variables)]
+        let new_rc = crate::mm::refcount::page_ref_dec(expected_phys);
         #[cfg(feature = "firefox-test-core")]
         {
+            // W215 cache-catch (H-cache-b arm).
+            if new_rc == 0 {
+                crate::mm::w215_diag::cache_prov_reclaim(expected_phys);
+            }
             crate::mm::w215_diag::prov_record(
                 expected_phys,
                 crate::mm::w215_diag::KIND_EVICT,
