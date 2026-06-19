@@ -202,16 +202,48 @@ pub struct PixmapData {
     pub width:  u16,
     pub height: u16,
     pub depth:  u8,
-    /// Pixel data: `width * height * 4` bytes, BGRA-ordered.
+    /// Pixel data: `width * height * 4` bytes, BGRA-ordered.  Empty for an
+    /// SHM-backed pixmap (its pixels live in the attached SysV-SHM segment and
+    /// are read live at draw time — see `shm_shmid`).
     pub pixels: Vec<u8>,
+    /// MIT-SHM backing.  `0` = a normal server-owned pixmap (pixels in `pixels`).
+    /// Non-zero = the pixmap's pixel storage IS the SysV-SHM segment with this
+    /// `shmid`; the client draws each frame into the segment and the server reads
+    /// the live bytes at `phys_base + shm_offset` (row stride `shm_stride`) when
+    /// the pixmap is used as a CopyArea source.  X11 MIT-SHM `ShmCreatePixmap`.
+    pub shm_shmid:  u32,
+    /// Byte offset of the pixmap's pixel origin within the SHM segment.
+    pub shm_offset: u32,
+    /// Row stride in bytes of the SHM-backed image (scanline pad applied client
+    /// side; for depth 24/32 at 32 bpp this is `width * 4`).
+    pub shm_stride: u32,
 }
 
 impl PixmapData {
     /// Allocate a zeroed pixel buffer for `width × height`.
     pub fn new(width: u16, height: u16, depth: u8) -> Self {
         let n = (width as usize) * (height as usize) * 4;
-        PixmapData { width, height, depth, pixels: alloc::vec![0u8; n] }
+        PixmapData {
+            width, height, depth, pixels: alloc::vec![0u8; n],
+            shm_shmid: 0, shm_offset: 0, shm_stride: 0,
+        }
     }
+
+    /// Create an MIT-SHM-backed pixmap: no server-owned pixel `Vec`; the pixels
+    /// live in the SysV-SHM segment `shmid` at byte `offset`, row stride `stride`.
+    /// Used by `ShmCreatePixmap` so a later `CopyArea(pixmap → window)` reads the
+    /// segment's live contents.
+    pub fn new_shm_backed(width: u16, height: u16, depth: u8,
+                          shmid: u32, offset: u32, stride: u32) -> Self {
+        PixmapData {
+            width, height, depth, pixels: Vec::new(),
+            shm_shmid: shmid, shm_offset: offset, shm_stride: stride,
+        }
+    }
+
+    /// True if this pixmap's storage is an attached SHM segment (no owned `Vec`).
+    #[inline]
+    pub fn is_shm_backed(&self) -> bool { self.shm_shmid != 0 }
 
     /// Fill an axis-aligned rectangle with `color` (0xAARRGGBB).
     /// Clamps to pixmap bounds; silently ignores out-of-range areas.
