@@ -6,6 +6,15 @@
 **GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
 **Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
 
+### Milestone 45 — X11 server-side GLX handshake + real MIT-SHM ShmPutImage (✅, PR #598)
+**Completed**: 2026-06-19
+
+**What was built:**
+- [x] **GLX extension (major opcode 146)** in the in-kernel X11 server (`kernel/src/x11/{proto,mod}.rs`): the handshake a software-OpenGL client (Mesa drisw + llvmpipe, direct/client-side rendering) needs to bind a GL context to its window. Advertised via QueryExtension/ListExtensions (first_event=0, 14-error first_error block). Requests: QueryVersion→1.4, GetVisualConfigs (two RGBA depth-24 configs, 18 positional CARD32 fields per the GLX Protocol Encoding), GetFBConfigs (two tagged fbconfigs), Create/Destroy/MakeCurrent context bookkeeping (tag≠0), IsDirect→true, QueryServerString/QueryExtensionsString/QueryContext/GetDrawableAttributes, ClientInfo/SetClientInfo*ARB/WaitGL/WaitX/SwapBuffers accepted no-reply. Per-connection context table freed on disconnect.
+- [x] **MIT-SHM made real** (was advertised-absent + no-op stub): re-advertised; ShmAttach/ShmDetach bind an X shmseg→SysV shmid; ShmPutImage reads pixels straight from the segment's physically-contiguous, kernel-readable backing (new `ipc::sysv_shm::segment_phys`) and composites the sub-rectangle into the destination window (same path as core PutImage), avoiding the per-frame request-body copy.
+- [x] **Headless tests** (`test_runner.rs`): GLX handshake test + real MIT-SHM ShmPutImage test (write known pattern to a real segment's phys backing → ShmAttach + ShmPutImage → verify window pixel composited). Both pass; full suite unregressed.
+- [x] **Known downstream gate (image, not kernel):** Firefox's glxtest cannot yet reach this surface — the boot image (`gui-complete.img`, musl FF) has **no Mesa GL runtime** (no libGL.so.1, libEGL.so.1, /usr/lib/dri, swrast_dri.so). Live FF boot shows glxtest dying at `dlopen("libGL.so.1")` with 0 GLX (op=146) requests reaching the server. Injecting a **musl-built** Mesa stack into the image is a prerequisite (toolchain/image-construction task).
+
 ### Milestone 44 — perf: gate high-frequency diagnostic serial behind *-trace features (✅, PR #518)
 **Completed**: 2026-06-04
 
