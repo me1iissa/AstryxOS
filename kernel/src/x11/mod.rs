@@ -2408,6 +2408,11 @@ fn op_copy_area(fd: u64, data: &[u8]) {
                             for col in 0..rw {
                                 let so = (((y0 + row as i32) * sw + x0 + col as i32) * 4) as usize;
                                 let bo = (row * rw + col) * 4;
+                                // SHM-backed sources have an empty owned `Vec`;
+                                // pixmap→pixmap from a live segment is not a path
+                                // FF uses, so leave those pixels zero rather than
+                                // index out of bounds.
+                                if so + 4 > p.pixels.len() { continue; }
                                 buf[bo..bo+4].copy_from_slice(&p.pixels[so..so+4]);
                             }
                         }
@@ -2442,8 +2447,11 @@ fn op_copy_area(fd: u64, data: &[u8]) {
             // (the compositor source of truth), NOT the transient screen
             // backbuffer.  Build a tightly packed BGRA buffer of the clipped
             // source rectangle and record the clip offset so the copy lands at
-            // the correct window-local position.
-            let (pixels, rw, rh, off_x, off_y) = {
+            // the correct window-local position.  Two source backings are
+            // supported: a server-owned pixel `Vec`, and an MIT-SHM-backed
+            // pixmap whose pixels live in an attached SysV-SHM segment (read
+            // LIVE here, so the frame the client just drew is the one copied).
+            let extracted = {
                 let srv = SERVER.lock();
                 let c = srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd);
                 match c.and_then(|c| c.resources.get_pixmap(src_id)) {
@@ -2456,19 +2464,70 @@ fn op_copy_area(fd: u64, data: &[u8]) {
                         let rw = (x1 - x0).max(0) as usize;
                         let rh = (y1 - y0).max(0) as usize;
                         let mut buf = alloc::vec![0u8; rw * rh * 4];
-                        for row in 0..rh {
-                            for col in 0..rw {
-                                let so = (((y0 + row as i32) * sw + x0 + col as i32) * 4) as usize;
-                                let bo = (row * rw + col) * 4;
-                                buf[bo..bo+4].copy_from_slice(&p.pixels[so..so+4]);
+                        let ok = if p.is_shm_backed() {
+                            // Resolve the segment's kernel-readable physical base
+                            // and copy the clipped rectangle from it.  Row stride
+                            // is the SHM image stride (scanline-padded), not sw*4.
+                            match crate::ipc::sysv_shm::segment_phys(p.shm_shmid) {
+                                Some((phys_base, seg_size)) => {
+                                    let stride = p.shm_stride as usize;
+                                    let base = phys_base as usize + p.shm_offset as usize;
+                                    // Last byte the loop touches must lie inside the
+                                    // segment (guards against a truncated/detached
+                                    // segment between CreatePixmap and CopyArea).
+                                    let last = (y0 + rh as i32 - 1).max(0) as usize * stride
+                                        + (x0 + rw as i32 - 1).max(0) as usize * 4 + 4;
+                                    if rw == 0 || rh == 0
+                                        || (p.shm_offset as u64 + last as u64) > seg_size {
+                                        false
+                                    } else {
+                                        // SAFETY: `phys_base` is the identity-mapped,
+                                        // kernel-readable base of a physically
+                                        // contiguous SysV segment (see
+                                        // sysv_shm::shmget); the bound check above
+                                        // keeps every read inside the segment.
+                                        for row in 0..rh {
+                                            for col in 0..rw {
+                                                let so = base
+                                                    + (y0 + row as i32) as usize * stride
+                                                    + (x0 + col as i32) as usize * 4;
+                                                let bo = (row * rw + col) * 4;
+                                                let px = unsafe {
+                                                    core::slice::from_raw_parts(so as *const u8, 4)
+                                                };
+                                                buf[bo..bo+4].copy_from_slice(px);
+                                            }
+                                        }
+                                        true
+                                    }
+                                }
+                                None => false,
                             }
-                        }
+                        } else {
+                            // Server-owned pixmap: source stride is sw*4.
+                            if rw == 0 || rh == 0 { false } else {
+                                for row in 0..rh {
+                                    for col in 0..rw {
+                                        let so = (((y0 + row as i32) * sw + x0 + col as i32) * 4) as usize;
+                                        let bo = (row * rw + col) * 4;
+                                        if so + 4 > p.pixels.len() { continue; }
+                                        buf[bo..bo+4].copy_from_slice(&p.pixels[so..so+4]);
+                                    }
+                                }
+                                true
+                            }
+                        };
                         // Window-local destination shifts by the amount the
                         // source origin was clipped (x0 - src_x, y0 - src_y).
-                        (buf, rw as i32, rh as i32, x0 - src_x, y0 - src_y)
+                        if ok { Some((buf, rw as i32, rh as i32, x0 - src_x, y0 - src_y)) }
+                        else { None }
                     }
-                    None => return,
+                    None => None,
                 }
+            };
+            let (pixels, rw, rh, off_x, off_y) = match extracted {
+                Some(v) => v,
+                None => return,
             };
             // CopyArea is a plain copy (RENDER_OP_SRC) of opaque pixels.
             window_composite_pixels(
@@ -3337,9 +3396,14 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
     let minor = data[1];
     match minor {
         proto::SHM_QUERY_VERSION => {
-            // ShmQueryVersionReply: shared_pixmaps=0, major=1, minor=2
+            // ShmQueryVersionReply (MIT-SHM §ShmQueryVersion): shared_pixmaps=1,
+            // major=1, minor=2.  Advertising shared_pixmaps=true tells the client
+            // it may back a Pixmap directly with an attached segment via
+            // ShmCreatePixmap; clients (e.g. nsShmImage's gUseShmPixmaps path)
+            // then present with CreatePixmap → CopyArea(pixmap → window) instead
+            // of ShmPutImage.  Both present paths are now implemented server-side.
             let mut b = [0u8; 32];
-            b[0] = 1; b[1] = 0; // shared_pixmaps = false
+            b[0] = 1; b[1] = 1; // shared_pixmaps = true
             w16(&mut b, 2, seq);
             w16(&mut b, 8, 1); w16(&mut b, 10, 2); // version 1.2
             b[16] = 2; // pixmap_format = ZPixmap
@@ -3352,9 +3416,7 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
         proto::SHM_GET_IMAGE => {
             with_client(fd, |c| c.send_error(proto::ERR_IMPLEMENTATION, 0, proto::SHM_MAJOR_OPCODE));
         }
-        // SHM_CREATE_PIXMAP: accept, treated as no-op (we route presents through
-        // ShmPutImage, not shm-backed pixmaps).
-        proto::SHM_CREATE_PIXMAP => {}
+        proto::SHM_CREATE_PIXMAP => op_shm_create_pixmap(fd, data),
         _ => {}
     }
 }
@@ -3392,6 +3454,56 @@ fn shm_lookup(fd: u64, shmseg: u32) -> Option<u32> {
     tbl.iter()
         .find(|a| a.shmseg == shmseg && a.fd == fd && a.shmseg != 0)
         .map(|a| a.shmid)
+}
+
+// ShmCreatePixmap request (MIT-SHM protocol §ShmCreatePixmap, 28 bytes):
+//   [0]      reqType        [1]  shmReqType (=5)   [2..4]  length
+//   [4..8]   pid            (new Pixmap X resource id)
+//   [8..12]  drawable       (a drawable on the target screen; only used to
+//                            pick the screen/depth — pixels come from the segment)
+//   [12..14] width          [14..16] height
+//   [16]     depth          [17..20] pad
+//   [20..24] shmseg         (the attached MIT-SHM segment id)
+//   [24..28] offset         (byte offset of the pixel origin within the segment)
+//
+// Creates a Pixmap RESOURCE whose pixel backing IS the attached SysV-SHM
+// segment: no server-owned pixel buffer is allocated.  The client draws each
+// frame directly into the segment and then `CopyArea`s the pixmap to a window;
+// `op_copy_area` reads the segment's LIVE bytes at copy time.  The row stride is
+// the scanline-padded byte width — for depth 24/32 at 32 bits-per-pixel this is
+// `width * 4` (4-byte scanline pad makes the pad a no-op at 32 bpp).
+fn op_shm_create_pixmap(fd: u64, data: &[u8]) {
+    if data.len() < 28 { return; }
+    let pid    = r32(data, 4);
+    let width  = r16(data, 12);
+    let height = r16(data, 14);
+    let depth  = data[16];
+    let shmseg = r32(data, 20);
+    let offset = r32(data, 24);
+
+    if width == 0 || height == 0 { return; }
+    // Only the 32-bpp ZPixmap depths the server composites are honoured; the
+    // CopyArea reader assumes a 4-byte BGRA pixel.
+    if depth < 24 { return; }
+
+    // The shmseg must be a live attachment owned by this client; resolve it to a
+    // SysV shmid and validate the requested image region fits in the segment
+    // before creating the resource (so a later CopyArea never reads out of range).
+    let shmid = match shm_lookup(fd, shmseg) { Some(id) => id, None => return };
+    let (_phys_base, seg_size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+        Some(v) => v, None => return,
+    };
+    let stride  = width as u64 * 4;
+    let img_len = stride * height as u64;
+    if (offset as u64).saturating_add(img_len) > seg_size { return; }
+
+    with_client(fd, |c| {
+        c.resources.insert(
+            pid,
+            ResourceBody::Pixmap(PixmapData::new_shm_backed(
+                width, height, depth, shmid, offset, stride as u32)),
+        );
+    });
 }
 
 // ShmPutImage request (MIT-SHM protocol §ShmPutImage):
