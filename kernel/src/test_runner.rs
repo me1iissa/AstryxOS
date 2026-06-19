@@ -877,6 +877,9 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_shm_put_image() { passed += 1; }
 
+    total += 1;
+    if test_x11_shm_create_pixmap() { passed += 1; }
+
     // ── Test 69: X11 RENDER extension — Pixmap + Picture + FillRectangles ────
 
     total += 1;
@@ -19355,6 +19358,172 @@ fn test_x11_shm_put_image() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 MIT-SHM ShmPutImage");
+    true
+}
+
+// ── X11 real MIT-SHM ShmCreatePixmap + CopyArea (Firefox gUseShmPixmaps present) ─
+//
+// The other supported MIT-SHM present path: a client backs a Pixmap directly
+// with an attached segment (ShmCreatePixmap), draws each frame into the segment,
+// and CopyAreas the pixmap to its window.  This is the path nsShmImage takes when
+// the server advertises shared_pixmaps=true.  This test verifies the full chain:
+// ShmQueryVersion reports shared_pixmaps=1, ShmCreatePixmap makes a pixmap whose
+// storage is the segment, and CopyArea(pixmap → window) reads the segment's LIVE
+// contents (we change the segment AFTER CreatePixmap to prove it is read at copy
+// time, not snapshotted at create time).  X11 MIT-SHM protocol §ShmCreatePixmap.
+fn test_x11_shm_create_pixmap() -> bool {
+    test_header!("X11 MIT-SHM ShmCreatePixmap + CopyArea (shared-pixmap present)");
+
+    let client = match x11_connect_setup("x11_shmpix") { Some(c) => c, None => return false };
+
+    // ShmQueryVersion must report shared_pixmaps=1 (so a real client takes this path).
+    {
+        let mut req = [0u8; 4];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_QUERY_VERSION;
+        req[2] = 1;
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+        let mut rep = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut rep);
+        if n < 17 || rep[1] != 1 {
+            test_fail!("x11_shmpix", "ShmQueryVersion shared_pixmaps={} (want 1, n={})", rep[1], n);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    const W: u32 = 8; const H: u32 = 8;
+    let seg_bytes = (W * H * 4) as u64;
+    let shmid = crate::ipc::sysv_shm::shmget(
+        crate::ipc::sysv_shm::IPC_PRIVATE, seg_bytes,
+        crate::ipc::sysv_shm::IPC_CREAT | 0o600);
+    if shmid < 0 {
+        test_fail!("x11_shmpix", "shmget failed: {}", shmid);
+        crate::net::unix::close(client); return false;
+    }
+    let shmid = shmid as u32;
+    let (phys_base, _size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+        Some(v) => v,
+        None => {
+            test_fail!("x11_shmpix", "segment_phys({}) returned None", shmid);
+            crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
+            crate::net::unix::close(client); return false;
+        }
+    };
+    // Initial pattern (will be OVERWRITTEN after CreatePixmap to prove live read).
+    // SAFETY: phys_base is the identity-mapped base of the just-allocated segment.
+    unsafe {
+        let p = phys_base as *mut u8;
+        for i in 0..(W * H) as usize {
+            *p.add(i * 4) = 0x00; *p.add(i * 4 + 1) = 0x00;
+            *p.add(i * 4 + 2) = 0x00; *p.add(i * 4 + 3) = 0xFF;
+        }
+    }
+
+    // CreateWindow (16×16) + MapWindow.
+    const WID: u32 = 0x0081_0001;
+    {
+        let mut cw = [0u8; 40];
+        cw[0] = 1; cw[2] = 10;
+        cw[4] = 0x01; cw[5] = 0x00; cw[6] = 0x81;
+        cw[8] = 0x01;
+        cw[16] = 16; cw[18] = 16;
+        cw[22] = 1; cw[24] = 32;
+        crate::net::unix::write(client, &cw);
+        let mut mw = [0u8; 8];
+        mw[0] = 8; mw[2] = 2;
+        mw[4] = 0x01; mw[5] = 0x00; mw[6] = 0x81;
+        crate::net::unix::write(client, &mw);
+        crate::x11::poll();
+        let mut drain = [0u8; 256];
+        let _ = crate::net::unix::read(client, &mut drain);
+    }
+
+    // ShmAttach: shmseg=0x00810100.
+    const SHMSEG: u32 = 0x0081_0100;
+    {
+        let mut req = [0u8; 16];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_ATTACH;
+        req[2] = 4;
+        req[4..8].copy_from_slice(&SHMSEG.to_le_bytes());
+        req[8..12].copy_from_slice(&shmid.to_le_bytes());
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+
+    // ShmCreatePixmap: pixmap=0x00810200, drawable=WID, 8×8 depth-24, offset 0.
+    const PIXID: u32 = 0x0081_0200;
+    {
+        let mut req = [0u8; 28];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_CREATE_PIXMAP;
+        req[2] = 7; // 7 words
+        req[4..8].copy_from_slice(&PIXID.to_le_bytes());   // pid
+        req[8..12].copy_from_slice(&WID.to_le_bytes());    // drawable
+        req[12..14].copy_from_slice(&(W as u16).to_le_bytes());
+        req[14..16].copy_from_slice(&(H as u16).to_le_bytes());
+        req[16] = 24;                                      // depth
+        req[20..24].copy_from_slice(&SHMSEG.to_le_bytes()); // shmseg
+        // offset = 0
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+
+    // Now CHANGE the segment AFTER the pixmap exists — CopyArea must see THIS,
+    // proving the pixmap reads live segment contents (not a create-time snapshot).
+    // SAFETY: same identity-mapped segment base, still allocated.
+    unsafe {
+        let p = phys_base as *mut u8;
+        for i in 0..(W * H) as usize {
+            *p.add(i * 4) = 0x44; *p.add(i * 4 + 1) = 0x55;
+            *p.add(i * 4 + 2) = 0x66; *p.add(i * 4 + 3) = 0xFF;
+        }
+    }
+
+    // CopyArea: pixmap(0,0,8×8) → window(0,0).
+    {
+        let mut req = [0u8; 28];
+        req[0] = crate::x11::proto::OP_COPY_AREA;
+        req[2] = 7;
+        req[4..8].copy_from_slice(&PIXID.to_le_bytes());   // src = shm pixmap
+        req[8..12].copy_from_slice(&WID.to_le_bytes());    // dst = window
+        // gc at [12..16] unused
+        // src_x/src_y = 0, dst_x/dst_y = 0
+        req[24..26].copy_from_slice(&(W as u16).to_le_bytes());  // width
+        req[26..28].copy_from_slice(&(H as u16).to_le_bytes());  // height
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+
+    // Verify the window got the POST-create segment pixels (live read).
+    let px = crate::x11::test_read_window_pixel(WID, 2, 2);
+    let ok = matches!(px, Some([0x44, 0x55, 0x66, _]));
+    if !ok {
+        test_fail!("x11_shmpix", "window pixel after CopyArea = {:?} (want [44,55,66,_] = live segment)", px);
+        crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  ShmCreatePixmap pixmap read LIVE segment via CopyArea ✓ ({:?})", px);
+
+    // FreePixmap + Detach + clean up.
+    {
+        let mut req = [0u8; 8];
+        req[0] = 54; req[2] = 2; // FreePixmap
+        req[4..8].copy_from_slice(&PIXID.to_le_bytes());
+        crate::net::unix::write(client, &req);
+        let mut det = [0u8; 8];
+        det[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        det[1] = crate::x11::proto::SHM_DETACH;
+        det[2] = 2;
+        det[4..8].copy_from_slice(&SHMSEG.to_le_bytes());
+        crate::net::unix::write(client, &det);
+        crate::x11::poll();
+    }
+    crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 MIT-SHM ShmCreatePixmap");
     true
 }
 
