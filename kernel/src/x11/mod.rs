@@ -180,6 +180,65 @@ impl Server {
 unsafe impl Send for Server {}
 static SERVER: Mutex<Server> = Mutex::new(Server::new());
 
+// ── MIT-SHM attachment table ─────────────────────────────────────────────────
+//
+// MIT-SHM ShmAttach binds an X resource id (`shmseg`) to a previously-created
+// SysV shared-memory segment (the integer `shmid` the client got from
+// `shmget`).  ShmPutImage then references the `shmseg`; the server resolves it
+// to the `shmid`, looks up the segment's physical backing via
+// `sysv_shm::segment_phys`, and reads pixel data directly.  Attachments are
+// few (a compositor uses a handful of back-buffers), so a small fixed table
+// shared across all clients is sufficient.
+const MAX_SHM_ATTACH: usize = 32;
+
+#[derive(Clone, Copy)]
+struct ShmAttach {
+    shmseg: u32, // X resource id (0 = free slot)
+    shmid:  u32, // SysV shmid the segment was created with
+    fd:     u64, // owning client connection (for cleanup on disconnect)
+}
+impl ShmAttach {
+    const fn empty() -> Self { ShmAttach { shmseg: 0, shmid: 0, fd: 0 } }
+}
+static SHM_ATTACH: Mutex<[ShmAttach; MAX_SHM_ATTACH]> =
+    Mutex::new([ShmAttach::empty(); MAX_SHM_ATTACH]);
+
+// ── GLX context table ────────────────────────────────────────────────────────
+//
+// GLX context bookkeeping.  With direct (client-side llvmpipe) rendering the
+// server never executes GL; it only needs to (a) acknowledge context creation
+// with a valid XID, (b) hand back a non-zero context tag on MakeCurrent, and
+// (c) answer IsDirect=true.  We record the context XID so DestroyContext and
+// QueryContext can validate it.
+const MAX_GLX_CONTEXTS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct GlxContext {
+    xid: u32, // GLX context resource id (0 = free slot)
+    fd:  u64, // owning client connection
+}
+impl GlxContext {
+    const fn empty() -> Self { GlxContext { xid: 0, fd: 0 } }
+}
+static GLX_CONTEXTS: Mutex<[GlxContext; MAX_GLX_CONTEXTS]> =
+    Mutex::new([GlxContext::empty(); MAX_GLX_CONTEXTS]);
+
+/// Free all GLX contexts and MIT-SHM attachments owned by a (now-dead) client
+/// connection.  Called from the client-reap path so a disconnecting client does
+/// not leak server-side handles.  The SysV segments themselves are owned by the
+/// client process and reclaimed on its exit; this only drops the X-server-side
+/// shmseg→shmid binding.
+fn glx_release_client(fd: u64) {
+    {
+        let mut tbl = GLX_CONTEXTS.lock();
+        for c in tbl.iter_mut() { if c.fd == fd { *c = GlxContext::empty(); } }
+    }
+    {
+        let mut tbl = SHM_ATTACH.lock();
+        for a in tbl.iter_mut() { if a.fd == fd { *a = ShmAttach::empty(); } }
+    }
+}
+
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 
 #[inline] fn r16(b: &[u8], o: usize) -> u16  { proto::read_u16le(b, o) }
@@ -530,6 +589,7 @@ pub fn poll() {
         for i in 0..MAX_CLIENTS {
             if dead_idx[i] != usize::MAX {
                 srv.clients[dead_idx[i]] = None;
+                glx_release_client(dead_fds[i]);
                 unix::close(dead_fds[i]);
             }
         }
@@ -925,6 +985,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::XKEYBOARD_MAJOR_OPCODE  => op_xkeyboard(fd, data, seq),
         proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
         proto::RANDR_MAJOR_OPCODE      => op_randr(fd, data, seq),
+        proto::GLX_MAJOR_OPCODE        => op_glx(fd, data, seq),
         // Polygon / arc drawing ops.  Per X11 core protocol §PolyArc /
         // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint /
         // §PolyRectangle — no reply; the request carries (drawable, gc,
@@ -2955,14 +3016,18 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     // the extension defines no events/errors); see proto.rs for the rationale —
     // clients key their event-dispatch maps on first_event.
     match name {
-        // MIT-SHM is deliberately NOT advertised.  We do not implement the
-        // shared-memory image transport (Attach → CreatePixmap(shmseg) →
-        // CopyArea(shm-pixmap → window)); advertising it would make clients
-        // believe SHM works and route paints through an unsupported arm,
-        // silently dropping them.  Per the MIT-SHM protocol spec, a client that
-        // gets present=0 from QueryExtension falls back to core XPutImage(72),
-        // which `op_put_image` composites correctly.  Falling into the `_` arm
-        // below yields the canonical not-present reply (present=0).
+        // MIT-SHM is advertised: `op_shm` implements a real ShmPutImage that
+        // reads pixels from the attached SysV segment's physical backing and
+        // composites them into the destination window (the same path as the core
+        // XPutImage).  Per the MIT-SHM protocol spec a client that sees present=1
+        // routes large framebuffer presents through ShmPutImage, avoiding the
+        // per-frame request-body copy that XPutImage incurs.
+        "MIT-SHM"   => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;     b[10]=proto::SHM_FIRST_EVENT;   b[11]=proto::SHM_FIRST_ERROR; }
+        // GLX: we perform the GLX handshake only (QueryVersion, Get{Visual,FB}Configs,
+        // Create/Destroy/MakeCurrent context bookkeeping, IsDirect=true, the
+        // Query*String requests).  With the Mesa software path the OpenGL
+        // rendering runs client-side (direct), so the server sees no GL stream.
+        "GLX"       => { b[8]=1; b[9]=proto::GLX_MAJOR_OPCODE;     b[10]=proto::GLX_FIRST_EVENT;   b[11]=proto::GLX_FIRST_ERROR; }
         "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE;    b[10]=0;                            b[11]=0; }
         "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=proto::XKEYBOARD_FIRST_EVENT; b[11]=proto::XKEYBOARD_FIRST_ERROR; }
         "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=proto::SHAPE_FIRST_EVENT;  b[11]=proto::SHAPE_FIRST_ERROR; }
@@ -2985,15 +3050,13 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
 // ── ListExtensions (99) ──────────────────────────────────────────────────────
 
 fn op_list_extensions(fd: u64, seq: u16) {
-    // MIT-SHM is intentionally absent: we do not implement the SHM image
-    // transport, and advertising it would make clients route paints through an
-    // unsupported arm.  Omitting it forces the core XPutImage(72) fallback
-    // (per the MIT-SHM protocol spec), which we composite correctly.  Keep this
-    // list in sync with `op_query_extension`.
+    // Keep this list in sync with `op_query_extension`.  MIT-SHM and GLX are now
+    // advertised (real ShmPutImage + GLX handshake respectively).
     let names: &[&[u8]] = &[
         b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
         b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
         b"DPMS", b"SYNC", b"COMPOSITE", b"RANDR",
+        b"MIT-SHM", b"GLX",
     ];
     let mut body: Vec<u8> = vec![];
     for &n in names { body.push(n.len() as u8); body.extend_from_slice(n); }
@@ -3446,18 +3509,397 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
             b[16] = 2; // pixmap_format = ZPixmap
             with_client(fd, |c| c.send(&b));
         }
-        // SHM_ATTACH / SHM_DETACH: side-effect, accept silently
-        proto::SHM_ATTACH | proto::SHM_DETACH => {}
-        // SHM_PUT_IMAGE: stub — no real shared memory backing
-        proto::SHM_PUT_IMAGE => {}
+        proto::SHM_ATTACH    => op_shm_attach(fd, data),
+        proto::SHM_DETACH    => op_shm_detach(fd, data),
+        proto::SHM_PUT_IMAGE => op_shm_put_image(fd, data),
         // SHM_GET_IMAGE: return unimplemented error
         proto::SHM_GET_IMAGE => {
             with_client(fd, |c| c.send_error(proto::ERR_IMPLEMENTATION, 0, proto::SHM_MAJOR_OPCODE));
         }
-        // SHM_CREATE_PIXMAP: accept, treated as no-op
+        // SHM_CREATE_PIXMAP: accept, treated as no-op (we route presents through
+        // ShmPutImage, not shm-backed pixmaps).
         proto::SHM_CREATE_PIXMAP => {}
         _ => {}
     }
+}
+
+// ShmAttach request (MIT-SHM protocol §ShmAttach):
+//   [4..8]   shmseg  (X resource id chosen by the client for this attachment)
+//   [8..12]  shmid   (SysV shmid the client created via shmget)
+//   [12]     read_only BOOL
+fn op_shm_attach(fd: u64, data: &[u8]) {
+    if data.len() < 13 { return; }
+    let shmseg = r32(data, 4);
+    let shmid  = r32(data, 8);
+    let mut tbl = SHM_ATTACH.lock();
+    // Replace an existing record for this shmseg, else take a free slot.
+    let idx = tbl.iter().position(|a| a.shmseg == shmseg)
+        .or_else(|| tbl.iter().position(|a| a.shmseg == 0));
+    if let Some(i) = idx {
+        tbl[i] = ShmAttach { shmseg, shmid, fd };
+    }
+}
+
+// ShmDetach request: [4..8] shmseg.
+fn op_shm_detach(fd: u64, data: &[u8]) {
+    if data.len() < 8 { return; }
+    let shmseg = r32(data, 4);
+    let mut tbl = SHM_ATTACH.lock();
+    if let Some(slot) = tbl.iter_mut().find(|a| a.shmseg == shmseg && a.fd == fd) {
+        *slot = ShmAttach::empty();
+    }
+}
+
+/// Resolve a `shmseg` X resource id (owned by `fd`) to its SysV `shmid`.
+fn shm_lookup(fd: u64, shmseg: u32) -> Option<u32> {
+    let tbl = SHM_ATTACH.lock();
+    tbl.iter()
+        .find(|a| a.shmseg == shmseg && a.fd == fd && a.shmseg != 0)
+        .map(|a| a.shmid)
+}
+
+// ShmPutImage request (MIT-SHM protocol §ShmPutImage):
+//   [4..8]   drawable
+//   [8..12]  gc
+//   [12..14] total_width   [14..16] total_height  (dims of the image in shm)
+//   [16..18] src_x         [18..20] src_y
+//   [20..22] src_width     [22..24] src_height
+//   [24..26] dst_x         [26..28] dst_y
+//   [28]     depth   [29] format   [30] send_event  [31] pad
+//   [32..36] shmseg
+//   [36..40] offset        (byte offset of the image base within the segment)
+//
+// The pixel data lives in the attached SysV segment, so the server reads it
+// directly from the segment's physical backing and composites the requested
+// sub-rectangle into the destination window — mirroring `op_put_image`'s
+// window-buffer write so the compositor's source-of-truth surface is updated.
+fn op_shm_put_image(fd: u64, data: &[u8]) {
+    if data.len() < 40 { return; }
+    let draw   = r32(data, 4);
+    let total_w = r16(data, 12) as i32;
+    let total_h = r16(data, 14) as i32;
+    let src_x   = r16(data, 16) as i32;
+    let src_y   = r16(data, 18) as i32;
+    let src_w   = r16(data, 20) as i32;
+    let src_h   = r16(data, 22) as i32;
+    let dst_x   = r16(data, 24) as i32;
+    let dst_y   = r16(data, 26) as i32;
+    let depth   = data[28];
+    let format  = data[29];
+    let shmseg  = r32(data, 32);
+    let offset  = r32(data, 36) as u64;
+
+    // Only ZPixmap, depth ≥ 24 (BGRA32) is composited; other formats are ignored
+    // (the same conservative guard as core PutImage).
+    if format != proto::IMAGE_FORMAT_ZPIXMAP || depth < 24 { return; }
+    if total_w <= 0 || total_h <= 0 || src_w <= 0 || src_h <= 0 { return; }
+
+    let shmid = match shm_lookup(fd, shmseg) { Some(id) => id, None => return };
+    let (phys_base, seg_size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+        Some(v) => v, None => return,
+    };
+
+    // The image occupies total_w*total_h*4 bytes from `offset`.  Validate the
+    // whole image region (plus the sub-rectangle's last byte) fits in the
+    // segment before reading any physical memory.
+    let stride  = total_w as u64 * 4;
+    let img_len = stride * total_h as u64;
+    if offset.saturating_add(img_len) > seg_size { return; }
+    // Sub-rectangle must lie inside the image.
+    if src_x < 0 || src_y < 0
+        || src_x + src_w > total_w || src_y + src_h > total_h { return; }
+
+    // SAFETY: `phys_base` is the identity-mapped, kernel-readable base of a
+    // physically-contiguous SysV segment (see sysv_shm::shmget).  The bounds
+    // checks above guarantee `[offset, offset+img_len)` is within the segment,
+    // so the slice never reads past the backing pages.
+    let src: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            (phys_base + offset) as *const u8,
+            img_len as usize,
+        )
+    };
+
+    // Composite the sub-rectangle (src_x,src_y,src_w,src_h) of the shm image
+    // into the window at (dst_x,dst_y).  The source slice is the full image
+    // (stride = total_w*4); `window_composite_pixels` indexes rows from the
+    // slice origin, so offset into the sub-rectangle's first row/col here.
+    let sub_origin = (src_y as u64 * stride + src_x as u64 * 4) as usize;
+    if sub_origin >= src.len() { return; }
+    window_composite_pixels(
+        fd, draw, dst_x, dst_y, src_w, src_h,
+        &src[sub_origin..], total_w, src_h, proto::RENDER_OP_SRC);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GLX extension (major opcode 146)
+//
+// Public reference: "OpenGL Graphics System: A Specification — GLX Extension"
+// and the GLX Protocol Encoding.  With the Mesa software path (the drisw loader +
+// llvmpipe) the GL rendering runs CLIENT-SIDE in the application's own address
+// space (direct rendering); the X server only answers the handshake/bookkeeping
+// requests so the client driver can bind a GL context to its window.  Presents
+// arrive over the core protocol (PutImage) or MIT-SHM (ShmPutImage), not GLX.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The single TrueColor depth-24 visual the server advertises is ROOT_VISUAL=32.
+// We expose two GLX configs over it: a single-buffered and a double-buffered
+// RGBA config, so glXChooseVisual succeeds whether or not the client requests
+// GLX_DOUBLEBUFFER (glxtest tries single-buffer first, then double-buffer).
+
+fn op_glx(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    match data[1] {
+        proto::GLX_QUERY_VERSION          => op_glx_query_version(fd, data, seq),
+        proto::GLX_GET_VISUAL_CONFIGS     => op_glx_get_visual_configs(fd, seq),
+        proto::GLX_GET_FB_CONFIGS         => op_glx_get_fb_configs(fd, seq),
+        proto::GLX_CREATE_CONTEXT         => op_glx_create_context(fd, data, 4),
+        proto::GLX_CREATE_NEW_CONTEXT     => op_glx_create_context(fd, data, 4),
+        proto::GLX_CREATE_CONTEXT_ATTRIBS_ARB => op_glx_create_context(fd, data, 4),
+        proto::GLX_DESTROY_CONTEXT        => op_glx_destroy_context(fd, data),
+        proto::GLX_MAKE_CURRENT           => op_glx_make_current(fd, data, seq),
+        proto::GLX_MAKE_CONTEXT_CURRENT   => op_glx_make_current(fd, data, seq),
+        proto::GLX_IS_DIRECT              => op_glx_is_direct(fd, seq),
+        proto::GLX_QUERY_SERVER_STRING    => op_glx_query_server_string(fd, data, seq),
+        proto::GLX_QUERY_EXTENSIONS_STRING=> op_glx_query_extensions_string(fd, seq),
+        proto::GLX_QUERY_CONTEXT          => op_glx_query_context(fd, data, seq),
+        proto::GLX_GET_DRAWABLE_ATTRIBUTES=> op_glx_get_drawable_attributes(fd, seq),
+        proto::GLX_CHANGE_DRAWABLE_ATTRIBUTES => {} // no reply; accept
+        proto::GLX_CREATE_WINDOW | proto::GLX_DESTROY_WINDOW |
+        proto::GLX_CREATE_PIXMAP | proto::GLX_DESTROY_PIXMAP |
+        proto::GLX_CREATE_GLX_PIXMAP | proto::GLX_DESTROY_GLX_PIXMAP |
+        proto::GLX_CREATE_PBUFFER | proto::GLX_DESTROY_PBUFFER |
+        proto::GLX_USE_X_FONT | proto::GLX_COPY_CONTEXT => {} // bookkeeping; no reply
+        // ClientInfo / SetClientInfo*ARB / WaitGL / WaitX / SwapBuffers: requests
+        // that carry no reply.  With direct rendering SwapBuffers is a client-side
+        // present (the client uses core PutImage / ShmPutImage), so we accept and
+        // ignore.  RenderLarge / Render likewise never reach us under direct GL.
+        proto::GLX_CLIENT_INFO | proto::GLX_SET_CLIENT_INFO_ARB |
+        proto::GLX_SET_CLIENT_INFO_2ARB | proto::GLX_WAIT_GL |
+        proto::GLX_WAIT_X | proto::GLX_SWAP_BUFFERS |
+        proto::GLX_RENDER | proto::GLX_RENDER_LARGE => {}
+        _ => {}
+    }
+}
+
+// GLXQueryVersion reply: [8..12]=major, [12..16]=minor.  We support GLX 1.4.
+fn op_glx_query_version(fd: u64, _data: &[u8], seq: u16) {
+    let mut b = [0u8; 32];
+    b[0] = 1; w16(&mut b, 2, seq);
+    w32(&mut b, 8, 1);  // major = 1
+    w32(&mut b, 12, 4); // minor = 4
+    with_client(fd, |c| c.send(&b));
+}
+
+// Append the 18 leading positional CARD32 fields of a GLX 1.2 visual-config
+// block, in the order the client unmarshals them (GLX Protocol Encoding §
+// GetVisualConfigs): visualID, X visual class, rgba-flag, R/G/B/A bits,
+// accum R/G/B/A bits, doubleBuffer, stereo, rgbBits, depthBits, stencilBits,
+// auxBuffers, level.
+fn push_visual_config(body: &mut Vec<u8>, double_buffer: bool) {
+    let fields: [u32; 18] = [
+        proto::ROOT_VISUAL,                  // visualID
+        proto::VISUAL_CLASS_TRUECOLOR as u32,// X visual class (TrueColor=4)
+        1,                                   // rgba flag (true)
+        8, 8, 8, 0,                          // red, green, blue, alpha bits
+        0, 0, 0, 0,                          // accum red/green/blue/alpha
+        double_buffer as u32,                // doubleBuffer
+        0,                                   // stereo
+        24,                                  // rgbBits (total colour bits)
+        24,                                  // depthBits
+        8,                                   // stencilBits
+        0,                                   // auxBuffers
+        0,                                   // level
+    ];
+    for v in fields { body.extend_from_slice(&v.to_le_bytes()); }
+}
+
+// GLXGetVisualConfigs reply (GLX Protocol Encoding §GetVisualConfigs):
+//   [8..12]  numVisuals
+//   [12..16] numProps  (CARD32 words per visual)
+//   body     numVisuals * numProps CARD32
+// length field = (numVisuals * numProps).
+fn op_glx_get_visual_configs(fd: u64, seq: u16) {
+    let num_visuals = 2u32;
+    let num_props   = 18u32; // 18 positional fields, no trailing tag/value pairs
+    let mut body: Vec<u8> = Vec::with_capacity((num_visuals * num_props * 4) as usize);
+    push_visual_config(&mut body, false); // single-buffered
+    push_visual_config(&mut body, true);  // double-buffered
+    let words = (num_visuals * num_props) as usize;
+    let mut rep = vec![0u8; 32 + words * 4];
+    rep[0] = 1; w16(&mut rep, 2, seq); w32(&mut rep, 4, words as u32);
+    w32(&mut rep, 8, num_visuals); w32(&mut rep, 12, num_props);
+    rep[32..32 + body.len()].copy_from_slice(&body);
+    with_client(fd, |c| c.send(&rep));
+}
+
+// Append one fully-tagged GLX 1.3 fbconfig as (tag, value) CARD32 pairs.  All
+// fields are tagged (the client reads them with tagged_only=TRUE).
+fn push_fbconfig(body: &mut Vec<u8>, fbconfig_id: u32, double_buffer: bool) {
+    let pairs: [(u32, u32); 23] = [
+        (proto::GLX_TOK_FBCONFIG_ID,    fbconfig_id),
+        (proto::GLX_TOK_VISUAL_ID,      proto::ROOT_VISUAL),
+        (proto::GLX_TOK_X_VISUAL_TYPE,  proto::GLX_VAL_TRUE_COLOR),
+        (proto::GLX_TOK_RENDER_TYPE,    proto::GLX_VAL_RGBA_BIT),
+        (proto::GLX_TOK_DRAWABLE_TYPE,  proto::GLX_VAL_WINDOW_BIT
+                                         | proto::GLX_VAL_PIXMAP_BIT),
+        (proto::GLX_TOK_X_RENDERABLE,   1),
+        (proto::GLX_TOK_RGBA,           1),
+        (proto::GLX_TOK_CONFIG_CAVEAT,  proto::GLX_VAL_NONE),
+        (proto::GLX_TOK_BUFFER_SIZE,    24),
+        (proto::GLX_TOK_LEVEL,          0),
+        (proto::GLX_TOK_DOUBLEBUFFER,   double_buffer as u32),
+        (proto::GLX_TOK_STEREO,         0),
+        (proto::GLX_TOK_AUX_BUFFERS,    0),
+        (proto::GLX_TOK_RED_SIZE,       8),
+        (proto::GLX_TOK_GREEN_SIZE,     8),
+        (proto::GLX_TOK_BLUE_SIZE,      8),
+        (proto::GLX_TOK_ALPHA_SIZE,     0),
+        (proto::GLX_TOK_DEPTH_SIZE,     24),
+        (proto::GLX_TOK_STENCIL_SIZE,   8),
+        (proto::GLX_TOK_ACCUM_RED,      0),
+        (proto::GLX_TOK_ACCUM_GREEN,    0),
+        (proto::GLX_TOK_ACCUM_BLUE,     0),
+        (proto::GLX_TOK_ACCUM_ALPHA,    0),
+    ];
+    for (tag, val) in pairs {
+        body.extend_from_slice(&tag.to_le_bytes());
+        body.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
+// GLXGetFBConfigs reply (GLX Protocol Encoding §GetFBConfigs):
+//   [8..12]  numFBConfigs
+//   [12..16] numAttribs  (number of (tag,value) PAIRS per fbconfig)
+//   body     numFBConfigs * numAttribs * 2 CARD32
+// length field = (numFBConfigs * numAttribs * 2).
+fn op_glx_get_fb_configs(fd: u64, seq: u16) {
+    let num_fbconfigs = 2u32;
+    let num_attribs   = 23u32; // pairs per fbconfig (matches push_fbconfig)
+    let mut body: Vec<u8> = Vec::with_capacity((num_fbconfigs * num_attribs * 8) as usize);
+    push_fbconfig(&mut body, 0x21, false); // single-buffered, fbconfig id 0x21
+    push_fbconfig(&mut body, 0x22, true);  // double-buffered, fbconfig id 0x22
+    let words = (num_fbconfigs * num_attribs * 2) as usize;
+    let mut rep = vec![0u8; 32 + words * 4];
+    rep[0] = 1; w16(&mut rep, 2, seq); w32(&mut rep, 4, words as u32);
+    w32(&mut rep, 8, num_fbconfigs); w32(&mut rep, 12, num_attribs);
+    rep[32..32 + body.len()].copy_from_slice(&body);
+    with_client(fd, |c| c.send(&rep));
+}
+
+// GLXCreateContext / GLXCreateNewContext / GLXCreateContextAttribsARB: the
+// context XID is the first request word at `id_off`.  No reply.  We just record
+// the XID so DestroyContext / QueryContext can validate it.
+fn op_glx_create_context(fd: u64, data: &[u8], id_off: usize) {
+    if data.len() < id_off + 4 { return; }
+    let xid = r32(data, id_off);
+    if xid == 0 { return; }
+    let mut tbl = GLX_CONTEXTS.lock();
+    let idx = tbl.iter().position(|c| c.xid == xid)
+        .or_else(|| tbl.iter().position(|c| c.xid == 0));
+    if let Some(i) = idx {
+        tbl[i] = GlxContext { xid, fd };
+    }
+}
+
+// GLXDestroyContext: [4..8]=context XID.  No reply.
+fn op_glx_destroy_context(fd: u64, data: &[u8]) {
+    if data.len() < 8 { return; }
+    let xid = r32(data, 4);
+    let mut tbl = GLX_CONTEXTS.lock();
+    if let Some(slot) = tbl.iter_mut().find(|c| c.xid == xid && c.fd == fd) {
+        *slot = GlxContext::empty();
+    }
+}
+
+// GLXMakeCurrent / GLXMakeContextCurrent reply: [8..12]=context_tag.  Per the
+// GLX encoding the tag is an opaque non-zero handle the client echoes back in
+// later requests (and which we never interpret under direct rendering).  We
+// return a stable non-zero tag.
+fn op_glx_make_current(fd: u64, _data: &[u8], seq: u16) {
+    let mut b = [0u8; 32];
+    b[0] = 1; w16(&mut b, 2, seq);
+    w32(&mut b, 8, 1); // context_tag = 1 (non-zero, opaque)
+    with_client(fd, |c| c.send(&b));
+}
+
+// GLXIsDirect reply: [8]=is_direct BOOL.  We answer true so the client binds the
+// local software driver (llvmpipe) and renders directly, rather than tunnelling
+// an indirect GL command stream over the wire (which we do not implement).
+fn op_glx_is_direct(fd: u64, seq: u16) {
+    let mut b = [0u8; 32];
+    b[0] = 1; w16(&mut b, 2, seq);
+    b[8] = 1; // is_direct = true
+    with_client(fd, |c| c.send(&b));
+}
+
+// GLXQueryContext reply: [8..12]=numAttribs (pairs), then numAttribs*2 CARD32.
+// We report the context's fbconfig id and render type so the client's
+// glXQueryContext succeeds.  Body is 2 (tag,value) pairs.
+fn op_glx_query_context(fd: u64, _data: &[u8], seq: u16) {
+    let pairs: [(u32, u32); 2] = [
+        (proto::GLX_TOK_FBCONFIG_ID, 0x22),
+        (proto::GLX_TOK_RENDER_TYPE, proto::GLX_VAL_RGBA_BIT),
+    ];
+    let n = pairs.len() as u32;
+    let words = (n * 2) as usize;
+    let mut rep = vec![0u8; 32 + words * 4];
+    rep[0] = 1; w16(&mut rep, 2, seq); w32(&mut rep, 4, words as u32);
+    w32(&mut rep, 8, n);
+    let mut off = 32;
+    for (tag, val) in pairs {
+        w32(&mut rep, off, tag); w32(&mut rep, off + 4, val); off += 8;
+    }
+    with_client(fd, |c| c.send(&rep));
+}
+
+// GLXGetDrawableAttributes reply (GLX Protocol Encoding §GetDrawableAttributes):
+//   [8..12]  numAttribs (number of (attrib,value) CARD32 PAIRS)
+//   body     numAttribs*2 CARD32 at [32..]
+// We return an empty attribute list (numAttribs=0); the client then uses its
+// defaults.  Issuing a reply (rather than silently dropping the request) is
+// essential — the request expects one, and a missing reply would wedge the
+// client's request queue.
+fn op_glx_get_drawable_attributes(fd: u64, seq: u16) {
+    let mut b = [0u8; 32];
+    b[0] = 1; w16(&mut b, 2, seq);
+    // length = 0, numAttribs = 0 (both already zero-filled).
+    with_client(fd, |c| c.send(&b));
+}
+
+// GLXQueryServerString request: [8..12]=name (GLX_VENDOR/VERSION/EXTENSIONS).
+// Reply: [12..16]=n (string length including the trailing NUL), string at [32..].
+// length = pad4(n)/4.
+fn op_glx_query_server_string(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 12 { return; }
+    let name = r32(data, 8);
+    let s: &[u8] = match name {
+        proto::GLX_STRING_VENDOR  => b"Xastryx",
+        proto::GLX_STRING_VERSION => b"1.4",
+        // No server GL extensions are advertised over the wire — under direct
+        // rendering the client driver (Mesa) provides its own extension string.
+        proto::GLX_STRING_EXTENSIONS => b"",
+        _ => b"",
+    };
+    glx_send_string(fd, seq, s);
+}
+
+// GLXQueryExtensionsString reply: same shape as QueryServerString (n at [12..16],
+// string at [32..]).  Empty: Mesa's direct driver supplies its own extensions.
+fn op_glx_query_extensions_string(fd: u64, seq: u16) {
+    glx_send_string(fd, seq, b"");
+}
+
+// Shared encoder for the GLX *String replies: n at [12..16] counts the NUL.
+fn glx_send_string(fd: u64, seq: u16, s: &[u8]) {
+    let n = s.len() + 1; // include trailing NUL
+    let pd = proto::pad4(n);
+    let mut rep = vec![0u8; 32 + pd];
+    rep[0] = 1; w16(&mut rep, 2, seq); w32(&mut rep, 4, (pd / 4) as u32);
+    w32(&mut rep, 12, n as u32);
+    rep[32..32 + s.len()].copy_from_slice(s);
+    // trailing NUL already zero-filled
+    with_client(fd, |c| c.send(&rep));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

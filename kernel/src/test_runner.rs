@@ -869,6 +869,14 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_request_reassembly() { passed += 1; }
 
+    // ── X11 GLX handshake + real MIT-SHM ShmPutImage (Firefox paint gate) ────
+
+    total += 1;
+    if test_x11_glx_handshake() { passed += 1; }
+
+    total += 1;
+    if test_x11_shm_put_image() { passed += 1; }
+
     // ── Test 69: X11 RENDER extension — Pixmap + Picture + FillRectangles ────
 
     total += 1;
@@ -19042,6 +19050,340 @@ fn test_x11_render_query() -> bool {
     crate::net::unix::close(client);
     test_pass!("X11 RENDER extension query");
     true
+}
+
+// ── X11 GLX handshake (Firefox software-OpenGL paint gate) ───────────────────
+//
+// Firefox's GPU probe (glxtest) needs the X server to advertise GLX and answer
+// the handshake so Mesa's software path (drisw + llvmpipe) binds a GL context
+// to the probe window and renders CLIENT-SIDE (direct).  This test exercises the
+// server-side surface end-to-end: QueryExtension("GLX") present, QueryVersion
+// (1.4), GetVisualConfigs (≥1 RGBA depth-24 visual on ROOT_VISUAL=32),
+// GetFBConfigs (≥1 fbconfig), CreateContext + MakeCurrent (non-zero context tag),
+// and IsDirect=true.  Per the GLX Protocol Encoding (X_GLX* single commands).
+fn test_x11_glx_handshake() -> bool {
+    test_header!("X11 GLX handshake (Firefox software-OpenGL paint gate)");
+
+    let client = match x11_connect_setup("x11_glx") { Some(c) => c, None => return false };
+
+    // Helper: send a GLX request (major=146, minor in data[1]) and read the reply.
+    let glx_req = |minor: u8, extra: &[u8], rep: &mut [u8]| -> i64 {
+        // Build a request: [0]=major, [1]=minor, [2..4]=len-in-words, then extra.
+        let total = 4 + extra.len();
+        let words = ((total + 3) & !3) / 4;
+        let mut req = [0u8; 64];
+        req[0] = crate::x11::proto::GLX_MAJOR_OPCODE;
+        req[1] = minor;
+        req[2] = (words & 0xFF) as u8;
+        req[3] = ((words >> 8) & 0xFF) as u8;
+        if !extra.is_empty() { req[4..4 + extra.len()].copy_from_slice(extra); }
+        crate::net::unix::write(client, &req[..words * 4]);
+        crate::x11::poll();
+        crate::net::unix::read(client, rep)
+    };
+
+    // 1. QueryExtension("GLX") → present, major=146, first_error=156.
+    {
+        let name = b"GLX";
+        let mut req = [0u8; 32];
+        req[0] = 98; req[2] = 3; req[4] = name.len() as u8;
+        req[8..8 + name.len()].copy_from_slice(name);
+        crate::net::unix::write(client, &req[..12]);
+        crate::x11::poll();
+        let mut rep = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut rep);
+        if n < 12 || rep[0] != 1 || rep[8] != 1 {
+            test_fail!("x11_glx", "QueryExtension(GLX) present={} (n={})", rep[8], n);
+            crate::net::unix::close(client); return false;
+        }
+        if rep[9] != crate::x11::proto::GLX_MAJOR_OPCODE
+            || rep[11] != crate::x11::proto::GLX_FIRST_ERROR {
+            test_fail!("x11_glx", "GLX major={} first_error={} (want {}/{})",
+                rep[9], rep[11], crate::x11::proto::GLX_MAJOR_OPCODE,
+                crate::x11::proto::GLX_FIRST_ERROR);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  QueryExtension(GLX): present major={} first_error={} ✓",
+            rep[9], rep[11]);
+    }
+
+    // 2. GLXQueryVersion(1,4) → reply major=1 minor=4.
+    {
+        let mut rep = [0u8; 32];
+        let extra = [1u8, 0, 0, 0, 4, 0, 0, 0]; // client major=1, minor=4
+        let n = glx_req(crate::x11::proto::GLX_QUERY_VERSION, &extra, &mut rep);
+        let major = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        let minor = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
+        if n < 16 || rep[0] != 1 || major != 1 || minor != 4 {
+            test_fail!("x11_glx", "QueryVersion → {}.{} (want 1.4, n={})", major, minor, n);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  GLXQueryVersion: {}.{} ✓", major, minor);
+    }
+
+    // 3. GLXGetVisualConfigs → numVisuals≥1, numProps=18, first visualID=ROOT_VISUAL.
+    {
+        let mut rep = [0u8; 512];
+        let extra = [1u8, 0, 0, 0]; // screen 0
+        let n = glx_req(crate::x11::proto::GLX_GET_VISUAL_CONFIGS, &extra, &mut rep);
+        let num_vis = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        let num_props = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
+        let first_vid = u32::from_le_bytes([rep[32], rep[33], rep[34], rep[35]]);
+        if n < 32 || rep[0] != 1 || num_vis < 1 || num_props != 18
+            || first_vid != crate::x11::proto::ROOT_VISUAL {
+            test_fail!("x11_glx",
+                "GetVisualConfigs numVis={} numProps={} vid={:#x} (want ≥1/18/{:#x}, n={})",
+                num_vis, num_props, first_vid, crate::x11::proto::ROOT_VISUAL, n);
+            crate::net::unix::close(client); return false;
+        }
+        // The 3rd field (rgba flag) of the first visual must be 1 (RGBA config).
+        let rgba = u32::from_le_bytes([rep[40], rep[41], rep[42], rep[43]]);
+        if rgba != 1 {
+            test_fail!("x11_glx", "GetVisualConfigs first visual rgba={} (want 1)", rgba);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  GLXGetVisualConfigs: {} visuals, {} props, vid={:#x} rgba ✓",
+            num_vis, num_props, first_vid);
+    }
+
+    // 4. GLXGetFBConfigs → numFBConfigs≥1.
+    {
+        let mut rep = [0u8; 1024];
+        let extra = [1u8, 0, 0, 0]; // screen 0
+        let n = glx_req(crate::x11::proto::GLX_GET_FB_CONFIGS, &extra, &mut rep);
+        let num_fb = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        if n < 32 || rep[0] != 1 || num_fb < 1 {
+            test_fail!("x11_glx", "GetFBConfigs numFBConfigs={} (want ≥1, n={})", num_fb, n);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  GLXGetFBConfigs: {} fbconfigs ✓", num_fb);
+    }
+
+    // 5. CreateContext (XID at [4..8]; no reply) then MakeCurrent → context_tag≠0.
+    {
+        let ctx_xid = [0x10u8, 0x00, 0x70, 0x00]; // 0x00700010
+        // CreateContext: data[4..8]=context, [8..12]=visual, [12..16]=screen,
+        // [16..20]=share, [20]=is_direct.  Only the XID is load-bearing for us.
+        let mut extra = [0u8; 20];
+        extra[0..4].copy_from_slice(&ctx_xid);
+        extra[4] = 32; // visual = ROOT_VISUAL
+        extra[16] = 1; // is_direct hint
+        let mut rep = [0u8; 32];
+        // CreateContext has no reply, so don't expect bytes back; just send.
+        let total = 4 + extra.len();
+        let words = ((total + 3) & !3) / 4;
+        let mut req = [0u8; 32];
+        req[0] = crate::x11::proto::GLX_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::GLX_CREATE_CONTEXT;
+        req[2] = words as u8;
+        req[4..4 + extra.len()].copy_from_slice(&extra);
+        crate::net::unix::write(client, &req[..words * 4]);
+        crate::x11::poll();
+
+        // MakeCurrent: [4..8]=drawable, [8..12]=context, [12..16]=old_tag.
+        let mut mc_extra = [0u8; 12];
+        mc_extra[4..8].copy_from_slice(&ctx_xid); // context
+        let n = glx_req(crate::x11::proto::GLX_MAKE_CURRENT, &mc_extra, &mut rep);
+        let tag = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        if n < 12 || rep[0] != 1 || tag == 0 {
+            test_fail!("x11_glx", "MakeCurrent context_tag={} (want ≠0, n={})", tag, n);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  GLXCreateContext + MakeCurrent: tag={} ✓", tag);
+    }
+
+    // 6. GLXIsDirect → is_direct=1.
+    {
+        let mut rep = [0u8; 32];
+        let extra = [0x10u8, 0x00, 0x70, 0x00]; // context XID
+        let n = glx_req(crate::x11::proto::GLX_IS_DIRECT, &extra, &mut rep);
+        if n < 12 || rep[0] != 1 || rep[8] != 1 {
+            test_fail!("x11_glx", "IsDirect={} (want 1, n={})", rep[8], n);
+            crate::net::unix::close(client); return false;
+        }
+        test_println!("  GLXIsDirect: direct=true ✓");
+    }
+
+    crate::net::unix::close(client);
+    test_pass!("X11 GLX handshake");
+    true
+}
+
+// ── X11 real MIT-SHM ShmPutImage (efficient Firefox framebuffer present) ─────
+//
+// The Firefox compositor presents its rendered framebuffer with XShmPutImage
+// (the golden host trace uses GLX + MIT-SHM + PutImage).  This test creates a
+// real SysV shared-memory segment, fills it with a known pixel pattern, attaches
+// it via MIT-SHM ShmAttach, issues ShmPutImage into a mapped window, and verifies
+// the pixel was composited into the window surface — i.e. the server read the
+// pixel data straight from the segment's physical backing (sysv_shm::segment_phys).
+fn test_x11_shm_put_image() -> bool {
+    test_header!("X11 MIT-SHM ShmPutImage (real shared-memory present)");
+
+    let client = match x11_connect_setup("x11_shm") { Some(c) => c, None => return false };
+
+    // QueryExtension("MIT-SHM") → present.
+    {
+        let name = b"MIT-SHM";
+        let mut req = [0u8; 32];
+        req[0] = 98; req[2] = 4; req[4] = name.len() as u8;
+        req[8..8 + name.len()].copy_from_slice(name);
+        crate::net::unix::write(client, &req[..16]);
+        crate::x11::poll();
+        let mut rep = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut rep);
+        if n < 12 || rep[0] != 1 || rep[8] != 1 {
+            test_fail!("x11_shm", "QueryExtension(MIT-SHM) present={} (n={})", rep[8], n);
+            crate::net::unix::close(client); return false;
+        }
+        if rep[9] != crate::x11::proto::SHM_MAJOR_OPCODE {
+            test_fail!("x11_shm", "MIT-SHM major={} (want {})",
+                rep[9], crate::x11::proto::SHM_MAJOR_OPCODE);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    // Create a real SysV segment large enough for a small RGBA image (8×8×4).
+    const W: u32 = 8; const H: u32 = 8;
+    let seg_bytes = (W * H * 4) as u64;
+    let shmid = crate::ipc::sysv_shm::shmget(
+        crate::ipc::sysv_shm::IPC_PRIVATE, seg_bytes,
+        crate::ipc::sysv_shm::IPC_CREAT | 0o600);
+    if shmid < 0 {
+        test_fail!("x11_shm", "shmget failed: {}", shmid);
+        crate::net::unix::close(client); return false;
+    }
+    let shmid = shmid as u32;
+    // Write a known BGRA pattern (0x11,0x22,0x33,0xFF) directly into the segment's
+    // physical backing — the same memory the X server will read on ShmPutImage.
+    let (phys_base, _size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+        Some(v) => v,
+        None => {
+            test_fail!("x11_shm", "segment_phys({}) returned None", shmid);
+            crate::net::unix::close(client); return false;
+        }
+    };
+    // SAFETY: phys_base is the identity-mapped base of the just-allocated segment.
+    unsafe {
+        let p = phys_base as *mut u8;
+        for i in 0..(W * H) as usize {
+            *p.add(i * 4)     = 0x11;
+            *p.add(i * 4 + 1) = 0x22;
+            *p.add(i * 4 + 2) = 0x33;
+            *p.add(i * 4 + 3) = 0xFF;
+        }
+    }
+
+    // CreateWindow (8×8 region painted) + MapWindow.
+    const WID: u32 = 0x0080_0001;
+    {
+        let mut cw = [0u8; 40];
+        cw[0] = 1; cw[2] = 10;
+        cw[4] = 0x01; cw[5] = 0x00; cw[6] = 0x80; // wid = 0x00800001
+        cw[8] = 0x01;                              // parent = ROOT
+        cw[16] = 16; cw[18] = 16;                  // width=16, height=16
+        cw[22] = 1;                                // class = InputOutput
+        cw[24] = 32;                               // visual = ROOT_VISUAL
+        crate::net::unix::write(client, &cw);
+        let mut mw = [0u8; 8];
+        mw[0] = 8; mw[2] = 2;
+        mw[4] = 0x01; mw[5] = 0x00; mw[6] = 0x80;
+        crate::net::unix::write(client, &mw);
+        crate::x11::poll();
+        // Drain any Expose/Map events the server emitted.
+        let mut drain = [0u8; 256];
+        let _ = crate::net::unix::read(client, &mut drain);
+    }
+
+    // ShmAttach: shmseg=0x00800100, shmid, read_only=0.
+    const SHMSEG: u32 = 0x0080_0100;
+    {
+        let mut req = [0u8; 16];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_ATTACH;
+        req[2] = 4; // 4 words
+        req[4..8].copy_from_slice(&SHMSEG.to_le_bytes());
+        req[8..12].copy_from_slice(&shmid.to_le_bytes());
+        req[12] = 0; // read_only = false
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+
+    // ShmPutImage: place the full 8×8 image at window (0,0).
+    {
+        let mut req = [0u8; 40];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_PUT_IMAGE;
+        req[2] = 10; // 10 words
+        req[4..8].copy_from_slice(&WID.to_le_bytes());        // drawable
+        // gc at [8..12] is unused by our compositor (left 0).
+        req[12..14].copy_from_slice(&(W as u16).to_le_bytes()); // total_width
+        req[14..16].copy_from_slice(&(H as u16).to_le_bytes()); // total_height
+        // src_x/src_y = 0
+        req[20..22].copy_from_slice(&(W as u16).to_le_bytes()); // src_width
+        req[22..24].copy_from_slice(&(H as u16).to_le_bytes()); // src_height
+        // dst_x/dst_y = 0
+        req[28] = 24; // depth
+        req[29] = crate::x11::proto::IMAGE_FORMAT_ZPIXMAP; // format
+        // send_event = 0
+        req[32..36].copy_from_slice(&SHMSEG.to_le_bytes());   // shmseg
+        // offset = 0
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+
+    // Verify the window pixel at (2,2) is the pattern we wrote into the segment.
+    let px = crate::x11::test_read_window_pixel(WID, 2, 2);
+    let ok = matches!(px, Some([0x11, 0x22, 0x33, _]));
+    if !ok {
+        test_fail!("x11_shm", "window pixel after ShmPutImage = {:?} (want [11,22,33,_])", px);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  ShmPutImage composited segment pixels into window ✓ ({:?})", px);
+
+    // Detach + clean up the segment.
+    {
+        let mut req = [0u8; 8];
+        req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
+        req[1] = crate::x11::proto::SHM_DETACH;
+        req[2] = 2;
+        req[4..8].copy_from_slice(&SHMSEG.to_le_bytes());
+        crate::net::unix::write(client, &req);
+        crate::x11::poll();
+    }
+    crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
+
+    crate::net::unix::close(client);
+    test_pass!("X11 MIT-SHM ShmPutImage");
+    true
+}
+
+// Shared X11 test helper: open a connection to the X server, perform the setup
+// handshake, and return the client fd (or None on failure, logging via `tag`).
+fn x11_connect_setup(tag: &str) -> Option<u64> {
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX {
+        test_println!("  [{}] unix::create() failed", tag);
+        return None;
+    }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_println!("  [{}] connect failed", tag);
+        crate::net::unix::close(client);
+        return None;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_println!("  [{}] setup failed (n={} byte0={})", tag, n, setup_buf[0]);
+        crate::net::unix::close(client);
+        return None;
+    }
+    Some(client)
 }
 
 // ── X11 QueryExtension first_event / first_error bases ───────────────────────
