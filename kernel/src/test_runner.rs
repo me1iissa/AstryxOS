@@ -14871,6 +14871,101 @@ fn test_unix_pollout_writable_gate() -> bool {
 
     unix::close(a);
     unix::close(b);
+
+    // ── gap #3: SEQPACKET message-slot ring back-pressure ─────────────────────
+    //
+    // A SOCK_SEQPACKET `write()` returns -EAGAIN once the peer's per-message
+    // slot ring is full *even when the byte ring still has room* — a SEQPACKET
+    // socket preserves message boundaries, so each outstanding datagram costs
+    // one slot regardless of size.  Firefox's IPDL channels (socketpair
+    // SOCK_SEQPACKET) burst many tiny messages; if `writable()` only checked
+    // the byte ring, a producer whose peer drained the bytes but not the
+    // messages would be told the socket is POLLOUT-ready, retry `sendmsg(2)`,
+    // get -EAGAIN, and busy-spin (or tear the channel down).  The POLLOUT /
+    // EPOLLOUT predicate must mirror BOTH halves of the send-side EAGAIN
+    // condition (`man 7 unix` SOCK_SEQPACKET, `man 2 poll`).
+    let (sa, sb) = unix::socketpair(unix::SockKind::SeqPacket,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if sa == u64::MAX || sb == u64::MAX {
+        test_fail!("unix_pollout_gate", "SEQPACKET socketpair returned MAX");
+        return false;
+    }
+
+    // Fresh SEQPACKET pair → writable.
+    if !unix::writable(sa) {
+        test_fail!("unix_pollout_gate", "fresh SEQPACKET socket sa not writable");
+        unix::close(sa); unix::close(sb);
+        return false;
+    }
+
+    // Fill `sb`'s SEQPACKET slot ring with tiny (1-byte) messages.  Each costs
+    // one slot but ~nothing of the 32 KiB byte ring, so the slot ring fills
+    // (write→EAGAIN) long before the byte ring does — the exact state that
+    // exposes gap #3.
+    let one = [0x5au8; 1];
+    let mut msgs: i64 = 0;
+    loop {
+        let n = unix::write(sa, &one);
+        if n == -11 { break; }            // EAGAIN — slot ring full
+        if n <= 0 {
+            test_fail!("unix_pollout_gate", "unexpected SEQPACKET write ret {}", n);
+            unix::close(sa); unix::close(sb);
+            return false;
+        }
+        msgs += 1;
+        if msgs > 4096 {                  // slot ring is SEQ_QUEUE_CAP (64) — must
+            test_fail!("unix_pollout_gate",  // EAGAIN well before this
+                "SEQPACKET slot ring never filled ({} msgs, byte ring not the gate)",
+                msgs);
+            unix::close(sa); unix::close(sb);
+            return false;
+        }
+    }
+    test_println!("  SEQPACKET: filled slot ring with {} 1-byte msgs (write→EAGAIN) ✓",
+        msgs);
+
+    // Slot ring full but byte ring nearly empty → `sa` must NOT be writable.
+    // Before the gap-#3 fix `writable()` only checked `recv_space() > 0` (true
+    // here, since msgs tiny bytes « 32 KiB) and wrongly reported POLLOUT-ready.
+    if unix::writable(sa) {
+        test_fail!("unix_pollout_gate",
+            "SEQPACKET sa still writable with full slot ring but empty byte ring \
+             (POLLOUT/EAGAIN divergence — gap #3)");
+        unix::close(sa); unix::close(sb);
+        return false;
+    }
+    test_println!("  SEQPACKET slot ring full: writable(sa)=false ✓ (gap #3)");
+
+    // Drain one message from `sb` → frees a slot → `sa` writable again, and the
+    // recv-drain rings the write-space bell (gap #2 for SEQPACKET).
+    let before_seq = BELL_RINGS_BY_SOURCE[PollBellSource::UnixRead as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let mut one_sink = [0u8; 1];
+    let r = unix::read(sb, &mut one_sink);
+    if r != 1 {
+        test_fail!("unix_pollout_gate", "SEQPACKET drain-one returned {}", r);
+        unix::close(sa); unix::close(sb);
+        return false;
+    }
+    let after_seq = BELL_RINGS_BY_SOURCE[PollBellSource::UnixRead as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if after_seq <= before_seq {
+        test_fail!("unix_pollout_gate",
+            "SEQPACKET recv drain did not ring UnixRead bell ({}→{})",
+            before_seq, after_seq);
+        unix::close(sa); unix::close(sb);
+        return false;
+    }
+    if !unix::writable(sa) {
+        test_fail!("unix_pollout_gate",
+            "SEQPACKET sa not writable after freeing a slot");
+        unix::close(sa); unix::close(sb);
+        return false;
+    }
+    test_println!("  SEQPACKET: drain-one freed a slot, rang bell, writable(sa)=true ✓");
+
+    unix::close(sa);
+    unix::close(sb);
     test_pass!("AF_UNIX POLLOUT writable-gate + recv-drain wake");
     true
 }
