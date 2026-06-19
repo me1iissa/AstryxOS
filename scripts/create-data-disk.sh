@@ -788,6 +788,37 @@ printf '/lib64\n/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu\n' \
 : > "${STAGING_TREE}/etc/ld.so.cache"
 echo "[DATA-DISK] Seeded /etc/ (hostname, hosts, resolv.conf, nsswitch.conf, passwd, group, ld.so.conf)"
 
+# ── GUI runtime caches: regenerate the GdkPixbuf loaders.cache (and the glib
+# schema / mime caches) into the staging tree before mke2fs snaps it ─────────
+# The windowed Firefox (--ff-gui) path realizes a real toplevel, which makes
+# GTK decode its compiled-in symbolic titlebar icons (PNG resources) through
+# GdkPixbuf.  GdkPixbuf only registers an image loader when a matching stanza
+# exists in /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache; with no cache it comes
+# up with an EMPTY loader set, gdk_pixbuf_new_from_*() returns NULL for the very
+# first PNG icon, and the subsequent gdk_cairo_surface_create_from_pixbuf(NULL)
+# / g_object_unref(NULL) cascade dereferences a garbage pointer — a SIGSEGV in
+# the parent process before any window is mapped.  (The PNG/JPEG decoders are
+# linked directly into libgdk_pixbuf via DT_NEEDED libpng16/libjpeg, so the
+# cache only needs the name-matched "png"/"jpeg" stanzas — no external
+# libpixbufloader-png.so is required.)  install-firefox-musl.sh generates this
+# cache when it (re)installs Firefox, but the common fast path reuses an
+# already-installed build/disk and skips that step, leaving the cache absent.
+# Regenerate it here unconditionally so every data image carries it.  Best
+# effort: cache generation never fails the image build.  Refs:
+# gdk-pixbuf-query-loaders(1), glib-compile-schemas(1).
+if [ -f "${ROOT_DIR}/scripts/patch-gui-caches.sh" ] \
+   && [ -d "${STAGING_TREE}/usr/lib/gdk-pixbuf-2.0" ]; then
+    ASTRYXOS_BUILD_DIR="${BUILD_DIR}" \
+        bash "${ROOT_DIR}/scripts/patch-gui-caches.sh" --stage-only \
+            --disk-dir "${STAGING_TREE}" 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: patch-gui-caches.sh failed — GUI caches not regenerated"
+    if [ -f "${STAGING_TREE}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]; then
+        echo "[DATA-DISK] gdk-pixbuf loaders.cache present ($(grep -c '^"' "${STAGING_TREE}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" 2>/dev/null || echo 0) stanza lines)"
+    else
+        echo "[DATA-DISK] WARNING: loaders.cache still absent after regen — windowed GTK may fault on PNG icons"
+    fi
+fi
+
 # ── Welcome/readme/docs files ────────────────────────────────────────────────
 mkdir -p "${STAGING_TREE}/home" "${STAGING_TREE}/docs" "${STAGING_TREE}/bin"
 printf 'Welcome to AstryxOS persistent storage!\n' \
