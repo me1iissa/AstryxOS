@@ -1365,6 +1365,8 @@ user_pref("media.gmp-gmpopenh264.enabled", false);
 user_pref("media.gmp-gmpopenh264.autoupdate", false);
 user_pref("media.gmp.decoder.enabled", false);
 user_pref("media.peerconnection.enabled", false);
+user_pref("network.process.enabled", false);
+user_pref("network.http.network_access_on_socket_process.enabled", false);
 "#;
             let _ = crate::vfs::mkdir("/tmp/ff-profile");
             let _ = crate::vfs::create_file("/tmp/ff-profile/prefs.js");
