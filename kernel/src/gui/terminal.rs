@@ -1073,6 +1073,23 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
+        // Mesa software-GL (Gallium llvmpipe) selection.  There is no GPU and no
+        // DRM render node on this target, so we pin Mesa to the CPU rasteriser
+        // and skip hardware-driver probing:
+        //   GALLIUM_DRIVER / MESA_LOADER_DRIVER_OVERRIDE=llvmpipe force the
+        //     Gallium frontend to load the llvmpipe pipe driver directly
+        //     instead of enumerating DRM devices (which would fail with no
+        //     /dev/dri), so glxtest's GLX context-create succeeds and reports
+        //     a "llvmpipe" GL_RENDERER.
+        //   LIBGL_DRIVERS_PATH lists both the historical /usr/lib/dri and the
+        //     compiled-in default /usr/lib/xorg/modules/dri so libGL finds
+        //     libgallium_dri.so (= swrast_dri.so) regardless of which staging
+        //     path the image carries it at.
+        // Refs: Mesa 3D environment-variables docs (LIBGL_*, GALLIUM_DRIVER,
+        // MESA_LOADER_DRIVER_OVERRIDE); OpenGL/GLX 1.4 spec.
+        "GALLIUM_DRIVER=llvmpipe",
+        "MESA_LOADER_DRIVER_OVERRIDE=llvmpipe",
+        "LIBGL_DRIVERS_PATH=/usr/lib/dri:/usr/lib/xorg/modules/dri",
         // LD_LIBRARY_PATH (the variant-aware search scope selected from the
         // binary's PT_INTERP) is already in the base environment above; it
         // covers the firefox-esr / opt / in-tree tail for both libcs.
