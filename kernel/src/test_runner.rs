@@ -28449,18 +28449,19 @@ fn test_x11_big_requests_enable() -> bool {
     true
 }
 
-// ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ─────────
+// ── Test 134: X11 MIT-SHM — QueryExtension present + listed ─────────────────
 
 fn test_x11_query_extension_mit_shm() -> bool {
-    test_header!("X11 MIT-SHM — QueryExtension NOT present + absent from ListExtensions");
+    test_header!("X11 MIT-SHM — QueryExtension present + listed in ListExtensions");
 
-    // Regression for the SHM-deadvertise paint fix (equivalent to the
-    // purge-lost Test 75b): the server does NOT implement the MIT-SHM image
-    // transport, so it must report the extension as ABSENT.  Per the MIT-SHM
-    // protocol spec, a client that gets present=0 from QueryExtension falls
-    // back to core XPutImage(72), which `op_put_image` composites correctly.
-    // Advertising present=1 would make Firefox route paints through the
-    // unsupported SHM CopyArea arm and silently drop the window contents.
+    // MIT-SHM is now implemented for real: `op_shm` services ShmAttach/ShmDetach
+    // and a real ShmPutImage that reads pixels directly from the attached SysV
+    // segment's physical backing and composites them into the destination window
+    // (the efficient large-framebuffer present path Firefox's compositor uses).
+    // The server therefore advertises MIT-SHM as present.  (Earlier the
+    // extension was deliberately de-advertised because ShmPutImage was a no-op
+    // stub; that stub is gone — see the GLX + real-SHM change.)  Correctness of
+    // the actual transport is covered by `test_x11_shm_put_image`.
 
     let fd = x11_connect_and_setup("mitshm");
     if fd == u64::MAX {
@@ -28468,7 +28469,7 @@ fn test_x11_query_extension_mit_shm() -> bool {
         return false;
     }
 
-    // ── QueryExtension("MIT-SHM") → must reply present=0 ─────────────────────
+    // ── QueryExtension("MIT-SHM") → must reply present=1, major=SHM_MAJOR ─────
     // Name = 7 bytes → padded to 8; header=8 → total=16 = 4 words.
     let name = b"MIT-SHM"; // 7 bytes
     let nlen = name.len() as u16;
@@ -28487,14 +28488,20 @@ fn test_x11_query_extension_mit_shm() -> bool {
         crate::net::unix::close(fd);
         return false;
     }
-    if rep[8] != 0 {
-        test_fail!("x11_mitshm", "MIT-SHM advertised as present (present={}), expected 0", rep[8]);
+    if rep[8] != 1 {
+        test_fail!("x11_mitshm", "MIT-SHM present={} (expected 1)", rep[8]);
         crate::net::unix::close(fd);
         return false;
     }
-    test_println!("  QueryExtension(MIT-SHM): present=0 ✓");
+    if rep[9] != crate::x11::proto::SHM_MAJOR_OPCODE {
+        test_fail!("x11_mitshm", "MIT-SHM major={} (expected {})",
+            rep[9], crate::x11::proto::SHM_MAJOR_OPCODE);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(MIT-SHM): present=1 major={} ✓", rep[9]);
 
-    // ── ListExtensions(99) → MIT-SHM must NOT appear ─────────────────────────
+    // ── ListExtensions(99) → MIT-SHM must appear ─────────────────────────────
     let le = [99u8, 0, 1, 0]; // OP_LIST_EXTENSIONS, 1 word
     crate::net::unix::write(fd, &le);
     crate::x11::poll();
@@ -28506,7 +28513,7 @@ fn test_x11_query_extension_mit_shm() -> bool {
         return false;
     }
     // Reply body is a sequence of length-prefixed names starting at byte 32.
-    // Scan for the literal "MIT-SHM" name; it must be absent.
+    // Scan for the literal "MIT-SHM" name; it must be present.
     let nbytes = n as usize;
     let mut p = 32usize;
     let mut found_mit_shm = false;
@@ -28520,15 +28527,15 @@ fn test_x11_query_extension_mit_shm() -> bool {
         }
         p += len;
     }
-    if found_mit_shm {
-        test_fail!("x11_mitshm", "MIT-SHM still present in ListExtensions");
+    if !found_mit_shm {
+        test_fail!("x11_mitshm", "MIT-SHM missing from ListExtensions");
         crate::net::unix::close(fd);
         return false;
     }
-    test_println!("  ListExtensions: MIT-SHM absent ✓");
+    test_println!("  ListExtensions: MIT-SHM present ✓");
 
     crate::net::unix::close(fd);
-    test_pass!("X11 MIT-SHM deadvertised (forces core XPutImage fallback)");
+    test_pass!("X11 MIT-SHM advertised (real ShmPutImage transport)");
     true
 }
 
