@@ -1776,11 +1776,12 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 //
 // ## Fingerprint
 //
-// Per-frame we record a 64-bit content fingerprint (FNV-1a over the first 256
-// bytes of the frame, sampled through the kernel higher-half identity map at
-// insert/validate time).  256 bytes covers the ELF entry stub + the first few
-// code lines of a libxul page, which is where the observed bucket-A 16-bit
-// flips landed; FNV-1a detects single-bit changes.  At fault bucket-A time the
+// Per-frame we record a 64-bit content fingerprint (FNV-1a over the WHOLE
+// 4096-byte frame, sampled through the kernel higher-half identity map at
+// insert/validate time).  The full page is hashed because the observed
+// bucket-A clobbers landed at page offsets 0x1c4 and 0x8a0 — both beyond a
+// 256-byte prefix — so a prefix-only fingerprint would have missed them;
+// FNV-1a detects single-bit changes.  At fault bucket-A time the
 // fingerprint is recomputed from the live frame and compared: a mismatch with
 // the SAME key recorded is the smoking gun, and the recorded last-writer
 // RIP/CPU/tick (captured by the per-write `cache_prov_write` hook) names the
@@ -1870,7 +1871,7 @@ struct CacheProvEntry {
     /// (file_page_index_low32)`.  Identifies the (mount,inode,offset) the
     /// frame was last INSTALLED for.
     key: AtomicU64,
-    /// FNV-1a fingerprint of the first 256 bytes at insert/validate time.
+    /// FNV-1a fingerprint of the whole 4096-byte frame at insert/validate time.
     fp: AtomicU64,
     /// Last writer return-address recorded by `cache_prov_write` while the
     /// frame was INSTALLED for its key.  `0` if no in-window write recorded.
@@ -2043,6 +2044,16 @@ fn cache_prov_generation(meta: u64) -> u8 { (meta & 0xFF) as u8 }
 
 /// FNV-1a over the first `N` bytes of the frame at `PHYS_OFF + phys`.
 ///
+/// `N` is the FULL page (4096), not a 256-byte prefix.  The first reproductions
+/// of the W215 clobber landed the wrong content at page offsets 0x1c4 (452) and
+/// 0x8a0 (2208) — both BEYOND a 256-byte prefix, so a prefix-only fingerprint
+/// would `fp_match` (false-negative) even with the frame correctly in-band and
+/// the recorded provenance surviving.  A code/data page that is the validated
+/// read-only resident of its key must keep ALL 4096 bytes (Intel SDM Vol. 3A
+/// §4.10.5, page-level coherence), so the fingerprint must cover the whole page
+/// to witness an in-place clobber wherever it lands.  4 KiB of FNV-1a per
+/// install/fault is a few microseconds and the install path is not hot.
+///
 /// SAFETY contract: `phys` must be a live PMM frame (the caller holds a cache
 /// reference or is in the fault handler with the frame still mapped); the
 /// kernel higher-half identity map covers every PMM frame per Intel SDM
@@ -2050,7 +2061,7 @@ fn cache_prov_generation(meta: u64) -> u8 { (meta & 0xFF) as u8 }
 /// sample across a concurrent install.
 #[inline]
 fn cache_prov_fingerprint(phys: u64) -> u64 {
-    const N: usize = 256;
+    const N: usize = 4096;
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME:  u64 = 0x0000_0100_0000_01b3;
     let base = (CACHE_PROV_PHYS_OFF + (phys & !0xFFFu64)) as *const u8;
@@ -2222,10 +2233,12 @@ pub fn cache_prov_write(phys: u64, writer_rip: u64) {
 ///     key was unchanged — the W215 bucket-A clobber.  Emit
 ///     `[W215/CACHE-CLOBBER]` naming the recorded last-writer RIP/CPU and the
 ///     install→fault generation; cross-reference the alloc/free shadows.
-///   * fingerprint MATCHES → the corruption is NOT in the first 256 bytes
-///     this catch fingerprints (or the recorded slot was displaced); tick the
-///     negative-control counter so the operator can tell "catch ran, no fp
-///     change" from "catch never ran".
+///   * fingerprint MATCHES → the whole 4096-byte frame is byte-identical to
+///     install time, so the faulting code/data page is NOT clobbered; the
+///     fault is downstream data corruption (e.g. a #GP on a register holding a
+///     bad pointer, valid code at the RIP).  Tick the negative-control counter
+///     so the operator can tell "catch ran, page intact" from "catch never
+///     ran".
 ///
 /// `expected_key` is the (mount,inode,offset) the fault classifier resolved;
 /// it must match the slot's recorded key for the verdict to be authoritative.
@@ -2293,8 +2306,9 @@ pub fn cache_prov_fault_bucket_a(
         CACHE_PROV_FP_MATCH.fetch_add(1, Ordering::Relaxed);
         crate::serial_println!(
             "[W215/CACHE-CLOBBER] phys={:#x} probe=fp_match \
-             (key matched, first-256B fingerprint unchanged — corruption is \
-             outside the fingerprint window or not in this frame) state={}",
+             (key matched, whole-page 4096B fingerprint unchanged — the faulting \
+             code/data frame is byte-intact; this fault is downstream data \
+             corruption, NOT a page-cache clobber) state={}",
             phys, cache_prov_state(meta),
         );
     } else {
