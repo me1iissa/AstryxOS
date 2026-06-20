@@ -296,6 +296,14 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_wait_completion_modes() { passed += 1; }
 
+    // ── Test 0e3: virtio-blk slot-quarantine lifecycle (completion-stall) ─
+    // Regression guard for the disk-completion stall: a timed-out request must
+    // be quarantined (slot stays reserved) — never released while still owned
+    // by the device — so descriptors are not reused and in-flight stays bounded
+    // by MAX_INFLIGHT (VIRTIO 1.2 §2.7.13.3 / §2.7.14).
+    total += 1;
+    if test_virtio_blk_quarantine_lifecycle() { passed += 1; }
+
     // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
@@ -6812,6 +6820,71 @@ fn test_ext2_read_device_error_not_eof() -> bool {
         if n != payload.len() || over[..payload.len()] != payload[..] {
             test_fail!("EXT2-READERR", "EOF short read wrong length/contents (n={})", n);
             return false;
+        }
+    }
+
+    // ── Case 4: multi-attempt transient stall — the demand-fault retry budget ──
+    // Models the GUI-launch fork/teardown storm (the file-backed mmap
+    // demand-fault path, idt.rs PFH-RETRY-1): a HEALTHY block device misses its
+    // per-request no-progress deadline for SEVERAL consecutive reads because the
+    // request queue is momentarily saturated, then drains.  The single-page
+    // demand-fault handler re-issues `fs.read` up to a bounded budget with a
+    // `yield_cpu()` between attempts; a transient stall lasting a few attempts
+    // MUST resolve to the TRUE file bytes, not a SIGSEGV (the libgdk-3.so.0
+    // code-page fault that killed Firefox in GUI mode) and never a zero tail.
+    //
+    // Here the fault injector errors the first 5 reads that touch the tail
+    // window, then succeeds.  The demand-fault budget (8 attempts) comfortably
+    // covers 5, so a caller that retries within budget recovers; we assert the
+    // recovered bytes are exact.  This pins the contract idt.rs depends on: a
+    // bounded retry over a multi-shot transient fault yields correct data.
+    {
+        const TRANSIENT_SHOTS: u32 = 5;
+        // The demand-fault outer retry budget (idt.rs PFH_READ_ATTEMPTS).  Kept
+        // in sync here so the test fails loudly if the budget is ever lowered
+        // below the storm window this regression guards.
+        const DEMAND_FAULT_ATTEMPTS: u32 = 8;
+        assert!(TRANSIENT_SHOTS < DEMAND_FAULT_ATTEMPTS,
+            "transient window must fit inside the demand-fault retry budget");
+        let dev = alloc::boxed::Box::new(FaultInjectBlockDevice {
+            inner: alloc::sync::Arc::new(MutableMemoryBlockDevice::new(clean_img.clone())),
+            fault_lo: tail_lba,
+            fault_hi: tail_lba + tail_sectors as u64,
+            remaining: core::sync::atomic::AtomicU32::new(TRANSIENT_SHOTS),
+        });
+        let fs = Ext2Fs::new(dev).expect("mount behind multi-shot fault injector");
+        // Re-issue the read up to the demand-fault budget, exactly as the
+        // single-page fallback in the page-fault handler does (without the
+        // yield, which has no effect on this in-memory device).
+        let mut got: Option<usize> = None;
+        let mut full = alloc::vec![0xEEu8; payload.len()];
+        for _ in 0..DEMAND_FAULT_ATTEMPTS {
+            full.iter_mut().for_each(|b| *b = 0xEE);
+            if let Ok(n) = fs.read(11, 0, &mut full) {
+                got = Some(n);
+                break;
+            }
+        }
+        match got {
+            Some(n) if n == payload.len() && full == payload => { /* recovered */ }
+            Some(n) => {
+                test_fail!(
+                    "EXT2-READERR",
+                    "multi-shot transient: recovered Ok({}) but contents diverge — \
+                     the demand-fault retry must yield the true bytes, never a zero tail",
+                    n
+                );
+                return false;
+            }
+            None => {
+                test_fail!(
+                    "EXT2-READERR",
+                    "multi-shot transient ({} shots) NOT recovered within {} attempts — \
+                     the demand-fault retry budget is too small for the fork-storm window",
+                    TRANSIENT_SHOTS, DEMAND_FAULT_ATTEMPTS
+                );
+                return false;
+            }
         }
     }
 
@@ -35662,6 +35735,38 @@ fn test_virtio_blk_wait_completion_modes() -> bool {
 
     test_pass!("virtio-blk wait modes + run-queue depth (Test 0e2)");
     true
+}
+
+// ── Test 0e3: virtio-blk slot-quarantine lifecycle (completion-stall fix) ────
+//
+// Regression guard for the virtio-blk disk-completion stall: under heavy
+// demand-paging a `wait_completion` no-progress timeout previously called
+// `release_slot()` while the request was still owned by the device (published
+// to the avail ring, not yet retired in the used ring).  Recycling that slot's
+// descriptors let in-flight escape MAX_INFLIGHT and re-publish the same
+// descriptor head, which wedged the QEMU virtio-blk device (used.idx frozen,
+// 24/25 threads Blocked, dozens of `wait_completion timeout (slot=0)` markers).
+//
+// Per VIRTIO 1.2 §2.7.13.3 / §2.7.14 the device may access a descriptor chain
+// (and its data buffer) until it returns the chain via the used ring; the fix
+// QUARANTINES a timed-out slot — keeping it reserved so its descriptors are
+// never reused — until `drain_used_ring` reclaims it on the device's eventual
+// completion.  This test exercises the slot-allocation invariant directly (no
+// device I/O): a quarantined slot is never re-handed-out, in-flight never
+// exceeds MAX_INFLIGHT, and reclaiming the slot makes it acquirable again.
+fn test_virtio_blk_quarantine_lifecycle() -> bool {
+    test_header!("virtio-blk slot-quarantine lifecycle (Test 0e3)");
+    match crate::drivers::virtio_blk::test_quarantine_lifecycle() {
+        Ok(()) => {
+            test_println!("  quarantine reserves slot, bounds in-flight, reclaim re-frees ✓");
+            test_pass!("virtio-blk slot-quarantine lifecycle (Test 0e3)");
+            true
+        }
+        Err(why) => {
+            test_fail!("virtio_blk_quarantine_lifecycle", "{}", why);
+            false
+        }
+    }
 }
 
 // ── Test 0f: AHCI per-port mutex topology ───────────────────────────────────

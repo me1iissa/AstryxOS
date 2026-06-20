@@ -2695,12 +2695,54 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                     // authoritative file contents.  Free the frame and let
                     // the page-fault propagate as SIGSEGV — POSIX-equivalent
                     // behaviour for I/O errors during demand-page.
-                    if fs.read(inode, file_page_offset, buf).is_err() {
+                    //
+                    // PFH-RETRY-1: ride out a *transient* backing-store stall
+                    // before surfacing the fault as a SIGSEGV.  Under a heavy
+                    // fork/teardown storm (e.g. the GTK/X11 GUI launch path
+                    // spawning ~200 threads plus a vfork glxtest child) a
+                    // HEALTHY block device can miss its per-request
+                    // no-progress deadline simply because its request queue is
+                    // momentarily saturated — the same transient condition the
+                    // ext2 read path already tolerates with a bounded
+                    // yield-then-retry (see `Ext2Fs::read_sectors_retry`).  The
+                    // single `fs.read` below, however, gives up after exactly
+                    // ONE such window and delivers SIGSEGV, killing the faulting
+                    // process even though its code/data page is perfectly
+                    // readable a moment later.  On a real kernel a demand-fault
+                    // that races a transient device stall blocks and retries the
+                    // I/O; it does NOT SIGBUS the process unless the device is
+                    // genuinely, durably wedged.  We approximate that here with a
+                    // bounded outer retry: on a failed read we `yield_cpu()` so
+                    // the device's in-flight requests can drain and the storm
+                    // subsides, then re-issue.  The budget is bounded so a truly
+                    // dead device still fails the fault in finite time (POSIX
+                    // SIGBUS/SIGSEGV on a durable I/O error during demand-page).
+                    //
+                    // The freshly-allocated `phys` frame is reused across
+                    // attempts; it was zero-filled once above and a failed
+                    // `fs.read` leaves the slice's contents unspecified but never
+                    // installs them, so re-reading into it is sound.
+                    const PFH_READ_ATTEMPTS: u32 = 8;
+                    let mut read_ok = false;
+                    for attempt in 0..PFH_READ_ATTEMPTS {
+                        if fs.read(inode, file_page_offset, buf).is_ok() {
+                            read_ok = true;
+                            break;
+                        }
+                        // Give the contended device room to drain before the
+                        // next attempt.  Never allocates, never takes a sleeping
+                        // lock — safe on the page-fault path.  Skip the yield on
+                        // the final attempt (nothing follows it).
+                        if attempt + 1 < PFH_READ_ATTEMPTS {
+                            crate::sched::yield_cpu();
+                        }
+                    }
+                    if !read_ok {
                         crate::mm::pmm::free_page(phys);
                         #[cfg(feature = "firefox-test-core")]
                         crate::serial_println!(
-                            "[PF/io-err] single-page read failed inode={} foff={:#x} addr={:#x}",
-                            inode, file_page_offset, page_addr);
+                            "[PF/io-err] single-page read failed inode={} foff={:#x} addr={:#x} (after {} attempts)",
+                            inode, file_page_offset, page_addr, PFH_READ_ATTEMPTS);
                         return false;
                     }
                     // Snapshot the first 64 bytes immediately.  Any later
