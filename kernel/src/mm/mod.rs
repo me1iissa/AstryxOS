@@ -55,6 +55,13 @@ pub fn init(boot_info: &BootInfo) {
     heap::init();
     crate::serial_println!("[MM] Heap done, installing heap guard pages...");
     heap::init_guard_pages();
+    // W215 page-cache provenance table is heap-allocated (12 MiB), NOT a BSS
+    // static — a static of that size would push the kernel image past the
+    // BootInfo handoff page at physical 16 MiB (`shared::BOOT_INFO_PHYS_BASE`)
+    // and `_start` BSS zeroing would corrupt it.  Allocate now that the heap
+    // is up and before any page-cache install can record into it.
+    #[cfg(feature = "firefox-test-core")]
+    w215_diag::cache_prov_init();
     crate::serial_println!("[MM] Heap guard pages installed, starting refcount init...");
     refcount::init();
     crate::serial_println!("[MM] Memory management subsystem initialized");

@@ -58,7 +58,7 @@
 
 #![cfg(feature = "firefox-test-core")]
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 // ── Event kinds for Arm-1 provenance ring ───────────────────────────────────
 
@@ -1796,8 +1796,9 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 // the cache lock interior, and the PMM free path.  Gated under
 // `firefox-test-core`; default builds are byte-identical.
 
-/// Direct-map size for the cache-provenance table.  `64 Ki slots × 48 B =
-/// 3 MiB BSS` (gated on `firefox-test-core`).
+/// Slot count for the cache-provenance table.  `256 Ki slots × 48 B = 12 MiB`,
+/// HEAP-allocated (not BSS — see [`cache_prov_init`]), gated on
+/// `firefox-test-core`.
 ///
 /// ## Band-scoped, NON-DISPLACING addressing (the displacement fix)
 ///
@@ -1814,7 +1815,7 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 /// frame's offset WITHIN a phys band that the table covers 1:1, so no two
 /// frames in the band ever alias the same slot.  `CACHE_PROV_SIZE = 256 Ki`
 /// slots cover exactly `256 Ki × 4 KiB = 1024 MiB` of contiguous physical
-/// address space collision-free (12 MiB BSS, `firefox-test-core`-gated),
+/// address space collision-free (12 MiB heap table, `firefox-test-core`-gated),
 /// addressed band-relatively.
 ///
 /// The band `[CACHE_BAND_LO, CACHE_BAND_HI)` is positioned over the live
@@ -1824,19 +1825,19 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 /// near ~376 MiB, but a confirmed bucket-A reproduction landed the corrupting
 /// `inode=0x12d off=0x186000` frame at phys 0x2c802000 (~712 MiB) — 200 MiB
 /// ABOVE a 512 MiB ceiling, so the probe returned `out_of_band` and the
-/// writer went unnamed.  The drift tracks the usable-RAM floor (which itself
-/// rises as this BSS table grows, since the PMM derives the floor from
-/// `__kernel_end`), so the band must cover the whole region the buddy
-/// allocator hands file-backed page-cache frames out of.
+/// writer went unnamed.  The drift tracks the usable-RAM floor, so the band
+/// must cover the whole region the buddy allocator hands file-backed
+/// page-cache frames out of.
 ///
 /// The band is therefore widened to `[256 MiB, 1280 MiB)` = 1024 MiB at 1:1
-/// (`CACHE_PROV_SIZE = 256 Ki` slots, 12 MiB BSS, `firefox-test-core`-gated),
-/// bracketing every corrupting frame observed so far (376 MiB and 712 MiB)
-/// with >560 MiB of headroom above.  Per Intel SDM Vol. 3A §4.10.5
+/// (`CACHE_PROV_SIZE = 256 Ki` slots, 12 MiB HEAP table — see
+/// [`cache_prov_init`] for why it is not a BSS static — `firefox-test-core`-
+/// gated), bracketing every corrupting frame observed so far (376 MiB and
+/// 712 MiB) with >560 MiB of headroom above.  Per Intel SDM Vol. 3A §4.10.5
 /// (page-level coherence) a validated read-only file-backed frame must keep
 /// its content while it is the live resident of its key; a band-scoped 1:1
 /// record lets us name the writer that violates this without alias eviction.
-const CACHE_PROV_SIZE: usize = 262144; // 256 Ki slots × 48 B = 12 MiB BSS
+const CACHE_PROV_SIZE: usize = 262144; // 256 Ki slots × 48 B = 12 MiB heap table
 const CACHE_PROV_MASK: usize = CACHE_PROV_SIZE - 1;
 
 /// File-backed page-cache provenance band, lower bound (inclusive), 256 MiB.
@@ -1894,18 +1895,75 @@ impl CacheProvEntry {
     }
 }
 
-struct CacheProvTable {
-    slots: [CacheProvEntry; CACHE_PROV_SIZE],
-}
+/// Heap-backed slot array, installed once by [`cache_prov_init`] after the
+/// kernel heap is up.
+///
+/// The table is NOT a `static [CacheProvEntry; CACHE_PROV_SIZE]` BSS array.
+/// At `CACHE_PROV_SIZE = 256 Ki × 48 B` it would be a 12 MiB `.bss` block,
+/// and the kernel image is loaded at physical 1 MiB while the bootloader
+/// hands off `BootInfo` at `BOOT_INFO_PHYS_BASE = 16 MiB` (`shared/src/lib.rs`).
+/// A 12 MiB `.bss` pushes the image end from ~14.6 MiB past 16 MiB, so `_start`
+/// BSS zeroing wipes the BootInfo handoff page → `Invalid BootInfo magic`
+/// panic at boot (observed empirically; see also `mm/w215_crc.rs`).  Per the
+/// System V AMD64 ABI §3.4.1 the loader maps `.bss` immediately after `.data`
+/// in the load segment, so a large static is a hard layout constraint.
+///
+/// Allocating the slots from the 128 MiB kernel heap (`mm/heap.rs`) after
+/// `heap::init()` removes the constraint entirely: the image stays small and
+/// the table lives in dynamic memory.  `Box::leak` gives a genuine `'static`
+/// slice (the table lives for the lifetime of the kernel), so the hot-path
+/// `cache_prov_slot` can still return `&'static CacheProvEntry`.
+static CACHE_PROV_SLOTS: AtomicPtr<CacheProvEntry> = AtomicPtr::new(core::ptr::null_mut());
 
-impl CacheProvTable {
-    const fn new() -> Self {
-        const E: CacheProvEntry = CacheProvEntry::new();
-        Self { slots: [E; CACHE_PROV_SIZE] }
+/// Number of slots actually installed (0 until [`cache_prov_init`] runs).
+/// Read by the selftest/residency walks so they iterate only the live table.
+static CACHE_PROV_INSTALLED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve the live heap-backed slot slice, or `None` before init.
+#[inline]
+fn cache_prov_slots() -> Option<&'static [CacheProvEntry]> {
+    let p = CACHE_PROV_SLOTS.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
     }
+    let len = CACHE_PROV_INSTALLED_LEN.load(Ordering::Acquire);
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: `p` was produced by `Box::leak` of a `[CacheProvEntry; len]` in
+    // `cache_prov_init` under an Acquire/Release handshake, is never freed, and
+    // `len` is the matching element count.  The leaked allocation lives for the
+    // lifetime of the kernel, so the `'static` lifetime is sound.
+    Some(unsafe { core::slice::from_raw_parts(p, len) })
 }
 
-static CACHE_PROV: CacheProvTable = CacheProvTable::new();
+/// Allocate and zero-initialise the page-cache provenance table on the kernel
+/// heap.  Idempotent; must be called once after `heap::init()` and before any
+/// `cache_prov_install`/`cache_prov_slot` use (the install path no-ops on a
+/// `None` slot until this runs).  `firefox-test-core`-gated build only.
+pub fn cache_prov_init() {
+    use alloc::vec::Vec;
+    if !CACHE_PROV_SLOTS.load(Ordering::Acquire).is_null() {
+        return; // already initialised
+    }
+    let mut v: Vec<CacheProvEntry> = Vec::new();
+    v.reserve_exact(CACHE_PROV_SIZE);
+    for _ in 0..CACHE_PROV_SIZE {
+        v.push(CacheProvEntry::new());
+    }
+    let slice: &'static mut [CacheProvEntry] = Vec::leak(v);
+    // Publish length first, then the pointer with Release so any reader that
+    // observes a non-null pointer (Acquire) also observes the matching length.
+    CACHE_PROV_INSTALLED_LEN.store(slice.len(), Ordering::Release);
+    CACHE_PROV_SLOTS.store(slice.as_mut_ptr(), Ordering::Release);
+    crate::serial_println!(
+        "[W215/CACHE-CATCH] provenance table heap-allocated: {} slots \
+         ({} MiB) band=[{:#x},{:#x})",
+        CACHE_PROV_SIZE,
+        (CACHE_PROV_SIZE * core::mem::size_of::<CacheProvEntry>()) / (1024 * 1024),
+        CACHE_BAND_LO, CACHE_BAND_HI,
+    );
+}
 
 // ── Cache-catch counters (kdb-readable) ─────────────────────────────────────
 
@@ -1957,7 +2015,8 @@ fn cache_prov_slot(phys: u64) -> Option<&'static CacheProvEntry> {
     let idx = ((p - CACHE_BAND_LO) >> 12) as usize;
     // `idx < CACHE_PROV_SIZE` is guaranteed by the band bounds, but mask for
     // defence in depth against any future band/size mismatch.
-    Some(&CACHE_PROV.slots[idx & CACHE_PROV_MASK])
+    let slots = cache_prov_slots()?;
+    slots.get(idx & CACHE_PROV_MASK)
 }
 
 /// Pack a cache key (mount, inode, file_offset) into 64 bits.
@@ -2273,8 +2332,12 @@ pub fn cache_prov_counts() -> [(&'static str, u64); 9] {
 /// O(CACHE_PROV_SIZE) — only invoked from the kdb self-test path, never on the
 /// hot fault/install path.
 pub fn cache_band_resident_count() -> u64 {
+    let slots = match cache_prov_slots() {
+        Some(s) => s,
+        None => return 0,
+    };
     let mut n = 0u64;
-    for slot in CACHE_PROV.slots.iter() {
+    for slot in slots.iter() {
         if slot.phys.load(Ordering::Relaxed) != 0
             && cache_prov_state(slot.meta.load(Ordering::Relaxed)) == CACHE_STATE_INSTALLED
         {
@@ -2293,10 +2356,14 @@ pub fn cache_band_resident_count() -> u64 {
 /// `probed > 0 && miss == 0` — every recorded in-band frame still resolves to
 /// its own slot, proving the band-relative addressing did NOT displace it.
 pub fn cache_prov_band_selftest() -> (u64, u64, u64) {
+    let slots = match cache_prov_slots() {
+        Some(s) => s,
+        None => return (0, 0, 0),
+    };
     let mut probed = 0u64;
     let mut hit = 0u64;
     let mut miss = 0u64;
-    for slot in CACHE_PROV.slots.iter() {
+    for slot in slots.iter() {
         let recorded = slot.phys.load(Ordering::Relaxed);
         if recorded == 0 {
             continue;
