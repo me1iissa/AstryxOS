@@ -865,6 +865,10 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_query_extension_event_bases() { passed += 1; }
 
+    // ── X11 request reassembly across socket reads (over-length PutImage) ─────
+    total += 1;
+    if test_x11_request_reassembly() { passed += 1; }
+
     // ── Test 69: X11 RENDER extension — Pixmap + Picture + FillRectangles ────
 
     total += 1;
@@ -18998,6 +19002,167 @@ fn test_x11_query_extension_event_bases() -> bool {
 }
 
 // ── Test 69: X11 RENDER — Pixmap + Picture + FillRectangles + Composite ──────
+
+// ── X11 request reassembly across socket reads (over-length PutImage) ─────────
+//
+// Regression for an X11-protocol correctness bug that blanks windowed clients:
+// a single X request larger than one socket read returns (the AF_UNIX recv ring
+// is bounded, and a BIG-REQUESTS PutImage can carry a whole window's chrome)
+// must be reassembled across reads and dispatched intact — never partially read
+// and dropped, which would desynchronise the client's request stream.  (X11
+// Protocol Encoding §Requests; BIG-REQUESTS extension.)
+//
+// This test sends a PutImage whose pixel payload alone exceeds 4 KiB, SPLIT
+// across two separate writes with a poll() in between, so the server first
+// reads an incomplete request (must retain it) and only on the second poll has
+// the whole request buffered (must dispatch it).  It does this for both a core
+// (16-bit length) PutImage and a BIG-REQUESTS (32-bit length) PutImage, then
+// reads back the painted window pixels to prove the request was dispatched and
+// applied — not silently dropped.
+#[cfg(feature = "test-mode")]
+fn test_x11_request_reassembly() -> bool {
+    test_header!("X11 request reassembly across reads (over-length PutImage)");
+
+    // ── Connect + setup ──────────────────────────────────────────────────────
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX { test_fail!("x11_reasm", "unix::create() failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_reasm", "connect failed");
+        crate::net::unix::close(client); return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_reasm", "setup failed (n={})", n);
+        crate::net::unix::close(client); return false;
+    }
+
+    // ── Create + map a 64×64 window so PutImage has a pixel surface ───────────
+    const WID: u32 = 0x0071_0501;
+    let mut cw = [0u8; 40];
+    cw[0] = 1; cw[2] = 10;
+    cw[4..8].copy_from_slice(&WID.to_le_bytes());
+    cw[8] = 1;                                  // parent = ROOT
+    cw[12] = 5; cw[14] = 5;                      // x=5 y=5
+    cw[16] = 64; cw[18] = 64;                    // w=64 h=64
+    cw[22] = 1;                                  // class = InputOutput
+    cw[24] = 32;                                 // visual = ROOT_VISUAL
+    cw[28] = 0x02;                               // vmask = CW_BACK_PIXEL
+    let mut mw = [0u8; 8];
+    mw[0] = 8; mw[2] = 2; mw[4..8].copy_from_slice(&WID.to_le_bytes());
+    crate::net::unix::write(client, &cw);
+    crate::net::unix::write(client, &mw);
+    crate::x11::poll();
+    let mut ev = [0u8; 64];
+    let _ = crate::net::unix::read(client, &mut ev);
+    test_println!("  created + mapped 64×64 window ✓");
+
+    const W: u32 = 64; const H: u32 = 64;
+    // Helper: build a ZPixmap PutImage (opcode 72) filled with `bgra`, standard
+    // (16-bit-length) wire form.
+    let build_core_put_image = |bgra: [u8; 4]| -> alloc::vec::Vec<u8> {
+        let px_len = (W * H * 4) as usize;            // 16384 bytes
+        let total  = 24 + px_len;                      // 16408 bytes
+        let units  = (total / 4) as u16;               // fits in 16 bits
+        let mut r = alloc::vec![0u8; total];
+        r[0] = 72;
+        r[1] = crate::x11::proto::IMAGE_FORMAT_ZPIXMAP;
+        r[2] = units as u8; r[3] = (units >> 8) as u8;
+        r[4..8].copy_from_slice(&WID.to_le_bytes());
+        r[12] = W as u8; r[13] = (W >> 8) as u8;
+        r[14] = H as u8; r[15] = (H >> 8) as u8;
+        r[20] = 0;                                      // left-pad
+        r[21] = 24;                                     // depth = 24
+        for px in r[24..].chunks_exact_mut(4) { px.copy_from_slice(&bgra); }
+        r
+    };
+    // Helper: same image in BIG-REQUESTS form — 16-bit length = 0, a 32-bit
+    // extended length word inserted between the 4-byte header and the body,
+    // length counted in 4-byte units of the WHOLE request incl. the inserted
+    // word.  (BIG-REQUESTS extension.)
+    let build_big_put_image = |bgra: [u8; 4]| -> alloc::vec::Vec<u8> {
+        let px_len = (W * H * 4) as usize;
+        let total  = 28 + px_len;
+        let units  = (total / 4) as u32;
+        let mut r = alloc::vec![0u8; total];
+        r[0] = 72;
+        r[1] = crate::x11::proto::IMAGE_FORMAT_ZPIXMAP;
+        r[2] = 0; r[3] = 0;                            // 16-bit length = 0 → big
+        r[4..8].copy_from_slice(&units.to_le_bytes()); // 32-bit length (units)
+        r[8..12].copy_from_slice(&WID.to_le_bytes());  // drawable (body+0)
+        r[16] = W as u8; r[17] = (W >> 8) as u8;       // width  (body+8)
+        r[18] = H as u8; r[19] = (H >> 8) as u8;       // height (body+10)
+        r[24] = 0;                                      // left-pad (body+16)
+        r[25] = 24;                                     // depth (body+17)
+        for px in r[28..].chunks_exact_mut(4) { px.copy_from_slice(&bgra); }
+        r
+    };
+
+    // Split a request across two writes with a poll() in between, forcing the
+    // server to read an incomplete request first (retain) then complete it.
+    let send_split_and_check = |req: &[u8], bgra: [u8; 4], label: &str| -> bool {
+        let cut = 4000usize.min(req.len() / 2);
+        let n1 = crate::net::unix::write(client, &req[..cut]);
+        if n1 != cut as i64 {
+            test_fail!("x11_reasm", "{}: first write {} != {}", label, n1, cut);
+            return false;
+        }
+        crate::x11::poll();
+        let before = crate::x11::test_read_window_pixel(WID, 1, 1);
+        if before == Some(bgra) {
+            test_fail!("x11_reasm", "{}: pixel applied from PARTIAL request (drop/desync bug)", label);
+            return false;
+        }
+        let n2 = crate::net::unix::write(client, &req[cut..]);
+        if n2 != (req.len() - cut) as i64 {
+            test_fail!("x11_reasm", "{}: second write {} != {}", label, n2, req.len() - cut);
+            return false;
+        }
+        crate::x11::poll();
+        let after = crate::x11::test_read_window_pixel(WID, 1, 1);
+        if after != Some(bgra) {
+            test_fail!("x11_reasm", "{}: window pixel = {:?} (want {:?}) — request not reassembled",
+                label, after, bgra);
+            return false;
+        }
+        let corner = crate::x11::test_read_window_pixel(WID, (W - 1) as u32, (H - 1) as u32);
+        if corner != Some(bgra) {
+            test_fail!("x11_reasm", "{}: corner pixel = {:?} (want {:?}) — tail of payload lost",
+                label, corner, bgra);
+            return false;
+        }
+        test_println!("  {}: {}-byte PutImage reassembled across 2 reads + applied ✓",
+            label, req.len());
+        true
+    };
+
+    let req_a = build_core_put_image([0x11, 0x22, 0x33, 0xFF]);
+    if !send_split_and_check(&req_a, [0x11, 0x22, 0x33, 0xFF], "core") {
+        crate::net::unix::close(client); return false;
+    }
+    let req_b = build_big_put_image([0x44, 0x55, 0x66, 0xFF]);
+    if !send_split_and_check(&req_b, [0x44, 0x55, 0x66, 0xFF], "big-requests") {
+        crate::net::unix::close(client); return false;
+    }
+
+    if crate::net::unix::has_data(client) {
+        let mut extra = [0u8; 32];
+        let n = crate::net::unix::read(client, &mut extra);
+        if n > 0 && extra[0] == 0 {
+            test_fail!("x11_reasm", "unexpected X error after reassembly (code={})", extra[1]);
+            crate::net::unix::close(client); return false;
+        }
+    }
+
+    crate::net::unix::close(client);
+    test_pass!("X11 request reassembly across reads");
+    true
+}
 
 fn test_x11_render_draw() -> bool {
     test_header!("X11 RENDER extension — CreatePixmap + Picture + FillRectangles");
