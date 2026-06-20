@@ -6894,7 +6894,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "bell-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
-              "w215-h1", "w215-cache", "w215-all",
+              "w215-h1", "w215-cache", "w215-cache-selftest", "w215-all",
               "coverage-flush", "proc-metrics",
               "futex-stats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
@@ -12730,7 +12730,7 @@ def main():
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
-        "w215-h1", "w215-cache", "w215-all",
+        "w215-h1", "w215-cache", "w215-cache-selftest", "w215-all",
         "arm-phys",
         # blk-trace: drain the virtio-blk LBA ring (JSON) / re-emit `[BLK]`
         # serial lines for the heatmap. Also exposed as the `blk-trace`

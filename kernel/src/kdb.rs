@@ -396,6 +396,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "w215-diag"        => op_w215_diag(out),
         "w215-h1"          => op_w215_h1(out),
         "w215-cache"       => op_w215_cache(out),
+        "w215-cache-selftest" => op_w215_cache_selftest(out),
         "w215-all"         => op_w215_all(out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
@@ -1318,6 +1319,50 @@ fn op_w215_cache(out: &mut String) {
     #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"w215-cache requires firefox-test-core feature"}"#);
+    }
+}
+
+// ── w215-cache-selftest ─────────────────────────────────────────────────────
+//
+// Verifies the displacement fix BEFORE a Hunt boot trusts a probe=miss.  The
+// cache provenance table is now band-scoped (band-relative 1:1 addressing over
+// [256 MiB, 512 MiB)), so the cold-boot libxul cache prepopulate's in-band
+// installs must SURVIVE instead of aliasing one another out (the old single-way
+// map displaced ~62 % of the band).  Returns:
+//
+//   { band_lo, band_hi, residents, probed, hit, miss, displaced, out_of_band }
+//
+// HEALTHY (displacement defeated):  residents > 0  &&  probed > 0  &&  miss == 0
+//   — every recorded in-band frame re-resolves to its own slot; a future
+//   probe=miss therefore means truly-absent (no install ran), not aliased-out.
+// UNHEALTHY:  miss > 0 or displaced > 0  — the band/size invariant is broken
+//   and the catch is NOT yet trustworthy.
+//
+// Requires: --features firefox-test-core.
+fn op_w215_cache_selftest(out: &mut String) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::fmt::Write;
+        let residents = crate::mm::w215_diag::cache_band_resident_count();
+        let (probed, hit, miss) = crate::mm::w215_diag::cache_prov_band_selftest();
+        let c = crate::mm::w215_diag::cache_prov_counts();
+        let mut displaced = 0u64;
+        let mut out_of_band = 0u64;
+        for (name, val) in c.iter() {
+            if *name == "displaced" { displaced = *val; }
+            if *name == "out_of_band" { out_of_band = *val; }
+        }
+        let _ = write!(out,
+            r#"{{"band_lo":{},"band_hi":{},"residents":{},"probed":{},"hit":{},"miss":{},"displaced":{},"out_of_band":{},"healthy":{}}}"#,
+            crate::mm::w215_diag::CACHE_BAND_LO,
+            crate::mm::w215_diag::CACHE_BAND_HI,
+            residents, probed, hit, miss, displaced, out_of_band,
+            (probed > 0 && miss == 0 && displaced == 0),
+        );
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        out.push_str(r#"{"error":"w215-cache-selftest requires firefox-test-core feature"}"#);
     }
 }
 

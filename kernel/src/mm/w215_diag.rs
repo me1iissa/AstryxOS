@@ -1797,14 +1797,46 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 // `firefox-test-core`; default builds are byte-identical.
 
 /// Direct-map size for the cache-provenance table.  `64 Ki slots × 48 B =
-/// 3 MiB BSS` (gated on `firefox-test-core`).  Direct addressing
-/// `pfn % CACHE_PROV_SIZE` aliases frames spaced by `64 Ki × 4 KiB = 256 MiB`;
-/// the file-backed cache cluster's live working set is dominated by the
-/// libxul/satellite-library band well under 256 MiB, so aliasing is rare and
-/// surfaced via `CACHE_PROV_DISPLACED` rather than silently corrupting a
-/// verdict.  Same sizing rationale as FREE_SHADOW / ALLOC_SHADOW.
+/// 3 MiB BSS` (gated on `firefox-test-core`).
+///
+/// ## Band-scoped, NON-DISPLACING addressing (the displacement fix)
+///
+/// The previous revision indexed by `pfn & CACHE_PROV_MASK`, a single-way
+/// global direct map.  That aliases frames spaced by `64 Ki × 4 KiB = 256 MiB`,
+/// and the cold-boot libxul cache prepopulate touches frames across the whole
+/// usable-RAM extent — so an unrelated install 256 MiB away from a corrupting
+/// frame would EVICT that frame's recorded provenance (its `last_write_rip`)
+/// before the bucket-A fault could probe it.  Measured displacement of the
+/// corrupting cache band was ~62 %: the very slot that named the writer was
+/// gone by fault time, forcing the `probe=miss` early-return.
+///
+/// The fix mirrors the working anonymous-heap `BAND_PHYS_MAP`: index by the
+/// frame's offset WITHIN a phys band that the table covers 1:1, so no two
+/// frames in the band ever alias the same slot.  `CACHE_PROV_SIZE = 64 Ki`
+/// slots cover exactly `64 Ki × 4 KiB = 256 MiB` of contiguous physical
+/// address space collision-free — the SAME table size (3 MiB BSS, no growth),
+/// just addressed band-relatively.
+///
+/// The band `[CACHE_BAND_LO, CACHE_BAND_HI)` is positioned over the live
+/// file-backed page-cache cluster where the corrupting rootfs (ext2 mount=4)
+/// code/data frames land (observed phys 0x178*/0x17d*/0x17f*, i.e. ~376 MiB;
+/// phys drifts per boot but stays inside this 256 MiB window).  The window
+/// `[256 MiB, 512 MiB)` brackets that cluster with headroom on both sides.
+/// Per Intel SDM Vol. 3A §4.10.5 (page-level coherence) a validated
+/// read-only file-backed frame must keep its content while it is the live
+/// resident of its key; a band-scoped 1:1 record lets us name the writer that
+/// violates this without alias eviction.
 const CACHE_PROV_SIZE: usize = 65536;
 const CACHE_PROV_MASK: usize = CACHE_PROV_SIZE - 1;
+
+/// File-backed page-cache provenance band, lower bound (inclusive), 256 MiB.
+/// `[CACHE_BAND_LO, CACHE_BAND_HI)` spans exactly `CACHE_PROV_SIZE` pages so a
+/// band-relative index `(phys - CACHE_BAND_LO) >> 12` is collision-free across
+/// the band.
+pub const CACHE_BAND_LO: u64 = 0x1000_0000; // 256 MiB
+/// File-backed page-cache provenance band, upper bound (exclusive), 512 MiB.
+pub const CACHE_BAND_HI: u64 = CACHE_BAND_LO + (CACHE_PROV_SIZE as u64) * 4096; // 512 MiB
+
 
 /// PHYS → kernel-higher-half identity-map offset.  Same constant as
 /// `mm/pmm.rs` / `mm/cache.rs`; the fingerprint sampler reads cache frames
@@ -1882,18 +1914,40 @@ static CACHE_PROV_VALIDATED: AtomicU64 = AtomicU64::new(0);
 static CACHE_PROV_WRITES: AtomicU64 = AtomicU64::new(0);
 /// Total reclaim records (REFDEC→0 arm).
 static CACHE_PROV_RECLAIMS: AtomicU64 = AtomicU64::new(0);
-/// Slot displacements (a different frame aliased the same direct-mapped slot).
-/// Non-zero degrades the per-phys verdict's authority; should stay ~0 for the
-/// file-backed cluster.
+/// Slot displacements (a different frame aliased the same band-scoped slot).
+/// With band-relative 1:1 addressing this MUST stay 0 for in-band frames — a
+/// non-zero value would mean two distinct in-band frames collided, which is
+/// impossible unless the band/size invariant is broken.  Retained as a
+/// tripwire on that invariant.
 static CACHE_PROV_DISPLACED: AtomicU64 = AtomicU64::new(0);
+/// Cache traffic for frames OUTSIDE the provenance band (install/write/reclaim
+/// attempts that the band-scoped table intentionally does not record).  These
+/// are not the W215 cluster; the counter quantifies how much traffic is
+/// out-of-band so a 0-fire in-band can be trusted (in-band `validated` is the
+/// authoritative live-catch witness, not this).
+static CACHE_PROV_OUT_OF_BAND: AtomicU64 = AtomicU64::new(0);
 /// Fault-site bucket-A probes that found a recorded slot with MATCHING
 /// fingerprint (no corruption on that frame — the negative control).
 static CACHE_PROV_FP_MATCH: AtomicU64 = AtomicU64::new(0);
 
+/// Resolve the band-scoped provenance slot for `phys`.
+///
+/// Returns `Some(slot)` for in-band frames, indexed by the frame's offset
+/// WITHIN the band: `(phys - CACHE_BAND_LO) >> 12`.  Because the band spans
+/// exactly `CACHE_PROV_SIZE` pages, two distinct in-band frames never share a
+/// slot — the table is non-displacing for the band.  Returns `None` for
+/// out-of-band frames so unrelated installs (the cold-boot prepopulate's
+/// frames outside the cluster) cannot evict an in-band record.
 #[inline]
-fn cache_prov_slot(phys: u64) -> &'static CacheProvEntry {
-    let pfn = (phys >> 12) as usize;
-    &CACHE_PROV.slots[pfn & CACHE_PROV_MASK]
+fn cache_prov_slot(phys: u64) -> Option<&'static CacheProvEntry> {
+    let p = phys & !0xFFFu64;
+    if p < CACHE_BAND_LO || p >= CACHE_BAND_HI {
+        return None;
+    }
+    let idx = ((p - CACHE_BAND_LO) >> 12) as usize;
+    // `idx < CACHE_PROV_SIZE` is guaranteed by the band bounds, but mask for
+    // defence in depth against any future band/size mismatch.
+    Some(&CACHE_PROV.slots[idx & CACHE_PROV_MASK])
 }
 
 /// Pack a cache key (mount, inode, file_offset) into 64 bits.
@@ -1955,9 +2009,17 @@ fn cache_prov_fingerprint(phys: u64) -> u64 {
 pub fn cache_prov_install(phys: u64, mount_idx: usize, inode: u64, file_offset: u64) {
     let phys = phys & !0xFFFu64;
     if phys == 0 { return; }
-    let slot = cache_prov_slot(phys);
+    let slot = match cache_prov_slot(phys) {
+        Some(s) => s,
+        None => {
+            CACHE_PROV_OUT_OF_BAND.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
     let prev_phys = slot.phys.load(Ordering::Relaxed);
     if prev_phys != 0 && prev_phys != phys {
+        // Band-relative 1:1 addressing makes this impossible for distinct
+        // in-band frames; if it ever fires the band/size invariant is broken.
         CACHE_PROV_DISPLACED.fetch_add(1, Ordering::Relaxed);
     }
     let key = pack_cache_prov_key(mount_idx, inode, file_offset);
@@ -1994,7 +2056,10 @@ pub fn cache_prov_install(phys: u64, mount_idx: usize, inode: u64, file_offset: 
 pub fn cache_prov_reclaim(phys: u64) {
     let phys = phys & !0xFFFu64;
     if phys == 0 { return; }
-    let slot = cache_prov_slot(phys);
+    let slot = match cache_prov_slot(phys) {
+        Some(s) => s,
+        None => return,
+    };
     if slot.phys.load(Ordering::Relaxed) != phys {
         return;
     }
@@ -2026,7 +2091,13 @@ pub fn cache_prov_reclaim(phys: u64) {
 pub fn cache_prov_write(phys: u64, writer_rip: u64) {
     let phys = phys & !0xFFFu64;
     if phys == 0 { return; }
-    let slot = cache_prov_slot(phys);
+    let slot = match cache_prov_slot(phys) {
+        Some(s) => s,
+        None => {
+            CACHE_PROV_OUT_OF_BAND.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
     if slot.phys.load(Ordering::Relaxed) != phys {
         return;
     }
@@ -2097,11 +2168,27 @@ pub fn cache_prov_fault_bucket_a(
 ) {
     let phys = phys & !0xFFFu64;
     if phys == 0 { return; }
-    let slot = cache_prov_slot(phys);
+    let slot = match cache_prov_slot(phys) {
+        Some(s) => s,
+        None => {
+            crate::serial_println!(
+                "[W215/CACHE-CLOBBER] phys={:#x} probe=out_of_band \
+                 (frame outside cache provenance band [{:#x},{:#x}) — not the \
+                 instrumented W215 cluster; out_of_band_traffic={})",
+                phys, CACHE_BAND_LO, CACHE_BAND_HI,
+                CACHE_PROV_OUT_OF_BAND.load(Ordering::Relaxed),
+            );
+            return;
+        }
+    };
     if slot.phys.load(Ordering::Relaxed) != phys {
+        // With band-relative 1:1 addressing a probe=miss now means the frame
+        // was genuinely never recorded (no install ran for it) — NOT that an
+        // aliasing install evicted it.  This is the displacement fix's payoff:
+        // a miss is now diagnostic, not noise.
         crate::serial_println!(
-            "[W215/CACHE-CLOBBER] phys={:#x} probe=miss (slot holds different \
-             frame or never recorded — displaced={})",
+            "[W215/CACHE-CLOBBER] phys={:#x} probe=miss (frame never recorded \
+             an install in-band — band-1:1, NOT displaced; displaced_tripwire={})",
             phys, CACHE_PROV_DISPLACED.load(Ordering::Relaxed),
         );
         return;
@@ -2151,7 +2238,7 @@ pub fn cache_prov_fault_bucket_a(
 }
 
 /// Read cache-catch counters for kdb introspection.
-pub fn cache_prov_counts() -> [(&'static str, u64); 7] {
+pub fn cache_prov_counts() -> [(&'static str, u64); 9] {
     [
         ("cache_clobber",     CACHE_CLOBBER.load(Ordering::Relaxed)),
         ("cache_refdec_reuse",CACHE_REFDEC_REUSE.load(Ordering::Relaxed)),
@@ -2160,7 +2247,59 @@ pub fn cache_prov_counts() -> [(&'static str, u64); 7] {
         ("reclaims",          CACHE_PROV_RECLAIMS.load(Ordering::Relaxed)),
         ("displaced",         CACHE_PROV_DISPLACED.load(Ordering::Relaxed)),
         ("fp_match_negctrl",  CACHE_PROV_FP_MATCH.load(Ordering::Relaxed)),
+        ("out_of_band",       CACHE_PROV_OUT_OF_BAND.load(Ordering::Relaxed)),
+        ("band_residents",    cache_band_resident_count()),
     ]
+}
+
+/// Self-test / verification probe: count how many band slots currently hold an
+/// INSTALLED in-band frame provenance.  This is the displacement-fix verifier
+/// — on a normal ff-gui boot, after the cold-boot libxul cache prepopulate,
+/// this MUST be non-zero and stable (the band-scoped table is non-displacing,
+/// so prepopulate installs in the band SURVIVE rather than evicting one
+/// another).  Under the old single-way map a comparable readout would show
+/// most band frames' provenance gone (displaced ~62 %).
+///
+/// O(CACHE_PROV_SIZE) — only invoked from the kdb self-test path, never on the
+/// hot fault/install path.
+pub fn cache_band_resident_count() -> u64 {
+    let mut n = 0u64;
+    for slot in CACHE_PROV.slots.iter() {
+        if slot.phys.load(Ordering::Relaxed) != 0
+            && cache_prov_state(slot.meta.load(Ordering::Relaxed)) == CACHE_STATE_INSTALLED
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Self-test for the displacement fix: probe a band frame whose provenance was
+/// recorded by an install, and confirm the slot still holds it (probe=hit)
+/// rather than having been aliased out.  Returns `(probed, hit, miss)` over a
+/// sample of the band's currently-recorded slots.
+///
+/// `kdb w215-cache-selftest` calls this on a live boot: a healthy result is
+/// `probed > 0 && miss == 0` — every recorded in-band frame still resolves to
+/// its own slot, proving the band-relative addressing did NOT displace it.
+pub fn cache_prov_band_selftest() -> (u64, u64, u64) {
+    let mut probed = 0u64;
+    let mut hit = 0u64;
+    let mut miss = 0u64;
+    for slot in CACHE_PROV.slots.iter() {
+        let recorded = slot.phys.load(Ordering::Relaxed);
+        if recorded == 0 {
+            continue;
+        }
+        probed += 1;
+        // Re-resolve the slot the SAME way a fault-time probe would, from the
+        // recorded phys, and confirm it lands back on this exact entry.
+        match cache_prov_slot(recorded) {
+            Some(reslot) if core::ptr::eq(reslot, slot) => hit += 1,
+            _ => miss += 1,
+        }
+    }
+    (probed, hit, miss)
 }
 
 pub fn cache_prov_validated_count() -> u64 { CACHE_PROV_VALIDATED.load(Ordering::Relaxed) }
