@@ -407,6 +407,25 @@ class GdbClient:
         resp = self.send(f"z0,{addr:x},1")
         return resp == "OK"
 
+    def set_hbreak(self, addr: int) -> bool:
+        """Set a HARDWARE execution breakpoint via the GDB Z1 packet.
+
+        Unlike a Z0 software breakpoint (which writes a 0xCC into the target
+        page and therefore needs that page mapped in the CPU's current CR3),
+        a Z1 breakpoint is programmed into the x86 debug registers (DR0..DR3
+        + DR7) and fires on the linear address regardless of which CR3 is
+        loaded.  This is the only way to break on a userspace VA while both
+        vCPUs are parked in the kernel on the kernel CR3 — exactly the
+        situation when investigating a user-space library routine.
+        """
+        resp = self.send(f"Z1,{addr:x},1")
+        return resp == "OK"
+
+    def del_hbreak(self, addr: int) -> bool:
+        """Remove a hardware execution breakpoint via z1."""
+        resp = self.send(f"z1,{addr:x},1")
+        return resp == "OK"
+
     # ── hardware watchpoints (Z2/Z3/Z4 packets) ──────────────────────────────
     #
     # GDB remote-protocol watchpoint kinds (see the GDB Remote Serial Protocol
@@ -6717,10 +6736,14 @@ def cmd_autopsy(args):
 
     armed_addrs: list[int] = []
     try:
-        # Arm all requested breakpoints.
+        # Arm all requested breakpoints.  A hardware (Z1) breakpoint fires on
+        # the linear address regardless of CR3 — necessary for userspace VAs
+        # while the vCPUs are parked on the kernel CR3.
+        use_hw = bool(getattr(args, "hw_break", False))
         for b in breaks:
-            ok = gdb.set_bp(b["addr"])
+            ok = gdb.set_hbreak(b["addr"]) if use_hw else gdb.set_bp(b["addr"])
             b["armed"] = bool(ok)
+            b["hw"] = use_hw
             if ok:
                 armed_addrs.append(b["addr"])
         if not armed_addrs:
@@ -6818,7 +6841,10 @@ def cmd_autopsy(args):
         # surprise the next agent who attaches via `step`/`cont`.
         for addr in armed_addrs:
             try:
-                gdb.del_bp(addr)
+                if bool(getattr(args, "hw_break", False)):
+                    gdb.del_hbreak(addr)
+                else:
+                    gdb.del_bp(addr)
             except Exception:
                 pass
         try:
@@ -7014,10 +7040,16 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         # as "0x29d91000".
         phys = int(rest[0], 0)
         return {"op": "arm-phys", "phys": f"0x{phys:x}"}
-    if op == "user-mem":
+    if op == "user-mem" or op == "uread":
+        # Read a slice of a user process's address space by walking that
+        # process's CR3 (kernel op "uread").  Resolves the target pid's CR3
+        # from the process table, so the read works regardless of which CR3
+        # the inspecting vCPU holds (both vCPUs are usually parked on the
+        # kernel CR3 in the scheduler).
         if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
-        return {"op": "user-mem", "pid": int(rest[0], 0),
-                "addr": rest[1], "len": int(rest[2], 0)}
+        addr = int(rest[1], 0)
+        return {"op": "uread", "pid": int(rest[0], 0),
+                "addr": f"0x{addr:x}", "len": int(rest[2], 0)}
     if op == "rip-trace":
         # Periodic userspace RIP sampler for one TID over a fixed
         # wall-clock window.  Used to characterise userspace plateaux
@@ -12712,6 +12744,15 @@ def main():
              "session can pick up state). Default: resume the guest.",
     )
     p_autopsy.add_argument(
+        "--hw-break", action="store_true", dest="hw_break",
+        help="Arm the breakpoint(s) as HARDWARE execution breakpoints "
+             "(GDB Z1 / x86 debug registers) instead of software (Z0). "
+             "Required to break on a userspace VA while both vCPUs are "
+             "parked on the kernel CR3 — a Z0 sw breakpoint needs the user "
+             "page mapped in the inspecting CR3, a Z1 hw breakpoint fires "
+             "on the linear address regardless of CR3.",
+    )
+    p_autopsy.add_argument(
         "--output", default=None, metavar="PATH",
         help="Optional: also write the structured JSON to PATH "
              "(in addition to stdout) for archival in a doc / commit message.",
@@ -12726,7 +12767,7 @@ def main():
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
-        "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
+        "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",

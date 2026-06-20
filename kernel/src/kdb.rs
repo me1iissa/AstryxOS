@@ -371,6 +371,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "dmesg"          => op_dmesg(req, out),
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
+        "uread"          => op_uread(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
         // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
@@ -894,6 +895,98 @@ fn op_mem(req: &str, out: &mut String) {
     out.push('{');
     j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
     j_kv(out, "len", &alloc::format!("{}", len));
+    j_kv_str(out, "hex", &hex);
+    j_trim_comma(out);
+    out.push('}');
+}
+
+// ── uread ─────────────────────────────────────────────────────────────────────
+//
+// Read a slice of a *user* process's address space by walking that process's
+// CR3 page table and loading through the kernel direct map (PHYS_OFF + phys).
+// Unlike `mem` (which only accepts kernel higher-half VAs against the currently
+// loaded CR3) this resolves the target pid's CR3 from the process table, so a
+// user VA can be inspected regardless of which CR3 the inspecting vCPU happens
+// to hold — the common case when both vCPUs are parked in the scheduler on the
+// kernel CR3.  Per-page virt_to_phys_in walk (Intel SDM Vol.3A §4.5 4-level
+// paging); refuses cleanly on an unmapped page rather than faulting.
+//
+// Request : {"op":"uread","pid":1,"addr":"0x7eff62006580","len":64}
+// Response: {"pid":N,"cr3":..,"addr":..,"len":K,"first_phys":..,"hex":".."}
+fn op_uread(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+        Some(a) => a,
+        None => { out.push_str(r#"{"error":"missing 'addr'"}"#); return; }
+    };
+    let len = match extract_field(req, "len").and_then(|s| parse_u64(&s)) {
+        Some(l) if l > 0 && l <= MEM_MAX => l,
+        Some(_) => { out.push_str(r#"{"error":"len out of range (1..=4096)"}"#); return; }
+        None    => { out.push_str(r#"{"error":"missing 'len'"}"#); return; }
+    };
+
+    // Resolve the target process's CR3 under a brief PROCESS_TABLE lock.
+    let cr3 = {
+        let pt = match try_lock_brief(&PROCESS_TABLE) {
+            Some(g) => g,
+            None => { out.push_str(r#"{"busy":"PROCESS_TABLE held"}"#); return; }
+        };
+        let c = pt.iter().find(|p| p.pid == pid).map(|p| p.cr3);
+        drop(pt);
+        match c {
+            Some(c) => c,
+            None => { let _ = write!(out, r#"{{"error":"pid {} not found"}}"#, pid); return; }
+        }
+    };
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let Some(end) = addr.checked_add(len) else {
+        out.push_str(r#"{"error":"addr+len overflow"}"#); return;
+    };
+    let mut first_phys: Option<u64> = None;
+    let mut hex = alloc::string::String::with_capacity((len as usize) * 2);
+    let mut i = 0u64;
+    while i < len {
+        let va = addr + i;
+        let page = va & !0xFFF;
+        let phys = match crate::mm::vmm::virt_to_phys_in(cr3, page) {
+            Some(p) => p,
+            None => {
+                let _ = write!(out, r#"{{"pid":{},"cr3":"#, pid);
+                j_hex(out, cr3);
+                out.push_str(r#","error":"unmapped page","unmapped_page":"#);
+                j_hex(out, page);
+                let _ = write!(out, r#","read":{}}}"#, i);
+                return;
+            }
+        };
+        if first_phys.is_none() { first_phys = Some(phys + (va & 0xFFF)); }
+        let off = va & 0xFFF;
+        // bytes available in this page
+        let avail = 0x1000 - off;
+        let take = core::cmp::min(avail, len - i);
+        for b in 0..take {
+            // SAFETY: page verified mapped via virt_to_phys_in; the kernel
+            // direct map (PHYS_OFF + phys) covers all PMM frames.  Volatile so
+            // the read isn't elided.
+            let byte = unsafe {
+                core::ptr::read_volatile((PHYS_OFF + phys + off + b) as *const u8)
+            };
+            let _ = write!(hex, "{:02x}", byte);
+        }
+        i += take;
+        let _ = end; // end computed for overflow check only
+    }
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
+    j_str(out, "cr3"); out.push(':'); j_hex(out, cr3); out.push(',');
+    j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
+    j_kv(out, "len", &alloc::format!("{}", len));
+    if let Some(fp) = first_phys { j_str(out, "first_phys"); out.push(':'); j_hex(out, fp); out.push(','); }
     j_kv_str(out, "hex", &hex);
     j_trim_comma(out);
     out.push('}');
