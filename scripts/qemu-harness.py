@@ -7014,10 +7014,16 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         # as "0x29d91000".
         phys = int(rest[0], 0)
         return {"op": "arm-phys", "phys": f"0x{phys:x}"}
-    if op == "user-mem":
+    if op == "user-mem" or op == "uread":
+        # Read a slice of a user process's address space by walking that
+        # process's CR3 (kernel op "uread").  Resolves the target pid's CR3
+        # from the process table, so the read works regardless of which CR3
+        # the inspecting vCPU holds (both vCPUs are usually parked on the
+        # kernel CR3 in the scheduler).
         if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
-        return {"op": "user-mem", "pid": int(rest[0], 0),
-                "addr": rest[1], "len": int(rest[2], 0)}
+        addr = int(rest[1], 0)
+        return {"op": "uread", "pid": int(rest[0], 0),
+                "addr": f"0x{addr:x}", "len": int(rest[2], 0)}
     if op == "rip-trace":
         # Periodic userspace RIP sampler for one TID over a fixed
         # wall-clock window.  Used to characterise userspace plateaux
@@ -12726,7 +12732,7 @@ def main():
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
-        "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
+        "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
