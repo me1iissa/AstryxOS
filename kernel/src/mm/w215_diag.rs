@@ -1812,21 +1812,31 @@ pub fn band_stale_tlb_count() -> u64 { BAND_STALE_TLB.load(Ordering::Relaxed) }
 ///
 /// The fix mirrors the working anonymous-heap `BAND_PHYS_MAP`: index by the
 /// frame's offset WITHIN a phys band that the table covers 1:1, so no two
-/// frames in the band ever alias the same slot.  `CACHE_PROV_SIZE = 64 Ki`
-/// slots cover exactly `64 Ki × 4 KiB = 256 MiB` of contiguous physical
-/// address space collision-free — the SAME table size (3 MiB BSS, no growth),
-/// just addressed band-relatively.
+/// frames in the band ever alias the same slot.  `CACHE_PROV_SIZE = 256 Ki`
+/// slots cover exactly `256 Ki × 4 KiB = 1024 MiB` of contiguous physical
+/// address space collision-free (12 MiB BSS, `firefox-test-core`-gated),
+/// addressed band-relatively.
 ///
 /// The band `[CACHE_BAND_LO, CACHE_BAND_HI)` is positioned over the live
 /// file-backed page-cache cluster where the corrupting rootfs (ext2 mount=4)
-/// code/data frames land (observed phys 0x178*/0x17d*/0x17f*, i.e. ~376 MiB;
-/// phys drifts per boot but stays inside this 256 MiB window).  The window
-/// `[256 MiB, 512 MiB)` brackets that cluster with headroom on both sides.
-/// Per Intel SDM Vol. 3A §4.10.5 (page-level coherence) a validated
-/// read-only file-backed frame must keep its content while it is the live
-/// resident of its key; a band-scoped 1:1 record lets us name the writer that
-/// violates this without alias eviction.
-const CACHE_PROV_SIZE: usize = 65536;
+/// code/data frames land.  The corrupting frame's physical address drifts
+/// per boot far more widely than first assumed: an early observation put it
+/// near ~376 MiB, but a confirmed bucket-A reproduction landed the corrupting
+/// `inode=0x12d off=0x186000` frame at phys 0x2c802000 (~712 MiB) — 200 MiB
+/// ABOVE a 512 MiB ceiling, so the probe returned `out_of_band` and the
+/// writer went unnamed.  The drift tracks the usable-RAM floor (which itself
+/// rises as this BSS table grows, since the PMM derives the floor from
+/// `__kernel_end`), so the band must cover the whole region the buddy
+/// allocator hands file-backed page-cache frames out of.
+///
+/// The band is therefore widened to `[256 MiB, 1280 MiB)` = 1024 MiB at 1:1
+/// (`CACHE_PROV_SIZE = 256 Ki` slots, 12 MiB BSS, `firefox-test-core`-gated),
+/// bracketing every corrupting frame observed so far (376 MiB and 712 MiB)
+/// with >560 MiB of headroom above.  Per Intel SDM Vol. 3A §4.10.5
+/// (page-level coherence) a validated read-only file-backed frame must keep
+/// its content while it is the live resident of its key; a band-scoped 1:1
+/// record lets us name the writer that violates this without alias eviction.
+const CACHE_PROV_SIZE: usize = 262144; // 256 Ki slots × 48 B = 12 MiB BSS
 const CACHE_PROV_MASK: usize = CACHE_PROV_SIZE - 1;
 
 /// File-backed page-cache provenance band, lower bound (inclusive), 256 MiB.
@@ -1834,8 +1844,8 @@ const CACHE_PROV_MASK: usize = CACHE_PROV_SIZE - 1;
 /// band-relative index `(phys - CACHE_BAND_LO) >> 12` is collision-free across
 /// the band.
 pub const CACHE_BAND_LO: u64 = 0x1000_0000; // 256 MiB
-/// File-backed page-cache provenance band, upper bound (exclusive), 512 MiB.
-pub const CACHE_BAND_HI: u64 = CACHE_BAND_LO + (CACHE_PROV_SIZE as u64) * 4096; // 512 MiB
+/// File-backed page-cache provenance band, upper bound (exclusive), 1280 MiB.
+pub const CACHE_BAND_HI: u64 = CACHE_BAND_LO + (CACHE_PROV_SIZE as u64) * 4096; // 1280 MiB
 
 
 /// PHYS → kernel-higher-half identity-map offset.  Same constant as

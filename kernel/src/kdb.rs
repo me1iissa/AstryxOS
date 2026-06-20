@@ -1326,7 +1326,7 @@ fn op_w215_cache(out: &mut String) {
 //
 // Verifies the displacement fix BEFORE a Hunt boot trusts a probe=miss.  The
 // cache provenance table is now band-scoped (band-relative 1:1 addressing over
-// [256 MiB, 512 MiB)), so the cold-boot libxul cache prepopulate's in-band
+// [256 MiB, 1280 MiB)), so the cold-boot libxul cache prepopulate's in-band
 // installs must SURVIVE instead of aliasing one another out (the old single-way
 // map displaced ~62 % of the band).  Returns:
 //
