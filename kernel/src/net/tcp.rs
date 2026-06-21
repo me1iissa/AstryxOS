@@ -445,8 +445,22 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         // on SMP would stall a peer core spinning on the lock across the
         // unbounded transmit.  See `OutSeg`.
         let mut out: Vec<OutSeg> = Vec::new();
-        process_segment(&mut conns[i], &hdr, payload, &mut out);
+        let readiness_edge = process_segment(&mut conns[i], &hdr, payload, &mut out);
         drop(conns);
+        // Ring the poll bell AFTER dropping `TCP_CONNECTIONS` (lock-free,
+        // exactly like the UDP receive path) so a thread parked in
+        // `poll(2)` / `epoll_wait(2)` / `select(2)` / a blocking `recv(2)`
+        // on this socket re-evaluates immediately rather than only on the
+        // 1 s resync floor.  IEEE Std 1003.1-2017 §poll requires a socket
+        // with newly-arrived data — or a peer-FIN that makes a read return
+        // EOF, or a completed handshake that makes `accept(2)` not block —
+        // to report readiness; the bell delivers that edge with sub-second
+        // latency.  Rung before the transmit below so the wake is not
+        // delayed by the (unbounded, I/O-bearing) `send_ipv4` calls.
+        if readiness_edge {
+            crate::ipc::waitlist::ring_poll_bell_for(
+                crate::ipc::waitlist::PollBellSource::InetRx);
+        }
         for o in out {
             super::ipv4::send_ipv4(o.remote_ip, super::ipv4::PROTO_TCP, &o.seg);
         }
@@ -526,9 +540,31 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
 /// Process one segment on an existing connection (lock already held by
 /// caller).  Any reply segments are pushed into `out` for the caller to
 /// transmit *after* releasing the `TCP_CONNECTIONS` lock — see `OutSeg`.
+///
+/// Returns `true` if this segment advanced the connection across a
+/// readiness edge a `poll(2)` / `epoll_wait(2)` / `select(2)` caller cares
+/// about, so the caller can ring the poll bell *after* dropping the
+/// `TCP_CONNECTIONS` lock (the bell is rung lock-free, exactly like the
+/// UDP receive path).  The edges are, per IEEE Std 1003.1-2017 §poll:
+///   * new in-order data delivered into `recv_buffer` → `POLLIN`;
+///   * a state transition the poller observes as readable/writable —
+///     `SynReceived`→`Established` (a listener child completed the
+///     handshake → `accept(2)` will not block), `SynSent`→`Established`
+///     (an active `connect(2)` completed → `POLLOUT`), or any move into a
+///     read-closed state (`CloseWait`/`FinWait2`/`TimeWait`/`Closed`,
+///     peer-FIN → an empty stream read returns 0/EOF → `POLLIN`).
+/// A spurious ring is harmless: the woken poller re-scans its fd set and
+/// re-parks if nothing it watches is ready.
+#[must_use]
 fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
-                   out: &mut Vec<OutSeg>) {
+                   out: &mut Vec<OutSeg>) -> bool {
     conn.peer_window = hdr.window as u32;
+
+    // Snapshot the poll-relevant fields before processing so we can detect
+    // a readiness edge by comparison afterwards, rather than threading a
+    // flag through every `match` arm (which is brittle to future edits).
+    let state_before = conn.state;
+    let recv_len_before = conn.recv_buffer.len();
 
     let lp = conn.local_port;
     let rp = conn.remote_port;
@@ -657,6 +693,22 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
 
         _ => {}
     }
+
+    // A readiness edge fired if new data landed in the receive buffer, or
+    // the connection moved into a state a poller observes as readable
+    // (read-closed / accept-pending) or writable (connect completed).
+    // Mirrors the "wake socket sleepers on data ready" discipline: ring on
+    // the data-arrival and read-shutdown edges, not on every segment.
+    let data_arrived = conn.recv_buffer.len() > recv_len_before;
+    let edge_state = state_before != conn.state
+        && matches!(conn.state,
+            TcpState::Established      // 3WHS done: accept(2)/connect(2) ready
+            | TcpState::CloseWait      // peer FIN: empty read → EOF (POLLIN)
+            | TcpState::FinWait2       // our FIN ACKed (no read-closed edge,
+                                       //   but a poller may watch the change)
+            | TcpState::TimeWait       // peer FIN: read-closed
+            | TcpState::Closed);       // connection done: read-closed
+    data_arrived || edge_state
 }
 
 // ── Send path ─────────────────────────────────────────────────────────────────
@@ -1127,7 +1179,9 @@ pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
         checksum:    0,
     };
     let mut out: Vec<OutSeg> = Vec::new();
-    process_segment(conn, &hdr, payload, &mut out);
+    // The readiness-edge return is irrelevant to this state-inspection
+    // helper (no poller is parked in the in-kernel test path); discard it.
+    let _ = process_segment(conn, &hdr, payload, &mut out);
     Some((conn.state, conn.recv_buffer.len()))
 }
 

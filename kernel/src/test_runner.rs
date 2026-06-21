@@ -2697,6 +2697,13 @@ pub fn run() -> ! {
         if test_523_tcp_graceful_close_fin_defer() { passed += 1; }
     }
 
+    // ── Test 522: TCP RX rings the InetRx poll-bell on readiness edges ──
+    // Asserts the TCP receive path wakes pollers (and blocking recv/accept)
+    // on the accept-complete and data-arrival edges, matching the UDP path,
+    // so poll/epoll readiness has sub-second latency (IEEE 1003.1 §poll).
+    total += 1;
+    if test_522_tcp_rx_poll_bell() { passed += 1; }
+
     // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
     // Exercises the three socket-layer fixes that unblock outbound DNS
     // for any glibc/musl-linked Linux client:
@@ -33895,6 +33902,137 @@ fn test_276_tcp_send_buffer_drain() -> bool {
 /// have been segmentized, then form a FIN segment and send it"), RFC 9293
 /// §3.7 (data transfer), RFC 5681 §3.1 (slow start), IEEE Std 1003.1-2017
 /// §close / §shutdown.
+// ── Test 522: TCP RX rings the InetRx poll-bell on readiness edges ──────────
+//
+// The TCP receive path must wake `poll(2)` / `epoll_wait(2)` / `select(2)`
+// and blocking `recv(2)` callers the moment a watched socket becomes
+// readable, exactly as the UDP path does — otherwise a poller observes the
+// new data only on the bell's ~1 s resync floor (a latency tail userspace
+// reactors and DNS resolvers cannot absorb, IEEE Std 1003.1-2017 §poll).
+//
+// This test drives `handle_tcp` with synthetic segments over an in-kernel
+// listener (no wire, no NIC) and asserts that the two readiness edges a
+// poller cares about each bump the `BELL_RINGS_BY_SOURCE[InetRx]` counter:
+//   1. the listener child completing the 3-way handshake
+//      (SynReceived → Established → `accept(2)` will not block); and
+//   2. in-order data arriving on the Established connection (POLLIN).
+//
+// Counting the per-source ring (not a wake) makes the assertion hermetic —
+// no thread need be parked.  A regression that drops the ring (e.g. reverts
+// `handle_tcp` to the pre-fix "deliver data, never ring" path) makes the
+// observed delta zero and fails the test.
+fn test_522_tcp_rx_poll_bell() -> bool {
+    test_header!("TCP RX rings InetRx poll-bell on accept + data readiness edges");
+
+    use core::sync::atomic::Ordering;
+    use crate::net::tcp;
+    use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};
+
+    const LOCAL_PORT: u16 = 47018; // distinct from the 3WHS test's 47017
+    let client_ip: [u8; 4] = [10, 0, 2, 9];
+    let client_port: u16   = 54399;
+    let our_ip = crate::net::our_ip();
+    let inet_rx = PollBellSource::InetRx as usize;
+
+    // Build a data-bearing segment inline so the test compiles in every
+    // lane (the shared payload helper is kdb-gated).  Layout matches
+    // `make_tcp_seg`: 20-byte header (data-offset 5) then the payload.
+    fn data_seg(src: u16, dst: u16, seq: u32, ack: u32, flags: u8,
+                payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut s = alloc::vec::Vec::with_capacity(20 + payload.len());
+        s.extend_from_slice(&src.to_be_bytes());
+        s.extend_from_slice(&dst.to_be_bytes());
+        s.extend_from_slice(&seq.to_be_bytes());
+        s.extend_from_slice(&ack.to_be_bytes());
+        s.push(5 << 4);          // data offset = 5 words (20 bytes), no options
+        s.push(flags);
+        s.extend_from_slice(&65535u16.to_be_bytes()); // window
+        s.push(0); s.push(0);    // checksum (unchecked on this synthetic path)
+        s.push(0); s.push(0);    // urgent pointer
+        s.extend_from_slice(payload);
+        s
+    }
+
+    if let Err(e) = tcp::listen(LOCAL_PORT) {
+        test_fail!("test_522_tcp_rx_poll_bell", "listen({}) failed: {}", LOCAL_PORT, e);
+        return false;
+    }
+
+    // ── Edge 1: SYN → SynReceived (no readiness edge yet — a half-open
+    // child is not accept-ready, so the bell must NOT advance here). ──
+    let before_syn = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    let client_isn: u32 = 0x5EED_0001;
+    let syn = make_tcp_seg(client_port, LOCAL_PORT, client_isn, 0, tcp::SYN);
+    tcp::handle_tcp(client_ip, our_ip, &syn);
+    let after_syn = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    if after_syn != before_syn {
+        test_fail!("test_522_tcp_rx_poll_bell",
+            "SYN (half-open child) rang InetRx (delta {}) — not an accept edge",
+            after_syn - before_syn);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  SYN → SynReceived: no spurious ring ✓");
+
+    // ── Edge 2: ACK completes the handshake (SynReceived → Established).
+    // accept(2) will not block → InetRx must ring. ──
+    let before_ack = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    let ack = make_tcp_seg(client_port, LOCAL_PORT,
+                           client_isn.wrapping_add(1), 0, tcp::ACK);
+    tcp::handle_tcp(client_ip, our_ip, &ack);
+    let after_ack = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    // Confirm the child actually reached Established (guards against the
+    // ring firing for an unrelated reason).
+    let established = tcp::snapshot_connections().iter().any(|c|
+        c.local_port == LOCAL_PORT && c.remote_ip == client_ip
+        && c.remote_port == client_port && c.state == tcp::TcpState::Established);
+    if !established {
+        test_fail!("test_522_tcp_rx_poll_bell", "child not Established after ACK");
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    if after_ack <= before_ack {
+        test_fail!("test_522_tcp_rx_poll_bell",
+            "handshake-complete edge did not ring InetRx (delta {})",
+            after_ack - before_ack);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  ACK → Established: accept edge rang InetRx (Δ{}) ✓",
+        after_ack - before_ack);
+
+    // ── Edge 3: in-order data arrival on the Established connection. ──
+    let before_data = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    const PAYLOAD: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
+    let seg = data_seg(client_port, LOCAL_PORT, client_isn.wrapping_add(1),
+                       0, tcp::PSH | tcp::ACK, PAYLOAD);
+    tcp::handle_tcp(client_ip, our_ip, &seg);
+    let after_data = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
+    let got = tcp::read_from(LOCAL_PORT, client_ip, client_port);
+    if got != PAYLOAD {
+        test_fail!("test_522_tcp_rx_poll_bell",
+            "data not buffered: read {} bytes, expected {}", got.len(), PAYLOAD.len());
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    if after_data <= before_data {
+        test_fail!("test_522_tcp_rx_poll_bell",
+            "data-arrival edge did not ring InetRx (delta {})",
+            after_data - before_data);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  in-order data arrival: POLLIN edge rang InetRx (Δ{}) ✓",
+        after_data - before_data);
+
+    // Hermetic teardown — drop the synthetic child and the listener so
+    // sibling tests on neighbouring ports are unaffected.
+    let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+
+    test_pass!("TCP RX rings InetRx poll-bell on accept + data readiness edges");
+    true
+}
+
 #[cfg(any(feature = "test-mode", feature = "firefox-test-core",
           feature = "oracle-test", feature = "oracle-daemon-test"))]
 fn test_523_tcp_graceful_close_fin_defer() -> bool {
