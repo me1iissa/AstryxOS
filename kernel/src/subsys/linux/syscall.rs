@@ -10909,14 +10909,21 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // dup'd epoll fds share the inode and thus the same instance.
     // Symmetric with sys_epoll_ctl above; see that block for the full
     // by-id rationale (PIVOT-I2 Phase D, 2026-05-23).
-    // Snapshot tuple: (fd, events-interest, data-cookie, last_ready-edge-state).
+    // Snapshot tuple: (fd, events-interest, data-cookie, last_ready-edge-state,
+    // et_rise-generation, eventfd-slot-id-if-any).
     // `last_ready` is the asserted-interest level most recently DELIVERED for
     // this watch; it is consulted only for EPOLLET watches (events & EPOLLET)
-    // to suppress repeat reports while the readiness level stays high.  The
-    // epoll_id is also captured so the freshly-computed edge levels can be
+    // to suppress repeat reports while the readiness level stays high.
+    // `et_rise` is the readiness-rise generation last delivered for an EPOLLET
+    // watch on a source that exposes one (the eventfd `rise_seq`); it re-arms
+    // the EPOLLIN edge across a drain-then-rise that no `epoll_wait` observed at
+    // level 0.  `evfd_slot` carries the eventfd slot id (FileDescriptor.inode)
+    // when the watched fd is an eventfd, so the live generation can be read
+    // lock-free below; `None` for every other fd type (level-diff governs).
+    // The epoll_id is also captured so the freshly-computed edge state can be
     // committed back to the instance after delivery.
     let epoll_id_for_commit;
-    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32)> = {
+    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32, u64, Option<u64>)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -10931,10 +10938,16 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             None    => return -9,
         };
         epoll_id_for_commit = epoll_id;
-        inst.watches.iter().map(|w| (w.fd, w.events, w.data, w.last_ready)).collect()
+        inst.watches.iter().map(|w| {
+            let evfd_slot = proc.file_descriptors.get(w.fd)
+                .and_then(|f| f.as_ref())
+                .filter(|f| matches!(f.file_type, crate::vfs::FileType::EventFd))
+                .map(|f| f.inode);
+            (w.fd, w.events, w.data, w.last_ready, w.et_rise, evfd_slot)
+        }).collect()
     }; // lock released here
 
-    use crate::ipc::epoll::EPOLLET;
+    use crate::ipc::epoll::{EPOLLET, EPOLLIN};
 
     // Compute the deliverable interest mask for one watched fd.
     //
@@ -10960,16 +10973,37 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // exactly once and then suppressed until the level drops and rises again.
     // Level-triggered watches (the default) deliver the full asserted `level`
     // unconditionally, as before.  Returns `(delivered_mask, asserted_level)`.
-    let watch_events = |fd: usize, subscribed: u32, last_ready: u32| -> (u32, u32) {
+    // Returns `(delivered_mask, asserted_level, current_rise_generation)`.
+    // `current_rise` is the eventfd `rise_seq` (0 for sources without one).
+    let watch_events = |fd: usize, subscribed: u32, last_ready: u32,
+                        et_rise: u64, evfd_slot: Option<u64>| -> (u32, u32, u64) {
         let ready_ev = epoll_poll_events(pid, fd);
         let level =
             (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
+        // Live rise generation for sources that expose one (eventfd only here).
+        let current_rise = evfd_slot
+            .and_then(crate::ipc::eventfd::rise_seq)
+            .unwrap_or(0);
         let delivered = if subscribed & EPOLLET != 0 {
-            level & !last_ready
+            // Bits newly asserted by a level change since the last delivery …
+            let mut d = level & !last_ready;
+            // … plus a re-armed EPOLLIN when the source posted a fresh
+            // 0→ready rise (a generation bump) that no `epoll_wait` observed at
+            // level 0 — the drain-then-rise-between-waits edge.  Per `epoll(7)`
+            // every not-ready→ready transition is a distinct edge, independent
+            // of whether `epoll_wait` ran while the fd was drained.  Bounded to
+            // the EPOLLIN bit and only when it is currently subscribed-asserted.
+            if evfd_slot.is_some()
+                && current_rise != et_rise
+                && (level & EPOLLIN) != 0
+            {
+                d |= EPOLLIN;
+            }
+            d
         } else {
             level
         };
-        (delivered, level)
+        (delivered, level, current_rise)
     };
 
     // ── Step 2: poll without holding the lock ────────────────────────────────
@@ -10979,9 +11013,10 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // on the instance and safe to call repeatedly in the wait loop.
     let do_poll = |fired: &mut alloc::vec::Vec<EpollEvent>| {
         fired.clear();
-        for &(fd, subscribed, data, last_ready) in &watches_snap {
+        for &(fd, subscribed, data, last_ready, et_rise, evfd_slot) in &watches_snap {
             if fired.len() >= maxevents { break; }
-            let (delivered, _level) = watch_events(fd, subscribed, last_ready);
+            let (delivered, _level, _rise) =
+                watch_events(fd, subscribed, last_ready, et_rise, evfd_slot);
             if delivered != 0 {
                 fired.push(EpollEvent { events: delivered, data });
             }
@@ -10997,8 +11032,9 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // after its single delivery must NOT keep the waiter awake (which would
     // reproduce the busy-spin); `delivered == 0` for such a watch parks us.
     let probe_ready = || -> bool {
-        for &(fd, subscribed, _data, last_ready) in &watches_snap {
-            let (delivered, _level) = watch_events(fd, subscribed, last_ready);
+        for &(fd, subscribed, _data, last_ready, et_rise, evfd_slot) in &watches_snap {
+            let (delivered, _level, _rise) =
+                watch_events(fd, subscribed, last_ready, et_rise, evfd_slot);
             if delivered != 0 { return true; }
         }
         false
@@ -11098,11 +11134,12 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // write the results back into the instance under a single brief lock hold.
     // Level-triggered watches are never touched (their `last_ready` is unused).
     {
-        let mut et_levels: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
-        for &(fd, subscribed, _data, last_ready) in &watches_snap {
+        let mut et_levels: alloc::vec::Vec<(usize, u32, u64)> = alloc::vec::Vec::new();
+        for &(fd, subscribed, _data, last_ready, et_rise, evfd_slot) in &watches_snap {
             if subscribed & EPOLLET != 0 {
-                let (_delivered, level) = watch_events(fd, subscribed, last_ready);
-                et_levels.push((fd, level));
+                let (_delivered, level, rise) =
+                    watch_events(fd, subscribed, last_ready, et_rise, evfd_slot);
+                et_levels.push((fd, level, rise));
             }
         }
         if !et_levels.is_empty() {

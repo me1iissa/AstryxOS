@@ -47,6 +47,19 @@ pub struct EpollWatch {
     /// reporting is unconditional.  Reset to 0 on `EPOLL_CTL_MOD` so a MOD
     /// re-arms the edge (Linux behaviour).
     pub last_ready: u32,
+    /// Edge-trigger rise generation last *delivered* for this watch, for
+    /// readiness sources that expose a monotonic 0→ready rise counter (the
+    /// eventfd `rise_seq`).  The `last_ready` level-diff alone cannot detect a
+    /// drain-then-rise that happens entirely between two `epoll_wait` calls
+    /// (no call observes the intermediate level==0, so the asserted level is
+    /// identical at both observations and `level & !last_ready == 0`).  Per
+    /// `epoll(7)` each not-ready→ready transition is a fresh edge that must be
+    /// reported regardless of `epoll_wait` timing; comparing the source's live
+    /// generation against this stored value re-arms the EPOLLIN edge across
+    /// such a transition.  Sources without a generation report 0, so the
+    /// level-diff behaviour governs them unchanged.  Ignored for
+    /// level-triggered watches; reset to 0 on ADD / `EPOLL_CTL_MOD`.
+    pub et_rise: u64,
 }
 
 /// Per-process monotonically increasing identifier for epoll instances.
@@ -141,7 +154,7 @@ impl EpollInstance {
         // any currently-asserted readiness (a 0→ready transition), matching
         // Linux, where a newly-added EPOLLET fd that is already ready fires
         // once immediately.
-        self.watches.push(EpollWatch { fd, events, data, last_ready: 0 });
+        self.watches.push(EpollWatch { fd, events, data, last_ready: 0, et_rise: 0 });
         true
     }
 
@@ -170,28 +183,33 @@ impl EpollInstance {
             // re-evaluates readiness).  Clear the recorded level so the next
             // poll treats the present readiness as a fresh 0→ready transition.
             w.last_ready = 0;
+            // A MOD also re-arms the generation edge: the next poll must treat
+            // the current generation as already-consumed → 0 forces the live
+            // generation to look "newer" so a currently-ready eventfd refires.
+            w.et_rise = 0;
             true
         } else {
             false
         }
     }
 
-    /// Commit the per-watch edge state after a delivery.  `delivered` maps
-    /// `fd → asserted-interest-level` for every watch that contributed to the
-    /// returned event set; for an EPOLLET watch this becomes its new
-    /// `last_ready` so the same asserted level is not re-reported.  Level-
-    /// triggered watches are unaffected (their reporting is unconditional and
-    /// `last_ready` is never consulted for them).
-    ///
-    /// We also clear `last_ready` for any EPOLLET watch whose current asserted
-    /// level is recorded as dropping to a subset — handled by the caller
-    /// passing the freshly-computed level (including 0) so a level-drop re-arms
-    /// the edge automatically.
-    pub fn commit_edges(&mut self, delivered: &[(usize, u32)]) {
-        for &(fd, level) in delivered {
+    /// Commit the per-watch edge state after a delivery.  Each tuple is
+    /// `(fd, asserted-interest-level, rise-generation)` for an EPOLLET watch:
+    ///   * `last_ready` becomes the asserted level so the same level is not
+    ///     re-reported while it stays high (and a level-drop to a subset —
+    ///     including 0 — re-arms automatically, since the caller passes the
+    ///     freshly-computed level), and
+    ///   * `et_rise` becomes the source's current rise generation so a future
+    ///     0→ready transition (a generation bump) re-arms the EPOLLIN edge even
+    ///     if the level looked continuously high across two `epoll_wait` calls.
+    /// Level-triggered watches are unaffected (their reporting is unconditional
+    /// and neither `last_ready` nor `et_rise` is consulted for them).
+    pub fn commit_edges(&mut self, delivered: &[(usize, u32, u64)]) {
+        for &(fd, level, rise) in delivered {
             if let Some(w) = self.watches.iter_mut().find(|w| w.fd == fd) {
                 if w.events & EPOLLET != 0 {
                     w.last_ready = level;
+                    w.et_rise    = rise;
                 }
             }
         }

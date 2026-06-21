@@ -366,6 +366,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc-tree"      => op_proc_tree(req, out),
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
+        "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
         "dmesg"          => op_dmesg(req, out),
@@ -1881,6 +1882,139 @@ fn op_fd_table(req: &str, out: &mut String) {
     if rows.len() > 256 {
         out.push_str(r#","truncated":true"#);
     }
+    out.push('}');
+}
+
+// ── epoll-watch ────────────────────────────────────────────────────────────
+//
+// Per-process epoll introspection: for every epoll instance owned by the pid,
+// dump each registered watch with its interest mask, the EPOLLET edge-trigger
+// flag, the recorded `last_ready` edge state, and the LIVE computed readiness
+// level of the target fd.  For an eventfd target the slot counter is included.
+//
+// This makes the edge-trigger contract directly observable: an EPOLLET watch
+// is "edge-suppressed" when its target currently asserts a non-zero level but
+// `level & !last_ready == 0` (no newly-asserted bit), i.e. epoll_wait will NOT
+// deliver it even though the fd is ready.  Per epoll(7) ("Level-triggered and
+// edge-triggered notification") that is correct ONLY if the level never
+// dropped-then-rose since the last delivery; if it did, the edge was lost.
+fn op_epoll_watch(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+
+    // One epoll watch, snapshotted under the PROCESS_TABLE lock.  The live
+    // readiness level is computed AFTER the lock is dropped, because
+    // `epoll_poll_events` itself acquires PROCESS_TABLE (would deadlock).
+    struct WatchSnap {
+        inst_id:    u64,
+        epfd:       usize,
+        watch_fd:   usize,
+        events:     u32,
+        last_ready: u32,
+        et_rise:    u64,
+        is_eventfd: bool,
+        evfd_inode: u64,
+    }
+
+    let snaps: Option<Vec<WatchSnap>> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g.iter().find(|p| p.pid == pid).map(|p| {
+            let mut v: Vec<WatchSnap> = Vec::new();
+            for inst in p.epoll_sets.iter() {
+                for w in inst.watches.iter() {
+                    // Resolve whether the watched fd is an eventfd so the
+                    // caller can correlate the asserted level with a stuck
+                    // counter (the libevent notify-eventfd is the suspect).
+                    let (is_eventfd, evfd_inode) = p.file_descriptors
+                        .get(w.fd)
+                        .and_then(|f| f.as_ref())
+                        .map(|f| (matches!(f.file_type, crate::vfs::FileType::EventFd), f.inode))
+                        .unwrap_or((false, 0));
+                    v.push(WatchSnap {
+                        inst_id:    inst.id,
+                        epfd:       inst.epfd,
+                        watch_fd:   w.fd,
+                        events:     w.events,
+                        last_ready: w.last_ready,
+                        et_rise:    w.et_rise,
+                        is_eventfd,
+                        evfd_inode,
+                    });
+                }
+            }
+            v
+        }),
+        None => {
+            out.push_str(r#"{"busy":"PROCESS_TABLE held","instances":[]}"#);
+            return;
+        }
+    };
+
+    let snaps = match snaps {
+        Some(s) => s,
+        None => { let _ = write!(out, r#"{{"error":"pid {} not found"}}"#, pid); return; }
+    };
+
+    const EPOLLET: u32 = 1 << 31;
+
+    out.push('{');
+    j_kv(out, "pid", &alloc::format!("{}", pid));
+    j_kv(out, "watch_count", &alloc::format!("{}", snaps.len()));
+    j_str(out, "watches"); out.push(':'); out.push('[');
+    for (i, s) in snaps.iter().take(512).enumerate() {
+        if i > 0 { out.push(','); }
+        // Lock-free live reads (PROCESS_TABLE already dropped).
+        let live_level = crate::subsys::linux::syscall::epoll_poll_events(pid, s.watch_fd);
+        const EPOLLIN: u32 = 0x0001;
+        let is_et = s.events & EPOLLET != 0;
+        // The subscribed-and-asserted level, as sys_epoll_wait computes it.
+        let asserted = s.events & live_level;
+        // Live readiness-rise generation for an eventfd source (0 otherwise).
+        let (evfd_counter, rise_seq) = if s.is_eventfd {
+            (crate::ipc::eventfd::peek_counter(s.evfd_inode),
+             crate::ipc::eventfd::rise_seq(s.evfd_inode).unwrap_or(0))
+        } else { (None, 0) };
+        // For an EPOLLET watch, the bits epoll_wait would DELIVER right now —
+        // mirrors the kernel `watch_events`: level-diff PLUS a re-armed EPOLLIN
+        // when the source posted a fresh 0→ready rise the epoll never observed
+        // at level 0 (rise_seq != et_rise).
+        let deliverable = if is_et {
+            let mut d = asserted & !s.last_ready;
+            if s.is_eventfd && rise_seq != s.et_rise && (asserted & EPOLLIN) != 0 {
+                d |= EPOLLIN;
+            }
+            d
+        } else { asserted };
+        // "edge-suppressed" = ET watch, fd currently ready, but nothing new to
+        // deliver (the residual-gap fingerprint — should be FALSE post-fix when
+        // a genuine drain-then-rise occurred).
+        let edge_suppressed = is_et && asserted != 0 && deliverable == 0;
+
+        out.push('{');
+        j_kv(out, "inst_id",  &alloc::format!("{}", s.inst_id));
+        j_kv(out, "epfd",     &alloc::format!("{}", s.epfd));
+        j_kv(out, "fd",       &alloc::format!("{}", s.watch_fd));
+        j_str(out, "events");      out.push(':'); j_hex(out, s.events as u64); out.push(',');
+        j_kv(out, "et",       if is_et { "true" } else { "false" });
+        j_str(out, "last_ready");  out.push(':'); j_hex(out, s.last_ready as u64); out.push(',');
+        j_str(out, "live_level");  out.push(':'); j_hex(out, live_level as u64); out.push(',');
+        j_str(out, "asserted");    out.push(':'); j_hex(out, asserted as u64); out.push(',');
+        j_str(out, "deliverable"); out.push(':'); j_hex(out, deliverable as u64); out.push(',');
+        j_kv(out, "is_eventfd", if s.is_eventfd { "true" } else { "false" });
+        match evfd_counter {
+            Some(c) => j_kv(out, "evfd_counter", &alloc::format!("{}", c)),
+            None    => j_kv_str(out, "evfd_counter", "n/a"),
+        }
+        j_kv(out, "rise_seq", &alloc::format!("{}", rise_seq));
+        j_kv(out, "et_rise",  &alloc::format!("{}", s.et_rise));
+        j_kv(out, "edge_suppressed", if edge_suppressed { "true" } else { "false" });
+        j_trim_comma(out);
+        out.push('}');
+    }
+    out.push(']');
+    if snaps.len() > 512 { out.push_str(r#","truncated":true"#); }
     out.push('}');
 }
 

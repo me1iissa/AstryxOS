@@ -7006,6 +7006,13 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "fd-table":
         if not rest: raise ValueError("fd-table requires <pid>")
         return {"op": "fd-table", "pid": int(rest[0], 0)}
+    if op == "epoll-watch":
+        # Per-process epoll introspection: dump each watch's interest mask,
+        # EPOLLET flag, last_ready edge state, live readiness level, and
+        # (for eventfd targets) the slot counter — plus an "edge_suppressed"
+        # fingerprint for the EPOLLET drop-then-rise residual gap.
+        if not rest: raise ValueError("epoll-watch requires <pid>")
+        return {"op": "epoll-watch", "pid": int(rest[0], 0)}
     if op == "fd-map":
         pid = int(rest[0], 0) if rest else 0  # 0 = all processes
         req: dict = {"op": "fd-map"}
@@ -12766,6 +12773,7 @@ def main():
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
+        "epoll-watch",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
