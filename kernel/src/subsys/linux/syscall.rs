@@ -10871,7 +10871,14 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // dup'd epoll fds share the inode and thus the same instance.
     // Symmetric with sys_epoll_ctl above; see that block for the full
     // by-id rationale (PIVOT-I2 Phase D, 2026-05-23).
-    let watches_snap: alloc::vec::Vec<(usize, u32, u64)> = {
+    // Snapshot tuple: (fd, events-interest, data-cookie, last_ready-edge-state).
+    // `last_ready` is the asserted-interest level most recently DELIVERED for
+    // this watch; it is consulted only for EPOLLET watches (events & EPOLLET)
+    // to suppress repeat reports while the readiness level stays high.  The
+    // epoll_id is also captured so the freshly-computed edge levels can be
+    // committed back to the instance after delivery.
+    let epoll_id_for_commit;
+    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -10885,51 +10892,76 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             Some(i) => i,
             None    => return -9,
         };
-        inst.watches.iter().map(|w| (w.fd, w.events, w.data)).collect()
+        epoll_id_for_commit = epoll_id;
+        inst.watches.iter().map(|w| (w.fd, w.events, w.data, w.last_ready)).collect()
     }; // lock released here
 
+    use crate::ipc::epoll::EPOLLET;
+
+    // Compute the deliverable interest mask for one watched fd.
+    //
+    // Per `epoll(7)`: "EPOLLERR and EPOLLHUP ... it is not necessary to set
+    // [them] in events"; the kernel reports them whenever they occur,
+    // independent of the caller's interest set.  The asserted *level* is two
+    // disjoint parts:
+    //   * the caller-subscribed bits that are currently ready
+    //     (`subscribed & ready_ev`), and
+    //   * any EPOLLERR / EPOLLHUP that is ready, delivered even when
+    //     unsubscribed (`ready_ev & (EPOLLERR | EPOLLHUP)`).
+    // EPOLLRDHUP flows through the first term only (Linux reports it only when
+    // subscribed).  The stored `subscribed` mask is the caller's raw interest
+    // and is never mutated.
+    //
+    // Edge-trigger (`EPOLLET`): per `epoll(7)`, an edge-triggered watch
+    // delivers a readiness bit only on a not-ready→ready transition ("events
+    // [are delivered] only when changes occur on the monitored file
+    // descriptor").  We compute the asserted `level`, then for an EPOLLET watch
+    // deliver only the bits NEWLY asserted since the last delivery
+    // (`level & !last_ready`); a bit that stays asserted (e.g. an eventfd whose
+    // counter never drops to 0, or a socket with un-drained data) is reported
+    // exactly once and then suppressed until the level drops and rises again.
+    // Level-triggered watches (the default) deliver the full asserted `level`
+    // unconditionally, as before.  Returns `(delivered_mask, asserted_level)`.
+    let watch_events = |fd: usize, subscribed: u32, last_ready: u32| -> (u32, u32) {
+        let ready_ev = epoll_poll_events(pid, fd);
+        let level =
+            (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
+        let delivered = if subscribed & EPOLLET != 0 {
+            level & !last_ready
+        } else {
+            level
+        };
+        (delivered, level)
+    };
+
     // ── Step 2: poll without holding the lock ────────────────────────────────
+    // Fills `fired` with the edge-aware deliverable events.  The EPOLLET edge
+    // state is committed separately in Step 2b (a single recompute + write-back)
+    // after the returned set is settled, so `do_poll` itself is side-effect-free
+    // on the instance and safe to call repeatedly in the wait loop.
     let do_poll = |fired: &mut alloc::vec::Vec<EpollEvent>| {
-        for &(fd, subscribed, data) in &watches_snap {
+        fired.clear();
+        for &(fd, subscribed, data, last_ready) in &watches_snap {
             if fired.len() >= maxevents { break; }
-            let ready_ev = epoll_poll_events(pid, fd);
-            // Per `epoll(7)`: "EPOLLERR and EPOLLHUP ... it is not necessary
-            // to set [them] in events"; the kernel reports them whenever they
-            // occur, independent of the caller's interest set.  Build the
-            // delivered mask as two disjoint parts:
-            //   * the caller-subscribed bits that are currently ready
-            //     (`subscribed & ready_ev`), and
-            //   * any EPOLLERR / EPOLLHUP that is ready, delivered even when
-            //     unsubscribed (`ready_ev & (EPOLLERR | EPOLLHUP)`).
-            // EPOLLRDHUP is NOT in the always-on set — Linux only reports it
-            // when subscribed — so it flows through the first term only.
-            //
-            // The stored `subscribed` mask is the caller's raw interest and is
-            // never mutated; ERR/HUP are force-added to the *ready* side here
-            // at the single delivery site.  This keeps the readiness/wake
-            // matching wake-safe: a healthy fd reporting only EPOLLOUT against
-            // an EPOLLIN-only watch yields `(EPOLLIN & EPOLLOUT) | (EPOLLOUT &
-            // (ERR|HUP)) = 0`, so no spurious-ready perturbs the parking
-            // decision — exactly as before this ABI fix.
-            let interest =
-                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
-            if interest != 0 {
-                fired.push(EpollEvent { events: interest, data });
+            let (delivered, _level) = watch_events(fd, subscribed, last_ready);
+            if delivered != 0 {
+                fired.push(EpollEvent { events: delivered, data });
             }
         }
     };
 
-    // Read-only readiness probe over the watch snapshot — true if any
-    // watched fd currently has a deliverable event.  Mirrors `do_poll`'s
-    // interest/ERR/HUP masking but allocates nothing and pushes nothing;
-    // used as the recheck-under-lock predicate for `wait_poll_event` so
-    // the check-and-park lost-wakeup window is closed (prepare-to-wait).
+    // Read-only readiness probe over the watch snapshot — true if any watched
+    // fd currently has a deliverable (edge-aware) event.  Mirrors `do_poll`'s
+    // edge/ERR/HUP masking but allocates nothing and pushes nothing; used as
+    // the recheck-under-lock predicate for `wait_poll_event` so the
+    // check-and-park lost-wakeup window is closed (prepare-to-wait).  Being
+    // edge-aware here is essential: an EPOLLET watch whose level stayed high
+    // after its single delivery must NOT keep the waiter awake (which would
+    // reproduce the busy-spin); `delivered == 0` for such a watch parks us.
     let probe_ready = || -> bool {
-        for &(fd, subscribed, _data) in &watches_snap {
-            let ready_ev = epoll_poll_events(pid, fd);
-            let interest =
-                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
-            if interest != 0 { return true; }
+        for &(fd, subscribed, _data, last_ready) in &watches_snap {
+            let (delivered, _level) = watch_events(fd, subscribed, last_ready);
+            if delivered != 0 { return true; }
         }
         false
     };
@@ -11010,6 +11042,39 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
                 if signal_pending(pid) { return -4; } // EINTR
                 let now = crate::arch::x86_64::irq::get_ticks();
                 if now >= deadline_tick { break; }
+            }
+        }
+    }
+
+    // ── Step 2b: commit EPOLLET edge state ───────────────────────────────────
+    // Record, for every edge-triggered watch, the asserted readiness level as
+    // of NOW so the next `epoll_wait` reports only fresh transitions:
+    //   * a watch that stayed high keeps its level → suppressed next time
+    //     (this is what stops an edge-triggered notify-eventfd busy-spin: the
+    //     counter stays 1, level stays EPOLLIN, last_ready=EPOLLIN ⇒
+    //     delivered=0), and
+    //   * a watch whose level DROPPED (e.g. the consumer drained the fd to
+    //     not-ready) records the lower level, so the next rise is a genuine
+    //     0→ready edge and fires again.
+    // We recompute the current level for each ET watch under no lock, then
+    // write the results back into the instance under a single brief lock hold.
+    // Level-triggered watches are never touched (their `last_ready` is unused).
+    {
+        let mut et_levels: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
+        for &(fd, subscribed, _data, last_ready) in &watches_snap {
+            if subscribed & EPOLLET != 0 {
+                let (_delivered, level) = watch_events(fd, subscribed, last_ready);
+                et_levels.push((fd, level));
+            }
+        }
+        if !et_levels.is_empty() {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                if let Some(inst) = proc.epoll_sets.iter_mut()
+                    .find(|e| e.id == epoll_id_for_commit)
+                {
+                    inst.commit_edges(&et_levels);
+                }
             }
         }
     }

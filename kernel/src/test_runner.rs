@@ -2825,6 +2825,14 @@ pub fn run() -> ! {
     total += 1;
     if test_293_epoll_listening_unix_has_pending() { passed += 1; }
 
+    // ── Test 305: epoll EPOLLET edge-trigger on a persistently-ready eventfd ─
+    // An EPOLLET watch must report a stays-ready fd exactly once (not on every
+    // epoll_wait); the level-only-kernel re-report was the libevent notify-
+    // eventfd busy-spin that wedged windowed Firefox before the toplevel map.
+    // Refs: epoll(7) (EPOLLET edge-triggered semantics), eventfd(2).
+    total += 1;
+    if test_305_epoll_edge_trigger() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -16494,6 +16502,138 @@ fn test_epoll_and_proc_fd() -> bool {
     if ok {
         test_pass!("epoll + /proc/self/fd (readlink+getdents) + /proc/self/status");
     }
+    ok
+}
+
+// ── Test 305: epoll EPOLLET edge-trigger semantics on an eventfd ──────────────
+//
+// Per `epoll(7)`: an `EPOLLET` (edge-triggered) watch delivers a readiness bit
+// only on a not-ready→ready transition ("events [are delivered] only when
+// changes occur on the monitored file descriptor"); a fd that STAYS ready (an
+// eventfd whose counter never returns to 0) must be reported exactly ONCE and
+// then suppressed until the level drops and rises again.  A level-triggered
+// watch (the default) is reported on EVERY `epoll_wait` while the level holds.
+//
+// This is the regression guard for the windowed-Firefox gate: libevent
+// registers its notify-eventfd EPOLLET; a level-only kernel reported it ready
+// on every `epoll_wait`, so libevent's event loop busy-spun (the eventfd
+// counter stayed 1, never drained) and the single core never ran the GTK
+// dispatch that maps+paints the toplevel.  With correct ET semantics the
+// always-ready eventfd is reported once and the loop parks.
+fn test_305_epoll_edge_trigger() -> bool {
+    test_header!("epoll EPOLLET edge-trigger on a persistently-ready eventfd (Test 305)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    // 12-byte struct epoll_event: [events: u32 LE, data: u64 LE].
+    fn make_ev(events: u32, data: u64) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&events.to_le_bytes());
+        b[4..12].copy_from_slice(&data.to_le_bytes());
+        b
+    }
+
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLET: u32 = 1 << 31;
+    const CTL_ADD: u64 = 1;
+    const CTL_MOD: u64 = 3;
+    const EFD_NONBLOCK: u64 = 0x0800;
+
+    let mut ok = true;
+
+    // Non-blocking poll: epoll_wait(timeout_ms=0) does a single poll, no park.
+    let wait_once = |epfd: u64| -> i64 {
+        let mut buf = [[0u8; 12]; 4];
+        dispatch(232, epfd, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0)
+    };
+
+    // ── Setup: eventfd (initval=0, NONBLOCK) + epoll instance ────────────────
+    let efd = dispatch(290 /*eventfd2*/, 0, EFD_NONBLOCK, 0, 0, 0, 0);
+    let epfd = dispatch(291 /*epoll_create1*/, 0, 0, 0, 0, 0, 0);
+    if efd < 0 || epfd < 0 {
+        test_fail!("ET setup", "eventfd={} epoll_create1={}", efd, epfd);
+        // fall through to teardown
+    } else {
+        let (efd, epfd) = (efd as u64, epfd as u64);
+
+        // Register the eventfd EPOLLET | EPOLLIN.
+        let ev = make_ev(EPOLLIN | EPOLLET, efd);
+        let r = dispatch(233 /*epoll_ctl*/, epfd, CTL_ADD, efd, ev.as_ptr() as u64, 0, 0);
+        if r != 0 { test_fail!("ET add", "epoll_ctl ADD = {}", r); ok = false; }
+
+        // (a) Counter is 0 → not ready → epoll_wait returns 0.
+        let r0 = wait_once(epfd);
+        if r0 != 0 { test_fail!("ET idle", "expected 0, got {}", r0); ok = false; }
+        else { test_println!("  (a) ET idle eventfd → 0 events ✓"); }
+
+        // Write 1 → counter becomes 1 (0→ready transition).
+        let one: u64 = 1;
+        let _ = dispatch(1 /*write*/, efd, &one as *const u64 as u64, 8, 0, 0, 0);
+
+        // (b) First poll after the rise → reported ONCE.
+        let r1 = wait_once(epfd);
+        if r1 != 1 { test_fail!("ET first", "expected 1 (the edge), got {}", r1); ok = false; }
+        else { test_println!("  (b) ET 0→ready: reported once ✓"); }
+
+        // (c) THE FIX: counter still 1 (never drained), level still asserted →
+        //     a second poll must report ZERO (edge already consumed).  A
+        //     level-only kernel returns 1 here forever = the busy-spin.
+        let r2 = wait_once(epfd);
+        if r2 != 0 {
+            test_fail!("ET suppress",
+                "edge-triggered watch re-reported a persistently-ready eventfd \
+                 (got {} events, expected 0) — this is the libevent busy-spin bug", r2);
+            ok = false;
+        } else { test_println!("  (c) ET stays-ready: suppressed (0 events) ✓"); }
+
+        // Drain the eventfd (read → counter back to 0), then write again
+        // (0→ready) → the edge must re-arm and fire once more.
+        let mut rbuf = [0u8; 8];
+        let _ = dispatch(0 /*read*/, efd, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        // After a drain to 0, level dropped; a poll observes not-ready (re-arms).
+        let r3 = wait_once(epfd);
+        if r3 != 0 { test_fail!("ET drained", "expected 0 after drain, got {}", r3); ok = false; }
+        let _ = dispatch(1, efd, &one as *const u64 as u64, 8, 0, 0, 0);
+        let r4 = wait_once(epfd);
+        if r4 != 1 {
+            test_fail!("ET rearm", "edge did not re-arm after drain+rewrite (got {}, expected 1)", r4);
+            ok = false;
+        } else { test_println!("  (d) ET re-arm after drain+rewrite: fired once ✓"); }
+
+        // (e) Level-triggered control: re-register the SAME eventfd WITHOUT
+        //     EPOLLET (via MOD).  Counter is 1 (still ready).  Two successive
+        //     polls must BOTH report it — level-triggered is unconditional.
+        let evl = make_ev(EPOLLIN, efd);
+        let rm = dispatch(233, epfd, CTL_MOD, efd, evl.as_ptr() as u64, 0, 0);
+        if rm != 0 { test_fail!("LT mod", "epoll_ctl MOD = {}", rm); ok = false; }
+        let l1 = wait_once(epfd);
+        let l2 = wait_once(epfd);
+        if l1 != 1 || l2 != 1 {
+            test_fail!("LT level", "level-triggered eventfd not reported on every poll (l1={} l2={})", l1, l2);
+            ok = false;
+        } else { test_println!("  (e) level-triggered: reported on every poll ✓"); }
+
+        let _ = crate::vfs::close(pid, epfd as usize);
+        let _ = crate::vfs::close(pid, efd as usize);
+    }
+
+    // ── Tear down ────────────────────────────────────────────────────────────
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = false;
+            p.subsystem = crate::win32::SubsystemType::Aether;
+        }
+    }
+
+    if ok { test_pass!("epoll EPOLLET edge-trigger semantics (Test 305)"); }
     ok
 }
 
