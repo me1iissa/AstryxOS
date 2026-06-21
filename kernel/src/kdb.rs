@@ -2072,8 +2072,11 @@ fn op_fd_map(req: &str, out: &mut String) {
                     if fd.is_console { continue; }
                     use crate::vfs::FileType::*;
                     match fd.file_type {
-                        Socket | Pipe => {}
-                        _ => continue, // only emit types with meaningful peers
+                        // Socket / Pipe have meaningful peers; EventFd is the
+                        // GLib GWakeup source — emit it too so the main-context
+                        // wakeup fd-set (self-pipe + eventfd) is fully visible.
+                        Socket | Pipe | EventFd => {}
+                        _ => continue,
                     }
                     v.push(FdSnap {
                         pid:       p.pid,
@@ -2172,12 +2175,32 @@ fn op_fd_map(req: &str, out: &mut String) {
                     }
                 }
             }
+            crate::vfs::FileType::EventFd => {
+                // GLib GWakeup source.  Report the live readiness so the
+                // main-context wakeup-fd golden-diff can see whether the
+                // kernel's poll-readiness for the eventfd matches the heartbeat
+                // pattern (eventfd(2) / poll(2)).
+                //
+                // NOTE: readiness (here and on pipes below) is sampled in this
+                // Stage-4 emit, i.e. *after* the PROCESS_TABLE snapshot was
+                // released, so it reflects a slightly later instant than the FD
+                // snapshot.  This is a benign, intentional TOCTOU — the goal is
+                // the *live* readiness level, not strict snapshot consistency.
+                j_kv_str(out, "kind", "eventfd");
+                j_kv(out, "eventfd_id", &alloc::format!("{}", snap.inode));
+                j_kv_str(out, "readable",
+                    if crate::ipc::eventfd::is_readable(snap.inode) { "true" } else { "false" });
+            }
             crate::vfs::FileType::Pipe => {
                 j_kv_str(out, "kind", "pipe");
                 j_kv(out, "pipe_id", &alloc::format!("{}", snap.inode));
                 // Bit 0 of flags: 1 = write end (see FileDescriptor::pipe_write_end)
                 let is_write = snap.flags & 1 == 1;
                 j_kv_str(out, "pipe_end", if is_write { "write" } else { "read" });
+                // Live readiness of the read-end (data buffered).  For the GLib
+                // self-pipe this is the poll(2) level the main loop keys on.
+                j_kv_str(out, "has_data",
+                    if crate::ipc::pipe::pipe_has_data(snap.inode) { "true" } else { "false" });
 
                 // Find the complementary end (same pipe_id, opposite direction).
                 let peer = fd_snaps.iter().find(|s| {
