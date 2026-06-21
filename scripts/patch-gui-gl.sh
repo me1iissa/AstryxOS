@@ -111,6 +111,17 @@ DRI_REL="usr/lib/xorg/modules/dri"
 # xorg/modules/dri/ — libGL's compiled-in default LIBGL_DRIVERS_PATH — as a
 # single 34 MiB object hardlinked under three names; swrast_dri.so is the name
 # the loader opens for software rendering.
+#
+# The GL-only second-order deps below (the DT_NEEDED of libGL/libEGL/libgbm and
+# of the Gallium driver that NO base-image library needs) must be injected and
+# verified too: ld.so resolves a DT_NEEDED chain eagerly at dlopen(3) time
+# (ld.so(8)), so if any of them is absent the dlopen("libGL.so.1") /
+# dlopen("swrast_dri.so") still fails even when the anchor itself is present.
+#   libdrm_{radeon,amdgpu,nouveau,intel}         DT_NEEDED of the Gallium driver
+#   libxcb-{glx,dri2,present,randr,sync,xfixes}   DT_NEEDED of libGL/libEGL/libgbm
+# (Their own DT_NEEDED in turn — libdrm.so.2, libxcb.so.1, libX11*, libz,
+# libzstd, libxcb-shm/dri3 — is base-shared and already in every FF/X11 image,
+# so it is NOT injected here.)
 GL_LIBS=(
     libGL.so.1            libGL.so.1.2.0
     libEGL.so.1           libEGL.so.1.0.0
@@ -122,6 +133,16 @@ GL_LIBS=(
     libLLVM-17.so         libLLVM-17.0.6.so
     libelf.so.1           libelf-0.191.so
     libz.so.1
+    libdrm_radeon.so.1    libdrm_radeon.so.1.0.1
+    libdrm_amdgpu.so.1    libdrm_amdgpu.so.1.0.0
+    libdrm_nouveau.so.2   libdrm_nouveau.so.2.0.0
+    libdrm_intel.so.1     libdrm_intel.so.1.0.0
+    libxcb-glx.so.0       libxcb-glx.so.0.0.0
+    libxcb-dri2.so.0      libxcb-dri2.so.0.0.0
+    libxcb-present.so.0   libxcb-present.so.0.0.0
+    libxcb-randr.so.0     libxcb-randr.so.0.1.0
+    libxcb-sync.so.1      libxcb-sync.so.1.0.0
+    libxcb-xfixes.so.0    libxcb-xfixes.so.0.0.0
 )
 # DRI driver objects (under usr/lib/xorg/modules/dri/).  swrast_dri.so is the
 # load target for software rendering; libgallium_dri.so is the canonical object.
@@ -143,11 +164,29 @@ GL_REQUIRED=(
     "/usr/lib/libxshmfence.so.1"
     "/usr/lib/libXxf86vm.so.1"
     "/usr/lib/xorg/modules/dri/swrast_dri.so"
+    # GL-only DT_NEEDED of libGL/libEGL/libgbm + the Gallium driver (ld.so
+    # resolves these eagerly at dlopen time — a closure missing any of them
+    # still fails to load libGL/swrast even with the anchors present).
+    "/usr/lib/libxcb-glx.so.0"
+    "/usr/lib/libxcb-dri2.so.0"
+    "/usr/lib/libxcb-present.so.0"
+    "/usr/lib/libxcb-randr.so.0"
+    "/usr/lib/libxcb-sync.so.1"
+    "/usr/lib/libxcb-xfixes.so.0"
+    "/usr/lib/libdrm_radeon.so.1"
+    "/usr/lib/libdrm_amdgpu.so.1"
+    "/usr/lib/libdrm_nouveau.so.2"
+    "/usr/lib/libdrm_intel.so.1"
 )
 
 # ── image present-check ──────────────────────────────────────────────────────
-img_has() {  # img_has <image> <abs-path>  -> 0 if a regular file inode exists
-    debugfs -R "stat $2" "$1" 2>/dev/null | grep -q 'Inode:'
+# True only when the path is a REGULAR FILE in the image.  `debugfs stat` prints
+# "Inode:" for directories and symlinks too, so we additionally require
+# "Type: regular" — a GL closure member must be a real file the loader can mmap,
+# never a stray dir/symlink left by a partial write.
+img_has() {  # img_has <image> <abs-path>  -> 0 if a regular-file inode exists
+    debugfs -R "stat $2" "$1" 2>/dev/null \
+        | grep -qE 'Type: *regular'
 }
 
 # ── inject a staged regular file into the image at its absolute disk path ─────

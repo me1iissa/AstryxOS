@@ -60,6 +60,17 @@ GL_MEMBERS = [
     ("usr/lib/libxshmfence.so.1",               "/usr/lib/libxshmfence.so.1"),
     ("usr/lib/libXxf86vm.so.1",                 "/usr/lib/libXxf86vm.so.1"),
     ("usr/lib/xorg/modules/dri/swrast_dri.so",  "/usr/lib/xorg/modules/dri/swrast_dri.so"),
+    # GL-only second-order DT_NEEDED (must match GL_REQUIRED in patch-gui-gl.sh).
+    ("usr/lib/libxcb-glx.so.0",                 "/usr/lib/libxcb-glx.so.0"),
+    ("usr/lib/libxcb-dri2.so.0",                "/usr/lib/libxcb-dri2.so.0"),
+    ("usr/lib/libxcb-present.so.0",             "/usr/lib/libxcb-present.so.0"),
+    ("usr/lib/libxcb-randr.so.0",               "/usr/lib/libxcb-randr.so.0"),
+    ("usr/lib/libxcb-sync.so.1",                "/usr/lib/libxcb-sync.so.1"),
+    ("usr/lib/libxcb-xfixes.so.0",              "/usr/lib/libxcb-xfixes.so.0"),
+    ("usr/lib/libdrm_radeon.so.1",              "/usr/lib/libdrm_radeon.so.1"),
+    ("usr/lib/libdrm_amdgpu.so.1",              "/usr/lib/libdrm_amdgpu.so.1"),
+    ("usr/lib/libdrm_nouveau.so.2",             "/usr/lib/libdrm_nouveau.so.2"),
+    ("usr/lib/libdrm_intel.so.1",               "/usr/lib/libdrm_intel.so.1"),
 ]
 # Versioned/extra aliases the tool also injects (so the staging tree has them
 # present and the inject loop finds them).
@@ -72,6 +83,16 @@ GL_ALIASES = [
     "usr/lib/libelf-0.191.so",
     "usr/lib/libz.so.1",
     "usr/lib/xorg/modules/dri/libgallium_dri.so",
+    "usr/lib/libdrm_radeon.so.1.0.1",
+    "usr/lib/libdrm_amdgpu.so.1.0.0",
+    "usr/lib/libdrm_nouveau.so.2.0.0",
+    "usr/lib/libdrm_intel.so.1.0.0",
+    "usr/lib/libxcb-glx.so.0.0.0",
+    "usr/lib/libxcb-dri2.so.0.0.0",
+    "usr/lib/libxcb-present.so.0.0.0",
+    "usr/lib/libxcb-randr.so.0.1.0",
+    "usr/lib/libxcb-sync.so.1.0.0",
+    "usr/lib/libxcb-xfixes.so.0.0.0",
 ]
 
 
