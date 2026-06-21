@@ -427,7 +427,12 @@ pub fn dispatch(
             // same way the Linux personality does — an empty receive on a
             // live socket must not read as a 0-byte EOF, or a polled reader
             // busy-loops.  See recv(2) / IEEE 1003.1 §recv.
-            match crate::net::socket::socket_recv_status(socket_id) {
+            // Pass the user buffer size `buf_len` so a TCP stream drain
+            // returns at most `buf_len` octets and leaves the surplus
+            // queued for the next recvfrom (IEEE Std 1003.1-2017 §read;
+            // RFC 9293 §3.10.3) rather than draining the whole buffer and
+            // dropping the bytes past `buf_len`.
+            match crate::net::socket::socket_recv_status(socket_id, buf_len) {
                 Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                     let copy_len = data.len().min(buf_len);
                     if copy_len > 0 {

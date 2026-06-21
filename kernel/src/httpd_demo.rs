@@ -213,7 +213,10 @@ pub fn pump() {
 
     // ── Step 2: drain RX into per-session buffers ─────────────────────
     for (rip, rp) in &live_peers {
-        let bytes = tcp::read_from(HTTPD_PORT, *rip, *rp);
+        // Drain everything currently queued for this 4-tuple into the
+        // per-session accumulator (usize::MAX = no caller-buffer bound;
+        // the MAX_REQ_BYTES guard below caps the session buffer).
+        let bytes = tcp::read_from(HTTPD_PORT, *rip, *rp, usize::MAX);
         if bytes.is_empty() { continue; }
         let mut ss = HTTP_SESSIONS.lock();
         if let Some(s) = ss.iter_mut()
