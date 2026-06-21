@@ -2180,6 +2180,12 @@ fn op_fd_map(req: &str, out: &mut String) {
                 // main-context wakeup-fd golden-diff can see whether the
                 // kernel's poll-readiness for the eventfd matches the heartbeat
                 // pattern (eventfd(2) / poll(2)).
+                //
+                // NOTE: readiness (here and on pipes below) is sampled in this
+                // Stage-4 emit, i.e. *after* the PROCESS_TABLE snapshot was
+                // released, so it reflects a slightly later instant than the FD
+                // snapshot.  This is a benign, intentional TOCTOU — the goal is
+                // the *live* readiness level, not strict snapshot consistency.
                 j_kv_str(out, "kind", "eventfd");
                 j_kv(out, "eventfd_id", &alloc::format!("{}", snap.inode));
                 j_kv_str(out, "readable",
