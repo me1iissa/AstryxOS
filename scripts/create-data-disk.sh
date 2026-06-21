@@ -961,3 +961,28 @@ else
 fi
 
 echo "[DATA-DISK] Created: ${DATA_IMG} (${SIZE_MB} MiB, ext2)"
+
+# ── Verify the software-GL closure landed in the produced image ──────────────
+# The windowed (--ff-gui) Firefox path's GPU-feature probe (glxtest) and the
+# content-process compositor dlopen() libGL.so.1 / libEGL.so.1 by SONAME; if
+# those (or the Gallium llvmpipe DRI driver) are absent from the IMAGE, glxtest
+# reports "libGL.so.1 missing" and the content compositor child cannot bring up
+# a software OpenGL context (CompositorBridgeChild AbnormalShutdown → no render).
+# install-firefox-musl.sh already fails loud if the GL stack is missing from the
+# STAGING tree; this check closes the remaining gap — an image whose CONTENT is
+# GL-incomplete even though it was freshly written (e.g. a path that dropped the
+# xorg/modules/dri driver dir).  Only runs when the staging tree actually
+# carries the GL stack, so a deliberately GL-less build is unaffected.  Warn
+# (don't fail): headless Firefox boots and non-FF images do not need GL.
+# Ref: ld.so(8), dlopen(3), Mesa 3D docs (Gallium/llvmpipe).
+if [ -e "${STAGING_TREE}/usr/lib/libGL.so.1" ] \
+   && [ -f "${ROOT_DIR}/scripts/patch-gui-gl.sh" ] \
+   && command -v debugfs >/dev/null 2>&1; then
+    if bash "${ROOT_DIR}/scripts/patch-gui-gl.sh" --verify "${DATA_IMG}" >/dev/null 2>&1; then
+        echo "[DATA-DISK][GL] ok: image carries the complete software-GL closure (libGL/libEGL + llvmpipe DRI driver)"
+    else
+        echo "[DATA-DISK][GL] WARNING: image is GL-incomplete despite a GL-staged tree — the --ff-gui windowed path will fall back to 'libGL.so.1 missing'."
+        echo "[DATA-DISK][GL]          repair without a rebuild: scripts/patch-gui-gl.sh --image ${DATA_IMG} --in-place"
+        bash "${ROOT_DIR}/scripts/patch-gui-gl.sh" --verify "${DATA_IMG}" 2>&1 | grep -E 'MISSING|present' || true
+    fi
+fi
