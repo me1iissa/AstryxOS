@@ -71,6 +71,7 @@ GL_MEMBERS = [
     ("usr/lib/libdrm_amdgpu.so.1",              "/usr/lib/libdrm_amdgpu.so.1"),
     ("usr/lib/libdrm_nouveau.so.2",             "/usr/lib/libdrm_nouveau.so.2"),
     ("usr/lib/libdrm_intel.so.1",               "/usr/lib/libdrm_intel.so.1"),
+    ("usr/lib/libpciaccess.so.0",               "/usr/lib/libpciaccess.so.0"),
 ]
 # Versioned/extra aliases the tool also injects (so the staging tree has them
 # present and the inject loop finds them).
@@ -93,6 +94,7 @@ GL_ALIASES = [
     "usr/lib/libxcb-randr.so.0.1.0",
     "usr/lib/libxcb-sync.so.1.0.0",
     "usr/lib/libxcb-xfixes.so.0.0.0",
+    "usr/lib/libpciaccess.so.0.11.1",
 ]
 
 

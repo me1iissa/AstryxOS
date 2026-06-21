@@ -118,6 +118,7 @@ DRI_REL="usr/lib/xorg/modules/dri"
 # (ld.so(8)), so if any of them is absent the dlopen("libGL.so.1") /
 # dlopen("swrast_dri.so") still fails even when the anchor itself is present.
 #   libdrm_{radeon,amdgpu,nouveau,intel}         DT_NEEDED of the Gallium driver
+#   libpciaccess.so.0                            DT_NEEDED of libdrm_intel (3rd-order)
 #   libxcb-{glx,dri2,present,randr,sync,xfixes}   DT_NEEDED of libGL/libEGL/libgbm
 # (Their own DT_NEEDED in turn — libdrm.so.2, libxcb.so.1, libX11*, libz,
 # libzstd, libxcb-shm/dri3 — is base-shared and already in every FF/X11 image,
@@ -137,6 +138,7 @@ GL_LIBS=(
     libdrm_amdgpu.so.1    libdrm_amdgpu.so.1.0.0
     libdrm_nouveau.so.2   libdrm_nouveau.so.2.0.0
     libdrm_intel.so.1     libdrm_intel.so.1.0.0
+    libpciaccess.so.0     libpciaccess.so.0.11.1
     libxcb-glx.so.0       libxcb-glx.so.0.0.0
     libxcb-dri2.so.0      libxcb-dri2.so.0.0.0
     libxcb-present.so.0   libxcb-present.so.0.0.0
@@ -177,6 +179,7 @@ GL_REQUIRED=(
     "/usr/lib/libdrm_amdgpu.so.1"
     "/usr/lib/libdrm_nouveau.so.2"
     "/usr/lib/libdrm_intel.so.1"
+    "/usr/lib/libpciaccess.so.0"
 )
 
 # ── image present-check ──────────────────────────────────────────────────────
