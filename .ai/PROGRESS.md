@@ -6,6 +6,43 @@
 **GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
 **Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
 
+### Milestone 47 — Windowed Firefox PAINTS from a clean master build (✅, PR #606)
+**Completed**: 2026-06-21
+
+**What was built:** the held windowed-FF paint deltas (Milestones 45/46 = GLX handshake +
+real MIT-SHM ShmPutImage + Mesa llvmpipe runtime + ShmCreatePixmap) were consolidated onto
+`master` (on top of #601 W215 quarantine, #603 X11 reassembly, #604 loaders.cache, #605 EPOLLET
+edge-trigger). One reconciliation: `ShmQueryVersion` advertises **`shared_pixmaps=false`** so
+clients (nsShmImage) stay on the verified ShmPutImage / core PutImage (op72) present path; the
+`ShmCreatePixmap` handler stays wired + unit-tested for a future single-bit enable.
+
+- [x] **VERIFIED PAINT FROM MASTER:** clean build of the consolidated branch, booted
+  `--ff-gui --smp 1`, maps the real toplevel `0x400016` 1280×972 and paints the full Firefox
+  chrome into it (30× `op=72` PutImage); 0 SIGSEGV, 0 paint-flood regressions. Screendump read +
+  golden-compared to the proven first-paint = pixel-identical full FF chrome (logo, New-Tab tab,
+  URL bar, toolbar icons). Headless suite: 23 X11 tests PASS / 0 X11 FAIL.
+
+### Milestone 46 — Windowed Firefox: MIT-SHM shared pixmaps + GdkPixbuf loaders.cache (✅)
+**Completed**: 2026-06-19
+
+**What was built (combined windowed-paint branch):**
+- [x] **Real MIT-SHM `ShmCreatePixmap` + CopyArea-from-SHM-pixmap** (`kernel/src/x11/{mod,resource}.rs`): `ShmCreatePixmap` creates a real Pixmap resource whose pixel storage IS the attached SysV-SHM segment (records shmid/offset/scanline-padded stride, validates the image region fits the segment); `CopyArea(pixmap → window)` reads an SHM-backed source's LIVE pixels from the segment's physical backing at copy time. This is the second X11 present path (`gUseShmPixmaps`) — the one nsShmImage prefers when the server advertises shared pixmaps. Was a no-op stub. Headless test `test_x11_shm_create_pixmap` proves live-read (segment changed AFTER CreatePixmap; CopyArea sees the new pixels). Cites X11 MIT-SHM protocol §ShmCreatePixmap. **Note (PR #606):** `ShmQueryVersion` advertises `shared_pixmaps=false` — the verified paint goes through the ShmPutImage/op72 path, so this CreatePixmap handler stays dormant (wired + tested) behind a single-bit flip.
+- [x] **GdkPixbuf `loaders.cache` always provisioned** (`scripts/create-data-disk.sh`): the windowed (`--ff-gui`) path realizes a real toplevel, so GTK decodes its compiled-in symbolic PNG titlebar icons through GdkPixbuf. With no `loaders.cache`, GdkPixbuf comes up with an empty loader set, the first PNG decode returns NULL, and the `gdk_cairo_surface_create_from_pixbuf(NULL)`/`g_object_unref(NULL)` cascade dereferences a garbage pointer → deterministic SIGSEGV in the parent before any window is mapped. `install-firefox-musl.sh` generated the cache only on FF (re)install; the common fast path reuses an installed `build/disk` and skipped it. Now `patch-gui-caches.sh --stage-only` runs unconditionally on every data-image build. **Verified**: the parent SIGSEGV (deterministic, 5× identical-RIP) is eliminated; FF advances from "ff-launch crash" to a clean multi-thread startup park.
+- [x] **Combined branch** off `feat/mesa-gl-runtime` (GLX #598 + real ShmPutImage + Mesa injection #599) cherry-picking the mremap top-down/freed-gap fix (#596), the background-network-disable prefs seed (#597, kills the openh264 MOZ_CRASH), and `network.process.enabled=false`.
+- [x] **Residual gate at the time of this milestone (since CLEARED in Milestone 47):** the
+  windowed paint was gated by the kernel epoll ignoring `EPOLLET` (libevent notify-eventfd
+  busy-spin starved the SMP=1 core → GTK never mapped the toplevel). Fixed by the EPOLLET
+  edge-trigger (PR #605); FF then maps `0x400016` 1280×972 and paints (Milestone 47).
+
+### Milestone 45 — X11 server-side GLX handshake + real MIT-SHM ShmPutImage (✅, PR #598)
+**Completed**: 2026-06-19
+
+**What was built:**
+- [x] **GLX extension (major opcode 146)** in the in-kernel X11 server (`kernel/src/x11/{proto,mod}.rs`): the handshake a software-OpenGL client (Mesa drisw + llvmpipe, direct/client-side rendering) needs to bind a GL context to its window. Advertised via QueryExtension/ListExtensions (first_event=0, 14-error first_error block). Requests: QueryVersion→1.4, GetVisualConfigs (two RGBA depth-24 configs, 18 positional CARD32 fields per the GLX Protocol Encoding), GetFBConfigs (two tagged fbconfigs), Create/Destroy/MakeCurrent context bookkeeping (tag≠0), IsDirect→true, QueryServerString/QueryExtensionsString/QueryContext/GetDrawableAttributes, ClientInfo/SetClientInfo*ARB/WaitGL/WaitX/SwapBuffers accepted no-reply. Per-connection context table freed on disconnect.
+- [x] **MIT-SHM made real** (was advertised-absent + no-op stub): re-advertised; ShmAttach/ShmDetach bind an X shmseg→SysV shmid; ShmPutImage reads pixels straight from the segment's physically-contiguous, kernel-readable backing (new `ipc::sysv_shm::segment_phys`) and composites the sub-rectangle into the destination window (same path as core PutImage), avoiding the per-frame request-body copy.
+- [x] **Headless tests** (`test_runner.rs`): GLX handshake test + real MIT-SHM ShmPutImage test (write known pattern to a real segment's phys backing → ShmAttach + ShmPutImage → verify window pixel composited). Both pass; full suite unregressed.
+- [x] **Known downstream gate (image, not kernel):** Firefox's glxtest cannot yet reach this surface — the boot image (`gui-complete.img`, musl FF) has **no Mesa GL runtime** (no libGL.so.1, libEGL.so.1, /usr/lib/dri, swrast_dri.so). Live FF boot shows glxtest dying at `dlopen("libGL.so.1")` with 0 GLX (op=146) requests reaching the server. Injecting a **musl-built** Mesa stack into the image is a prerequisite (toolchain/image-construction task).
+
 ### Milestone 44 — perf: gate high-frequency diagnostic serial behind *-trace features (✅, PR #518)
 **Completed**: 2026-06-04
 

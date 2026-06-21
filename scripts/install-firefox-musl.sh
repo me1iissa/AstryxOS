@@ -147,6 +147,33 @@ case "${FIREFOX_PKG}" in
         ;;
 esac
 
+# ── Software-OpenGL (Mesa) runtime ───────────────────────────────────────────
+# Firefox's GPU-feature probe (glxtest) dlopen()s libGL.so.1 and runs a GLX
+# context-create + glGetString(GL_RENDERER) handshake in a forked child before
+# the compositor starts.  Without a GL client runtime the probe fails at
+# dlopen("libGL.so.1") ("libGL.so.1 missing"), GL is marked unavailable, and on
+# a headless/no-DRM target WebRender has no GL path for the windowed (--ff-gui)
+# compositor.  We therefore stage the Mesa software-GL stack (Gallium llvmpipe)
+# so the GLX handshake reaches the X server and WebRender can initialise a
+# software OpenGL context.  These are pure userland libraries from the same
+# pinned Alpine repo as the rest of the FF stack (no DRM / no kernel driver
+# dependency); llvmpipe renders entirely on the CPU.
+#
+# Package -> SONAME map (Alpine v3.20, mesa 24.0.9 / llvm17 17.0.6):
+#   mesa-gl           -> libGL.so.1            (GLX/OpenGL client + dispatch)
+#   mesa-egl          -> libEGL.so.1           (EGL client; FF probes it too)
+#   mesa-dri-gallium  -> /usr/lib/xorg/modules/dri/libgallium_dri.so
+#                        (+ swrast_dri.so symlink) = llvmpipe pipe driver
+#   mesa-gbm          -> libgbm.so.1           (DT_NEEDED of libEGL)
+# apk pulls the transitive runtime deps automatically: mesa + mesa-glapi
+# (libglapi.so.0), llvm17-libs (libLLVM-17.so), libelf, libxshmfence,
+# libxxf86vm, wayland-libs-server.  All land under ${ROOTFS}/usr/lib (the DRI
+# driver at .../usr/lib/xorg/modules/dri, which is libGL's compiled-in default
+# LIBGL_DRIVERS_PATH) and flow through the existing `cp -aL ${ROOTFS}/usr/lib/.`
+# staging step unchanged.  Refs: Mesa 3D docs (gallium/llvmpipe), OpenGL/GLX
+# 1.4 spec, EGL 1.5 spec.
+FIREFOX_GL_PACKAGES="mesa-gl mesa-egl mesa-dri-gallium mesa-gbm"
+
 # Mozilla artefacts ship with DT_RUNPATH=/usr/lib/<package> baked into the
 # ELF .dynamic section (where <package> is either "firefox-esr" or "firefox"
 # depending on the build).  Per the ELF gABI (System V ABI §5.4 "Dynamic
@@ -179,8 +206,10 @@ if [ "${FORCE}" = false ] && [ -f "${FIREFOX_BIN}" ] && \
    file "${FIREFOX_BIN}" 2>/dev/null | grep -q 'ld-musl' && \
    [ -e "${DISK_LIB}/libz.so.1" ] && \
    [ -e "${DISK_FF_TREE}/libxul.so" ] && \
+   [ -e "${DISK_USR_LIB}/libGL.so.1" ] && \
+   [ -e "${DISK_USR_LIB}/dri/libgallium_dri.so" ] && \
    [ "${EXISTING_PKG}" = "${FIREFOX_PKG}" ]; then
-    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked, base + runpath staged for ${FIREFOX_PKG} — skipping (use --force to reinstall)"
+    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked, base + runpath + Mesa-GL staged for ${FIREFOX_PKG} — skipping (use --force to reinstall)"
     exit 0
 fi
 
@@ -243,13 +272,37 @@ EOF
         --arch=x86_64 \
         --no-cache \
         --initdb \
-        add "${FIREFOX_PKG}" 2>&1 \
+        add "${FIREFOX_PKG}" ${FIREFOX_GL_PACKAGES} 2>&1 \
         | sed 's/^/[FF-MUSL apk] /' \
         | tail -40 || true
 
     if [ ! -f "${ROOTFS_FF_SENTINEL}" ]; then
         echo "[FF-MUSL] ERROR: ${FIREFOX_PKG} not present in rootfs after apk add"
         echo "[FF-MUSL]        Expected file: ${ROOTFS_FF_SENTINEL}"
+        exit 1
+    fi
+fi
+
+# ── Ensure the Mesa software-GL stack is present in the rootfs ───────────────
+# The bootstrap block above only runs when the FF sentinel is absent, so a
+# rootfs cached from a pre-Mesa build of this script would otherwise never gain
+# libGL.  Detect the GL runtime by its canonical SONAME and `apk add` the Mesa
+# package set into the existing rootfs when missing — idempotent, and a no-op
+# once present.  The sentinel is libGL.so.1 (owned by mesa-gl).
+ROOTFS_GL_SENTINEL="${ROOTFS}/usr/lib/libGL.so.1"
+if [ ! -e "${ROOTFS_GL_SENTINEL}" ]; then
+    echo "[FF-MUSL] Adding Mesa software-GL stack to rootfs (${FIREFOX_GL_PACKAGES})"
+    "${APK_BIN}" \
+        --root="${ROOTFS}" \
+        --arch=x86_64 \
+        --no-cache \
+        add ${FIREFOX_GL_PACKAGES} 2>&1 \
+        | sed 's/^/[FF-MUSL apk-gl] /' \
+        | tail -30 || true
+    if [ ! -e "${ROOTFS_GL_SENTINEL}" ]; then
+        echo "[FF-MUSL] ERROR: libGL.so.1 not present in rootfs after Mesa apk add"
+        echo "[FF-MUSL]        Expected file: ${ROOTFS_GL_SENTINEL}"
+        echo "[FF-MUSL]        The windowed (--ff-gui) GLX/WebRender path needs it."
         exit 1
     fi
 fi
@@ -694,6 +747,35 @@ if [ -n "${MISSING_BASE_LIBS}" ]; then
     echo "[FF-MUSL]        — check ${ROOTFS}/usr/lib/ and extend stage step (a)."
     exit 1
 fi
+
+# Verify the Mesa software-GL stack (FIREFOX_GL_PACKAGES) landed in the staging
+# tree.  The windowed (--ff-gui) Firefox path needs libGL.so.1 for the glxtest
+# GLX handshake and the Gallium llvmpipe DRI driver
+# (xorg/modules/dri/libgallium_dri.so = swrast_dri.so) for the software OpenGL
+# context WebRender initialises.  These flow through the bulk
+# `cp -aL ${ROOTFS}/usr/lib/.` stage; this check fails loud (greppable
+# "[FF-MUSL][GL]") if a stale rootfs or a copy error dropped them, so a GUI
+# image cannot ship GL-less and silently fall back to "libGL.so.1 missing".
+DISK_DRI_DRIVER="${DISK_USR_LIB}/xorg/modules/dri/libgallium_dri.so"
+MISSING_GL_LIBS=""
+for gl_lib in \
+    "${DISK_USR_LIB}/libGL.so.1" \
+    "${DISK_USR_LIB}/libEGL.so.1" \
+    "${DISK_USR_LIB}/libglapi.so.0" \
+    "${DISK_USR_LIB}/libLLVM-17.so" \
+    "${DISK_DRI_DRIVER}" \
+    "${DISK_USR_LIB}/libgbm.so.1" \
+    "${DISK_USR_LIB}/libxshmfence.so.1" \
+    "${DISK_USR_LIB}/libXxf86vm.so.1"; do
+    [ -e "${gl_lib}" ] || MISSING_GL_LIBS="${MISSING_GL_LIBS} ${gl_lib#${DISK_DIR}}"
+done
+if [ -n "${MISSING_GL_LIBS}" ]; then
+    echo "[FF-MUSL][GL] ERROR: Mesa software-GL libs missing from staging:${MISSING_GL_LIBS}"
+    echo "[FF-MUSL][GL]        ${FIREFOX_GL_PACKAGES} may have failed to install into"
+    echo "[FF-MUSL][GL]        ${ROOTFS}/usr/lib — re-run with --force to rebuild the rootfs."
+    exit 1
+fi
+echo "[FF-MUSL][GL] ok: Mesa software-GL stack staged (libGL.so.1, libEGL.so.1, xorg/modules/dri/libgallium_dri.so = llvmpipe)"
 
 # Verify the GUI runtime caches (c1/c3) actually landed in the staging tree.
 # These three BINARY index files are produced here (Alpine ships them only as
