@@ -35,6 +35,18 @@ pub struct EpollWatch {
     pub fd:     usize,
     pub events: u32,
     pub data:   u64,
+    /// Edge-trigger state: the ready-interest mask most recently *delivered*
+    /// to the caller for this watch.  Per `epoll(7)`, an `EPOLLET`
+    /// (edge-triggered) watch must report a readiness bit only on a
+    /// not-ready→ready transition — "events [are delivered] only when changes
+    /// occur on the monitored file descriptor".  `last_ready` records the
+    /// asserted level at the last delivery so `sys_epoll_wait` can suppress a
+    /// repeat report while the level stays high (the eventfd/socket whose
+    /// readiness never drops) and re-fire only after the level drops and rises
+    /// again.  Ignored for level-triggered watches (the default), whose
+    /// reporting is unconditional.  Reset to 0 on `EPOLL_CTL_MOD` so a MOD
+    /// re-arms the edge (Linux behaviour).
+    pub last_ready: u32,
 }
 
 /// Per-process monotonically increasing identifier for epoll instances.
@@ -125,7 +137,11 @@ impl EpollInstance {
     /// and no spurious HUP/ERR readiness leaks into the parking decision.
     pub fn add(&mut self, fd: usize, events: u32, data: u64) -> bool {
         if self.watches.iter().any(|w| w.fd == fd) { return false; }
-        self.watches.push(EpollWatch { fd, events, data });
+        // `last_ready = 0` arms a fresh edge: the first poll after ADD reports
+        // any currently-asserted readiness (a 0→ready transition), matching
+        // Linux, where a newly-added EPOLLET fd that is already ready fires
+        // once immediately.
+        self.watches.push(EpollWatch { fd, events, data, last_ready: 0 });
         true
     }
 
@@ -148,9 +164,36 @@ impl EpollInstance {
         if let Some(w) = self.watches.iter_mut().find(|w| w.fd == fd) {
             w.events = events;
             w.data   = data;
+            // `EPOLL_CTL_MOD` re-arms the edge: per `epoll(7)`, after a MOD the
+            // caller expects a currently-ready fd to be reported again (this is
+            // how EPOLLONESHOT consumers re-arm, and how an interest-mask change
+            // re-evaluates readiness).  Clear the recorded level so the next
+            // poll treats the present readiness as a fresh 0→ready transition.
+            w.last_ready = 0;
             true
         } else {
             false
+        }
+    }
+
+    /// Commit the per-watch edge state after a delivery.  `delivered` maps
+    /// `fd → asserted-interest-level` for every watch that contributed to the
+    /// returned event set; for an EPOLLET watch this becomes its new
+    /// `last_ready` so the same asserted level is not re-reported.  Level-
+    /// triggered watches are unaffected (their reporting is unconditional and
+    /// `last_ready` is never consulted for them).
+    ///
+    /// We also clear `last_ready` for any EPOLLET watch whose current asserted
+    /// level is recorded as dropping to a subset — handled by the caller
+    /// passing the freshly-computed level (including 0) so a level-drop re-arms
+    /// the edge automatically.
+    pub fn commit_edges(&mut self, delivered: &[(usize, u32)]) {
+        for &(fd, level) in delivered {
+            if let Some(w) = self.watches.iter_mut().find(|w| w.fd == fd) {
+                if w.events & EPOLLET != 0 {
+                    w.last_ready = level;
+                }
+            }
         }
     }
 }
