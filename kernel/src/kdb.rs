@@ -218,7 +218,10 @@ pub fn pump() {
     // than one harness shell is talking to kdb at the same time.  See
     // tcp::read_from for the per-connection variant.
     for (rip, rp) in &new_peers {
-        let bytes = tcp::read_from(KDB_PORT, *rip, *rp);
+        // Drain everything queued for this 4-tuple into the per-session
+        // accumulator (usize::MAX = no caller-buffer bound; MAX_REQ_BYTES
+        // below caps the session buffer).
+        let bytes = tcp::read_from(KDB_PORT, *rip, *rp, usize::MAX);
         if bytes.is_empty() { continue; }
         let mut ss = KDB_SESSIONS.lock();
         if let Some(s) = ss.iter_mut()

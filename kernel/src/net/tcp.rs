@@ -1072,17 +1072,45 @@ pub fn has_data_for(local_port: u16,
                  && !c.recv_buffer.is_empty())
 }
 
-pub fn read(port: u16) -> Vec<u8> {
+/// Dequeue up to `max_len` bytes from the receive buffer of the
+/// Established TCB on `port`, leaving any surplus queued for the next
+/// read.
+///
+/// A byte-stream read must return *at most* the number of bytes the
+/// caller asked for, and the bytes it does not return must remain
+/// available for a subsequent read (IEEE Std 1003.1-2017 §read; the
+/// receive side of RFC 9293 §3.10.3 — the receive buffer advances by
+/// exactly the consumed octet count). The previous behaviour cloned the
+/// whole buffer and cleared it unconditionally, so when the caller's
+/// buffer was smaller than the queued bytes the syscall layer copied
+/// `min(data, cap)` and dropped the rest on the floor — silently losing
+/// stream octets.
+///
+/// `max_len == 0` consumes nothing and returns an empty vector.
+pub fn read(port: u16, max_len: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
         .find(|c| c.local_port == port && c.state == TcpState::Established)
     {
-        let d = conn.recv_buffer.clone();
-        conn.recv_buffer.clear();
-        d
+        drain_recv(conn, max_len)
     } else {
         Vec::new()
     }
+}
+
+/// Drain at most `max_len` leading octets from `conn.recv_buffer`,
+/// shifting the remainder down to the front so it is returned by the
+/// next read. Shared by [`read`] and [`read_from`] so the bounded-drain
+/// invariant is enforced in exactly one place.
+fn drain_recv(conn: &mut TcpConnection, max_len: usize) -> Vec<u8> {
+    let take = max_len.min(conn.recv_buffer.len());
+    if take == 0 {
+        return Vec::new();
+    }
+    // `Vec::drain(..take)` removes the first `take` octets and shifts the
+    // tail down, so `recv_buffer` keeps exactly the bytes not yet
+    // delivered to user space.
+    conn.recv_buffer.drain(..take).collect()
 }
 
 /// Test-only: synthesise an Established TCB with the given 4-tuple and a
@@ -1208,7 +1236,12 @@ pub fn test_recv_next(local_port: u16, remote_ip: Ipv4Address,
 /// matches strictly so per-connection drains stay isolated.
 ///
 /// Mirrors the shape of [`send_data_to`] / [`close_connection`].
-pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> Vec<u8> {
+///
+/// Dequeues up to `max_len` bytes and leaves any surplus queued for the
+/// next read (see [`read`] for the byte-stream bounding contract — IEEE
+/// Std 1003.1-2017 §read, RFC 9293 §3.10.3).
+pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
+                 max_len: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut().find(|c| {
         c.local_port  == local_port
@@ -1216,9 +1249,7 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> V
             && c.remote_port == remote_port
             && c.state       == TcpState::Established
     }) {
-        let d = conn.recv_buffer.clone();
-        conn.recv_buffer.clear();
-        d
+        drain_recv(conn, max_len)
     } else {
         Vec::new()
     }

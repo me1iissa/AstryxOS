@@ -2134,7 +2134,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             || crate::net::socket::socket_read_ready(socket_id));
                     }
                 }
-                match crate::net::socket::socket_recvfrom(socket_id) {
+                // Pass the user buffer capacity `len` so a TCP stream
+                // drain returns at most `len` octets and leaves the
+                // remainder queued for the next recvfrom (IEEE Std
+                // 1003.1-2017 §read; RFC 9293 §3.10.3). A datagram (UDP)
+                // recv ignores it and dequeues the whole datagram, then
+                // truncates the copy below (recvfrom(2) discards the
+                // excess of an oversized datagram).
+                match crate::net::socket::socket_recvfrom(socket_id, len) {
                     Ok((data, src_ip, src_port)) => {
                         // Empty result on a non-blocking socket = EAGAIN
                         // per IEEE 1003.1 §recvfrom.  We can only hit
@@ -2818,7 +2825,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // the source, every reply is dropped and getaddrinfo(3)
                     // times out.  A datagram socket has no orderly-EOF concept,
                     // so an empty result is WouldBlock → EAGAIN per recvmsg(2).
-                    bytes_read = match crate::net::socket::socket_recvfrom(socket_id) {
+                    // `cap` (iov[0] length) is the datagram-recv buffer; a
+                    // UDP datagram larger than it is truncated and the
+                    // excess discarded (recvmsg(2)). The drain dequeues the
+                    // whole datagram regardless, so the cap only bounds the
+                    // copy below — it is not threaded into the dequeue.
+                    bytes_read = match crate::net::socket::socket_recvfrom(socket_id, cap) {
                         Ok((data, src_ip, src_port)) => {
                             if data.is_empty() {
                                 -11 // EAGAIN
@@ -2858,7 +2870,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // re-issued recvmsg in a tight loop, never yielding.  Use the
                     // status-aware recv so the two cases get their correct
                     // returns (WouldBlock → -EAGAIN, Eof → 0).
-                    bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                    // Pass `cap` (iov[0] length) so a TCP stream drain
+                    // returns at most `cap` octets and leaves the surplus
+                    // queued for the next recvmsg (IEEE Std 1003.1-2017
+                    // §read; RFC 9293 §3.10.3). Without it the full buffer
+                    // was drained and the bytes past `cap` were dropped —
+                    // silently losing stream octets when the caller's iov
+                    // was smaller than the queued bytes.
+                    bytes_read = match crate::net::socket::socket_recv_status(socket_id, cap) {
                         Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                             let n = data.len().min(cap);
                             unsafe {
@@ -6375,7 +6394,12 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         // reader does not mistake an empty queue for EOF and re-read in a
         // busy loop (mirrors the pipe path above, which already separates
         // EOF from would-block).
-        return match crate::net::socket::socket_recv_status(socket_id) {
+        // Pass the user buffer size `count` so a TCP stream drain returns
+        // at most `count` octets and leaves the surplus queued for the next
+        // read (IEEE Std 1003.1-2017 §read; RFC 9293 §3.10.3). Without it
+        // the full buffer was drained and the bytes past `count` were
+        // dropped — silently losing stream octets on a short read.
+        return match crate::net::socket::socket_recv_status(socket_id, count) {
             Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                 let n = data.len().min(count);
                 unsafe {

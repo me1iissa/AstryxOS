@@ -452,7 +452,14 @@ pub enum RecvOutcome {
 /// `recv(2)` on a non-blocking socket with no data pending must return
 /// `EAGAIN` per IEEE 1003.1; returning 0 there is an EOF lie that drives a
 /// polled reactor into a tight re-read loop.
-pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
+///
+/// `max_len` bounds a *stream* (TCP) drain to the caller's buffer
+/// capacity: a byte-stream read returns at most that many octets and the
+/// remainder stays queued for the next read (IEEE Std 1003.1-2017 §read,
+/// RFC 9293 §3.10.3). It is ignored for datagram (UDP) sockets, where a
+/// whole datagram is dequeued and any portion exceeding the buffer is
+/// truncated and discarded with MSG_TRUNC semantics (recvmsg(2)).
+pub fn socket_recv_status(id: u64, max_len: usize) -> Result<RecvOutcome, &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
@@ -484,9 +491,10 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
                 return Err("not bound");
             }
             let data = if sock.connected && sock.remote_port != 0 {
-                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+                super::tcp::read_from(sock.local_port, sock.remote_ip,
+                                      sock.remote_port, max_len)
             } else {
-                super::tcp::read(sock.local_port)
+                super::tcp::read(sock.local_port, max_len)
             };
             if !data.is_empty() {
                 crate::proc::proc_metrics::bump_net_read(
@@ -515,7 +523,11 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
 }
 
 /// Receive data from a socket (non-blocking).
-pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
+///
+/// `max_len` bounds a *stream* (TCP) drain to the caller's buffer
+/// capacity; surplus stream octets stay queued for the next read (IEEE
+/// Std 1003.1-2017 §read). Ignored for datagram (UDP) sockets.
+pub fn socket_recv(id: u64, max_len: usize) -> Result<Vec<u8>, &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
@@ -548,9 +560,10 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
             if sock.connected && sock.remote_port != 0 {
                 Ok(super::tcp::read_from(sock.local_port,
                                          sock.remote_ip,
-                                         sock.remote_port))
+                                         sock.remote_port,
+                                         max_len))
             } else {
-                Ok(super::tcp::read(sock.local_port))
+                Ok(super::tcp::read(sock.local_port, max_len))
             }
         }
     };
@@ -575,7 +588,13 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
 /// the payload is empty and the address is the zero 4-tuple — callers
 /// must check the byte count before consulting the address (matches the
 /// existing non-blocking semantics of [`socket_recv`]).
-pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static str> {
+///
+/// `max_len` bounds a *stream* (TCP) drain to the caller's buffer
+/// capacity; surplus stream octets stay queued for the next read (IEEE
+/// Std 1003.1-2017 §read, RFC 9293 §3.10.3). Ignored for datagram (UDP)
+/// sockets, where the whole datagram is dequeued (recvfrom(2) truncation
+/// discards the excess).
+pub fn socket_recvfrom(id: u64, max_len: usize) -> Result<(Vec<u8>, Ipv4Address, u16), &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
@@ -613,7 +632,7 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
             let peer_port = sock.remote_port;
             let local_port = sock.local_port;
             drop(sockets);
-            let data = super::tcp::read(local_port);
+            let data = super::tcp::read(local_port, max_len);
             Ok((data, peer_ip, peer_port))
         }
     };

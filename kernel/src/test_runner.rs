@@ -2704,6 +2704,20 @@ pub fn run() -> ! {
     total += 1;
     if test_522_tcp_rx_poll_bell() { passed += 1; }
 
+    // ── Test 524: TCP stream recv is length-bounded (no truncation loss) ─
+    // Regression gate for the recv truncation seam: a short read must
+    // return at most the requested octet count AND leave the surplus
+    // queued for the next read (IEEE Std 1003.1-2017 §read; RFC 9293
+    // §3.10.3).  Pre-fix the socket layer drained the whole recv_buffer
+    // and the syscall layer copied only min(buffer, cap) — silently
+    // losing every octet past the caller's buffer.  Gated on `kdb`
+    // because it uses test_inject_established() (kdb-only).
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_524_tcp_recv_length_bounded() { passed += 1; }
+    }
+
     // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
     // Exercises the three socket-layer fixes that unblock outbound DNS
     // for any glibc/musl-linked Linux client:
@@ -32845,7 +32859,7 @@ fn test_tcp_inbound_3whs() -> bool {
         client_isn.wrapping_add(1), 0, tcp::PSH | tcp::ACK, PAYLOAD);
     tcp::handle_tcp(client_ip, our_ip, &data_seg);
 
-    let got = tcp::read(LOCAL_PORT);
+    let got = tcp::read(LOCAL_PORT, usize::MAX);
     if got != PAYLOAD {
         test_fail!("tcp_inbound_3whs", "read() returned {} bytes, expected {}",
                     got.len(), PAYLOAD.len());
@@ -32901,14 +32915,14 @@ fn test_tcp_read_from_isolation() -> bool {
     // Established TCB matched first — typically A, leaving B's bytes
     // unread or vice versa.  read_from() must return EXACTLY each
     // session's bytes, regardless of insertion order.
-    let got_a = tcp::read_from(LOCAL_PORT, a_ip, a_port);
+    let got_a = tcp::read_from(LOCAL_PORT, a_ip, a_port, usize::MAX);
     if got_a != PAYLOAD_A {
         test_fail!("tcp_read_from_isolation",
             "A: got {} bytes (expected {}); cross-TCB leak?",
             got_a.len(), PAYLOAD_A.len());
         return false;
     }
-    let got_b = tcp::read_from(LOCAL_PORT, b_ip, b_port);
+    let got_b = tcp::read_from(LOCAL_PORT, b_ip, b_port, usize::MAX);
     if got_b != PAYLOAD_B {
         test_fail!("tcp_read_from_isolation",
             "B: got {} bytes (expected {})",
@@ -32918,8 +32932,8 @@ fn test_tcp_read_from_isolation() -> bool {
 
     // Second drain on either tuple must return empty — recv_buffer
     // has been cleared by the first read_from().
-    if !tcp::read_from(LOCAL_PORT, a_ip, a_port).is_empty()
-        || !tcp::read_from(LOCAL_PORT, b_ip, b_port).is_empty()
+    if !tcp::read_from(LOCAL_PORT, a_ip, a_port, usize::MAX).is_empty()
+        || !tcp::read_from(LOCAL_PORT, b_ip, b_port, usize::MAX).is_empty()
     {
         test_fail!("tcp_read_from_isolation", "second drain returned bytes");
         return false;
@@ -32928,8 +32942,8 @@ fn test_tcp_read_from_isolation() -> bool {
     // Mismatched 4-tuples must return empty.  This guards against
     // a regression where read_from accidentally matches by partial
     // tuple (e.g. local_port-only).
-    if !tcp::read_from(LOCAL_PORT, a_ip, b_port).is_empty()
-        || !tcp::read_from(LOCAL_PORT, b_ip, a_port).is_empty()
+    if !tcp::read_from(LOCAL_PORT, a_ip, b_port, usize::MAX).is_empty()
+        || !tcp::read_from(LOCAL_PORT, b_ip, a_port, usize::MAX).is_empty()
     {
         test_fail!("tcp_read_from_isolation",
             "mismatched 4-tuple returned bytes (partial-match regression)");
@@ -33133,7 +33147,7 @@ fn test_af_inet_accept_end_to_end() -> bool {
     }
 
     // Drain A — must see exactly RX_A.
-    let got_a = match socket::socket_recv(sid_a) {
+    let got_a = match socket::socket_recv(sid_a, usize::MAX) {
         Ok(d) => d,
         Err(e) => {
             test_fail!("test270", "socket_recv A failed: {}", e);
@@ -33150,7 +33164,7 @@ fn test_af_inet_accept_end_to_end() -> bool {
         test_fail!("test270", "B's recv buffer drained when only A was read");
         return false;
     }
-    let got_b = match socket::socket_recv(sid_b) {
+    let got_b = match socket::socket_recv(sid_b, usize::MAX) {
         Ok(d) => d,
         Err(e) => {
             test_fail!("test270", "socket_recv B failed: {}", e);
@@ -33531,7 +33545,7 @@ fn test_tcp_lock_released_before_send() -> bool {
         return false;
     }
 
-    let got = tcp::read_from(SERVER_PORT, LB_IP, client_port);
+    let got = tcp::read_from(SERVER_PORT, LB_IP, client_port, usize::MAX);
     if got.as_slice() != DATA {
         test_fail!("tcp_lock_release",
             "server payload mismatch: got {} bytes, want {}", got.len(), DATA.len());
@@ -33686,7 +33700,7 @@ fn test_273_tcp_medium_payload_loopback() -> bool {
     // the server child's remote_ip carries the client's reflected
     // loopback addr.
     let server_remote_ip = server_child.remote_ip;
-    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port);
+    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port, usize::MAX);
 
     if received.len() != PAYLOAD_LEN {
         test_fail!("tcp_medium_payload",
@@ -33839,7 +33853,7 @@ fn test_276_tcp_send_buffer_drain() -> bool {
 
     // Drain the server child's receive buffer.
     let server_remote_ip = server_child.remote_ip;
-    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port);
+    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port, usize::MAX);
 
     if received.len() != PAYLOAD_LEN {
         test_fail!("tcp_send_buf_drain",
@@ -34008,7 +34022,7 @@ fn test_522_tcp_rx_poll_bell() -> bool {
                        0, tcp::PSH | tcp::ACK, PAYLOAD);
     tcp::handle_tcp(client_ip, our_ip, &seg);
     let after_data = BELL_RINGS_BY_SOURCE[inet_rx].load(Ordering::Relaxed);
-    let got = tcp::read_from(LOCAL_PORT, client_ip, client_port);
+    let got = tcp::read_from(LOCAL_PORT, client_ip, client_port, usize::MAX);
     if got != PAYLOAD {
         test_fail!("test_522_tcp_rx_poll_bell",
             "data not buffered: read {} bytes, expected {}", got.len(), PAYLOAD.len());
@@ -34030,6 +34044,115 @@ fn test_522_tcp_rx_poll_bell() -> bool {
     let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
 
     test_pass!("TCP RX rings InetRx poll-bell on accept + data readiness edges");
+    true
+}
+
+/// Test 524: TCP stream recv is length-bounded — a short read returns at
+/// most the requested octet count and the surplus stays queued for the
+/// next read (no truncation loss).
+///
+/// Regression gate for the recv truncation seam.  The socket layer's
+/// `tcp::read` / `tcp::read_from` cloned the entire `recv_buffer` and
+/// `clear()`ed it, while the syscall layer (read(2)/recvfrom(45)/
+/// recvmsg(47)) copied only `min(buffer_len, user_cap)` into the user
+/// buffer and dropped `data[cap..]` on the floor.  A reader whose buffer
+/// was smaller than the queued bytes therefore lost every octet past its
+/// buffer — a silent data-loss bug on every short stream read.
+///
+/// The fix bounds the drain at the source: `tcp::read{,_from}` take a
+/// `max_len` and remove only the leading `min(max_len, queued)` octets
+/// via `Vec::drain(..take)`, leaving the remainder at the front of
+/// `recv_buffer` for the next read (IEEE Std 1003.1-2017 §read — a read
+/// "shall return ... a number of bytes less than or equal to" the
+/// requested count, the rest remaining available; RFC 9293 §3.10.3 — the
+/// receive buffer advances by exactly the consumed octet count).
+///
+/// Self-contained: a synthetic Established TCB pre-loaded with a known
+/// payload (no wire / NIC), drained in three bounded reads that together
+/// reconstruct the payload exactly with no loss and no duplication.
+#[cfg(feature = "kdb")]
+fn test_524_tcp_recv_length_bounded() -> bool {
+    test_header!("TCP stream recv is length-bounded — short read keeps the tail queued");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47019; // distinct from the 522/3WHS ports
+    let client_ip: [u8; 4] = [10, 0, 2, 24];
+    let client_port: u16   = 54401;
+
+    // 10 octets queued; the reader asks for 4, then 4, then the rest.
+    const PAYLOAD: &[u8] = b"ABCDEFGHIJ";
+
+    if let Err(e) = tcp::test_inject_established(
+        LOCAL_PORT, client_ip, client_port, PAYLOAD)
+    {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "test_inject_established failed: {}", e);
+        return false;
+    }
+
+    // ── Read 1: bounded to 4 octets — must return exactly the first 4,
+    // leaving 6 queued (not drain all 10 and discard 6). ──
+    let r1 = tcp::read_from(LOCAL_PORT, client_ip, client_port, 4);
+    if r1 != b"ABCD" {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "first bounded read: got {} bytes {:?}, expected 4 \"ABCD\"",
+            r1.len(), r1);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  read(max=4): returned exactly 4 octets, tail retained ✓");
+
+    // ── Read 2: bounded to 4 — must return the NEXT 4 (the tail survived
+    // read 1 instead of being dropped). ──
+    let r2 = tcp::read_from(LOCAL_PORT, client_ip, client_port, 4);
+    if r2 != b"EFGH" {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "second bounded read: got {} bytes {:?}, expected 4 \"EFGH\" \
+             (a regression here means the surplus was discarded)",
+            r2.len(), r2);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  read(max=4): returned the next 4 octets (no loss) ✓");
+
+    // ── Read 3: ask for more than remain (max=64) — must return exactly
+    // the remaining 2, never over-read. ──
+    let r3 = tcp::read_from(LOCAL_PORT, client_ip, client_port, 64);
+    if r3 != b"IJ" {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "final read: got {} bytes {:?}, expected 2 \"IJ\"", r3.len(), r3);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+    test_println!("  read(max=64): returned the final 2 octets ✓");
+
+    // ── Read 4: buffer now empty — a bounded read returns nothing. ──
+    let r4 = tcp::read_from(LOCAL_PORT, client_ip, client_port, 64);
+    if !r4.is_empty() {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "post-drain read returned {} unexpected bytes {:?}", r4.len(), r4);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+
+    // Cross-check: the three reads reconstruct the payload exactly — no
+    // bytes lost, none duplicated.
+    let mut reassembled = alloc::vec::Vec::new();
+    reassembled.extend_from_slice(&r1);
+    reassembled.extend_from_slice(&r2);
+    reassembled.extend_from_slice(&r3);
+    if reassembled != PAYLOAD {
+        test_fail!("test_524_tcp_recv_length_bounded",
+            "reassembled {:?} != original payload {:?}", reassembled, PAYLOAD);
+        let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+        return false;
+    }
+
+    // Hermetic teardown.
+    let _ = tcp::close_connection(LOCAL_PORT, client_ip, client_port);
+
+    test_pass!("TCP stream recv is length-bounded — short read keeps the tail queued");
     true
 }
 
@@ -34147,7 +34270,7 @@ fn test_523_tcp_graceful_close_fin_defer() -> bool {
     for _ in 0..48 { crate::net::poll(); }
 
     // (a) Full body must have arrived intact — no truncation.
-    let received = tcp::read_from(SERVER_PORT, server_child.remote_ip, client_port);
+    let received = tcp::read_from(SERVER_PORT, server_child.remote_ip, client_port, usize::MAX);
     if received.len() != PAYLOAD_LEN {
         test_fail!("tcp_graceful_close",
             "received {} B (expected {} — close orphaned the buffered tail)",
@@ -34514,7 +34637,7 @@ fn test_recvfrom_udp_returns_sender_4tuple() -> bool {
     udp::send([127, 0, 0, 1], CLIENT_PORT, SERVER_PORT, PAYLOAD);
     crate::net::poll();
 
-    let (data, src_ip, src_port) = match socket::socket_recvfrom(id) {
+    let (data, src_ip, src_port) = match socket::socket_recvfrom(id, usize::MAX) {
         Ok(t) => t,
         Err(e) => {
             socket::socket_close(id);
@@ -34571,7 +34694,7 @@ fn test_recvfrom_tcp_returns_peer_4tuple() -> bool {
     // recvfrom on the (just-connected, no data yet) client must still
     // report the peer 4-tuple — the address out-param is independent of
     // whether bytes were available.  We accept zero-length data here.
-    let (_data, peer_ip, peer_port) = match socket::socket_recvfrom(cid) {
+    let (_data, peer_ip, peer_port) = match socket::socket_recvfrom(cid, usize::MAX) {
         Ok(t) => t,
         Err(e) => {
             socket::socket_close(cid);
@@ -34628,7 +34751,7 @@ fn test_recvfrom_null_addr_ok() -> bool {
     udp::send([127, 0, 0, 1], 50032, PORT, PAYLOAD);
     crate::net::poll();
 
-    let result = socket::socket_recvfrom(id);
+    let result = socket::socket_recvfrom(id, usize::MAX);
     socket::socket_close(id);
 
     match result {
@@ -34784,7 +34907,7 @@ fn test_shutdown_tcp_rd_returns_eof() -> bool {
     };
     let _ = socket::socket_shutdown(id, socket::SHUT_RD);
     // Even though the TCB has QUEUED bytes pending, recv must return EOF.
-    let recv_result = socket::socket_recv(id);
+    let recv_result = socket::socket_recv(id, usize::MAX);
     let _ = tcp::abort(PORT);
     match recv_result {
         Ok(d) if d.is_empty() => {
@@ -34843,7 +34966,7 @@ fn test_shutdown_tcp_rdwr_breaks_both() -> bool {
         Some(i) => i, None => return false,
     };
     let _ = socket::socket_shutdown(id, socket::SHUT_RDWR);
-    let recv_ok    = matches!(socket::socket_recv(id), Ok(ref d) if d.is_empty());
+    let recv_ok    = matches!(socket::socket_recv(id, usize::MAX), Ok(ref d) if d.is_empty());
     let send_epipe = matches!(socket::socket_send(id, b"x"), Err("EPIPE"));
     let state = tcp::snapshot_connections().iter()
         .find(|c| c.local_port == PORT && c.remote_ip == peer).map(|c| c.state);
@@ -49069,7 +49192,7 @@ fn test_274_udp_connect_auto_bind() -> bool {
     const REPLY: &[u8] = b"AstryxOS-UDP-reply payload";
     udp::send([127, 0, 0, 1], PEER_PORT, lport_b, REPLY);
     crate::net::poll();
-    match socket::socket_recvfrom(sid_b) {
+    match socket::socket_recvfrom(sid_b, usize::MAX) {
         Ok((data, src_ip, src_port)) => {
             if data != REPLY {
                 test_fail!("274-C recvfrom",
@@ -50218,7 +50341,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
     }
 
     // (1) Empty queue, socket live → MUST be WouldBlock (the storm-fix case).
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::WouldBlock) => {
             test_println!("  empty bound UDP socket → WouldBlock ✓");
         }
@@ -50253,7 +50376,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
         pkt.extend_from_slice(PAYLOAD);
         crate::net::udp::handle_udp([10, 0, 2, 2], [10, 0, 2, 15], &pkt);
     }
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Data(d)) if d == PAYLOAD => {
             test_println!("  injected datagram → Data({} bytes) ✓", d.len());
         }
@@ -50271,7 +50394,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
     // (3) After draining, the queue is empty again → WouldBlock, NOT Eof.
     //     This is the regression's heart: an empty-but-live socket must never
     //     read as EOF.
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::WouldBlock) => {
             test_println!("  drained socket → WouldBlock (not EOF) ✓");
         }
@@ -50287,7 +50410,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
         test_fail!("recv_eagain", "socket_shutdown(SHUT_RD) failed");
         return false;
     }
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Eof) => {
             test_println!("  after SHUT_RD → Eof ✓");
         }
