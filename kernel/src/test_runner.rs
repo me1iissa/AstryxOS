@@ -2862,6 +2862,17 @@ pub fn run() -> ! {
     total += 1;
     if test_307_epoll_et_rearm_between_waits() { passed += 1; }
 
+    // ── Test 520: DNS name decompression compression-pointer loop guard ──
+    // A DNS response can encode a compression-pointer cycle (A→B→A or a
+    // self-pointer) or an unterminated forward chain.  A naive name parser
+    // follows pointers forever and hangs the kernel (CWE-835).  The skip
+    // routine must bound the parse — rejecting non-backward / cyclic pointers
+    // and capping the walked name length — while still resolving a legitimate
+    // backward compression pointer.  Refs: RFC 1035 §4.1.4 (message
+    // compression), §3.1 (255-octet name limit).
+    total += 1;
+    if test_520_dns_decompress_loop_guard() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -16897,6 +16908,127 @@ fn test_307_epoll_et_rearm_between_waits() -> bool {
     }
 
     if ok { test_pass!("EPOLLET re-arm across drain-then-rise between epoll_waits (Test 307)"); }
+    ok
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 520: DNS name decompression compression-pointer loop guard (CWE-835)
+//
+// `skip_dns_name` walks a DNS name, following compression pointers
+// (RFC 1035 §4.1.4: a two-octet field with the two high bits set, the low 14
+// bits an offset from the start of the message to a prior occurrence).  A
+// hostile or corrupt response can encode a pointer cycle (A→B→A, or a
+// self-pointer) or a never-terminating chain; an unguarded parser loops
+// forever and hangs the kernel.  The skip routine must bound the parse —
+// rejecting non-backward / cyclic pointers — while still resolving a
+// legitimate backward compression pointer.
+//
+// This test is self-contained (constructs raw DNS message buffers in memory,
+// no network).  The decisive property is that the malformed cases *return* at
+// all: if the guard were missing the kernel would hang here.
+// Refs: RFC 1035 §4.1.4 (message compression), §3.1 (255-octet name limit).
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_520_dns_decompress_loop_guard() -> bool {
+    test_header!("DNS decompression compression-pointer loop guard (CWE-835)");
+    let mut ok = true;
+
+    // ── Case 1: self-referential pointer at the very start ───────────────
+    // A 12-byte header followed by a pointer at offset 12 that points to
+    // offset 12 (itself).  An unguarded parser loops forever; the guard must
+    // reject it (not a strictly-backward target) and return None.
+    {
+        let mut msg = [0u8; 16];
+        // offset 12,13: pointer 0xC0 0x0C → target offset 12 == self.
+        msg[12] = 0xC0;
+        msg[13] = 0x0C;
+        let r = crate::net::dns::test_only_skip_dns_name(&msg, 12);
+        if r.is_some() {
+            test_fail!("DNS decompress loop guard",
+                "self-pointer at offset 12 returned {:?}, expected None (cycle)", r);
+            ok = false;
+        } else {
+            test_println!("  self-pointer (12→12) rejected (None) ✓");
+        }
+    }
+
+    // ── Case 2: two-pointer cycle A→B→A ──────────────────────────────────
+    // Pointer at offset 12 → offset 14; pointer at offset 14 → offset 12.
+    // Each individually is a pointer; together they form a 2-cycle.  The
+    // strictly-backward rule breaks the cycle: 14→12 is backward but 12→14 is
+    // forward, so following from offset 12 hits a forward pointer and is
+    // rejected.  The decisive property is that this returns rather than
+    // looping forever.
+    {
+        let mut msg = [0u8; 16];
+        msg[12] = 0xC0; msg[13] = 0x0E; // offset 12 → 14
+        msg[14] = 0xC0; msg[15] = 0x0C; // offset 14 → 12
+        let r = crate::net::dns::test_only_skip_dns_name(&msg, 12);
+        if r.is_some() {
+            test_fail!("DNS decompress loop guard",
+                "A→B→A cycle from offset 12 returned {:?}, expected None", r);
+            ok = false;
+        } else {
+            test_println!("  2-pointer cycle (12→14→12) rejected (None) ✓");
+        }
+    }
+
+    // ── Case 3: forward pointer (must be rejected per RFC 1035 §4.1.4) ────
+    // A pointer that targets a *later* offset violates the prior-occurrence
+    // guarantee and is the building block of forward loops.
+    {
+        let mut msg = [0u8; 24];
+        msg[12] = 0xC0; msg[13] = 0x14; // offset 12 → 20 (forward)
+        let r = crate::net::dns::test_only_skip_dns_name(&msg, 12);
+        if r.is_some() {
+            test_fail!("DNS decompress loop guard",
+                "forward pointer (12→20) returned {:?}, expected None", r);
+            ok = false;
+        } else {
+            test_println!("  forward pointer (12→20) rejected (None) ✓");
+        }
+    }
+
+    // ── Case 4 (positive): a legitimate BACKWARD pointer still resolves ──
+    // Lay down a real name "ns" (label len 2, 'n','s', then root 0x00) at
+    // offset 12.  Then at offset 17 place a pointer 0xC0 0x0C → offset 12.
+    // Skipping the name *at offset 17* must follow the backward pointer,
+    // resolve the prior name, and return the offset just past the pointer
+    // (17 + 2 = 19) — the on-the-wire continuation point.
+    {
+        let mut msg = [0u8; 24];
+        // Name at 12: "ns" root.
+        msg[12] = 2; msg[13] = b'n'; msg[14] = b's'; msg[15] = 0x00;
+        // Pointer at 17 → 12.
+        msg[17] = 0xC0; msg[18] = 0x0C;
+        let r = crate::net::dns::test_only_skip_dns_name(&msg, 17);
+        if r != Some(19) {
+            test_fail!("DNS decompress loop guard",
+                "legit backward pointer at 17→12 returned {:?}, expected Some(19)", r);
+            ok = false;
+        } else {
+            test_println!("  legit backward pointer (17→12) resolved → 19 ✓");
+        }
+    }
+
+    // ── Case 5 (positive): an uncompressed name resolves to its end ──────
+    // Name "ns" root at offset 12 occupies bytes 12..16; skipping from 12 must
+    // return 16 (one past the root label).
+    {
+        let mut msg = [0u8; 24];
+        msg[12] = 2; msg[13] = b'n'; msg[14] = b's'; msg[15] = 0x00;
+        let r = crate::net::dns::test_only_skip_dns_name(&msg, 12);
+        if r != Some(16) {
+            test_fail!("DNS decompress loop guard",
+                "uncompressed name at 12 returned {:?}, expected Some(16)", r);
+            ok = false;
+        } else {
+            test_println!("  uncompressed name (12) resolved → 16 ✓");
+        }
+    }
+
+    if ok {
+        test_pass!("DNS decompression compression-pointer loop guard (Test 520)");
+    }
     ok
 }
 
