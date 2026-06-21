@@ -749,6 +749,13 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_socketpair() { passed += 1; }
 
+    // ── Test 306: writev contiguous-prefix invariant on AF_UNIX short write ─
+    // Regression for the content-render gate: a multi-iovec writev whose first
+    // buffer short-writes (recv ring fills mid-buffer) must return a contiguous
+    // prefix and must NOT push later buffers' bytes ahead of the unwritten tail.
+    total += 1;
+    if test_writev_contiguous_prefix_on_short_write() { passed += 1; }
+
     // ── Test 294: proc_metrics net_r_bytes via recvmsg(2) ─────────────────
     // Regression for the omission where nr-47 on AF_UNIX called read_msg()
     // directly and skipped bump_net_read(); the counter appeared to freeze
@@ -14860,6 +14867,126 @@ fn test_unix_socketpair() -> bool {
     crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
 
     test_pass!("AF_UNIX socketpair round-trip");
+    true
+}
+
+// ── Test 306: writev(2) contiguous-prefix invariant on a short stream write ────
+//
+// POSIX writev(2)/sendmsg(2): the byte count returned is always a CONTIGUOUS
+// PREFIX of the gathered iovec sequence.  When a single buffer short-writes —
+// here the 32 KiB AF_UNIX recv ring fills partway through the first iovec —
+// the kernel must stop and report the prefix; it must NOT proceed to push the
+// next iovec's bytes (which would land in the stream ahead of the first iovec's
+// unwritten tail).  A non-prefix return reorders the byte stream: a caller that
+// retries from the returned count re-sends the skipped tail AFTER the later
+// buffer, corrupting any framed protocol on top (the exact failure mode that
+// desynced Mozilla's IPC channel and aborted the content process).
+//
+// This is the writev mirror of sys_readv's short-read `break`.
+fn test_writev_contiguous_prefix_on_short_write() -> bool {
+    test_header!("writev contiguous-prefix on AF_UNIX short write");
+
+    // AF_UNIX recv ring capacity (net/unix.rs RECV_BUF_CAP).  recv_space() is
+    // CAP-1 (one slot reserved to disambiguate full/empty), so the most a
+    // peer can hold before writes start short-writing is CAP-1 bytes.
+    const RING_CAP: usize = 32768;
+    const RING_USABLE: usize = RING_CAP - 1;
+
+    let mut fds = [0i32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        53, 1, 1, 0, fds.as_mut_ptr() as u64, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("writev_prefix", "socketpair() returned {}", r);
+        return false;
+    }
+
+    // Pre-fill the peer ring (fd[1]) to leave exactly `room` free bytes so the
+    // first iovec of the writev below short-writes after `room` bytes.
+    let room: usize = 100;
+    let prefill = alloc::vec![0xAAu8; RING_USABLE - room];
+    let pn = crate::syscall::dispatch_linux_kernel(
+        1, fds[0] as u64, prefill.as_ptr() as u64, prefill.len() as u64, 0, 0, 0,
+    );
+    if pn != prefill.len() as i64 {
+        test_fail!("writev_prefix", "prefill write returned {} (expected {})",
+                   pn, prefill.len());
+        return false;
+    }
+
+    // writev with two iovecs.  iov[0] is larger than `room`, so it short-writes
+    // after `room` bytes; iov[1] must NOT be pushed (would reorder the stream).
+    //   iov[0] = 0xB1 * 200   (only first `room`=100 should land)
+    //   iov[1] = 0xC2 * 200   (must NOT land at all)
+    let buf0 = alloc::vec![0xB1u8; 200];
+    let buf1 = alloc::vec![0xC2u8; 200];
+    let iov: [[u64; 2]; 2] = [
+        [buf0.as_ptr() as u64, buf0.len() as u64],
+        [buf1.as_ptr() as u64, buf1.len() as u64],
+    ];
+    let wn = crate::syscall::dispatch_linux_kernel(
+        20, fds[0] as u64, iov.as_ptr() as u64, 2, 0, 0, 0, // writev
+    );
+
+    // Expect exactly `room` bytes (contiguous prefix), NOT room + 200 (iov[1]).
+    if wn != room as i64 {
+        test_fail!("writev_prefix",
+            "writev returned {} — expected contiguous prefix {} (a value of {} \
+             means iov[1] was pushed past iov[0]'s unwritten tail = stream reorder)",
+            wn, room, room + buf1.len());
+        crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  writev short-write returned {} (contiguous prefix) ✓", wn);
+
+    // Drain the whole ring and verify byte ORDER: prefill 0xAA bytes, then
+    // exactly `room` 0xB1 bytes, then NOTHING (no 0xC2 from iov[1]).  Any 0xC2
+    // appearing before the trailing 0xB1 tail would prove a reorder.
+    let total_expected = (RING_USABLE - room) + room; // prefill + iov[0] prefix
+    let mut drained = alloc::vec![0u8; RING_CAP];
+    let mut got = 0usize;
+    // Read in chunks until the ring is empty (read returns -EAGAIN=-11).
+    loop {
+        let rn = crate::syscall::dispatch_linux_kernel(
+            0, fds[1] as u64, drained[got..].as_mut_ptr() as u64,
+            (drained.len() - got) as u64, 0, 0, 0,
+        );
+        if rn <= 0 { break; }
+        got += rn as usize;
+        if got >= drained.len() { break; }
+    }
+    if got != total_expected {
+        test_fail!("writev_prefix",
+            "drained {} bytes, expected {} (prefill {} + prefix {})",
+            got, total_expected, RING_USABLE - room, room);
+        crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    // No 0xC2 byte (iov[1]) may appear anywhere in the stream.
+    if drained[..got].iter().any(|&b| b == 0xC2) {
+        test_fail!("writev_prefix",
+            "found a 0xC2 byte (iov[1]) in the stream — iov[1] was pushed \
+             despite iov[0] short-writing = byte-stream reorder/corruption");
+        crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    // The last `room` bytes must be 0xB1 (iov[0] prefix), preceded by 0xAA.
+    if drained[got - room..got].iter().any(|&b| b != 0xB1)
+        || drained[got - room - 1] != 0xAA
+    {
+        test_fail!("writev_prefix", "byte ordering at the prefill/prefix seam is wrong");
+        crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  drained {} bytes in order, zero iov[1] bytes leaked ✓", got);
+
+    crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
+    test_pass!("writev contiguous-prefix on AF_UNIX short write");
     true
 }
 

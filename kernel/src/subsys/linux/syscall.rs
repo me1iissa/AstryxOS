@@ -2381,21 +2381,46 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
                 };
                 let data: &[u8] = &data_owned;
+                // POSIX sendmsg(2): bytes sent are a CONTIGUOUS PREFIX of the
+                // gathered iovec sequence.  When a single buffer is short-written
+                // (the AF_UNIX byte-stream recv ring or the AF_INET send buffer
+                // filled mid-buffer), we MUST stop and return the prefix; pushing
+                // the next iovec's bytes while the tail of this one is unwritten
+                // would reorder the stream, because the caller retries from `total`
+                // and would re-send the skipped tail AFTER the later buffer.
+                // (Mozilla's IPC channel — ipc_channel_posix.cc
+                // ProcessOutgoingMessages — sends a multi-iovec header+payload
+                // frame and advances its write iterator by the returned byte
+                // count, so a non-prefix return corrupts the message stream and
+                // the reader parses payload as a garbage header.)
+                let short_write;
                 if crate::syscall::is_unix_socket_fd(pid, fd) {
                     let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                     match crate::net::unix::write(unix_id, data) {
-                        n if n >= 0 => total += n as usize,
-                        e => return e,
+                        n if n >= 0 => {
+                            total += n as usize;
+                            short_write = (n as usize) < data.len();
+                        }
+                        e => {
+                            // A surfaced error after a partial success is reported
+                            // as the prefix; an error before any bytes is the error.
+                            if total > 0 { return total as i64; }
+                            return e;
+                        }
                     }
                 } else {
                     if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                     let socket_id = crate::syscall::get_socket_id(pid, fd);
                     match crate::net::socket::socket_send(socket_id, data) {
-                        Ok(n) => total += n,
-                        Err("EPIPE") => return -32,
-                        Err(_) => return -104,
+                        Ok(n) => {
+                            total += n;
+                            short_write = n < data.len();
+                        }
+                        Err("EPIPE") => { if total > 0 { return total as i64; } return -32; }
+                        Err(_)       => { if total > 0 { return total as i64; } return -104; }
                     }
                 }
+                if short_write { break; } // contiguous-prefix contract — stop
             }
             total as i64
         }
@@ -7892,8 +7917,21 @@ pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
         let len = iov[1] as usize;
         if len == 0 { continue; }
         let result = sys_write_linux(fd, base, len as u64);
-        if result < 0 { return result; }
+        // POSIX writev(2): the return value is the number of bytes written,
+        // which is always a CONTIGUOUS PREFIX of the gathered iovec sequence.
+        // If a single buffer is short-written (e.g. a byte-stream socket whose
+        // send buffer filled mid-buffer), we MUST stop here and report the
+        // prefix; continuing to the next iovec would push its bytes into the
+        // stream ahead of the unwritten tail of this one, and the caller —
+        // which retries from `total` per the contiguous-prefix contract —
+        // would then re-send those skipped bytes after the later buffer,
+        // permanently reordering the stream.  A surfaced error after a partial
+        // success is reported as the prefix (matching writev(2): a partial
+        // write is success, not failure); an error before any bytes is the
+        // error itself.  Mirrors sys_readv's short-read handling below.
+        if result < 0 { return if total > 0 { total } else { result }; }
         total += result;
+        if (result as usize) < len { break; } // short write — stop (prefix contract)
     }
     total
 }
