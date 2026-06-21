@@ -2851,6 +2851,17 @@ pub fn run() -> ! {
     total += 1;
     if test_305_epoll_edge_trigger() { passed += 1; }
 
+    // ── Test 307: EPOLLET re-arm across a drain-then-rise BETWEEN epoll_waits ─
+    // The residual edge-suppression gap (a documented follow-up to the
+    // EPOLLET edge-trigger work in Test 305): if an eventfd is drained to 0
+    // and re-raised entirely between two epoll_wait calls (no call observes
+    // the intermediate level==0), a level-diff-only kernel suppresses the
+    // genuine new edge.  The eventfd rise-generation must re-arm EPOLLIN
+    // regardless of epoll_wait timing.
+    // Refs: epoll(7) ("delivers events only when changes occur"), eventfd(2).
+    total += 1;
+    if test_307_epoll_et_rearm_between_waits() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -16772,6 +16783,120 @@ fn test_305_epoll_edge_trigger() -> bool {
     }
 
     if ok { test_pass!("epoll EPOLLET edge-trigger semantics (Test 305)"); }
+    ok
+}
+
+// ── Test 307: EPOLLET re-arm across a drain-then-rise between epoll_waits ─────
+//
+// Per `epoll(7)` ("Level-triggered and edge-triggered notification"): an
+// edge-triggered watch "delivers events only when changes occur on the
+// monitored file descriptor"; each not-ready→ready transition is a distinct
+// edge that MUST be reported, independent of whether `epoll_wait` ran while the
+// fd was drained.
+//
+// Test 305 covers the case where a poll observes the drained level-0 state
+// between the drain and the re-write (the level-diff alone re-arms).  THIS test
+// covers the residual case the level-diff cannot see: the eventfd is drained to
+// 0 and re-raised entirely BETWEEN two `epoll_wait` calls, with NO intervening
+// call to observe level==0.  The asserted level is identical (EPOLLIN) at both
+// observations, so `level & !last_ready == 0`; only the readiness-rise
+// generation distinguishes the fresh edge.  A kernel without that generation
+// suppresses the edge (got 0).  Refs: epoll(7), eventfd(2).
+fn test_307_epoll_et_rearm_between_waits() -> bool {
+    test_header!("EPOLLET re-arm across drain-then-rise between epoll_waits (Test 307)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    fn make_ev(events: u32, data: u64) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&events.to_le_bytes());
+        b[4..12].copy_from_slice(&data.to_le_bytes());
+        b
+    }
+
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLET: u32 = 1 << 31;
+    const CTL_ADD: u64 = 1;
+    const EFD_NONBLOCK: u64 = 0x0800;
+
+    let mut ok = true;
+
+    let wait_once = |epfd: u64| -> i64 {
+        let mut buf = [[0u8; 12]; 4];
+        dispatch(232, epfd, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0)
+    };
+
+    let efd = dispatch(290 /*eventfd2*/, 0, EFD_NONBLOCK, 0, 0, 0, 0);
+    let epfd = dispatch(291 /*epoll_create1*/, 0, 0, 0, 0, 0, 0);
+    if efd < 0 || epfd < 0 {
+        test_fail!("307 setup", "eventfd={} epoll_create1={}", efd, epfd);
+        ok = false;
+    } else {
+        let (efd, epfd) = (efd as u64, epfd as u64);
+        let one: u64 = 1;
+
+        // Register EPOLLET | EPOLLIN.
+        let ev = make_ev(EPOLLIN | EPOLLET, efd);
+        let r = dispatch(233 /*epoll_ctl*/, epfd, CTL_ADD, efd, ev.as_ptr() as u64, 0, 0);
+        if r != 0 { test_fail!("307 add", "epoll_ctl ADD = {}", r); ok = false; }
+
+        // Rise #1: write 1 (0→ready).  First poll delivers the edge once.
+        let _ = dispatch(1 /*write*/, efd, &one as *const u64 as u64, 8, 0, 0, 0);
+        let r1 = wait_once(epfd);
+        if r1 != 1 { test_fail!("307 first", "expected 1, got {}", r1); ok = false; }
+        else { test_println!("  (a) rise #1 delivered once ✓"); }
+
+        // Persistently-ready suppression still holds (sanity vs Test 305).
+        let r2 = wait_once(epfd);
+        if r2 != 0 { test_fail!("307 suppress", "expected 0 (stays-ready), got {}", r2); ok = false; }
+        else { test_println!("  (b) stays-ready suppressed ✓"); }
+
+        // ── THE RESIDUAL GAP ── drain to 0 and re-raise with NO intervening
+        // epoll_wait observing level==0:
+        //   read(efd)  → counter 1→0 (level drops, but no poll sees it)
+        //   write(efd) → counter 0→1 (fresh 0→ready edge, generation bumps)
+        let mut rbuf = [0u8; 8];
+        let rd = dispatch(0 /*read*/, efd, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if rd != 8 { test_fail!("307 drain", "read returned {}", rd); ok = false; }
+        let _ = dispatch(1 /*write*/, efd, &one as *const u64 as u64, 8, 0, 0, 0);
+
+        // The next poll is the FIRST epoll_wait since rise #1.  It must report
+        // the fresh edge (rise #2).  A level-diff-only kernel returns 0 here
+        // because last_ready==EPOLLIN and the asserted level is again EPOLLIN.
+        let r3 = wait_once(epfd);
+        if r3 != 1 {
+            test_fail!("307 rearm-between-waits",
+                "drain+rise between two epoll_waits did NOT re-arm the EPOLLET edge \
+                 (got {} events, expected 1) — the suppressed-edge residual gap \
+                 (the windowed-Firefox -url busy-spin)", r3);
+            ok = false;
+        } else { test_println!("  (c) drain+rise BETWEEN waits re-armed ✓"); }
+
+        // And it is then suppressed again until the next genuine transition.
+        let r4 = wait_once(epfd);
+        if r4 != 0 { test_fail!("307 resuppress", "expected 0 after re-delivery, got {}", r4); ok = false; }
+        else { test_println!("  (d) re-suppressed after re-delivery ✓"); }
+
+        let _ = crate::vfs::close(pid, epfd as usize);
+        let _ = crate::vfs::close(pid, efd as usize);
+    }
+
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = false;
+            p.subsystem = crate::win32::SubsystemType::Aether;
+        }
+    }
+
+    if ok { test_pass!("EPOLLET re-arm across drain-then-rise between epoll_waits (Test 307)"); }
     ok
 }
 

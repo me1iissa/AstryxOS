@@ -56,11 +56,23 @@ struct EventFdEntry {
     counter: u64,
     flags:   u32,
     in_use:  bool,
+    /// Monotonic readiness-rise generation.  Bumped on every counter
+    /// `0 → non-zero` transition (a fresh not-ready→ready edge per
+    /// `eventfd(2)` + `epoll(7)`), and never on a write that only grows an
+    /// already-non-zero counter.  An edge-triggered (`EPOLLET`) epoll watch
+    /// records the generation it last delivered; `sys_epoll_wait` re-arms the
+    /// EPOLLIN edge whenever the live generation differs from the recorded
+    /// one, even when the asserted *level* looks continuously high.  This
+    /// records the 0-crossing at the moment readiness rises (the canonical
+    /// epoll ready-list / wakeup-callback contract) rather than only when an
+    /// `epoll_wait` happens to observe the drained state — closing the
+    /// drain-then-rise-between-two-waits edge-suppression gap.
+    rise_seq: u64,
 }
 
 impl EventFdEntry {
     const fn empty() -> Self {
-        Self { counter: 0, flags: 0, in_use: false }
+        Self { counter: 0, flags: 0, in_use: false, rise_seq: 0 }
     }
 }
 
@@ -134,6 +146,31 @@ pub fn read(id: u64) -> Result<u64, i64> {
     try_read(id)
 }
 
+/// Read the live counter value for an eventfd slot without mutating it.
+///
+/// Diagnostic-only (kdb introspection): returns `Some(counter)` for a live
+/// slot, `None` for a free/invalid id.  Unlike `try_read` this never resets
+/// the counter, so it is safe to call from a debugger snapshot path that must
+/// not perturb the protocol state of a live workload.
+pub fn peek_counter(id: u64) -> Option<u64> {
+    let table = TABLE.lock();
+    table.get(id as usize)
+        .filter(|s| s.in_use)
+        .map(|s| s.counter)
+}
+
+/// Read the live readiness-rise generation for an eventfd slot (see
+/// `EventFdEntry.rise_seq`).  Returns `Some(seq)` for a live slot, `None` for
+/// a free/invalid id.  `sys_epoll_wait` consults this to re-arm an EPOLLET
+/// EPOLLIN edge across a drain-then-rise that no `epoll_wait` observed at
+/// level 0.  Non-mutating; safe to call from any context.
+pub fn rise_seq(id: u64) -> Option<u64> {
+    let table = TABLE.lock();
+    table.get(id as usize)
+        .filter(|s| s.in_use)
+        .map(|s| s.rise_seq)
+}
+
 /// Was this eventfd created with `EFD_NONBLOCK`?  Per `man 2 eventfd`,
 /// EFD_NONBLOCK is shorthand for setting `O_NONBLOCK` on the resulting fd.
 /// The syscall layer combines this with the per-fd O_NONBLOCK status
@@ -163,7 +200,21 @@ pub fn write(id: u64, val: u64) -> Result<(), i64> {
     if val > u64::MAX - 1 - slot.counter {
         return Err(-27); // EFBIG
     }
+    // A write that takes the counter from 0 to non-zero is a fresh
+    // not-ready→ready edge: bump the rise generation so an edge-triggered
+    // epoll watch that already delivered the previous rise (and was drained to
+    // 0 since) re-arms.  A write that only grows an already-non-zero counter
+    // is NOT a new edge (the fd was continuously ready), so the generation is
+    // left untouched — matching `EPOLLET` "deliver only on changes" semantics.
+    let was_zero = slot.counter == 0;
     slot.counter += val;
+    if was_zero && val > 0 {
+        // `wrapping_add` is intentional and benign: only inequality with the
+        // watch's recorded `et_rise` is consulted, never an ordering, and a u64
+        // wrap requires ~2^64 rise events (centuries of edges) — a wrap would
+        // at worst alias one generation and miss a single edge, never panic.
+        slot.rise_seq = slot.rise_seq.wrapping_add(1);
+    }
     Ok(())
 }
 
