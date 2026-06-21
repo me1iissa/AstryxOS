@@ -950,6 +950,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
     // small, portable base environment above.  Detection is by binary name —
     // the Firefox launcher is `firefox` / `firefox-bin`.
     let is_firefox = name.contains("firefox");
+    // A network (http/https) launch URL means the page itself must reach the
+    // network, so the non-local-connection block and the in-process-collapse
+    // switch are dropped (see the GUI-mode block below).  A local (file://)
+    // target keeps both, preserving the single-process render path.  Computed
+    // once here so both the per-mode block and the shared block agree.
+    let is_network_browse =
+        cmd.contains("http://") || cmd.contains("https://");
     if is_firefox {
     if !gui_mode {
         // Tell Firefox to run headless even when DISPLAY is set.  libxul
@@ -1009,8 +1016,24 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // here.  For a network URL the two are mutually exclusive and the
         // windowed path necessarily runs the normal multi-process tree.
         // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
-        envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
-        envp_vec.push("MOZ_DISABLE_NONLOCAL_CONNECTIONS=1");
+        //
+        // We therefore pick the process model from the launch URL itself: a
+        // local target keeps the in-process collapse (single-process render,
+        // no content-init handshake); a network target (http/https) drops both
+        // switches so the normal multi-process content tree comes up and necko
+        // is allowed to reach the network.  Background network features are
+        // still disabled via the seeded profile prefs (network.process.enabled
+        // = false, telemetry/safebrowsing/update off), so only the page's own
+        // load reaches out — exactly what browsing a real site requires.
+        if is_network_browse {
+            crate::serial_println!(
+                "[FFTEST] GUI network browse: multi-process tree, non-local \
+                 connections allowed (background-net still pref-disabled)"
+            );
+        } else {
+            envp_vec.push("MOZ_FORCE_DISABLE_E10S=1");
+            envp_vec.push("MOZ_DISABLE_NONLOCAL_CONNECTIONS=1");
+        }
         // GUI-mode (windowed) runtime data that headless mode never needs.
         // When libxul opens the display it brings up GTK/GDK, which loads
         // image data through GdkPixbuf and resolves fonts through fontconfig.
@@ -1037,9 +1060,15 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         envp_vec.push("FONTCONFIG_FILE=/etc/fonts/fonts.conf");
         envp_vec.push("FONTCONFIG_PATH=/etc/fonts");
     }
+    // Non-local connections are blocked for every Firefox launch EXCEPT a
+    // network (http/https) browse, where the page load itself must reach the
+    // network.  Background network features remain disabled via the profile
+    // prefs, so even in the browse case only the page's own load goes out.
+    if !is_network_browse {
+        envp_vec.push("MOZ_DISABLE_NONLOCAL_CONNECTIONS=1");
+    }
     envp_vec.extend_from_slice(&[
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
-        "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
         // Short-circuit SetExceptionHandler() before it touches the
         // Crash Reports directory tree.  Release builds of Firefox check
