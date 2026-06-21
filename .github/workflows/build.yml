@@ -136,6 +136,19 @@ jobs:
       # one that corrupts the ext2 image while patching it.
       - name: patch-gui-caches smoke (image cache provisioning + ext2 integrity)
         run: python3 scripts/patch-gui-caches-smoke.py
+      # Boot-free smoke for the software-GL (Mesa llvmpipe) image-provisioning
+      # tool (patch-gui-gl.sh).  Exercises arg validation, --verify on a GL-less
+      # image (must report the closure incomplete + exit non-zero), and — the
+      # load-bearing path — the debugfs injection of the libGL/libEGL closure
+      # (incl. the llvmpipe DRI driver under xorg/modules/dri/) into a scratch
+      # ext2 image, asserting byte-identical readback, that e2fsck still reports
+      # the image clean, and that a follow-up --verify then passes.
+      # Failure mode this prevents: a --ff-gui data image that ships GL-less
+      # (glxtest "libGL.so.1 missing" → content compositor child cannot bring up
+      # a software OpenGL context → CompositorBridgeChild AbnormalShutdown → no
+      # render), or an injection path that corrupts the ext2 image.
+      - name: patch-gui-gl smoke (software-GL image provisioning + ext2 integrity)
+        run: python3 scripts/patch-gui-gl-smoke.py
 
   kernel-build:
     name: bootloader + kernel builds
