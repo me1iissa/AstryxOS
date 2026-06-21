@@ -2724,6 +2724,17 @@ pub fn run() -> ! {
         if test_274_udp_connect_auto_bind() { passed += 1; }
     }
 
+    // ── Test 521: UDP per-port receive-queue cap (rx-flood DoS) ───────────
+    // Regression test for the unbounded per-port UDP receive queue: a flood
+    // of datagrams to a bound port grew the queue without limit (memory
+    // exhaustion).  Verifies the per-port depth never exceeds
+    // UDP_PORT_QUEUE_CAP and that overflow drops the *incoming* datagram
+    // (the cap-many earliest survivors are retained, FIFO).
+    // Refs: RFC 768 (UDP, unreliable datagram delivery); POSIX SO_RCVBUF
+    // (datagram socket may drop on a full receive buffer).
+    total += 1;
+    if test_521_udp_queue_cap() { passed += 1; }
+
     // ── Test 277: PT_TLS page refcount initialisation (process-teardown) ──
     // Verifies that each physical frame backing a PT_TLS segment receives
     // refcount = 1 immediately after map_page_in, mirroring the PT_LOAD
@@ -49252,6 +49263,122 @@ fn test_275_pty_syscall_smoke() -> bool {
 
     if ok { test_pass!("PTY syscall smoke — open/ioctl/read/write end-to-end (Test 275)"); }
     ok
+}
+
+// ── Test 521: UDP per-port receive-queue cap (rx-flood DoS) ─────────────────
+//
+// Regression test for the unbounded per-port UDP receive queue.  Incoming
+// datagrams to a bound port were pushed onto a per-port queue with no upper
+// limit, so a UDP/QUIC flood aimed at the port grew the queue without bound
+// until the kernel exhausted memory (a denial-of-service).
+//
+// A connectionless datagram socket has no on-the-wire flow control (RFC 768),
+// so the kernel must bound its own receive buffer and drop excess datagrams.
+// POSIX SO_RCVBUF semantics permit a datagram socket to silently discard a
+// newly-arrived datagram once its receive buffer is full; UDP's unreliable
+// contract means the sender already tolerates loss.  The fix caps the per-port
+// depth at UDP_PORT_QUEUE_CAP and drops the *incoming* datagram on overflow,
+// never evicting an already-queued datagram the application has not yet read.
+//
+// Strategy (self-contained — no real network, no sockets):
+//   1. bind() a fresh port and drain any residue.
+//   2. Build a single cksum-0 (sender opt-out, RFC 768 / RFC 1122 §4.1.3.4)
+//      datagram template whose payload encodes a 1-byte sequence number, so
+//      no per-datagram checksum recompute is needed.
+//   3. Feed (cap + overflow) datagrams through handle_udp() with ascending
+//      sequence numbers.
+//   4. Assert: exactly `overflow` datagrams were counted as queue-full drops,
+//      and recv() yields exactly `cap` datagrams whose sequence numbers are
+//      the first `cap` (0..cap) in FIFO order — i.e. the earliest survivors
+//      are retained and the newest are dropped.
+//
+// Refs: RFC 768 (UDP); RFC 1122 §4.1.3.4 (UDP checksum opt-out);
+// POSIX (IEEE 1003.1) SO_RCVBUF.
+fn test_521_udp_queue_cap() -> bool {
+    test_header!("net: UDP per-port receive-queue cap (RFC 768, SO_RCVBUF)");
+
+    use crate::net::udp;
+    const PORT: u16 = 17521;
+    // Local mirror of the kernel cap; the kernel's UDP_PORT_QUEUE_CAP is
+    // private to net/udp.rs.  Keep these in sync.
+    const CAP: usize = 256;
+    const OVERFLOW: usize = 64;
+
+    if let Err(e) = udp::bind(PORT) {
+        test_fail!("test521", "bind({}) failed: {}", PORT, e);
+        return false;
+    }
+
+    // Drain any pre-existing datagrams on the port.
+    while udp::recv(PORT).is_some() {}
+
+    // Build a cksum-0 datagram template: header (8 bytes) + 1-byte payload.
+    // payload[0] is the sequence number, overwritten per send.
+    let udp_len: u16 = 8 + 1;
+    let mut pkt = alloc::vec::Vec::with_capacity(udp_len as usize);
+    pkt.extend_from_slice(&12345u16.to_be_bytes()); // src port
+    pkt.extend_from_slice(&PORT.to_be_bytes());      // dst port
+    pkt.extend_from_slice(&udp_len.to_be_bytes());   // length
+    pkt.push(0); pkt.push(0);                        // checksum = 0 (opt-out)
+    pkt.push(0);                                     // payload[0] = seq
+
+    let src = [127, 0, 0, 1];
+    let dst = [127, 0, 0, 1];
+
+    // Feed CAP + OVERFLOW datagrams.  Sequence numbers wrap into a u8 but
+    // the first CAP are 0..CAP-1 mod 256 (CAP == 256 → 0..255), which is
+    // exactly the survivor set we assert below.
+    let total_sent = CAP + OVERFLOW;
+    let before_full = udp::rx_queue_full_count();
+    for i in 0..total_sent {
+        pkt[8] = (i & 0xFF) as u8;
+        udp::handle_udp(src, dst, &pkt);
+    }
+    let after_full = udp::rx_queue_full_count();
+
+    // Exactly OVERFLOW datagrams must have been dropped as queue-full.
+    let drops = after_full.wrapping_sub(before_full);
+    test_println!("  sent {} datagrams (cap {}); queue-full drops: {}",
+                  total_sent, CAP, drops);
+    if drops != OVERFLOW as u64 {
+        udp::unbind(PORT);
+        test_fail!("test521",
+            "expected {} queue-full drops, got {}", OVERFLOW, drops);
+        return false;
+    }
+
+    // recv() must yield exactly CAP datagrams — the earliest CAP sent — in
+    // FIFO order.  The queue depth never exceeded the cap.
+    let mut received = 0usize;
+    let mut order_ok = true;
+    while let Some(dg) = udp::recv(PORT) {
+        let expected = (received & 0xFF) as u8;
+        if dg.data.len() != 1 || dg.data[0] != expected {
+            order_ok = false;
+        }
+        received += 1;
+        // Defensive: a broken cap would let this run past CAP forever.
+        if received > CAP + OVERFLOW + 1 {
+            break;
+        }
+    }
+    test_println!("  received {} datagrams; FIFO order ok: {}", received, order_ok);
+
+    udp::unbind(PORT);
+
+    if received != CAP {
+        test_fail!("test521",
+            "queue held {} datagrams, expected exactly cap={}", received, CAP);
+        return false;
+    }
+    if !order_ok {
+        test_fail!("test521",
+            "survivors were not the earliest CAP datagrams in FIFO order");
+        return false;
+    }
+
+    test_pass!("UDP per-port receive-queue cap (RFC 768, SO_RCVBUF)");
+    true
 }
 
 // ── Test 277: PT_TLS page refcount initialisation ───────────────────────────

@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -21,6 +22,33 @@ static UDP_RX_BAD_CSUM: AtomicU64 = AtomicU64::new(0);
 /// Read the running count of UDP RX checksum drops.
 pub fn rx_bad_csum_count() -> u64 {
     UDP_RX_BAD_CSUM.load(Ordering::Relaxed)
+}
+
+/// Maximum number of datagrams a single bound UDP port will buffer before
+/// the receive queue is considered full.  A connectionless socket has no
+/// flow control on the wire (RFC 768) — a peer can transmit faster than
+/// the application drains, and a flood (e.g. a UDP/QUIC reflection storm
+/// aimed at a bound port) would otherwise grow this queue without bound
+/// until the kernel exhausts memory.  POSIX permits a datagram socket to
+/// silently drop received datagrams once its receive buffer is full
+/// (`SO_RCVBUF` semantics); UDP's unreliable contract means the sender
+/// must already tolerate loss.  We therefore cap the per-port depth and
+/// drop the *incoming* datagram on overflow, never evicting a datagram the
+/// application has not yet read.  Sized to absorb a normal request/reply
+/// burst (a DNS resolver's parallel A/AAAA queries, a DHCP exchange)
+/// without spilling.
+const UDP_PORT_QUEUE_CAP: usize = 256;
+
+/// Count of UDP datagrams discarded on receive because the destination
+/// port's receive queue was already at [`UDP_PORT_QUEUE_CAP`].  Exposed
+/// for tests and the stats surface; Relaxed because the counter carries
+/// no synchronisation duty.
+static UDP_RX_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Read the running count of UDP RX drops caused by a full per-port
+/// receive queue.
+pub fn rx_queue_full_count() -> u64 {
+    UDP_RX_QUEUE_FULL.load(Ordering::Relaxed)
 }
 
 /// A UDP header (parsed).
@@ -51,9 +79,13 @@ pub struct UdpDatagram {
 }
 
 /// Per-port receive buffer.
+///
+/// `queue` is a `VecDeque` so the common receive path can dequeue from the
+/// front in O(1) (`pop_front`) instead of the O(n) shift a `Vec` incurs on
+/// `remove(0)`, and the enqueue path appends at the back (`push_back`).
 struct UdpBinding {
     port: u16,
-    queue: Vec<UdpDatagram>,
+    queue: VecDeque<UdpDatagram>,
 }
 
 /// Bound UDP ports.
@@ -99,12 +131,25 @@ pub fn handle_udp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
     // Deliver to bound port.
     let mut bindings = UDP_BINDINGS.lock();
     let delivered = if let Some(binding) = bindings.iter_mut().find(|b| b.port == header.dst_port) {
-        binding.queue.push(UdpDatagram {
-            src_ip,
-            src_port: header.src_port,
-            data: Vec::from(payload),
-        });
-        true
+        // Bound but full: the application has not drained the receive
+        // queue and we are already holding `UDP_PORT_QUEUE_CAP` datagrams.
+        // Per POSIX `SO_RCVBUF` semantics a datagram socket may silently
+        // drop the newly-arrived datagram once its buffer is full; UDP's
+        // unreliable contract (RFC 768) means the sender already tolerates
+        // loss.  Dropping the *incoming* datagram (rather than evicting a
+        // queued one) preserves the data the application has yet to read
+        // and bounds memory under a receive flood.
+        if binding.queue.len() >= UDP_PORT_QUEUE_CAP {
+            UDP_RX_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            binding.queue.push_back(UdpDatagram {
+                src_ip,
+                src_port: header.src_port,
+                data: Vec::from(payload),
+            });
+            true
+        }
     } else {
         false
     };
@@ -146,7 +191,7 @@ pub fn bind(port: u16) -> Result<(), &'static str> {
     }
     bindings.push(UdpBinding {
         port,
-        queue: Vec::new(),
+        queue: VecDeque::new(),
     });
     Ok(())
 }
@@ -156,7 +201,7 @@ pub fn recv(port: u16) -> Option<UdpDatagram> {
     let mut bindings = UDP_BINDINGS.lock();
     if let Some(binding) = bindings.iter_mut().find(|b| b.port == port) {
         if !binding.queue.is_empty() {
-            return Some(binding.queue.remove(0));
+            return binding.queue.pop_front();
         }
     }
     None
