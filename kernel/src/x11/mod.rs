@@ -3560,14 +3560,18 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
     let minor = data[1];
     match minor {
         proto::SHM_QUERY_VERSION => {
-            // ShmQueryVersionReply (MIT-SHM §ShmQueryVersion): shared_pixmaps=1,
-            // major=1, minor=2.  Advertising shared_pixmaps=true tells the client
-            // it may back a Pixmap directly with an attached segment via
-            // ShmCreatePixmap; clients (e.g. nsShmImage's gUseShmPixmaps path)
-            // then present with CreatePixmap → CopyArea(pixmap → window) instead
-            // of ShmPutImage.  Both present paths are now implemented server-side.
+            // ShmQueryVersionReply (MIT-SHM §ShmQueryVersion): major=1, minor=2.
+            //
+            // shared_pixmaps is advertised FALSE.  Both server-side present paths
+            // are implemented — ShmPutImage (op below) and the shared-pixmap path
+            // (ShmCreatePixmap + CopyArea-from-segment, op_shm_create_pixmap) — but
+            // the verified windowed-Firefox paint goes through the PutImage path
+            // (core PutImage / ShmPutImage), so we advertise shared_pixmaps=false
+            // to keep clients (nsShmImage) on that proven path.  The CreatePixmap
+            // request handler stays wired (and unit-tested) so a future enable is
+            // a single-bit flip + re-verify rather than a re-implementation.
             let mut b = [0u8; 32];
-            b[0] = 1; b[1] = 1; // shared_pixmaps = true
+            b[0] = 1; b[1] = 0; // shared_pixmaps = false
             w16(&mut b, 2, seq);
             w16(&mut b, 8, 1); w16(&mut b, 10, 2); // version 1.2
             b[16] = 2; // pixmap_format = ZPixmap

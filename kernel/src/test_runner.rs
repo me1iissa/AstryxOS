@@ -19366,17 +19366,24 @@ fn test_x11_shm_put_image() -> bool {
 // The other supported MIT-SHM present path: a client backs a Pixmap directly
 // with an attached segment (ShmCreatePixmap), draws each frame into the segment,
 // and CopyAreas the pixmap to its window.  This is the path nsShmImage takes when
-// the server advertises shared_pixmaps=true.  This test verifies the full chain:
-// ShmQueryVersion reports shared_pixmaps=1, ShmCreatePixmap makes a pixmap whose
-// storage is the segment, and CopyArea(pixmap → window) reads the segment's LIVE
-// contents (we change the segment AFTER CreatePixmap to prove it is read at copy
-// time, not snapshotted at create time).  X11 MIT-SHM protocol §ShmCreatePixmap.
+// the server advertises shared_pixmaps=true.  The server keeps the request handler
+// wired regardless of the advertised bit, so this test verifies the full chain
+// works: ShmCreatePixmap makes a pixmap whose storage is the segment, and
+// CopyArea(pixmap → window) reads the segment's LIVE contents (we change the
+// segment AFTER CreatePixmap to prove it is read at copy time, not snapshotted at
+// create time).  X11 MIT-SHM protocol §ShmCreatePixmap.
+//
+// NOTE: ShmQueryVersion advertises shared_pixmaps=FALSE — the verified windowed
+// paint goes through the ShmPutImage/core-PutImage path, so clients are steered
+// there.  This test exercises the CreatePixmap handler directly (not gated on the
+// advertised bit) so the capability stays covered for a future enable.
 fn test_x11_shm_create_pixmap() -> bool {
     test_header!("X11 MIT-SHM ShmCreatePixmap + CopyArea (shared-pixmap present)");
 
     let client = match x11_connect_setup("x11_shmpix") { Some(c) => c, None => return false };
 
-    // ShmQueryVersion must report shared_pixmaps=1 (so a real client takes this path).
+    // ShmQueryVersion advertises shared_pixmaps=false (paint goes through
+    // ShmPutImage), but the ShmCreatePixmap handler is wired and tested below.
     {
         let mut req = [0u8; 4];
         req[0] = crate::x11::proto::SHM_MAJOR_OPCODE;
@@ -19386,8 +19393,8 @@ fn test_x11_shm_create_pixmap() -> bool {
         crate::x11::poll();
         let mut rep = [0u8; 32];
         let n = crate::net::unix::read(client, &mut rep);
-        if n < 17 || rep[1] != 1 {
-            test_fail!("x11_shmpix", "ShmQueryVersion shared_pixmaps={} (want 1, n={})", rep[1], n);
+        if n < 17 || rep[1] != 0 {
+            test_fail!("x11_shmpix", "ShmQueryVersion shared_pixmaps={} (want 0, n={})", rep[1], n);
             crate::net::unix::close(client); return false;
         }
     }
