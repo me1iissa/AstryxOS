@@ -44,6 +44,15 @@ static X11_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─────────────────────────────────────────────────────────────────────────────
 const MAX_CLIENTS:      usize = 32;
+/// Largest single request the server will buffer for reassembly, in bytes.
+/// This matches the maximum request length advertised to clients after they
+/// enable the BIG-REQUESTS extension (BIGREQ_MAX_REQUEST_LEN is in 4-byte
+/// units; ×4 gives bytes).  A client whose pending request exceeds this cap is
+/// disconnected rather than allowed to grow the per-client receive buffer
+/// without bound (DoS guard — `panic=abort` makes an OOM/over-large alloc
+/// fatal to the whole kernel, so hostile input must be rejected gracefully).
+/// See the X11 BIG-REQUESTS extension specification.
+const MAX_REQUEST_BYTES: usize = (proto::BIGREQ_MAX_REQUEST_LEN as usize) * 4;
 const SOCKET_PATH:      &[u8] = b"/tmp/.X11-unix/X0\0";
 const RESOURCE_ID_BASE: u32   = 0x0040_0000;
 const RESOURCE_ID_MASK: u32   = 0x001F_FFFF;
@@ -58,6 +67,17 @@ struct Client {
     /// Per-client event mask selected on the root window (updated by
     /// ChangeWindowAttributes when the target is ROOT_WINDOW_ID).
     root_event_mask: u32,
+    /// Persistent receive-reassembly buffer.  A single X request can be larger
+    /// than one socket read returns (the AF_UNIX recv ring is bounded, and a
+    /// BIG-REQUESTS PutImage can be up to MAX_REQUEST_BYTES), so request bytes
+    /// are accumulated here across reads and a request is only dispatched once
+    /// fully buffered.  Bytes consumed by complete requests are drained from
+    /// the front; an incomplete tail is retained for the next read.  See the
+    /// X11 Protocol Encoding §Requests and the BIG-REQUESTS extension.
+    recv:            alloc::vec::Vec<u8>,
+    /// Guards against two concurrent `service_fd` calls (poll() can run on more
+    /// than one CPU) draining the same client's `recv` buffer simultaneously.
+    servicing:       bool,
     resources:       Box<ResourceTable>,
 }
 
@@ -65,6 +85,8 @@ impl Client {
     fn new(fd: u64) -> Self {
         Client { fd, seq: 0, setup_done: false,
                  root_event_mask: 0,
+                 recv: alloc::vec::Vec::new(),
+                 servicing: false,
                  resources: Box::new(ResourceTable::new()) }
     }
     fn next_seq(&mut self) -> u16 { self.seq = self.seq.wrapping_add(1); self.seq }
@@ -530,63 +552,205 @@ pub fn poll() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn service_fd(fd: u64) {
-    let mut buf = [0u8; 4096];
-    let n = unix::read(fd, &mut buf);
-    if n <= 0 { return; }
-    let data = &buf[..n as usize];
-    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
-    crate::serial_println!("[X11SVC] fd={} read {} bytes", fd, n);
+    // Take ownership of this client's reassembly buffer for the duration of the
+    // call.  `poll()` can run concurrently on more than one CPU, so guard with a
+    // `servicing` flag: if another CPU is already draining this client, bail —
+    // the in-progress call will pick up the freshly-arrived bytes on its next
+    // read loop.  Moving `recv` out (rather than holding SERVER across the parse
+    // loop) is mandatory: per-op handlers re-take SERVER via `with_client`, so
+    // holding it across dispatch would deadlock.
+    let mut recv = {
+        let mut srv = SERVER.lock();
+        match srv.clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd) {
+            Some(c) if !c.servicing => {
+                c.servicing = true;
+                core::mem::take(&mut c.recv)
+            }
+            _ => return,
+        }
+    };
+
+    // Drain every byte currently queued on the socket and append it to the
+    // reassembly buffer.  Draining fully (rather than a single ≤4096 read) frees
+    // the peer's bounded AF_UNIX send ring promptly, so a client streaming a
+    // request larger than the ring (e.g. a 128 KiB BIG-REQUESTS PutImage) can
+    // push the remainder — without this, a request bigger than the recv ring
+    // could never be fully delivered.
+    let mut chunk = [0u8; 4096];
+    let mut overflow = false;
+    loop {
+        let n = unix::read(fd, &mut chunk);
+        if n <= 0 { break; } // -EAGAIN (empty) / EOF / error → stop draining
+        let n = n as usize;
+        // DoS guard: never let the per-client buffer exceed the advertised
+        // maximum request length.  A pending request larger than the cap is a
+        // protocol violation (or hostile input); disconnect the client rather
+        // than grow the buffer unbounded (panic=abort makes OOM fatal).
+        if recv.len() + n > MAX_REQUEST_BYTES {
+            overflow = true;
+            break;
+        }
+        recv.extend_from_slice(&chunk[..n]);
+        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+        crate::serial_println!("[X11SVC] fd={} read {} bytes (buffered={})", fd, n, recv.len());
+    }
+
+    if overflow {
+        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+        crate::serial_println!("[X11SVC] fd={} pending request exceeds max ({} bytes) — disconnecting",
+            fd, MAX_REQUEST_BYTES);
+        let mut srv = SERVER.lock();
+        for slot in srv.clients.iter_mut() {
+            if let Some(c) = slot { if c.fd == fd { *slot = None; break; } }
+        }
+        unix::close(fd);
+        return; // `recv` (the local Vec) is dropped — client state is gone.
+    }
+
+    // Is the connection-setup handshake complete?  (Re-read under the lock; it
+    // may have been set by a prior `service_fd` for the same fd.)
     let setup = {
         let s = SERVER.lock();
         s.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
          .map(|c| c.setup_done).unwrap_or(false)
     };
-    if !setup { handle_setup(fd, data); return; }
+
     let mut off = 0usize;
-    while off + 4 <= data.len() {
-        // X11 core request length is a 16-bit count of 4-byte units (§Requests).
-        // Under the BIG-REQUESTS extension a length field of 0 means the real
-        // length is the following 32-bit word (in 4-byte units), inserted
-        // between the 4-byte request header and the body — so the body that
-        // would normally start at offset 4 starts at offset 8.  Treating length
-        // 0 as "stop parsing" would silently drop this request AND every request
-        // batched after it in the same read — desynchronising the client's
-        // reply/sequence expectations.  (X11 BIG-REQUESTS extension spec.)
-        let short_len = r16(data, off + 2) as usize;
-        let req_len_units = if short_len == 0 {
-            if off + 8 > data.len() { break; }
-            // A big request always spans >= 2 units: the 4-byte request header
-            // plus the inserted 4-byte extended-length word.  A reported length
-            // of 0 or 1 is malformed; accepting it makes the body splice
-            // [off+8..end] have start > end (end <= off+4) → slice-index panic
-            // (and panic=abort would take the whole kernel down on hostile
-            // client input).  Reject malformed big requests instead.
-            let big = r32(data, off + 4) as usize;
-            if big < 2 { break; }
-            big
-        } else {
-            short_len
-        };
-        if req_len_units == 0 { break; } // malformed: zero even in big form
-        let end = off + req_len_units * 4;
-        if end > data.len() || end <= off { break; }
-        if short_len == 0 {
-            // Big request: normalise to standard layout before dispatch so the
-            // per-op handlers (which read fields at fixed standard offsets) see
-            // a conventional request.  Splice out the inserted 4-byte
-            // extended-length word: keep the 4-byte header [off..off+4], then
-            // the body [off+8..end].  The reconstructed 16-bit length field is
-            // left as the request's true length truncated into 16 bits (the
-            // handlers key off the slice length, not this field).
-            let mut norm = alloc::vec::Vec::with_capacity(4 + (end - (off + 8)));
-            norm.extend_from_slice(&data[off..off + 4]);
-            norm.extend_from_slice(&data[off + 8..end]);
-            handle_request(fd, &norm);
-        } else {
-            handle_request(fd, &data[off..end]);
+    if !setup {
+        // The first message (ClientHello) may itself span reads.  Only consume
+        // it once fully buffered; otherwise retain everything for the next read.
+        match try_parse_setup(&recv) {
+            SetupParse::NeedMore => off = 0,
+            SetupParse::Consumed(used) => { handle_setup(fd, &recv[..used]); off = used; }
+            SetupParse::Failed(reason) => {
+                send_fail(fd, reason);
+                // Drop all buffered bytes for a failed setup; the client is
+                // expected to close after a failure reply.
+                off = recv.len();
+            }
         }
-        off = end;
     }
+
+    if setup {
+        // Request-stream parse loop over the persistent buffer.  Dispatch every
+        // COMPLETE request and advance `off`; stop (retaining the tail) at the
+        // first request that is not yet fully buffered.
+        while off + 4 <= recv.len() {
+            let data = &recv[..];
+            // X11 core request length is a 16-bit count of 4-byte units
+            // (§Requests).  Under the BIG-REQUESTS extension a length field of 0
+            // means the real length is the following 32-bit word (in 4-byte
+            // units), inserted between the 4-byte request header and the body —
+            // so the body that would normally start at offset 4 starts at
+            // offset 8.  Treating length 0 as "stop parsing" would silently drop
+            // this request and every request batched after it, desynchronising
+            // the client's reply/sequence stream.  (X11 BIG-REQUESTS extension.)
+            let short_len = r16(data, off + 2) as usize;
+            let req_len_units = if short_len == 0 {
+                // Need the inserted 32-bit length word to know the real size.
+                if off + 8 > data.len() { break; } // not yet buffered → wait
+                // A big request always spans ≥ 2 units (header + inserted word).
+                // A reported length of 0 or 1 is malformed; accepting it makes
+                // the body splice [off+8..end] have start > end → slice panic
+                // (panic=abort would take the kernel down on hostile input).
+                let big = r32(data, off + 4) as usize;
+                if big < 2 {
+                    // Malformed big request — cannot resync; drop the client.
+                    drop_servicing_client(fd);
+                    unix::close(fd);
+                    return;
+                }
+                big
+            } else {
+                short_len
+            };
+            let end = off + req_len_units * 4;
+            // Sanity: a non-overflowing end that is still past what we have
+            // buffered means the request is incomplete → retain and wait.
+            if end <= off { // overflow / malformed length
+                drop_servicing_client(fd);
+                unix::close(fd);
+                return;
+            }
+            if end > recv.len() { break; } // not fully buffered yet → wait
+
+            if short_len == 0 {
+                // Big request: normalise to standard layout before dispatch so
+                // the per-op handlers (which read fields at fixed standard
+                // offsets) see a conventional request.  Splice out the inserted
+                // 4-byte extended-length word: keep the 4-byte header
+                // [off..off+4], then the body [off+8..end].
+                let mut norm = alloc::vec::Vec::with_capacity(4 + (end - (off + 8)));
+                norm.extend_from_slice(&recv[off..off + 4]);
+                norm.extend_from_slice(&recv[off + 8..end]);
+                handle_request(fd, &norm);
+            } else {
+                // Dispatch the complete request in place.  `handle_request` may
+                // re-enter the X11 server (event delivery) but never touches this
+                // client's `recv` — it was moved out and is protected by the
+                // `servicing` guard — so borrowing a slice of the local buffer
+                // across the call is sound and avoids a per-request copy.
+                handle_request(fd, &recv[off..end]);
+            }
+            off = end;
+        }
+    }
+
+    // Drain the consumed prefix; retain the partial tail for the next read.
+    // Then return the buffer to the client and clear the servicing guard.
+    if off > 0 { recv.drain(..off); }
+    // Reclaim capacity once the buffer empties so a one-off large request does
+    // not pin MAX_REQUEST_BYTES of heap for the client's lifetime.
+    if recv.is_empty() && recv.capacity() > 8192 {
+        recv = alloc::vec::Vec::new();
+    }
+    let mut srv = SERVER.lock();
+    if let Some(c) = srv.clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd) {
+        // The client still exists (it was not disconnected mid-parse).  Restore
+        // its reassembly buffer and clear the guard.
+        c.recv = recv;
+        c.servicing = false;
+    }
+    // If the client vanished (closed concurrently), `recv` is simply dropped.
+}
+
+/// Clear the `servicing` guard for a client that is about to be force-closed
+/// from inside the parse loop, so the slot is consistent before removal.
+fn drop_servicing_client(fd: u64) {
+    let mut srv = SERVER.lock();
+    for slot in srv.clients.iter_mut() {
+        if let Some(c) = slot { if c.fd == fd { *slot = None; return; } }
+    }
+}
+
+/// Result of attempting to parse the connection-setup request from a buffer
+/// that may not yet hold the whole message.
+enum SetupParse<'a> {
+    /// The full setup request is not yet buffered — read more and retry.
+    NeedMore,
+    /// The setup request occupies `usize` bytes at the front of the buffer.
+    Consumed(usize),
+    /// The setup request is malformed; reply with the given failure reason.
+    Failed(&'a [u8]),
+}
+
+/// Determine whether a complete X11 connection-setup request is buffered.
+///
+/// Layout (X11 Protocol Encoding §Connection Setup): a 12-byte fixed header
+/// (byte-order, protocol major/minor, auth-name length `n`, auth-data length
+/// `d`), followed by the auth name padded to a 4-byte boundary and the auth
+/// data padded to a 4-byte boundary.  The total length is therefore
+/// `12 + pad4(n) + pad4(d)`; the request must not be dispatched until that
+/// many bytes are present.
+fn try_parse_setup(data: &[u8]) -> SetupParse<'static> {
+    if data.len() < 12 { return SetupParse::NeedMore; }
+    if data[0] != 0x6C { return SetupParse::Failed(b"big-endian not supported"); }
+    if r16(data, 2) != 11 { return SetupParse::Failed(b"unsupported protocol"); }
+    let n_auth = r16(data, 6) as usize;
+    let d_auth = r16(data, 8) as usize;
+    let total = 12 + ((n_auth + 3) & !3) + ((d_auth + 3) & !3);
+    if data.len() < total { return SetupParse::NeedMore; }
+    SetupParse::Consumed(total)
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -3306,9 +3470,11 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
 //
 // After this exchange the client may send requests whose 16-bit length field
 // is 0; in that case the next four bytes carry the real (32-bit) length.
-// We acknowledge the negotiation and advertise 4 MiB, but we do not yet
-// handle 32-bit lengths in the dispatcher — requests that large aren't needed
-// for GTK/Firefox init.
+// We acknowledge the negotiation and advertise 4 MiB.  `service_fd` reads the
+// 32-bit extended length, reassembles the request across socket reads (the
+// AF_UNIX recv ring is smaller than a large PutImage), and normalises it to the
+// standard layout before dispatch — so GTK/Firefox BIG-REQUESTS PutImage
+// (e.g. window chrome) is delivered intact rather than dropped.
 // ═════════════════════════════════════════════════════════════════════════════
 
 fn op_bigreq(fd: u64, data: &[u8], seq: u16) {
