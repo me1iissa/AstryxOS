@@ -180,11 +180,46 @@ fn parse_response(data: &[u8], expected_id: u16) -> Option<Ipv4Address> {
     None
 }
 
+/// Maximum length of a domain name, in octets, including label-length octets
+/// (RFC 1035 §3.1: "the total length of a domain name (i.e., label octets and
+/// label length octets) is restricted to 255 octets or less").  Used to bound
+/// the bytes a single name may consume so a maliciously long or looping label
+/// run cannot run away.
+const MAX_DNS_NAME_LEN: usize = 255;
+
 /// Skip a DNS name in the packet (handles compression pointers).
 /// Returns the new offset after the name.
+///
+/// A DNS name is a sequence of length-prefixed labels terminated by a
+/// zero-length label, optionally truncated by a compression pointer
+/// (RFC 1035 §4.1.4).  A compression pointer is a two-octet field whose two
+/// high bits are set; the remaining 14 bits give an offset, from the start of
+/// the message, of a prior occurrence of the (suffix of the) name.
+///
+/// RFC 1035 §4.1.4 specifies that a pointer references a *prior* occurrence,
+/// so a well-formed pointer always targets an offset strictly less than the
+/// field that holds it.  A malformed or hostile response can encode pointer
+/// cycles (A→B→A, or a self-pointer) or a forward chain that never
+/// terminates, which would loop a naive parser forever (CWE-835).  This
+/// routine bounds the parse against that:
+///   * every followed pointer must point **strictly backward** (target offset
+///     < the offset of the pointer field), which makes the followed offsets
+///     strictly decreasing and therefore loop-free;
+///   * the number of pointer jumps is capped (belt-and-suspenders: even a
+///     non-monotonic encoding cannot exceed the message length in jumps);
+///   * the total name length walked is bounded to `MAX_DNS_NAME_LEN`.
+/// Any violation returns `None` (the response is treated as malformed) rather
+/// than looping or over-reading.
 fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
     let mut jumped = false;
     let mut result_offset = 0usize;
+    // Cap pointer follows by the message length: a message holds at most
+    // data.len()/2 distinct two-octet pointers, so no legitimate name needs
+    // more jumps than that.  Combined with the strictly-backward check below
+    // this is redundant, but it bounds even a pathological implementation slip.
+    let mut jumps_left = data.len() / 2 + 1;
+    // Bound the total name length walked across all labels (RFC 1035 §3.1).
+    let mut name_len = 0usize;
 
     loop {
         if offset >= data.len() { return None; }
@@ -196,21 +231,43 @@ fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
         }
 
         if len & 0xC0 == 0xC0 {
-            // Compression pointer (2 bytes)
+            // Compression pointer (2 bytes).  Record the position just past
+            // the pointer the *first* time we jump — that is where the name
+            // ends in the on-the-wire stream the caller is walking.
             if !jumped {
                 result_offset = offset + 2;
             }
             if offset + 1 >= data.len() { return None; }
             let ptr = ((len & 0x3F) << 8) | data[offset + 1] as usize;
+            // RFC 1035 §4.1.4: a pointer references a *prior* occurrence, so
+            // it must point strictly backward.  Reject self-pointers and
+            // forward/cyclic pointers — the followed offsets are then strictly
+            // decreasing and cannot loop.
+            if ptr >= offset { return None; }
+            // Belt-and-suspenders bound on the number of follows.
+            if jumps_left == 0 { return None; }
+            jumps_left -= 1;
             offset = ptr;
             jumped = true;
             continue;
         }
 
+        // Ordinary label: 1 length octet + `len` label octets.  Bound the
+        // accumulated name length (RFC 1035 §3.1).
+        name_len += len + 1;
+        if name_len > MAX_DNS_NAME_LEN { return None; }
         offset += 1 + len;
     }
 
     Some(if jumped { result_offset } else { offset })
+}
+
+/// Test-only re-export of [`skip_dns_name`] for the in-kernel test suite
+/// (`kernel/src/test_runner.rs` Test 520, the compression-pointer loop-guard
+/// regression).  Not exposed in any production build.
+#[cfg(feature = "test-mode")]
+pub fn test_only_skip_dns_name(data: &[u8], offset: usize) -> Option<usize> {
+    skip_dns_name(data, offset)
 }
 
 /// Resolve a hostname to an IPv6 address (AAAA record).
