@@ -247,6 +247,41 @@ pub struct PeerCreds {
     pub gid: u32,
 }
 
+/// Normalise an AF_UNIX address slice into the byte sequence that is stored
+/// in (and matched against) a socket slot's `path`.
+///
+/// Two namespaces per `man 7 unix`:
+///   * **pathname** — `addr[0] != 0`: a NUL-terminated filesystem path.  The
+///     stored name is the bytes up to (excluding) the first NUL.  This is the
+///     historical behaviour; pathnames never contain a leading NUL.
+///   * **abstract** — `addr[0] == 0`: an abstract-namespace name.  Its length
+///     is taken from the address length (`addr.len()` here, since the syscall
+///     layer already sliced to `addrlen - sizeof(sa_family)`), it is NOT
+///     NUL-terminated, and it MAY contain embedded NULs.  The stored name is
+///     the *entire* slice, leading NUL included — which makes it disjoint from
+///     every pathname name (a pathname can never begin with a NUL) and keeps
+///     embedded NULs significant rather than truncating at the first one.
+///
+/// Returns the slice to store/match, capped at `UNIX_PATH_MAX`.  An empty
+/// `addr` returns an empty slice (the caller maps that to EINVAL where the
+/// contract requires a non-empty name).
+fn unix_name(addr: &[u8]) -> &[u8] {
+    if addr.first() == Some(&0) {
+        // Abstract namespace: length is addrlen-derived; embedded NULs kept.
+        &addr[..addr.len().min(UNIX_PATH_MAX)]
+    } else {
+        // Pathname: NUL-terminated C string.
+        let raw_len = addr.iter().position(|&b| b == 0).unwrap_or(addr.len());
+        &addr[..raw_len.min(UNIX_PATH_MAX)]
+    }
+}
+
+/// True if `name` (as returned by [`unix_name`]) is an abstract-namespace
+/// name (leading NUL) rather than a filesystem pathname.
+fn is_abstract(name: &[u8]) -> bool {
+    name.first() == Some(&0)
+}
+
 pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
     let mut t = TABLE.lock();
     for (i, s) in t.0.iter_mut().enumerate() {
@@ -266,10 +301,18 @@ pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
 
 pub fn bind(id: u64, path: &[u8]) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
-    // Strip trailing NUL so paths stored by bind always match paths from connect.
-    let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-    let plen = raw_len.min(UNIX_PATH_MAX);
-    let new_path = &path[..plen];
+    // Select pathname vs abstract namespace per `man 7 unix`.  A pathname is
+    // NUL-terminated (stored up to the first NUL); an abstract name (leading
+    // NUL) keeps its full addrlen-derived length and any embedded NULs.  Using
+    // the same normaliser for bind and connect guarantees a name bound here
+    // matches a name connected later in *both* namespaces.
+    let new_path = unix_name(path);
+    let plen = new_path.len();
+    // A zero-length name is not bindable (POSIX/`man 7 unix`: an autobind
+    // would be requested with addrlen == sizeof(sa_family); here addrlen > 2
+    // is already guaranteed by the syscall layer, but an all-empty slice is
+    // still rejected defensively as EINVAL).
+    if plen == 0 { return -22; }
     let mut t = TABLE.lock();
     for (i, s) in t.0.iter().enumerate() {
         if i as u64 == id { continue; }
@@ -301,17 +344,40 @@ pub fn listen(id: u64) -> i64 {
 
 pub fn connect(id: u64, path: &[u8], _client_creds: PeerCreds) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
-    // Strip trailing NUL to match paths stored by bind.
-    let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-    let plen = raw_len.min(UNIX_PATH_MAX);
-    let search = &path[..plen];
+    // Select pathname vs abstract namespace per `man 7 unix`, using the same
+    // normaliser as bind() so a bound name matches.  Abstract names keep their
+    // full addrlen-derived length and embedded NULs; pathnames are NUL-stripped.
+    let search = unix_name(path);
+    if search.is_empty() { return -22; } // EINVAL — empty name is not connectable
+    let abstract_ns = is_abstract(search);
     let mut t = TABLE.lock();
 
+    // Distinguish the two failure modes the contract requires (`man 2 connect`,
+    // `man 7 unix`):
+    //   * a *listening* socket bound to this name → connect succeeds;
+    //   * a socket bound (but not listening) to a *pathname* → the socket file
+    //     exists but nobody is accepting → ECONNREFUSED;
+    //   * NO socket bound to this *pathname* at all → the socket file does not
+    //     exist → ENOENT;
+    //   * an *abstract* name with no listener → ECONNREFUSED (there is no
+    //     filesystem object, so a missing abstract name maps to "refused",
+    //     never ENOENT).
     let server_id = t.0.iter().enumerate()
-        .find(|(_, s)| s.state == UnixState::Listening && &s.path[..s.path_len] == search)
+        .find(|(_, s)| s.state == UnixState::Listening
+            && &s.path[..s.path_len] == search)
         .map(|(i, _)| i as u64)
         .unwrap_or(u64::MAX);
-    if server_id == u64::MAX { return -111; }
+    if server_id == u64::MAX {
+        if abstract_ns {
+            return -111; // ECONNREFUSED — abstract name has no listener
+        }
+        // Pathname: does a (non-listening) bound socket exist at this path?
+        let exists = t.0.iter().any(|s|
+            (s.state == UnixState::Bound || s.state == UnixState::Connected)
+            && !is_abstract(&s.path[..s.path_len])
+            && &s.path[..s.path_len] == search);
+        return if exists { -111 } else { -2 }; // ECONNREFUSED vs ENOENT
+    }
 
     // The accepted peer (server-side end of the new connection) inherits the
     // server's socket type per `man 7 unix` — a SEQPACKET listener must yield
