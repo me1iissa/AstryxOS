@@ -18,8 +18,8 @@ pub const EPOLLOUT:     u32 = 0x0004;
 pub const EPOLLERR:     u32 = 0x0008;
 pub const EPOLLHUP:     u32 = 0x0010;
 pub const EPOLLRDHUP:   u32 = 0x2000;
-pub const EPOLLET:      u32 = 1 << 31; // edge-triggered (accepted but not enforced)
-pub const EPOLLONESHOT: u32 = 1 << 30;
+pub const EPOLLET:      u32 = 1 << 31; // edge-triggered (enforced in sys_epoll_wait)
+pub const EPOLLONESHOT: u32 = 1 << 30; // accepted; one-shot disable not yet enforced
 
 /// Equivalent to Linux `struct epoll_event` (packed, 12 bytes).
 #[repr(C, packed)]
