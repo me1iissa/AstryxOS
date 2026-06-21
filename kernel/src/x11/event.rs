@@ -44,6 +44,30 @@ pub fn encode_expose(seq: u16, window: u32,
     b
 }
 
+// ── VisibilityNotify event (15) ───────────────────────────────────────────────
+//
+// Per X11 protocol (Appendix B, §Events):
+//   [0]   15 (VisibilityNotify)
+//   [1]   0 (pad)
+//   [2-3] sequence-number
+//   [4-7] window
+//   [8]   state: 0=Unobscured, 1=PartiallyObscured, 2=FullyObscured
+//   [9-31] pad
+//
+// A real X server, on a window selecting VisibilityChangeMask, reports the
+// window's visibility when it becomes viewable.  For a freshly-mapped top-level
+// with nothing above it, the state is Unobscured (0).  Toolkits use this as the
+// "the surface is now visible" cue alongside the map/expose handshake.
+
+pub fn encode_visibility_notify(seq: u16, window: u32, state: u8) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0] = proto::EVENT_VISIBILITY_NOTIFY;
+    w16(&mut b, 2, seq);
+    w32(&mut b, 4, window);
+    b[8] = state; // 0 = Unobscured
+    b
+}
+
 // ── ConfigureNotify event (22) ────────────────────────────────────────────────
 //
 //   [0]   22
@@ -196,6 +220,49 @@ pub fn encode_motion_notify(seq: u16, window: u32,
     w16(&mut b, 26, ry as u16);
     w16(&mut b, 28, state);
     b[30] = 1;
+    b
+}
+
+// ── EnterNotify event (7) ─────────────────────────────────────────────────────
+//
+// Per X11 protocol (Appendix B, §Events) — same wire layout as the crossing
+// (Enter/Leave) events:
+//   [0]   7 (EnterNotify)
+//   [1]   detail (0=Ancestor)
+//   [2-3] sequence-number
+//   [4-7] time
+//   [8-11] root
+//   [12-15] event-window
+//   [16-19] child (0=None)
+//   [20-21] root-x  [22-23] root-y
+//   [24-25] event-x  [26-27] event-y
+//   [28-29] state (key/button mask)
+//   [30]  mode (0=Normal)
+//   [31]  flags: bit 0x01 = focus, bit 0x02 = same-screen
+//
+// Emitted to a freshly-mapped top-level that selected EnterWindowMask so the
+// toolkit sees the pointer is in (and the window holds focus for) the new
+// surface.  We use detail=Ancestor, mode=Normal, child=None, and set both the
+// focus and same-screen flag bits (0x03) since the mapped top-level is the
+// focus window on the same screen as the root.
+
+pub fn encode_enter_notify(seq: u16, window: u32, root: u32,
+                            root_x: i16, root_y: i16) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0] = proto::EVENT_ENTER_NOTIFY;
+    b[1] = 0; // detail = NotifyAncestor
+    w16(&mut b, 2, seq);
+    // [4..8] time = 0
+    w32(&mut b, 8, root);          // root
+    w32(&mut b, 12, window);       // event-window
+    // [16..20] child = None (0)
+    w16(&mut b, 20, root_x as u16);
+    w16(&mut b, 22, root_y as u16);
+    w16(&mut b, 24, root_x as u16); // event-x (== root-x for a top-level under root)
+    w16(&mut b, 26, root_y as u16); // event-y
+    // [28..30] state = 0
+    b[30] = 0;    // mode = Normal
+    b[31] = 0x03; // flags: focus (0x01) | same-screen (0x02)
     b
 }
 

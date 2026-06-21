@@ -847,6 +847,13 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_map_event_sequence() { passed += 1; }
 
+    // ── Test 308: X11 golden no-WM top-level map burst ──────────────────────
+    // MapNotify→VisibilityNotify→Expose→EnterNotify+FocusIn for a top-level,
+    // and the #581 leaf-invariant (child gets only MapNotify+Expose).
+
+    total += 1;
+    if test_x11_map_burst_golden() { passed += 1; }
+
     // ── X11 server — TranslateCoordinates (opcode 40) ────────────────────────
 
     total += 1;
@@ -18967,6 +18974,169 @@ fn test_x11_map_event_sequence() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 map event sequence (MapNotify→Expose)");
+    true
+}
+
+// ── Test 308: X11 golden no-WM top-level map burst ───────────────────────────
+//
+// Verifies our map-event burst is byte-equivalent to a real no-WM X server.
+// Per the X11 core protocol §MapWindow, mapping a top-level that selected the
+// relevant masks yields, in order:
+//   MapNotify(19) → VisibilityNotify(15, Unobscured) → Expose(12)
+//                 → EnterNotify(7, focus) → FocusIn(9)
+// A NON-root (leaf/child) window must receive ONLY MapNotify(19) + Expose(12)
+// — it gets no EnterNotify/FocusIn (the #581 invariant that keeps a toolkit
+// leaf widget, e.g. the xeyes Eyes child, from being driven through a spurious
+// crossing/focus pass).
+fn test_x11_map_burst_golden() -> bool {
+    test_header!("X11 golden no-WM map burst (MapNotify→VisibilityNotify→Expose→EnterNotify+FocusIn)");
+
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream,
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if client == u64::MAX { test_fail!("x11_burst", "unix::create() failed"); return false; }
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0",
+        crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("x11_burst", "connect failed");
+        crate::net::unix::close(client);
+        return false;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(client, &hello);
+    crate::x11::poll();
+    let mut setup_buf = [0u8; 128];
+    let n = crate::net::unix::read(client, &mut setup_buf);
+    if n < 8 || setup_buf[0] != 1 {
+        test_fail!("x11_burst", "setup failed (n={} byte0={})", n, setup_buf[0]);
+        crate::net::unix::close(client);
+        return false;
+    }
+
+    // Helper: build a CreateWindow(wid, parent, w, h, event_mask) request into
+    // `out`, mirroring the byte layout used by test_x11_map_event_sequence.
+    // value-mask = CW_EVENT_MASK (0x0800); the 32-bit event_mask follows.
+    fn create_window(out: &mut [u8], wid: u32, parent: u32, w: u16, h: u16, evmask: u32) {
+        let wb = wid.to_le_bytes();
+        let pb = parent.to_le_bytes();
+        let em = evmask.to_le_bytes();
+        out[0] = 1; out[2] = 10;                       // opcode, length=10 words
+        out[4] = wb[0]; out[5] = wb[1]; out[6] = wb[2]; out[7] = wb[3];
+        out[8] = pb[0]; out[9] = pb[1]; out[10] = pb[2]; out[11] = pb[3];
+        out[12] = 30; out[14] = 40;                    // x=30 y=40
+        let wbw = w.to_le_bytes(); let hbw = h.to_le_bytes();
+        out[16] = wbw[0]; out[17] = wbw[1];            // width
+        out[18] = hbw[0]; out[19] = hbw[1];            // height
+        out[22] = 1;                                   // class = InputOutput
+        out[24] = 32;                                  // visual = ROOT_VISUAL
+        out[28] = 0x00; out[29] = 0x08;                // vmask = CW_EVENT_MASK
+        out[32] = em[0]; out[33] = em[1]; out[34] = em[2]; out[35] = em[3];
+    }
+    fn map_window(out: &mut [u8], wid: u32) {
+        let wb = wid.to_le_bytes();
+        out[0] = 8; out[2] = 2;                        // MapWindow, length=2 words
+        out[4] = wb[0]; out[5] = wb[1]; out[6] = wb[2]; out[7] = wb[3];
+    }
+
+    // ── Top-level: parent=root, selects Visibility|Enter|Focus|Exposure|Structure
+    let top_wid: u32 = 0x00720001;
+    let top_evmask: u32 = 0x00000010   // EnterWindow
+                        | 0x00008000   // Exposure
+                        | 0x00010000   // VisibilityChange
+                        | 0x00020000   // StructureNotify
+                        | 0x00200000;  // FocusChange  → 0x00238010
+    let mut top_req = [0u8; 48];
+    create_window(&mut top_req[0..40], top_wid, 1, 200, 100, top_evmask);
+    map_window(&mut top_req[40..48], top_wid);
+    crate::net::unix::write(client, &top_req);
+    crate::x11::poll();
+
+    // Expect 5 events = 160 bytes: MapNotify, VisibilityNotify, Expose,
+    // EnterNotify, FocusIn — in that exact order.
+    let mut buf = [0u8; 256];
+    let n = crate::net::unix::read(client, &mut buf);
+    if n != 160 {
+        test_fail!("x11_burst",
+            "top-level read {} (expected 160 = 5 events: Map/Visibility/Expose/Enter/Focus)", n);
+        crate::net::unix::close(client); return false;
+    }
+    let u32le = |o: usize| u32::from_le_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]);
+
+    // [0] MapNotify(19), window=top
+    if buf[0] != 19 || u32le(8) != top_wid {
+        test_fail!("x11_burst", "evt0 type={} win={:#x} (expected 19 MapNotify {:#x})",
+            buf[0], u32le(8), top_wid);
+        crate::net::unix::close(client); return false;
+    }
+    // [1] VisibilityNotify(15), window=top, state=0 (Unobscured) at byte 8
+    if buf[32] != 15 || u32le(32 + 4) != top_wid || buf[32 + 8] != 0 {
+        test_fail!("x11_burst", "evt1 type={} win={:#x} state={} (expected 15 VisibilityNotify {:#x} state=0)",
+            buf[32], u32le(32 + 4), buf[32 + 8], top_wid);
+        crate::net::unix::close(client); return false;
+    }
+    // [2] Expose(12), window=top
+    if buf[64] != 12 || u32le(64 + 4) != top_wid {
+        test_fail!("x11_burst", "evt2 type={} win={:#x} (expected 12 Expose {:#x})",
+            buf[64], u32le(64 + 4), top_wid);
+        crate::net::unix::close(client); return false;
+    }
+    // [3] EnterNotify(7), event-window=top (byte 12), focus bit (0x01) set in
+    // flags byte (31).  Per X11 protocol the flags byte holds focus=0x01 and
+    // same-screen=0x02; we set both (0x03).
+    if buf[96] != 7 || u32le(96 + 12) != top_wid {
+        test_fail!("x11_burst", "evt3 type={} win={:#x} (expected 7 EnterNotify {:#x})",
+            buf[96], u32le(96 + 12), top_wid);
+        crate::net::unix::close(client); return false;
+    }
+    if buf[96 + 31] & 0x01 == 0 {
+        test_fail!("x11_burst", "EnterNotify flags={:#x} (expected focus bit 0x01 set)", buf[96 + 31]);
+        crate::net::unix::close(client); return false;
+    }
+    if buf[96 + 31] & 0x02 == 0 {
+        test_fail!("x11_burst", "EnterNotify flags={:#x} (expected same-screen bit 0x02 set)", buf[96 + 31]);
+        crate::net::unix::close(client); return false;
+    }
+    // [4] FocusIn(9), window=top
+    if buf[128] != 9 || u32le(128 + 4) != top_wid {
+        test_fail!("x11_burst", "evt4 type={} win={:#x} (expected 9 FocusIn {:#x})",
+            buf[128], u32le(128 + 4), top_wid);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  top-level burst: Map→Visibility→Expose→Enter(focus)→FocusIn ✓");
+
+    // ── Leaf child: parent=top-level (NON-root), selects ONLY Exposure|Structure.
+    // Per the #581 invariant it must get ONLY MapNotify + Expose — NO
+    // EnterNotify, NO FocusIn (and, having not selected VisibilityChange, no
+    // VisibilityNotify).
+    let child_wid: u32 = 0x00720002;
+    let child_evmask: u32 = 0x00008000 | 0x00020000; // Exposure | StructureNotify
+    let mut child_req = [0u8; 48];
+    create_window(&mut child_req[0..40], child_wid, top_wid, 50, 50, child_evmask);
+    map_window(&mut child_req[40..48], child_wid);
+    crate::net::unix::write(client, &child_req);
+    crate::x11::poll();
+
+    // Expect exactly 2 events = 64 bytes: MapNotify + Expose.
+    let mut cbuf = [0u8; 256];
+    let cn = crate::net::unix::read(client, &mut cbuf);
+    if cn != 64 {
+        test_fail!("x11_burst",
+            "leaf child read {} (expected 64 = ONLY MapNotify+Expose; #581 leaf invariant)", cn);
+        crate::net::unix::close(client); return false;
+    }
+    let cu32 = |o: usize| u32::from_le_bytes([cbuf[o], cbuf[o+1], cbuf[o+2], cbuf[o+3]]);
+    if cbuf[0] != 19 || cu32(8) != child_wid {
+        test_fail!("x11_burst", "leaf evt0 type={} win={:#x} (expected 19 MapNotify {:#x})",
+            cbuf[0], cu32(8), child_wid);
+        crate::net::unix::close(client); return false;
+    }
+    if cbuf[32] != 12 || cu32(32 + 4) != child_wid {
+        test_fail!("x11_burst", "leaf evt1 type={} win={:#x} (expected 12 Expose {:#x}; NO Enter/Focus)",
+            cbuf[32], cu32(32 + 4), child_wid);
+        crate::net::unix::close(client); return false;
+    }
+    test_println!("  leaf child: ONLY MapNotify+Expose (no Enter/Focus) ✓ (#581 preserved)");
+
+    crate::net::unix::close(client);
+    test_pass!("X11 golden no-WM map burst (MapNotify→VisibilityNotify→Expose→EnterNotify+FocusIn)");
     true
 }
 
