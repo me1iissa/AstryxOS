@@ -1863,14 +1863,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 
             // Dequeue one accept-pending child TCB on this listener's
             // local port.  When the pending queue is empty either
-            // block (BLOCKing socket) by yielding until the NIC RX
-            // path drives a fresh child past 3WHS (RFC 793 §3.4), or
+            // block (BLOCKing socket) until the NIC RX path drives a
+            // fresh child past the 3-way handshake (RFC 793 §3.4), or
             // return EAGAIN under SOCK_NONBLOCK / O_NONBLOCK.
             //
-            // The TCP RX advances connection state directly from the
-            // NIC IRQ, so a simple yield+poll loop is sufficient.
-            // `net::poll()` also drains other pending events so we
-            // don't starve sibling sockets.
+            // Blocking accept parks on the global IPC poll bell rather
+            // than spin-yielding at 100 Hz: the TCP receive path rings
+            // `PollBellSource::InetRx` when a listener child completes
+            // the handshake (`SynReceived`→`Established`), waking us
+            // immediately to re-check `has_pending_accept`.  Per IEEE
+            // Std 1003.1-2017 §accept the call blocks until a connection
+            // is present, so the caller deadline is infinite; the bell's
+            // resync floor bounds any (harmless) missed ring.
+            //
+            // Lost-wakeup safety: the `ready_now` predicate
+            // (`has_pending_accept`, side-effect free) re-checks the
+            // *only* condition the InetRx ring covers for this loop — a
+            // child reaching `Established`.  `wait_poll_event` runs that
+            // re-check under the POLL_BELL lock before committing to the
+            // park, so a ring that races the re-check is serialized
+            // behind the bell and cannot be lost.  `take_pending_accept`
+            // (which mutates `accepted`) is only called *after* a
+            // positive observation, never inside the wait predicate.
             let blocking = !(nonblock || fd_nonblock);
             let (peer_ip, peer_port) = loop {
                 if let Some(p) = crate::net::tcp::take_pending_accept(listener_port) {
@@ -1878,8 +1892,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
                 if !blocking { return -11; } // EAGAIN
                 if signal_pending(pid)       { return -4;  } // EINTR
+                // Pump the NIC RX ring + TCP demux so a freshly-arrived
+                // ACK completing a child's handshake becomes visible,
+                // then park on the bell until InetRx rings (or the
+                // resync floor fires) and re-check.
                 crate::net::poll();
-                crate::sched::yield_cpu();
+                if crate::net::tcp::has_pending_accept(listener_port) {
+                    continue;
+                }
+                crate::ipc::waitlist::wait_poll_event(
+                    u64::MAX,
+                    || crate::net::tcp::has_pending_accept(listener_port));
             };
 
             // Materialise the accept-side socket bound to this 4-tuple.
@@ -2062,21 +2085,53 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         .unwrap_or(false)
                 };
                 let blocking = !(msg_dontwait || fd_nonblock);
-                // For blocking sockets, yield until the socket has data
+                // For blocking sockets, park until the socket is readable
+                // (data queued OR an orderly EOF the peer's FIN produced)
                 // or the receive deadline fires.  3000 ticks (≈30 s) is
                 // the upper bound — matches SO_RCVTIMEO's POSIX default
                 // (zero = no timeout) cap of "very long" without leaving
                 // a zombie syscall pinning the runner forever.  Most
                 // DNS resolvers retry within 5 s anyway (RFC 1035 §4.2.1).
+                //
+                // Park on the global IPC poll bell rather than spin-
+                // yielding at 100 Hz: the TCP/UDP receive path rings
+                // `PollBellSource::InetRx` on data arrival and on the
+                // peer-FIN read-closed edge, waking us immediately to
+                // re-check.  IEEE Std 1003.1-2017 §recvfrom: a blocking
+                // receive returns when a message is available or the
+                // connection is shut down for reading.
+                //
+                // Lost-wakeup safety: the `ready_now` predicate
+                // `socket_read_ready` re-checks *both* conditions the
+                // InetRx ring covers — buffered bytes AND a stream
+                // peer-FIN/read-closed edge (so a recv that will return 0
+                // wakes promptly instead of stalling to the 30 s floor).
+                // It is strictly NON-DESTRUCTIVE (it does not dequeue a
+                // datagram or drain the stream buffer): the destructive
+                // drain happens only in `socket_recvfrom` below, after a
+                // positive observation — using the consuming
+                // `socket_recv_status` in the predicate would silently
+                // drop a UDP datagram or stream bytes the recv must return.
+                // `wait_poll_event` runs the re-check under the POLL_BELL
+                // lock before parking, so a ring that races the re-check is
+                // serialized behind the bell and cannot be lost.  (The old
+                // `socket_has_data` predicate checked data only and relied
+                // on the 30 s deadline to escape a peer-FIN-with-empty-
+                // buffer EOF; `socket_read_ready` is strictly more
+                // responsive while remaining non-destructive.)
                 if blocking {
                     let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
-                    while !crate::net::socket::socket_has_data(socket_id) {
+                    loop {
+                        if crate::net::socket::socket_read_ready(socket_id) { break; }
                         if signal_pending(pid) { return -4; } // EINTR
                         crate::net::poll();
+                        if crate::net::socket::socket_read_ready(socket_id) { break; }
                         if crate::arch::x86_64::irq::get_ticks() >= deadline {
                             return -11; // EAGAIN — surfaces as "timed out"
                         }
-                        crate::sched::yield_cpu();
+                        crate::ipc::waitlist::wait_poll_event(
+                            deadline,
+                            || crate::net::socket::socket_read_ready(socket_id));
                     }
                 }
                 match crate::net::socket::socket_recvfrom(socket_id) {
