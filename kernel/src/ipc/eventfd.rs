@@ -209,6 +209,10 @@ pub fn write(id: u64, val: u64) -> Result<(), i64> {
     let was_zero = slot.counter == 0;
     slot.counter += val;
     if was_zero && val > 0 {
+        // `wrapping_add` is intentional and benign: only inequality with the
+        // watch's recorded `et_rise` is consulted, never an ordering, and a u64
+        // wrap requires ~2^64 rise events (centuries of edges) — a wrap would
+        // at worst alias one generation and miss a single edge, never panic.
         slot.rise_seq = slot.rise_seq.wrapping_add(1);
     }
     Ok(())
