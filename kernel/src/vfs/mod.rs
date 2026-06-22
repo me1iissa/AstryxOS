@@ -2635,13 +2635,31 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 }
                 return Ok(count);
             }
-            // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
+            // bit 24 = /dev/urandom | /dev/random  → fill with random bytes
+            //
+            // MUST draw from the same RDRAND-backed entropy source as
+            // getrandom(2) (`security::rand::rand_u64`, RDRAND with a
+            // RDTSC/LAPIC-seeded xorshift fallback), advancing the value on
+            // every 8-byte word.  A correct /dev/urandom NEVER returns
+            // identical consecutive blocks: NSS softoken's FIPS 140-2 §4.9.2
+            // continuous-RNG self-test (and similar health tests) compare two
+            // back-to-back entropy reads and treat a match as a hardware RNG
+            // failure (CKR_DEVICE_ERROR), which would abort TLS init.  The
+            // previous implementation seeded a single LCG from get_ticks()
+            // once per read, so two reads serviced within one timer tick were
+            // byte-identical and tripped that test.  See random(4) /
+            // getrandom(2): /dev/urandom is a CSPRNG, not a clock-derived
+            // sequence.
             if flags & 0x0100_0000 != 0 {
-                let t = crate::arch::x86_64::irq::get_ticks();
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    for i in 0..count {
-                        *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8;
+                    let mut i = 0usize;
+                    while i < count {
+                        let val = crate::security::rand::rand_u64();
+                        let bytes = val.to_le_bytes();
+                        let n = core::cmp::min(8, count - i);
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(i), n);
+                        i += n;
                     }
                 }
                 return Ok(count);
