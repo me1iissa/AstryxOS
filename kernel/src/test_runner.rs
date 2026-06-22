@@ -1415,6 +1415,15 @@ pub fn run() -> ! {
     total += 1;
     if test_629_compositor_rate_gate() { passed += 1; }
 
+    // W215 frame-recycle zeroing invariant — the H_ZERO half of the Wikipedia
+    // re/fonts catch.  Gated on `firefox-test-core` because it calls the
+    // `w215_diag` content detector, which is compiled only in that profile.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        total += 1;
+        if test_640_frame_recycle_zeroing_invariant() { passed += 1; }
+    }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -53337,6 +53346,107 @@ fn test_629_compositor_rate_gate() -> bool {
         return false;
     }
 
+    test_pass!(NAME);
+    true
+}
+
+// ── Frame-recycle zeroing invariant (W215 Wikipedia re/fonts catch) ──────────
+//
+// The deterministic SMP=1 Wikipedia render crash was hypothesised to be a
+// recycled physical frame whose stale content was a font-path string
+// ("…/fonts/…", little-endian 0x73746e6f662f6572 = "re/fonts") surfacing into
+// a WebRender blob buffer.  Two sub-hypotheses were both anchored to a single
+// kernel invariant:
+//
+//   - H_ZERO  — a frame recycled into a writable user anonymous mapping must
+//     be ZEROED before the consumer can read it, else stale bytes leak.
+//   - H_ALIAS — a user-VA PTE swap must invalidate the local TLB, else the
+//     consumer reads the old frame.
+//
+// This test exercises the H_ZERO half at unit level: it seeds a freshly
+// allocated physical frame with the font-path sentinel, confirms the
+// `w215_diag` content detector recognises it, zeroes the frame the way every
+// kernel anon-install arm does (idt.rs anon arm, syscall CLEARTID arm,
+// proc vfork stack/TLS seed all `write_bytes(.., 0, PAGE_SIZE)` before
+// publishing), and asserts the sentinel is gone — i.e. a recycled font-path
+// frame cannot survive the zero-fill into a user mapping.
+//
+// Cite: POSIX mmap(2) (MAP_ANONYMOUS pages are zero-filled on first
+// reference); Intel SDM Vol. 3A §4.10.4 (paging/TLB caches).
+#[cfg(feature = "firefox-test-core")]
+fn test_640_frame_recycle_zeroing_invariant() -> bool {
+    const NAME: &str = "frame-recycle zeroing invariant (Test 640)";
+    test_header!(NAME);
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!(NAME, "alloc_page returned None"); return false; }
+    };
+
+    // 1. Seed the frame with a stale font-path sentinel at an offset (mirrors a
+    //    prior allocation that held a fontconfig path), as a recycled frame
+    //    would carry it.
+    let sentinel = b"/usr/share/fonts/TTF/DejaVuSans.ttf\0";
+    let seed_off = 0x800usize;
+    unsafe {
+        let kva = (PHYS_OFF + phys) as *mut u8;
+        core::ptr::write_bytes(kva, 0, crate::mm::pmm::PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(
+            sentinel.as_ptr(),
+            kva.add(seed_off),
+            sentinel.len(),
+        );
+    }
+
+    // 2. The content detector must recognise the "/fonts" run and report its
+    //    offset (the "/fonts" substring begins at seed_off + len("/usr/share")).
+    match crate::mm::w215_diag::frame_content_is_fontpath(phys) {
+        Some(off) => {
+            let expect = seed_off + "/usr/share".len();
+            if off != expect {
+                test_fail!(NAME, "detector found /fonts at wrong offset");
+                crate::serial_println!("  expected off={:#x} got off={:#x}", expect, off);
+                crate::mm::pmm::free_page(phys);
+                return false;
+            }
+        }
+        None => {
+            test_fail!(NAME, "detector did NOT recognise the seeded font path");
+            crate::mm::pmm::free_page(phys);
+            return false;
+        }
+    }
+
+    // 3. Zero the frame the way every kernel anon-install arm does before
+    //    publishing it into a user mapping.
+    unsafe {
+        core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    }
+
+    // 4. The sentinel must be gone: a recycled font-path frame cannot survive
+    //    the zero-fill into a user-visible mapping (the H_ZERO invariant).
+    if crate::mm::w215_diag::frame_content_is_fontpath(phys).is_some() {
+        test_fail!(NAME, "font-path sentinel survived the zero-fill (H_ZERO invariant broken)");
+        crate::mm::pmm::free_page(phys);
+        return false;
+    }
+
+    // 5. A clean (all-zero) frame must NOT false-positive as a font path.
+    let clean = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!(NAME, "alloc_page (clean) returned None"); crate::mm::pmm::free_page(phys); return false; }
+    };
+    unsafe { core::ptr::write_bytes((PHYS_OFF + clean) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE); }
+    if crate::mm::w215_diag::frame_content_is_fontpath(clean).is_some() {
+        test_fail!(NAME, "zeroed frame false-positived as a font path");
+        crate::mm::pmm::free_page(phys);
+        crate::mm::pmm::free_page(clean);
+        return false;
+    }
+
+    crate::mm::pmm::free_page(phys);
+    crate::mm::pmm::free_page(clean);
     test_pass!(NAME);
     true
 }
