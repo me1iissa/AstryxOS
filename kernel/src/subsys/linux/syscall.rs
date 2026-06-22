@@ -1697,12 +1697,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let s = unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) };
                     s.to_vec()
                 } else { return -22; };
+                // Pass the FULL address slice (length from addrlen) down to
+                // net::unix, which decides pathname vs abstract namespace.
+                // Per `man 7 unix`: a sun_path beginning with a NUL byte is an
+                // *abstract* name whose length is taken from addrlen (it may
+                // contain embedded NULs and is NOT NUL-terminated); a sun_path
+                // beginning with a non-NUL byte is a NUL-terminated filesystem
+                // pathname.  Stripping at the first NUL here would truncate an
+                // abstract name to the empty string — so namespace selection
+                // must happen below where the leading byte is still visible.
                 let path_bytes: &[u8] = &path_owned;
-                // Strip trailing NUL
-                let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
                 #[cfg(feature = "firefox-test-core")]
                 if pid >= 1 {
-                    if let Ok(p) = core::str::from_utf8(&path_bytes[..plen]) {
+                    let dbg_len = if path_bytes.first() == Some(&0) {
+                        path_bytes.len()
+                    } else {
+                        path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len())
+                    };
+                    if let Ok(p) = core::str::from_utf8(&path_bytes[..dbg_len]) {
                         crate::serial_println!("[FF/connect] pid={} path={}", pid, p);
                     }
                 }
@@ -1712,7 +1724,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // per unix(7) — finding H7 (CWE-287).
                 let (cpid, cuid, cgid) = crate::proc::current_creds_lockless();
                 let creds = crate::net::unix::PeerCreds { pid: cpid, uid: cuid, gid: cgid };
-                crate::net::unix::connect(unix_id, &path_bytes[..plen], creds)
+                crate::net::unix::connect(unix_id, path_bytes, creds)
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
@@ -2936,9 +2948,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
                     unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }.to_vec()
                 } else { return -22; };
+                // Pass the FULL address slice (length from addrlen); net::unix
+                // selects pathname vs abstract namespace from the leading byte
+                // per `man 7 unix` (a leading-NUL sun_path is an abstract name
+                // whose length is addrlen, not NUL-terminated).
                 let path_bytes: &[u8] = &path_owned;
-                let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
-                crate::net::unix::bind(unix_id, &path_bytes[..plen])
+                crate::net::unix::bind(unix_id, path_bytes)
             } else if family == 2 && addrlen >= 8 {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);

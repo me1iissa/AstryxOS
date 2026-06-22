@@ -2697,6 +2697,20 @@ pub fn run() -> ! {
         if test_523_tcp_graceful_close_fin_defer() { passed += 1; }
     }
 
+    // ── Test 525: AF_UNIX connect(2) errno — ENOENT vs ECONNREFUSED ─────
+    // connect to an absent pathname → ENOENT (-2); a pathname bound but not
+    // listening → ECONNREFUSED (-111).  Pre-fix conflated both into -111.
+    // Refs: man 2 connect, man 7 unix.
+    total += 1;
+    if test_525_unix_connect_enoent_vs_econnrefused() { passed += 1; }
+
+    // ── Test 526: AF_UNIX abstract namespace (leading-NUL) ──────────────
+    // A leading-NUL sun_path is an abstract name (no FS lookup, length from
+    // addrlen, embedded NULs significant); an unbound abstract name connects
+    // to ECONNREFUSED (never ENOENT).  Refs: man 7 unix §"Abstract sockets".
+    total += 1;
+    if test_526_unix_abstract_namespace() { passed += 1; }
+
     // ── Test 522: TCP RX rings the InetRx poll-bell on readiness edges ──
     // Asserts the TCP receive path wakes pollers (and blocking recv/accept)
     // on the accept-complete and data-arrival edges, matching the UDP path,
@@ -34321,6 +34335,188 @@ fn test_523_tcp_graceful_close_fin_defer() -> bool {
     let _ = tcp::abort(client_port);
     let _ = tcp::abort(SERVER_PORT);
     test_pass!("TCP graceful close — close() with pending send_buffer delivers full body (loopback)");
+    true
+}
+
+// ── Test 525: AF_UNIX connect(2) errno — ENOENT vs ECONNREFUSED ───────────────
+//
+// Per `man 2 connect` / `man 7 unix`, connect(2) on an AF_UNIX pathname socket
+// distinguishes two failure modes that the pre-fix code conflated into a blanket
+// ECONNREFUSED:
+//   * the socket pathname does not exist at all          → ENOENT       (-2)
+//   * the pathname exists (a socket is bound there) but
+//     nobody is listening on it                          → ECONNREFUSED (-111)
+//
+// Drives the real syscall path (connect == nr 42) so both the syscall-layer
+// addrlen threading and the net::unix lookup are exercised end to end.
+fn test_525_unix_connect_enoent_vs_econnrefused() -> bool {
+    test_header!("AF_UNIX connect(2) errno — absent path → ENOENT, bound-not-listening → ECONNREFUSED");
+
+    // Build a sockaddr_un for /tmp/nde525.sock.
+    let mut addr = [0u8; 110];
+    addr[0] = 1; addr[1] = 0; // sa_family = AF_UNIX
+    let path = b"/tmp/nde525.sock\0";
+    addr[2..2 + path.len()].copy_from_slice(path);
+    let addrlen = (2 + path.len()) as u64;
+
+    // (1) connect to a path with NO bound socket at all → ENOENT (-2).
+    let c1 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    if c1 < 0 { test_fail!("unix525", "socket() returned {}", c1); return false; }
+    let r1 = crate::syscall::dispatch_linux_kernel(
+        42, c1 as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if r1 != -2 {
+        test_fail!("unix525", "connect to absent path returned {} (expected -2 ENOENT)", r1);
+        crate::syscall::dispatch_linux_kernel(3, c1 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    crate::syscall::dispatch_linux_kernel(3, c1 as u64, 0, 0, 0, 0, 0);
+    test_println!("  connect(absent path) → ENOENT (-2) ✓");
+
+    // (2) bind a socket at the path but do NOT listen → connect → ECONNREFUSED.
+    let srv = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    if srv < 0 { test_fail!("unix525", "server socket() returned {}", srv); return false; }
+    let rb = crate::syscall::dispatch_linux_kernel(
+        49, srv as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if rb != 0 {
+        test_fail!("unix525", "bind() returned {} (expected 0)", rb);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    let c2 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    if c2 < 0 { test_fail!("unix525", "client2 socket() returned {}", c2); return false; }
+    let r2 = crate::syscall::dispatch_linux_kernel(
+        42, c2 as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if r2 != -111 {
+        test_fail!("unix525",
+            "connect to bound-not-listening path returned {} (expected -111 ECONNREFUSED)", r2);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  connect(bound, not listening) → ECONNREFUSED (-111) ✓");
+
+    // (3) sanity: once the server listen()s, connect succeeds (no regression).
+    let rl = crate::syscall::dispatch_linux_kernel(50, srv as u64, 5, 0, 0, 0, 0);
+    if rl != 0 {
+        test_fail!("unix525", "listen() returned {}", rl);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let c3 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    let r3 = crate::syscall::dispatch_linux_kernel(
+        42, c3 as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if r3 != 0 {
+        test_fail!("unix525", "connect to listening path returned {} (expected 0)", r3);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c3 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  connect(listening) → 0 (no regression) ✓");
+
+    crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, c3 as u64, 0, 0, 0, 0, 0);
+    test_pass!("AF_UNIX connect(2) errno — ENOENT vs ECONNREFUSED");
+    true
+}
+
+// ── Test 526: AF_UNIX abstract namespace (leading-NUL) connect ────────────────
+//
+// Per `man 7 unix` §"Abstract sockets": a sun_path beginning with a NUL byte
+// names an abstract socket, which:
+//   * lives in a distinct namespace with NO filesystem lookup;
+//   * has its length taken from addrlen (it is NOT NUL-terminated);
+//   * MAY contain embedded NUL bytes, which are significant.
+// Drives the real syscall path so addrlen threading from the syscall layer into
+// net::unix is exercised — the pre-fix code truncated the name at the leading
+// NUL (empty string) and could never bind or match an abstract name.
+fn test_526_unix_abstract_namespace() -> bool {
+    test_header!("AF_UNIX abstract namespace — leading-NUL bind/connect, embedded-NUL not truncated");
+
+    // Abstract name with an EMBEDDED NUL: sun_path = "\0nde\0526" (8 bytes).
+    // A C-string truncation at the first NUL would reduce this to length 0;
+    // a truncation at the embedded NUL would reduce it to "\0nde" and collide
+    // with any other "\0nde*" name.  Both must be avoided.
+    let abstract_name: &[u8] = b"\0nde\0526";
+    let mut addr = [0u8; 110];
+    addr[0] = 1; addr[1] = 0; // sa_family = AF_UNIX
+    addr[2..2 + abstract_name.len()].copy_from_slice(abstract_name);
+    let addrlen = (2 + abstract_name.len()) as u64;
+
+    // (1) connect to an unbound abstract name → ECONNREFUSED (-111), NEVER
+    //     ENOENT — there is no filesystem object for an abstract name.
+    let c1 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    if c1 < 0 { test_fail!("unix526", "socket() returned {}", c1); return false; }
+    let r1 = crate::syscall::dispatch_linux_kernel(
+        42, c1 as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if r1 != -111 {
+        test_fail!("unix526",
+            "connect to unbound abstract name returned {} (expected -111 ECONNREFUSED)", r1);
+        crate::syscall::dispatch_linux_kernel(3, c1 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    crate::syscall::dispatch_linux_kernel(3, c1 as u64, 0, 0, 0, 0, 0);
+    test_println!("  connect(unbound abstract) → ECONNREFUSED (-111), not ENOENT ✓");
+
+    // (2) bind + listen on the abstract name, then connect → 0.  This proves
+    //     the leading NUL was NOT stripped (else bind/connect would both see an
+    //     empty name) and that bind/connect agree on the addrlen-derived name.
+    let srv = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    if srv < 0 { test_fail!("unix526", "server socket() returned {}", srv); return false; }
+    let rb = crate::syscall::dispatch_linux_kernel(
+        49, srv as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if rb != 0 {
+        test_fail!("unix526", "bind(abstract) returned {} (expected 0)", rb);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let rl = crate::syscall::dispatch_linux_kernel(50, srv as u64, 5, 0, 0, 0, 0);
+    if rl != 0 {
+        test_fail!("unix526", "listen(abstract) returned {}", rl);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let c2 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    let r2 = crate::syscall::dispatch_linux_kernel(
+        42, c2 as u64, addr.as_ptr() as u64, addrlen, 0, 0, 0);
+    if r2 != 0 {
+        test_fail!("unix526", "connect(listening abstract) returned {} (expected 0)", r2);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  bind+listen+connect(abstract \"\\0nde\\0526\") → 0 ✓");
+
+    // (3) embedded-NUL significance: a connect to the truncated-at-embedded-NUL
+    //     prefix "\0nde" must NOT match the "\0nde\0526" listener — it is a
+    //     different abstract name → ECONNREFUSED.  This fails if the name were
+    //     ever truncated at an embedded NUL.
+    let prefix: &[u8] = b"\0nde";
+    let mut paddr = [0u8; 110];
+    paddr[0] = 1; paddr[1] = 0;
+    paddr[2..2 + prefix.len()].copy_from_slice(prefix);
+    let plen = (2 + prefix.len()) as u64;
+    let c3 = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
+    let r3 = crate::syscall::dispatch_linux_kernel(
+        42, c3 as u64, paddr.as_ptr() as u64, plen, 0, 0, 0);
+    if r3 != -111 {
+        test_fail!("unix526",
+            "connect to embedded-NUL prefix \"\\0nde\" returned {} (expected -111 — \
+             distinct abstract name; embedded NUL was truncated)", r3);
+        crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, c3 as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    crate::syscall::dispatch_linux_kernel(3, c3 as u64, 0, 0, 0, 0, 0);
+    test_println!("  connect(\"\\0nde\") ≠ \"\\0nde\\0526\" → ECONNREFUSED (embedded NUL kept) ✓");
+
+    crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
+    test_pass!("AF_UNIX abstract namespace — leading-NUL bind/connect, embedded-NUL not truncated");
     true
 }
 
