@@ -1505,6 +1505,11 @@ pub fn run() -> ! {
     total += 1;
     if test_mremap_grow_preserves_neighbour() { passed += 1; }
 
+    // ── Test 126c: mremap(MAYMOVE) grow MUST preserve the FULL old content ────
+
+    total += 1;
+    if test_mremap_maymove_preserves_content() { passed += 1; }
+
     // ── Test 127: set_robust_list / get_robust_list roundtrip ────────────────
 
     total += 1;
@@ -28997,6 +29002,111 @@ fn test_mremap_grow_preserves_neighbour() -> bool {
     let _ = crate::syscall::dispatch_linux_kernel(11, a_addr, 0x3000, 0, 0, 0, 0);
 
     test_pass!("mremap grow relocated A, neighbour B sentinel intact ✓");
+    true
+}
+
+// ── Test 126c: mremap(MAYMOVE) grow must preserve the FULL old content ─────────
+//
+// Per mremap(2): "mremap() ... can also change the location of a mapping ...
+// The contents of the mapping ... are preserved."  When MREMAP_MAYMOVE relocates
+// a grown mapping, EVERY byte of the old region must reappear at the same offset
+// in the new mapping; only the freshly-added tail (a new anonymous range) is
+// zero.  A relocation that copies fewer than `old_size` bytes, copies from the
+// wrong source, or whose copied stores are not observable through the new
+// mapping would leave the early bytes intact and the rest zero — the classic
+// "early bytes survive, rest is zero" degeneration.
+//
+// This pins the content-preservation invariant for the move path directly, over
+// a multi-page span (so any per-page copy bug surfaces), with a deterministic
+// non-zero pattern.  Ref: man7 mremap(2).
+fn test_mremap_maymove_preserves_content() -> bool {
+    test_header!("mremap(25): MAYMOVE grow preserves the FULL old content (Test 126c)");
+
+    // Deterministic, position-dependent pattern: byte[i] = (i*0x9E + 0x37) & 0xFF.
+    // Position-dependence catches a same-length-wrong-source copy (which would
+    // leave the pattern phase-shifted) as well as a short copy (zero tail).
+    #[inline]
+    fn pat(i: usize) -> u8 { ((i.wrapping_mul(0x9E)).wrapping_add(0x37) & 0xFF) as u8 }
+
+    // Old mapping: 3 pages.  New (grown) mapping: 8 pages.  Both cross several
+    // page boundaries so a per-page copy defect (e.g. copying only page 0) fails.
+    const OLD: usize = 0x3000; // 3 pages
+    const NEW: usize = 0x8000; // 8 pages
+
+    // Reserve a region with an occupied neighbour immediately after the old
+    // mapping so the in-place grow MUST fail and MAYMOVE relocates — exercising
+    // the copy path (not the cheaper in-place extension which leaves bytes put).
+    let block = crate::syscall::dispatch_linux_kernel(
+        9, 0, (OLD + 0x1000) as u64, 3, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, u64::MAX, 0,
+    );
+    if block <= 0 {
+        test_fail!("mremap_content", "mmap reservation failed: {}", block);
+        return false;
+    }
+    let old_addr = block as u64;                 // OLD-byte mapping A
+    let neigh    = old_addr + OLD as u64;         // 1-page occupied neighbour
+
+    // Fill A with the pattern (drives demand-faults across all OLD pages).
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        let p = old_addr as *mut u8;
+        for i in 0..OLD { core::ptr::write(p.add(i), pat(i)); }
+        // Touch the neighbour so it is a live, occupied page.
+        core::ptr::write(neigh as *mut u8, 0xEE);
+    }
+
+    // mremap(A, OLD -> NEW, MAYMOVE): neighbour is occupied -> must relocate.
+    let new_addr = crate::syscall::dispatch_linux_kernel(
+        25, old_addr, OLD as u64, NEW as u64, 1 /*MREMAP_MAYMOVE*/, 0, 0,
+    );
+    test_println!("  mremap(grow {:#x}->{:#x}, MAYMOVE) = {:#x}", OLD, NEW, new_addr as u64);
+    if new_addr <= 0 {
+        test_fail!("mremap_content", "mremap failed: {}", new_addr);
+        let _ = crate::syscall::dispatch_linux_kernel(11, old_addr, (OLD + 0x1000) as u64, 0, 0, 0, 0);
+        return false;
+    }
+    let dest = new_addr as u64;
+
+    // Verify EVERY old byte survived at the same offset in the relocated mapping.
+    let mut first_bad: Option<(usize, u8, u8)> = None;
+    let mut tail_nonzero: Option<(usize, u8)> = None;
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        let d = dest as *const u8;
+        for i in 0..OLD {
+            let got = core::ptr::read(d.add(i));
+            if got != pat(i) { first_bad = Some((i, pat(i), got)); break; }
+        }
+        // The freshly-added tail [OLD, NEW) must be readable and zero.
+        for i in OLD..NEW {
+            let got = core::ptr::read(d.add(i));
+            if got != 0 { tail_nonzero = Some((i, got)); break; }
+        }
+    }
+
+    if let Some((i, exp, got)) = first_bad {
+        test_fail!("mremap_content",
+            "content LOST after MAYMOVE relocation at off {:#x}: expected {:#04x} got {:#04x} \
+             (early-bytes-survive-rest-zero degeneration if off>0)", i, exp, got);
+        let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+        return false;
+    }
+    if let Some((i, got)) = tail_nonzero {
+        test_fail!("mremap_content",
+            "freshly-added tail at off {:#x} is not zero ({:#04x}) — MAYMOVE must zero-fill new range",
+            i, got);
+        let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Cleanup.
+    let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+
+    test_println!("  all {:#x} old bytes preserved across relocation; {:#x}-byte tail zero ✓", OLD, NEW - OLD);
+    test_pass!("mremap MAYMOVE preserves full old content (Test 126c)");
     true
 }
 
