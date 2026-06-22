@@ -804,6 +804,12 @@ pub fn tcp_timer_tick() {
     }
     let mut jobs:     Vec<SendJob> = Vec::new();
     let mut aborted:  Vec<u16>    = Vec::new(); // local_ports that hit MAX_RETRIES
+    // True once any connection's send buffer crosses the *rising* write-space
+    // edge below — set under the lock, acted on after it is dropped.  Ringing
+    // the poll bell here makes a producer parked in `poll(POLLOUT)` /
+    // `epoll_wait(EPOLLOUT)` / `select(writefds)` on a previously-full send
+    // buffer re-check immediately rather than only on the ~1 s resync floor.
+    let mut write_space_edge = false;
 
     {
         let mut conns = TCP_CONNECTIONS.lock();
@@ -868,6 +874,26 @@ pub fn tcp_timer_tick() {
                 if eff_window > in_flight {
                     let can  = (eff_window - in_flight) as usize;
                     let take = can.min(conn.send_buffer.len()).min(MSS as usize);
+                    // Detect the *rising* write-space edge (RFC 9293 §3.7): if
+                    // the send buffer was at/over the `sndbuf` high-water mark
+                    // before this drain — so the NDE-24 backpressure gate had
+                    // de-asserted POLLOUT (see `send_space_available`) — and
+                    // dropping `take` octets puts it back below the mark, a
+                    // parked `poll(POLLOUT)` producer must be woken.  Ringing
+                    // only on this rising edge (not on every drain of an
+                    // already-non-full buffer) avoids a wake storm on a busy
+                    // connection.  Mirrors the AF_UNIX recv-side write-space
+                    // wake and the POSIX rule that a `send(2)` that would no
+                    // longer block makes the socket writable.  Gated on the
+                    // two states that can buffer outbound app data (the same
+                    // states `send_space_available` evaluates for POLLOUT).
+                    if matches!(conn.state,
+                                TcpState::Established | TcpState::CloseWait)
+                        && (conn.send_buffer.len() as u32) >= conn.sndbuf
+                        && ((conn.send_buffer.len() - take) as u32) < conn.sndbuf
+                    {
+                        write_space_edge = true;
+                    }
                     let chunk: Vec<u8> = conn.send_buffer.drain(..take).collect();
                     let seq = conn.send_next;
                     conn.retransmit_queue.push_back(RetransmitEntry {
@@ -918,6 +944,20 @@ pub fn tcp_timer_tick() {
         // kernel heap until the 128 MiB heap guard fires.  Driven from the
         // 100 Hz timer tick — adds one O(n) retain per second.
         gc_closed_in(&mut conns, now);
+    }
+
+    // Ring the poll bell AFTER dropping `TCP_CONNECTIONS` (lock-free, exactly
+    // like the RX data-arrival edge in `handle_tcp` and the AF_UNIX recv-side
+    // write-space wake) so a producer parked in `poll(POLLOUT)` /
+    // `epoll_wait(EPOLLOUT)` / `select(writefds)` on a previously-full send
+    // buffer re-evaluates its mask immediately rather than only on the ~1 s
+    // resync floor.  Rung before the transmit below so the wake is not delayed
+    // by the (unbounded, I/O-bearing) `send_ipv4` calls, and exactly once per
+    // tick regardless of how many connections crossed the edge (the bell is a
+    // broadcast — every parked poller re-scans its own fd set).
+    if write_space_edge {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::InetTx);
     }
 
     for job in jobs {
@@ -1143,8 +1183,14 @@ pub fn inject_ack(port: u16, ack_num: u32, window: u16) {
 
 pub fn has_data(port: u16) -> bool {
     TCP_CONNECTIONS.lock().iter()
+        // `CloseWait` is included alongside `Established`: a peer FIN moves
+        // the TCB to CloseWait but does NOT discard receive bytes that
+        // arrived before it (RFC 9293 §3.10.3 — the FIN only marks the end
+        // of the peer's byte stream).  The application must still be able
+        // to drain that buffered tail, so it remains readable until the
+        // local side closes.
         .any(|c| c.local_port == port
-                 && c.state == TcpState::Established
+                 && matches!(c.state, TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
@@ -1160,7 +1206,9 @@ pub fn has_data_for(local_port: u16,
         .any(|c| c.local_port  == local_port
                  && c.remote_ip   == remote_ip
                  && c.remote_port == remote_port
-                 && c.state       == TcpState::Established
+                 // See `has_data`: a half-closed (CloseWait) TCB still has a
+                 // readable receive tail (RFC 9293 §3.10.3).
+                 && matches!(c.state, TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
@@ -1182,7 +1230,13 @@ pub fn has_data_for(local_port: u16,
 pub fn read(port: u16, max_len: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
-        .find(|c| c.local_port == port && c.state == TcpState::Established)
+        // A peer FIN advances the TCB to CloseWait but does not discard the
+        // receive bytes that preceded it (RFC 9293 §3.10.3): the buffered
+        // tail must stay readable until the local side closes, otherwise a
+        // peer that sends a body and then half-closes (Connection: close)
+        // would have its final octets silently dropped on the read side.
+        .find(|c| c.local_port == port
+                  && matches!(c.state, TcpState::Established | TcpState::CloseWait))
     {
         drain_recv(conn, max_len)
     } else {
@@ -1361,7 +1415,11 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
         c.local_port  == local_port
             && c.remote_ip   == remote_ip
             && c.remote_port == remote_port
-            && c.state       == TcpState::Established
+            // See `read`: CloseWait keeps the pre-FIN receive tail readable
+            // (RFC 9293 §3.10.3).  A server reading a body from a peer that
+            // half-closes (Connection: close) must still drain that tail —
+            // gating on Established alone races the FIN and loses the bytes.
+            && matches!(c.state, TcpState::Established | TcpState::CloseWait)
     }) {
         drain_recv(conn, max_len)
     } else {

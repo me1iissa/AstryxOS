@@ -217,20 +217,35 @@ pub enum PollBellSource {
     /// write-space wake).  Distinct from `UnixWrite` (data-arrival, which
     /// makes the reader `POLLIN`-ready) so kdb attribution stays honest.
     UnixRead     = 9,
+    /// `crate::net::tcp::tcp_timer_tick` send-buffer drain — bytes leaving
+    /// the TCP send buffer (as ACKs open the congestion/peer window per
+    /// RFC 9293 §3.7) free room below the `sndbuf` high-water mark, which
+    /// makes a connected TCP socket newly `POLLOUT`-ready.  Rung on the
+    /// *rising* write-space edge (the buffer was at/over `sndbuf` — POLLOUT
+    /// was de-asserted by the NDE-24 backpressure gate — and is now below
+    /// it) so a producer parked in `poll(POLLOUT)` / `epoll_wait(EPOLLOUT)`
+    /// / `select(writefds)` on a previously-full send buffer re-checks
+    /// immediately rather than only on the ~1 s resync floor (IEEE Std
+    /// 1003.1-2017 §poll: a socket whose `send(2)` would no longer block
+    /// must report writable).  Distinct from `InetRx` (the rx data-arrival
+    /// edge that makes a socket `POLLIN`-ready) so kdb attribution stays
+    /// honest — exactly the rationale that split `UnixRead` from
+    /// `UnixWrite`.
+    InetTx       = 10,
     /// Catch-all for ad-hoc readiness sources that have not yet been
     /// given their own variant (kept last for ABI tail-stability).
-    Other        = 10,
+    Other        = 11,
 }
 
 /// Number of `PollBellSource` variants — keep in sync with the enum.
-pub const N_BELL_SOURCES: usize = 11;
+pub const N_BELL_SOURCES: usize = 12;
 
 /// Stable string label for each `PollBellSource`, used by kdb to
 /// render the per-source counters.  Indexed by the enum's discriminant.
 pub const BELL_SOURCE_NAMES: [&str; N_BELL_SOURCES] = [
     "pipe", "eventfd", "unix_write", "unix_shutdown",
     "timerfd", "signalfd", "inotify", "signal_inject", "inet_rx",
-    "unix_read", "other",
+    "unix_read", "inet_tx", "other",
 ];
 
 /// Per-source ring counters.  Bumped (Relaxed) at every successful
@@ -241,7 +256,7 @@ pub static BELL_RINGS_BY_SOURCE: [AtomicU64; N_BELL_SOURCES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
 
 /// Cumulative number of `wait_poll_event` calls that woke via a bell

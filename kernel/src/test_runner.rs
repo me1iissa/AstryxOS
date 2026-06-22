@@ -2758,6 +2758,22 @@ pub fn run() -> ! {
         if test_528_tcp_poll_hangup_backpressure() { passed += 1; }
     }
 
+    // ── Test 529: TCP POLLOUT write-space edge rings the InetTx poll-bell ─
+    // NDE-24 (#619) de-asserts POLLOUT when the send buffer is full; NDE-25
+    // (#NDE) rings the poll bell on the *rising* write-space edge so a
+    // producer parked in poll(POLLOUT)/epoll_wait(EPOLLOUT)/select(writefds)
+    // wakes on the tcp_timer_tick send-buffer drain (sub-second) rather than
+    // only on the ~1 s resync floor.  Asserts both the POLLOUT mask
+    // transition (full → drained → writable) AND that the InetTx bell counter
+    // advanced exactly on the rising edge — and NOT on a drain of an
+    // already-non-full buffer (no wake storm).
+    // Refs: IEEE Std 1003.1-2017 §poll (POLLOUT), RFC 9293 §3.7.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_529_tcp_pollout_txdrain_bell() { passed += 1; }
+    }
+
     // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
     // Exercises the three socket-layer fixes that unblock outbound DNS
     // for any glibc/musl-linked Linux client:
@@ -34423,6 +34439,133 @@ fn test_528_tcp_poll_hangup_backpressure() -> bool {
     true
 }
 
+/// Test 529: the TCP POLLOUT write-space edge rings the `InetTx` poll-bell.
+///
+/// NDE-24 (#619) de-asserts POLLOUT when the send buffer fills to the
+/// `sndbuf` high-water mark.  NDE-25 closes the wakeup gap: when the buffer
+/// drains back below that mark in `tcp_timer_tick` (as ACKs reopen the
+/// congestion/peer window, RFC 9293 §3.7), the poll bell is rung so a
+/// producer parked in `poll(POLLOUT)` / `epoll_wait(EPOLLOUT)` /
+/// `select(writefds)` re-evaluates immediately rather than only on the ~1 s
+/// resync floor (IEEE Std 1003.1-2017 §poll — a `send(2)` that would no
+/// longer block makes the socket writable).
+///
+/// Drives the *real* `tcp_timer_tick` drain over a synthetic Established TCB
+/// (no NIC / wire) and asserts:
+///   1. send buffer filled to `sndbuf` → `socket_write_ready` false (POLLOUT
+///      de-asserted — the NDE-24 backpressure gate).
+///   2. one `tcp_timer_tick` drains the buffer below the mark → POLLOUT
+///      restored AND `BELL_RINGS_BY_SOURCE[InetTx]` advanced (the rising
+///      write-space edge rang the bell).
+///   3. a further `tcp_timer_tick` on the now-non-full (already writable)
+///      buffer does NOT ring `InetTx` again — proving the guard fires only on
+///      the rising edge, not on every drain (no wake storm on a busy flow).
+///
+/// Note: the bell is a global broadcast (`ring_poll_bell_for` → `drain_all`),
+/// so the most precise directly-assertable signal that the *write-space* edge
+/// fired is the per-source `InetTx` ring counter — that is what this test
+/// checks, alongside the POLLOUT mask transition the counter accompanies.
+/// Gated on `kdb` (uses `test_inject_established` / `test_set_send_buffer`).
+#[cfg(feature = "kdb")]
+fn test_529_tcp_pollout_txdrain_bell() -> bool {
+    test_header!("TCP POLLOUT write-space edge rings the InetTx poll-bell");
+
+    use crate::net::{tcp, socket};
+    use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};
+    use core::sync::atomic::Ordering;
+
+    let inet_tx = PollBellSource::InetTx as usize;
+
+    const LOCAL_PORT: u16 = 47021; // distinct from 522 / 524 / 528 ports
+    let peer_ip:   [u8; 4] = [10, 0, 2, 29];
+    let peer_port: u16     = 54406;
+    // Small high-water mark so a single tcp_timer_tick (drains up to ~MSS per
+    // tick) crosses the whole buffer below the mark in one step.
+    const SNDBUF: u32 = 64;
+
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, &[]) {
+        test_fail!("test_529", "test_inject_established failed: {}", e);
+        return false;
+    }
+    let sid = socket::socket_create_accepted(LOCAL_PORT, peer_ip, peer_port);
+    let cleanup = |sid: u64| { socket::socket_close(sid); };
+
+    // ── Step 1: fill the send buffer to sndbuf → POLLOUT de-asserted. ──
+    if let Err(e) = tcp::test_set_send_buffer(LOCAL_PORT, peer_ip, peer_port,
+                                              SNDBUF as usize, SNDBUF) {
+        test_fail!("test_529", "test_set_send_buffer(full) failed: {}", e);
+        cleanup(sid);
+        return false;
+    }
+    if socket::socket_write_ready(sid) {
+        test_fail!("test_529",
+            "full send buffer ({}/{}) still reports writable — NDE-24 \
+             backpressure precondition not met", SNDBUF, SNDBUF);
+        cleanup(sid);
+        return false;
+    }
+    test_println!("  send buffer full ({}/{}): POLLOUT de-asserted ✓", SNDBUF, SNDBUF);
+
+    // ── Step 2: one timer tick drains below the mark → POLLOUT restored AND
+    // the InetTx bell rang on the rising write-space edge. ──
+    let before_edge = BELL_RINGS_BY_SOURCE[inet_tx].load(Ordering::Relaxed);
+    tcp::tcp_timer_tick();
+    let after_edge = BELL_RINGS_BY_SOURCE[inet_tx].load(Ordering::Relaxed);
+
+    if !socket::socket_write_ready(sid) {
+        test_fail!("test_529",
+            "send buffer did not drain below sndbuf after one tcp_timer_tick \
+             — POLLOUT never restored (drain path: window/in-flight gate)");
+        cleanup(sid);
+        return false;
+    }
+    if after_edge <= before_edge {
+        test_fail!("test_529",
+            "rising write-space edge did NOT ring InetTx (counter {} → {}) — \
+             a parked POLLOUT producer would wake only on the ~1 s resync floor",
+            before_edge, after_edge);
+        cleanup(sid);
+        return false;
+    }
+    test_println!("  drain below mark: POLLOUT restored + InetTx rang (Δ{}) ✓",
+                  after_edge - before_edge);
+
+    // ── Step 3: a tick on the already-non-full (writable) buffer must NOT
+    // ring InetTx again — the guard fires only on the rising edge. ──
+    // Re-seed a small (below-mark) buffer so a tick has something to drain
+    // but the buffer was already below sndbuf → POLLOUT was already asserted.
+    if let Err(e) = tcp::test_set_send_buffer(LOCAL_PORT, peer_ip, peer_port,
+                                              (SNDBUF as usize) / 2, SNDBUF) {
+        test_fail!("test_529", "test_set_send_buffer(half) failed: {}", e);
+        cleanup(sid);
+        return false;
+    }
+    if !socket::socket_write_ready(sid) {
+        test_fail!("test_529",
+            "half-full send buffer (below mark) wrongly reports not-writable");
+        cleanup(sid);
+        return false;
+    }
+    let before_noedge = BELL_RINGS_BY_SOURCE[inet_tx].load(Ordering::Relaxed);
+    tcp::tcp_timer_tick();
+    let after_noedge = BELL_RINGS_BY_SOURCE[inet_tx].load(Ordering::Relaxed);
+    if after_noedge != before_noedge {
+        test_fail!("test_529",
+            "drain of an already-non-full buffer rang InetTx (counter {} → {}) \
+             — wake storm: the edge guard fired on a non-edge",
+            before_noedge, after_noedge);
+        cleanup(sid);
+        return false;
+    }
+    test_println!("  drain of already-writable buffer: no spurious InetTx ring ✓");
+
+    cleanup(sid);
+    let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+
+    test_pass!("TCP POLLOUT write-space edge rings the InetTx poll-bell");
+    true
+}
+
 #[cfg(any(feature = "test-mode", feature = "firefox-test-core",
           feature = "oracle-test", feature = "oracle-daemon-test"))]
 fn test_523_tcp_graceful_close_fin_defer() -> bool {
@@ -38324,10 +38467,10 @@ fn test_poll_bell_source_attribution() -> bool {
     }
 
     // Ring one of each tagged source.  Update the array length any time
-    // a new source variant lands in `PollBellSource` (currently 10 tagged
+    // a new source variant lands in `PollBellSource` (currently 11 tagged
     // variants — `Other` stays untagged by design so it can absorb
     // ad-hoc callers without skewing the per-source attribution).
-    let sources_to_ring: [PollBellSource; 10] = [
+    let sources_to_ring: [PollBellSource; 11] = [
         PollBellSource::Pipe,
         PollBellSource::Eventfd,
         PollBellSource::UnixWrite,
@@ -38338,6 +38481,7 @@ fn test_poll_bell_source_attribution() -> bool {
         PollBellSource::SignalInject,
         PollBellSource::InetRx,
         PollBellSource::UnixRead,
+        PollBellSource::InetTx,
     ];
     for s in &sources_to_ring {
         ring_poll_bell_for(*s);
