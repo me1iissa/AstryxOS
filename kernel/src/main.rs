@@ -1320,6 +1320,62 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // non-local connection is ever attempted.  Ref: Firefox profile
             // user_pref(3) prefs (media.gmp-*, app.update, toolkit.telemetry,
             // browser.safebrowsing, network.captive-portal-service).
+            //
+            // It also pins the audio backend so that bringing up a media
+            // context (HTMLMediaElement / Web Audio) does NOT initialise the
+            // out-of-process AudioIPC (cubeb-remoting) path.  On a target with
+            // no audio device the parent process's lazy cubeb initialisation
+            // takes the sandboxed AudioIPC branch, which synchronously awaits a
+            // server handshake that never completes here, parking the XPCOM
+            // main-thread event queue before the GLib/GTK poll loop is reached
+            // (so the browser never navigates or paints).  Two profile prefs
+            // close that path off:
+            //   media.cubeb.force_null_context = true  — cubeb returns a null
+            //     context immediately, so neither AudioIPC nor an in-process
+            //     cubeb_init() ever runs (audio is simply unavailable, which is
+            //     correct: there is no device).
+            //   media.cubeb.sandbox = false             — belt-and-suspenders:
+            //     the in-process cubeb_init() branch instead of the AudioIPC
+            //     server.  This is honoured because the content sandbox is
+            //     disabled via MOZ_DISABLE_CONTENT_SANDBOX in the launch env
+            //     (otherwise Firefox forces the sandboxed audio path back on).
+            //   media.volume_scale = "0.0"              — silence; no playback.
+            // Refs: Firefox media prefs (media.cubeb.*); content-sandbox docs
+            // https://firefox-source-docs.mozilla.org/security/sandbox/ .
+            //
+            // Heavy real-site (multi-resource) render trims, on top of the
+            // background-network and cubeb prefs above:
+            //   gfx.webrender.software = true           — force the software
+            //     WebRender backend (CPU rasteriser).  There is no GPU/DRM on
+            //     this target; pinning SW-WebRender keeps the compositor wholly
+            //     in-process and off any GL path.  Pairs with the launch env's
+            //     LIBGL_ALWAYS_SOFTWARE / MOZ_ACCELERATED=0.
+            //   layout.frame_rate = 0                   — "ASAP" refresh-driver
+            //     mode.  A value of 0 removes the vsync-throttled cadence and
+            //     drives layout/paint/composite as fast as the event loop will
+            //     allow, so the content layer composites without waiting on the
+            //     software-vsync timer.  Under SMP=1 the compositor would
+            //     otherwise miss its vsync window when a CPU-bound thread holds
+            //     the single core, leaving the content layer un-composited
+            //     (chrome-only paint); ASAP makes the content frame land
+            //     deterministically.  Documented as the gfx test/ASAP mode.
+            //   dom.serviceWorkers.enabled = false      — no SW registration
+            //     fetch/exec for sites that ship one (no compositing payoff,
+            //     extra connection/JS churn under the single core).
+            //   dom.ipc.processCount = 2,
+            //   dom.ipc.processCount.webIsolated = 1    — cap concurrent
+            //     content processes so the per-process AF_UNIX socketpair and
+            //     eventfd allocations stay well under the kernel's 64-slot
+            //     global caps for a multi-resource page.
+            //   browser.tabs.remote.autostart = true    — keep the normal
+            //     multi-process (e10s) model for the network browse path.
+            //   security.sandbox.content.level = 0      — disable the content
+            //     sandbox (matches MOZ_DISABLE_CONTENT_SANDBOX in the launch
+            //     env) so the sandbox broker's AF_UNIX shutdown self-kill is
+            //     not triggered.
+            // Refs: Firefox layout.frame_rate (gfx ASAP mode) and
+            // gfx.webrender.software, dom.ipc.processCount, content-sandbox
+            // level prefs (firefox-source-docs.mozilla.org).
             const FF_PREFS: &[u8] = br#"user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.startup.page", 0);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
@@ -1372,6 +1428,17 @@ user_pref("media.gmp.decoder.enabled", false);
 user_pref("media.peerconnection.enabled", false);
 user_pref("network.process.enabled", false);
 user_pref("network.http.network_access_on_socket_process.enabled", false);
+user_pref("media.cubeb.force_null_context", true);
+user_pref("media.cubeb.sandbox", false);
+user_pref("media.volume_scale", "0.0");
+user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.software.opengl", false);
+user_pref("layout.frame_rate", 0);
+user_pref("dom.serviceWorkers.enabled", false);
+user_pref("dom.ipc.processCount", 2);
+user_pref("dom.ipc.processCount.webIsolated", 1);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("security.sandbox.content.level", 0);
 "#;
             let _ = crate::vfs::mkdir("/tmp/ff-profile");
             let _ = crate::vfs::create_file("/tmp/ff-profile/prefs.js");
@@ -1472,17 +1539,16 @@ user_pref("network.http.network_access_on_socket_process.enabled", false);
             // compiled default.  Announce which source won so a forensic reader
             // of a render boot can tell at a glance whether the harness's
             // `--ff-url` actually took effect.
-            // GUI (windowed) mode pairs MOZ_DISABLE_NONLOCAL_CONNECTIONS=1 with
-            // the e10s-disable switch (mandatory for the in-process tab
-            // collapse — that switch is honoured only in automation/non-local
-            // mode).  The gate refuses every non-loopback connection in-process
-            // before any SYN, so a network URL (the https default) can never be
-            // fetched and the tab stays on an empty document — no reflow, no
-            // first paint requested.  A local file:// target needs no network
-            // and loads under the gate, so it is the correct compiled default
-            // for GUI mode.  An explicit astryx.ff_url= override still wins for
-            // callers that have arranged a reachable target.  RFC 8089 (the
-            // file URI scheme) covers the local-page form used here.
+            // GUI (windowed) mode selects its process model from the launch
+            // URL (see spawn_async): a LOCAL file:// target pairs
+            // MOZ_DISABLE_NONLOCAL_CONNECTIONS=1 with the e10s-disable switch
+            // for the in-process tab collapse (single-process render, no
+            // content-init handshake); a NETWORK http/https target drops both
+            // so the normal multi-process content tree comes up and necko may
+            // fetch the page.  The compiled GUI default is therefore a local
+            // page (no network needed); pass an explicit astryx.ff_url= http(s)
+            // override to browse a real site.  RFC 8089 (the file URI scheme)
+            // covers the local-page form used here.
             const GUI_DEFAULT_FF_URL: &str = "file:///tmp/hello.html";
             let ff_url: alloc::string::String = match boot_config::ff_url_override() {
                 Some(u) => {

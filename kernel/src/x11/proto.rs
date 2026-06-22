@@ -115,6 +115,7 @@ pub const EVENT_LEAVE_NOTIFY:      u8 = 8;
 pub const EVENT_FOCUS_IN:          u8 = 9;
 pub const EVENT_FOCUS_OUT:         u8 = 10;
 pub const EVENT_EXPOSE:            u8 = 12;
+pub const EVENT_VISIBILITY_NOTIFY: u8 = 15;
 pub const EVENT_CONFIGURE_NOTIFY:  u8 = 22;
 pub const EVENT_MAP_NOTIFY:        u8 = 19;
 pub const EVENT_UNMAP_NOTIFY:      u8 = 18;
@@ -130,12 +131,14 @@ pub const EVENT_MASK_KEY_PRESS:          u32 = 0x0001;
 pub const EVENT_MASK_KEY_RELEASE:        u32 = 0x0002;
 pub const EVENT_MASK_BUTTON_PRESS:       u32 = 0x0004;
 pub const EVENT_MASK_BUTTON_RELEASE:     u32 = 0x0008;
+pub const EVENT_MASK_ENTER_WINDOW:       u32 = 0x0010;
 pub const EVENT_MASK_POINTER_MOTION:     u32 = 0x0040;
-pub const EVENT_MASK_FOCUS_CHANGE:       u32 = 0x0020_0000;
-pub const EVENT_MASK_PROPERTY_CHANGE:    u32 = 0x0040_0000;
 pub const EVENT_MASK_EXPOSURE:           u32 = 0x8000;
+pub const EVENT_MASK_VISIBILITY_CHANGE:  u32 = 0x0001_0000;
 pub const EVENT_MASK_STRUCTURE_NOTIFY:   u32 = 0x0002_0000;
 pub const EVENT_MASK_SUBSTRUCTURE_NOTIFY:u32 = 0x0008_0000;
+pub const EVENT_MASK_FOCUS_CHANGE:       u32 = 0x0020_0000;
+pub const EVENT_MASK_PROPERTY_CHANGE:    u32 = 0x0040_0000;
 
 // ── CW value-list masks ───────────────────────────────────────────────────────
 pub const CW_BACK_PIXMAP:       u32 = 0x0001;
