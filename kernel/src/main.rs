@@ -1342,6 +1342,40 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             //   media.volume_scale = "0.0"              — silence; no playback.
             // Refs: Firefox media prefs (media.cubeb.*); content-sandbox docs
             // https://firefox-source-docs.mozilla.org/security/sandbox/ .
+            //
+            // Heavy real-site (multi-resource) render trims, on top of the
+            // background-network and cubeb prefs above:
+            //   gfx.webrender.software = true           — force the software
+            //     WebRender backend (CPU rasteriser).  There is no GPU/DRM on
+            //     this target; pinning SW-WebRender keeps the compositor wholly
+            //     in-process and off any GL path.  Pairs with the launch env's
+            //     LIBGL_ALWAYS_SOFTWARE / MOZ_ACCELERATED=0.
+            //   layout.frame_rate = 0                   — "ASAP" refresh-driver
+            //     mode.  A value of 0 removes the vsync-throttled cadence and
+            //     drives layout/paint/composite as fast as the event loop will
+            //     allow, so the content layer composites without waiting on the
+            //     software-vsync timer.  Under SMP=1 the compositor would
+            //     otherwise miss its vsync window when a CPU-bound thread holds
+            //     the single core, leaving the content layer un-composited
+            //     (chrome-only paint); ASAP makes the content frame land
+            //     deterministically.  Documented as the gfx test/ASAP mode.
+            //   dom.serviceWorkers.enabled = false      — no SW registration
+            //     fetch/exec for sites that ship one (no compositing payoff,
+            //     extra connection/JS churn under the single core).
+            //   dom.ipc.processCount = 2,
+            //   dom.ipc.processCount.webIsolated = 1    — cap concurrent
+            //     content processes so the per-process AF_UNIX socketpair and
+            //     eventfd allocations stay well under the kernel's 64-slot
+            //     global caps for a multi-resource page.
+            //   browser.tabs.remote.autostart = true    — keep the normal
+            //     multi-process (e10s) model for the network browse path.
+            //   security.sandbox.content.level = 0      — disable the content
+            //     sandbox (matches MOZ_DISABLE_CONTENT_SANDBOX in the launch
+            //     env) so the sandbox broker's AF_UNIX shutdown self-kill is
+            //     not triggered.
+            // Refs: Firefox layout.frame_rate (gfx ASAP mode) and
+            // gfx.webrender.software, dom.ipc.processCount, content-sandbox
+            // level prefs (firefox-source-docs.mozilla.org).
             const FF_PREFS: &[u8] = br#"user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.startup.page", 0);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
@@ -1397,6 +1431,14 @@ user_pref("network.http.network_access_on_socket_process.enabled", false);
 user_pref("media.cubeb.force_null_context", true);
 user_pref("media.cubeb.sandbox", false);
 user_pref("media.volume_scale", "0.0");
+user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.software.opengl", false);
+user_pref("layout.frame_rate", 0);
+user_pref("dom.serviceWorkers.enabled", false);
+user_pref("dom.ipc.processCount", 2);
+user_pref("dom.ipc.processCount.webIsolated", 1);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("security.sandbox.content.level", 0);
 "#;
             let _ = crate::vfs::mkdir("/tmp/ff-profile");
             let _ = crate::vfs::create_file("/tmp/ff-profile/prefs.js");
