@@ -4382,7 +4382,13 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         // pure fd handoff (e.g. an IPC channel/shared-memory fd pass).
         let has_scm = has_scm_deliverable(uid, crate::net::unix::recv_consumed(uid));
         let readable = has_d || has_p || has_scm;
-        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+        // [UNIXPOLL] fires on every poll(2) revents computation for an AF_UNIX
+        // fd with POLLIN interest — the single highest-frequency syscall-side
+        // emitter under Firefox (event-loop poll fan-out across ~100 threads),
+        // tens of thousands of lines per boot that saturate serial and throttle
+        // the system below the 60 Hz software-vsync cadence.  Trace profile only;
+        // `firefox-test-core` is the fast, low-serial functional profile.
+        #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
         if pid >= 1 && events & POLLIN != 0 {
             crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
                 pid, fd, uid, has_d, crate::net::unix::bytes_available(uid), events);
