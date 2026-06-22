@@ -1436,6 +1436,11 @@ pub fn run() -> ! {
     total += 1;
     if test_getrandom_fills_buffer() { passed += 1; }
 
+    // ── Test 529: /dev/urandom consecutive reads differ (NSS TLS RNG gate) ───
+
+    total += 1;
+    if test_dev_urandom_consecutive_reads_differ() { passed += 1; }
+
     // ── Test 126: mremap shrink — first 2 pages still readable ───────────────
 
     total += 1;
@@ -28277,6 +28282,71 @@ fn test_getrandom_fills_buffer() -> bool {
 
     test_println!("  buf[0..4] = {:02X} {:02X} {:02X} {:02X} (non-zero ✓)", buf[0], buf[1], buf[2], buf[3]);
     test_pass!("getrandom: 64 bytes, non-zero ✓");
+    true
+}
+
+// ── Test 529: /dev/urandom — consecutive reads must differ ───────────────────
+//
+// A correct /dev/urandom is a CSPRNG: two back-to-back reads must (with
+// overwhelming probability) return different bytes.  NSS softoken's FIPS
+// 140-2 §4.9.2 continuous-RNG health test reads two consecutive entropy
+// blocks at C_Initialize time and treats an identical pair as a hardware-RNG
+// failure (CKR_DEVICE_ERROR), which aborts TLS initialization.  A prior
+// implementation seeded a single LCG from the timer tick once per read, so
+// two reads serviced within one tick were byte-identical and tripped that
+// test — breaking HTTPS in the browser.  This reproduces the continuous-test
+// pattern (two reads with no delay between them) and asserts they differ.
+// See random(4) / getrandom(2).
+
+fn test_dev_urandom_consecutive_reads_differ() -> bool {
+    test_header!("/dev/urandom: two back-to-back reads differ (FIPS continuous-RNG invariant, Test 529)");
+
+    let pid = crate::proc::current_pid_lockless();
+    // The special-device read path is selected by the bit-24 (0x0100_0000)
+    // device flag the Linux open(2) dispatch ORs onto the fd for
+    // /dev/urandom; pass it directly to vfs::open here (it is stored verbatim
+    // into the fd's flags) so this in-kernel test exercises the same read
+    // path libc does, without going through the Linux open dispatch.
+    const DEV_URANDOM_FLAG: u32 = 0x0100_0000;
+    let fd = match crate::vfs::open(pid, "/dev/urandom", DEV_URANDOM_FLAG) {
+        Ok(fd) => fd,
+        Err(e) => {
+            test_fail!("dev_urandom_consecutive", "open(/dev/urandom) failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // Two reads with nothing in between — the worst case for a clock-seeded
+    // RNG (both reads land in the same timer tick).
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let ra = crate::vfs::fd_read(pid, fd, a.as_mut_ptr(), a.len());
+    let rb = crate::vfs::fd_read(pid, fd, b.as_mut_ptr(), b.len());
+    let _ = crate::vfs::close(pid, fd);
+
+    let na = ra.unwrap_or(0);
+    let nb = rb.unwrap_or(0);
+    if na != a.len() || nb != b.len() {
+        test_fail!("dev_urandom_consecutive", "short read: {} then {}", na, nb);
+        return false;
+    }
+
+    // Neither block may be all-zero (would also break NSS) ...
+    if a.iter().all(|&x| x == 0) || b.iter().all(|&x| x == 0) {
+        test_fail!("dev_urandom_consecutive", "an entropy block was all-zero");
+        return false;
+    }
+
+    // ... and the two consecutive blocks must differ (the FIPS continuous
+    // self-test invariant).
+    if a == b {
+        test_fail!("dev_urandom_consecutive", "two consecutive /dev/urandom reads were byte-identical");
+        return false;
+    }
+
+    test_println!("  a[0..4]={:02X}{:02X}{:02X}{:02X}  b[0..4]={:02X}{:02X}{:02X}{:02X} (differ ✓)",
+        a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+    test_pass!("/dev/urandom: consecutive reads differ ✓");
     true
 }
 
