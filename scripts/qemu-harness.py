@@ -6928,7 +6928,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit", "cache-aliasing",
+              "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
@@ -12787,7 +12787,8 @@ def main():
         "epoll-watch",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
-        "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
+        "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
+        "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
         # blk-trace: drain the virtio-blk LBA ring (JSON) / re-emit `[BLK]`

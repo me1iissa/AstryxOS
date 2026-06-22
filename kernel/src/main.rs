@@ -453,7 +453,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // before the workload maps its window (mirrors FFTEST wait).
             let t0 = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
-                gui::compositor::compose();
+                gui::compositor::compose_if_due();
                 core::hint::spin_loop();
             }
 
@@ -561,10 +561,11 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 crate::net::poll();
                 crate::x11::poll();
                 crate::gui::terminal::poll_output();
-                // Drive the compositor at ~50 Hz via the ISR-set tick flag.
-                // timer ISR sets COMPOSITOR_TICK_DUE every 2 ticks;
-                // compose() drains the tick flag and renders a frame.
-                gui::compositor::compose();
+                // Rate-gated, damage-driven compositor (≈50 Hz cap, skips when
+                // nothing changed) — avoids the spin-rate framebuffer-MMIO blit
+                // storm that, on a single vCPU under KVM, turns this loop into a
+                // VM-exit-bound spin.  See gui/compositor.rs::compose_if_due.
+                gui::compositor::compose_if_due();
 
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
@@ -1216,7 +1217,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // Use spin-wait (not hlt) — LAPIC timer delivery after MMIO exits is unreliable.
             let t0 = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
-                gui::compositor::compose();
+                gui::compositor::compose_if_due();
                 core::hint::spin_loop();
             }
 
@@ -1661,11 +1662,16 @@ user_pref("security.sandbox.content.level", 0);
                 }
 
                 crate::gui::terminal::poll_output();
-                // Drive the compositor via the ISR-set tick flag (≈50 Hz).
-                // The timer ISR sets COMPOSITOR_TICK_DUE every 2 published
-                // ticks; compose() drains it and renders a frame.  Replaces
-                // the unreliable `ticks % 3` check (see gui/compositor.rs).
-                gui::compositor::compose();
+                // Drive the compositor through the rate-gated, damage-driven
+                // entry point.  `compose_if_due()` caps repaints at ~50 Hz and
+                // skips entirely when no on-screen content changed, so the BSP
+                // spin loop no longer issues a full-screen framebuffer-MMIO
+                // blit on every iteration.  Under single-vCPU KVM each such
+                // blit is a burst of VM-exits; the unconditional spin-rate
+                // compose() made the vCPU VM-exit-bound and left little CPU for
+                // net::poll / the scheduler / the userspace threads.  See
+                // gui/compositor.rs::compose_if_due.
+                gui::compositor::compose_if_due();
 
                 // Log a heartbeat every 1000 ticks (~10s).  Use try_lock so a
                 // contended/leaked THREAD_TABLE never wedges CPU0; the BSP must

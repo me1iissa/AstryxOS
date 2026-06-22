@@ -392,6 +392,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "virtio-wait-spin"  => op_virtio_wait_spin(req, out),
         "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
+        "compose-stats"    => op_compose_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
         "fault-cache-keys" => op_fault_cache_keys(out),
@@ -1265,6 +1266,24 @@ fn op_bell_stats(out: &mut String) {
         out,
         r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{}}}"#,
         bell_wakes, resync_wakes, bell_ratio_permille
+    );
+}
+// ── compose-stats ─────────────────────────────────────────────────────────────
+//
+// Reports the rate-gated compositor's blit-vs-skip split: how many
+// `compose_if_due` calls actually issued a full-screen framebuffer-MMIO blit
+// versus how many the rate/damage gate cheaply skipped.  `gate_ratio_permille`
+// is blitted/(blitted+skipped) — a low value means the spin-rate BSP loop is
+// being correctly throttled (the MMIO VM-exit reduction this gate buys).
+fn op_compose_stats(out: &mut String) {
+    use core::fmt::Write;
+    let (blitted, skipped) = crate::gui::compositor::compose_gate_stats();
+    let total = blitted.saturating_add(skipped);
+    let gate_ratio_permille = if total == 0 { 0u64 } else { blitted.saturating_mul(1000) / total };
+    let _ = write!(
+        out,
+        r#"{{"blitted":{},"skipped":{},"total_calls":{},"gate_ratio_permille":{}}}"#,
+        blitted, skipped, total, gate_ratio_permille
     );
 }
 // ── cache-aliasing ────────────────────────────────────────────────────────────

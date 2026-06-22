@@ -1035,6 +1035,43 @@ fn handle_request(fd: u64, data: &[u8]) {
             with_client(fd, |c| c.send_error(proto::ERR_REQUEST, 0, opcode));
         }
     }
+
+    // Signal the rate-gated compositor that on-screen content may have changed.
+    // The X11 server's window pixel buffers (`WindowData::pixels`) are the
+    // compositor's source of truth (it re-blits them each frame), but unlike
+    // the native GDI accessors the X11 draw path does not go through
+    // `compositor::screen_*`, so nothing else bumps the damage counter.  Bump
+    // it here for every request that can alter a mapped window's contents or
+    // geometry — including the extension draw paths (RENDER / SHM PutImage /
+    // COMPOSITE) — so `compose_if_due()` repaints promptly.  A non-drawing
+    // request (reply-only, property, atom) leaves the desktop quiescent and
+    // costs zero framebuffer MMIO.
+    if x11_op_changes_screen(opcode) {
+        crate::gui::compositor::damage();
+    }
+}
+
+/// Whether an X11 request opcode can change on-screen window content/geometry
+/// and therefore owes the compositor a repaint.  Core drawing ops, map/unmap/
+/// configure, and the extension major opcodes that carry draws (RENDER, SHM,
+/// COMPOSITE, XFIXES) all return `true`; everything else (replies, properties,
+/// atoms, grabs, font/colour queries) returns `false`.
+#[inline]
+fn x11_op_changes_screen(opcode: u8) -> bool {
+    use proto::*;
+    matches!(
+        opcode,
+        // Window mapping / geometry.
+        OP_MAP_WINDOW | OP_MAP_SUBWINDOWS | OP_UNMAP_WINDOW | OP_CONFIGURE_WINDOW
+        // Core drawing.
+        | OP_CLEAR_AREA | OP_COPY_AREA | OP_POLY_POINT | OP_POLY_LINE
+        | OP_POLY_SEGMENT | OP_POLY_RECTANGLE | OP_POLY_ARC | OP_FILL_POLY
+        | OP_POLY_FILL_RECTANGLE | OP_POLY_FILL_ARC | OP_PUT_IMAGE
+        | OP_IMAGE_TEXT8 | OP_IMAGE_TEXT16
+        // Extension draw paths.
+        | RENDER_MAJOR_OPCODE | SHM_MAJOR_OPCODE | COMPOSITE_MAJOR_OPCODE
+        | XFIXES_MAJOR_OPCODE
+    )
 }
 
 fn with_client<F: FnOnce(&mut Client)>(fd: u64, f: F) {
