@@ -2711,6 +2711,16 @@ pub fn run() -> ! {
     total += 1;
     if test_526_unix_abstract_namespace() { passed += 1; }
 
+    // ── Test 527: ARP cache is bounded + ages out (TTL) ─────────────────
+    // The ARP cache must not grow without limit (a spoofed-source ARP flood
+    // would otherwise exhaust memory) and must not return a stale mapping
+    // after a host changes its MAC.  Asserts the MAX cap, TTL expiry, and
+    // that refreshing an IP updates both MAC and timestamp.  RFC 826 leaves
+    // cache management to the implementation; this is the bounding/aging
+    // discipline.
+    total += 1;
+    if test_527_arp_cache_bound_ttl() { passed += 1; }
+
     // ── Test 522: TCP RX rings the InetRx poll-bell on readiness edges ──
     // Asserts the TCP receive path wakes pollers (and blocking recv/accept)
     // on the accept-complete and data-arrival edges, matching the UDP path,
@@ -34517,6 +34527,135 @@ fn test_526_unix_abstract_namespace() -> bool {
     crate::syscall::dispatch_linux_kernel(3, srv as u64, 0, 0, 0, 0, 0);
     crate::syscall::dispatch_linux_kernel(3, c2 as u64, 0, 0, 0, 0, 0);
     test_pass!("AF_UNIX abstract namespace — leading-NUL bind/connect, embedded-NUL not truncated");
+    true
+}
+
+// ── Test 527: ARP cache is bounded + entries age out (TTL) ────────────────────
+//
+// RFC 826 specifies the ARP request/reply exchange but leaves cache management
+// to the implementation.  Two safety properties must hold regardless:
+//
+//   (1) Bound: the resolved-mapping table must not grow without limit.  A host
+//       that ARPs from many distinct (e.g. spoofed) source addresses would
+//       otherwise exhaust kernel memory.  Inserting MAX+N distinct IPs must
+//       leave the table at exactly MAX entries (oldest evicted).
+//   (2) Expiry (TTL): a mapping older than the TTL must not be returned by a
+//       lookup, so a frame is never routed to a host that has since changed its
+//       NIC/MAC.  A lookup that finds only an expired entry is a miss.
+//   (3) Refresh: re-learning an existing IP must update BOTH the MAC and the
+//       timestamp (the entry is rejuvenated, not duplicated, and a refreshed
+//       entry survives past the original TTL window).
+//
+// The cache stamps entries with the monotonic timer tick (≈100 Hz).  Spinning
+// for the full TTL (60 s) in a unit test is impractical, so the test drives the
+// internal aging/bounding path through the `test_*_at` hooks, injecting an
+// explicit `now` to make expiry and eviction deterministic.
+#[cfg(feature = "test-mode")]
+fn test_527_arp_cache_bound_ttl() -> bool {
+    test_header!("ARP cache — bounded at MAX, TTL expiry, refresh updates MAC+timestamp");
+
+    use crate::net::arp;
+
+    let max = arp::test_cache_max();
+    let ttl = arp::test_cache_ttl_ticks();
+
+    // Distinct, well-formed IPv4 addresses derived from an index; with MAX=256
+    // the low octet alone would collide, so spread across two octets.
+    let ip_for = |i: usize| -> [u8; 4] {
+        [10, 0, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8]
+    };
+    let mac_for = |i: usize| -> [u8; 6] {
+        [0x02, 0, 0, 0, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8]
+    };
+
+    // ── (1) Bound: insert MAX+16 distinct IPs at increasing ticks; the table
+    //     must never exceed MAX.  Using increasing `now` makes the eviction
+    //     victim (oldest last_seen) deterministic.
+    arp::test_clear_cache();
+    let overshoot = 16usize;
+    for i in 0..(max + overshoot) {
+        arp::test_update_at(ip_for(i), mac_for(i), 1000 + i as u64);
+        let len = arp::test_cache_len();
+        if len > max {
+            test_fail!("arp527",
+                "cache len {} exceeded MAX {} after {} inserts", len, max, i + 1);
+            arp::test_clear_cache();
+            return false;
+        }
+    }
+    if arp::test_cache_len() != max {
+        test_fail!("arp527",
+            "after MAX+{} inserts len = {} (expected exactly {})",
+            overshoot, arp::test_cache_len(), max);
+        arp::test_clear_cache();
+        return false;
+    }
+    // The earliest-inserted IPs were the oldest → evicted; the most-recent MAX
+    // distinct IPs must still resolve.  Check one freshly-inserted entry.
+    let last_i = max + overshoot - 1;
+    if arp::test_lookup_at(ip_for(last_i), 1000 + last_i as u64) != Some(mac_for(last_i)) {
+        test_fail!("arp527", "most-recent insert not resolvable after bound");
+        arp::test_clear_cache();
+        return false;
+    }
+    // An evicted early IP must now be a miss.
+    if arp::test_lookup_at(ip_for(0), 1000 + last_i as u64).is_some() {
+        test_fail!("arp527", "oldest entry was not evicted at the cap");
+        arp::test_clear_cache();
+        return false;
+    }
+    test_println!("  insert MAX+{} distinct IPs → len stays at MAX ({}), oldest evicted ✓",
+        overshoot, max);
+
+    // ── (2) TTL expiry: learn one IP at t0; a lookup just before TTL hits, a
+    //     lookup at/after TTL misses (entry treated as absent).
+    arp::test_clear_cache();
+    let ip = [192, 168, 1, 50];
+    let mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
+    let t0 = 5_000u64;
+    arp::test_update_at(ip, mac, t0);
+    if arp::test_lookup_at(ip, t0 + ttl - 1) != Some(mac) {
+        test_fail!("arp527", "entry expired one tick early (within TTL must hit)");
+        arp::test_clear_cache();
+        return false;
+    }
+    if arp::test_lookup_at(ip, t0 + ttl).is_some() {
+        test_fail!("arp527", "entry not expired at TTL boundary (must be a miss)");
+        arp::test_clear_cache();
+        return false;
+    }
+    test_println!("  entry hit at t0+TTL-1, miss at t0+TTL ({} ticks ≈ 60 s) ✓", ttl);
+
+    // ── (3) Refresh updates MAC + timestamp: re-learn the same IP with a new
+    //     MAC at a later tick; the new MAC resolves, and the refreshed entry
+    //     survives past the ORIGINAL TTL window (timestamp was rejuvenated).
+    let mac2 = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x02];
+    let t1 = t0 + 10; // still within original TTL
+    arp::test_update_at(ip, mac2, t1);
+    // No duplicate row created.
+    if arp::test_cache_len() != 1 {
+        test_fail!("arp527",
+            "refresh created a duplicate (len {} expected 1)", arp::test_cache_len());
+        arp::test_clear_cache();
+        return false;
+    }
+    // New MAC resolves.
+    if arp::test_lookup_at(ip, t1) != Some(mac2) {
+        test_fail!("arp527", "refresh did not update the MAC");
+        arp::test_clear_cache();
+        return false;
+    }
+    // Survives past the ORIGINAL expiry (t0+TTL) but inside the NEW window
+    // (t1+TTL) — proves the timestamp was refreshed, not just the MAC.
+    if arp::test_lookup_at(ip, t0 + ttl + 5) != Some(mac2) {
+        test_fail!("arp527", "refresh did not rejuvenate the timestamp");
+        arp::test_clear_cache();
+        return false;
+    }
+    test_println!("  refresh updates MAC + timestamp (no dup, survives past original TTL) ✓");
+
+    arp::test_clear_cache();
+    test_pass!("ARP cache — bounded at MAX, TTL expiry, refresh updates MAC+timestamp");
     true
 }
 
