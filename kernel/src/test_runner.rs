@@ -1454,6 +1454,15 @@ pub fn run() -> ! {
     total += 1;
     if test_log_ring_ab_com1_vs_ring() { passed += 1; }
 
+    // ── Tests 126c + 295: mm/IPC regressions placed HERE — ahead of the GDI
+    // PNG dump (a ~25k-line serial firehose) and the glibc X11-hello-oracle
+    // test (which can fault the teardown path on a Firefox data disk), so both
+    // always run and their results are not buried/blocked. ───────────────────
+    total += 1;
+    if test_mremap_maymove_preserves_content() { passed += 1; }
+    total += 1;
+    if test_295_scm_no_commit_without_byte() { passed += 1; }
+
     // ── Test 198: GDI PNG screenshot — render shapes + encode PNG headlessly
     // Runs here (before userspace ELF tests) because it only needs GDI + VFS.
 
@@ -29000,6 +29009,111 @@ fn test_mremap_grow_preserves_neighbour() -> bool {
     true
 }
 
+// ── Test 126c: mremap(MAYMOVE) grow must preserve the FULL old content ─────────
+//
+// Per mremap(2): "mremap() ... can also change the location of a mapping ...
+// The contents of the mapping ... are preserved."  When MREMAP_MAYMOVE relocates
+// a grown mapping, EVERY byte of the old region must reappear at the same offset
+// in the new mapping; only the freshly-added tail (a new anonymous range) is
+// zero.  A relocation that copies fewer than `old_size` bytes, copies from the
+// wrong source, or whose copied stores are not observable through the new
+// mapping would leave the early bytes intact and the rest zero — the classic
+// "early bytes survive, rest is zero" degeneration.
+//
+// This pins the content-preservation invariant for the move path directly, over
+// a multi-page span (so any per-page copy bug surfaces), with a deterministic
+// non-zero pattern.  Ref: man7 mremap(2).
+fn test_mremap_maymove_preserves_content() -> bool {
+    test_header!("mremap(25): MAYMOVE grow preserves the FULL old content (Test 126c)");
+
+    // Deterministic, position-dependent pattern: byte[i] = (i*0x9E + 0x37) & 0xFF.
+    // Position-dependence catches a same-length-wrong-source copy (which would
+    // leave the pattern phase-shifted) as well as a short copy (zero tail).
+    #[inline]
+    fn pat(i: usize) -> u8 { ((i.wrapping_mul(0x9E)).wrapping_add(0x37) & 0xFF) as u8 }
+
+    // Old mapping: 3 pages.  New (grown) mapping: 8 pages.  Both cross several
+    // page boundaries so a per-page copy defect (e.g. copying only page 0) fails.
+    const OLD: usize = 0x3000; // 3 pages
+    const NEW: usize = 0x8000; // 8 pages
+
+    // Reserve a region with an occupied neighbour immediately after the old
+    // mapping so the in-place grow MUST fail and MAYMOVE relocates — exercising
+    // the copy path (not the cheaper in-place extension which leaves bytes put).
+    let block = crate::syscall::dispatch_linux_kernel(
+        9, 0, (OLD + 0x1000) as u64, 3, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, u64::MAX, 0,
+    );
+    if block <= 0 {
+        test_fail!("mremap_content", "mmap reservation failed: {}", block);
+        return false;
+    }
+    let old_addr = block as u64;                 // OLD-byte mapping A
+    let neigh    = old_addr + OLD as u64;         // 1-page occupied neighbour
+
+    // Fill A with the pattern (drives demand-faults across all OLD pages).
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        let p = old_addr as *mut u8;
+        for i in 0..OLD { core::ptr::write(p.add(i), pat(i)); }
+        // Touch the neighbour so it is a live, occupied page.
+        core::ptr::write(neigh as *mut u8, 0xEE);
+    }
+
+    // mremap(A, OLD -> NEW, MAYMOVE): neighbour is occupied -> must relocate.
+    let new_addr = crate::syscall::dispatch_linux_kernel(
+        25, old_addr, OLD as u64, NEW as u64, 1 /*MREMAP_MAYMOVE*/, 0, 0,
+    );
+    test_println!("  mremap(grow {:#x}->{:#x}, MAYMOVE) = {:#x}", OLD, NEW, new_addr as u64);
+    if new_addr <= 0 {
+        test_fail!("mremap_content", "mremap failed: {}", new_addr);
+        let _ = crate::syscall::dispatch_linux_kernel(11, old_addr, (OLD + 0x1000) as u64, 0, 0, 0, 0);
+        return false;
+    }
+    let dest = new_addr as u64;
+
+    // Verify EVERY old byte survived at the same offset in the relocated mapping.
+    let mut first_bad: Option<(usize, u8, u8)> = None;
+    let mut tail_nonzero: Option<(usize, u8)> = None;
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        let d = dest as *const u8;
+        for i in 0..OLD {
+            let got = core::ptr::read(d.add(i));
+            if got != pat(i) { first_bad = Some((i, pat(i), got)); break; }
+        }
+        // The freshly-added tail [OLD, NEW) must be readable and zero.
+        for i in OLD..NEW {
+            let got = core::ptr::read(d.add(i));
+            if got != 0 { tail_nonzero = Some((i, got)); break; }
+        }
+    }
+
+    if let Some((i, exp, got)) = first_bad {
+        test_fail!("mremap_content",
+            "content LOST after MAYMOVE relocation at off {:#x}: expected {:#04x} got {:#04x} \
+             (early-bytes-survive-rest-zero degeneration if off>0)", i, exp, got);
+        let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+        return false;
+    }
+    if let Some((i, got)) = tail_nonzero {
+        test_fail!("mremap_content",
+            "freshly-added tail at off {:#x} is not zero ({:#04x}) — MAYMOVE must zero-fill new range",
+            i, got);
+        let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Cleanup.
+    let _ = crate::syscall::dispatch_linux_kernel(11, dest, NEW as u64, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(11, neigh, 0x1000, 0, 0, 0, 0);
+
+    test_println!("  all {:#x} old bytes preserved across relocation; {:#x}-byte tail zero ✓", OLD, NEW - OLD);
+    test_pass!("mremap MAYMOVE preserves full old content (Test 126c)");
+    true
+}
+
 // ── Test 123: set_robust_list / get_robust_list roundtrip ─────────────────────
 
 fn test_set_robust_list_roundtrip() -> bool {
@@ -51712,6 +51826,191 @@ fn test_278_mounts_lock_not_held_across_fs_dispatch() -> bool {
 //
 // Refs: recvmsg(2)/sendmsg(2), poll(2), epoll(7), unix(7) SCM_RIGHTS,
 // POSIX.1-2017 §2.10.10 (Socket Receive Queue), §2.14 (File Descriptors).
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 295 — sendmsg(2) commits SCM_RIGHTS fds only WITH their first data byte
+//
+// Per unix(7) / recvmsg(2) / POSIX.1-2017 §2.10.6, ancillary SCM_RIGHTS data is
+// delivered together with the message data it accompanies: the fds belong to a
+// message that carries bytes, and are received with that message's bytes.
+// A send that accepts ZERO data bytes (the AF_UNIX recv ring was full → EAGAIN)
+// commits no skb and therefore commits no fds — and a retry of the same frame
+// must re-deliver exactly one batch, never accumulate duplicates.
+//
+// This kernel was queueing the fd batch into PENDING_SCM (and taking the
+// per-object reference / inode pin) BEFORE pushing the data bytes, with no
+// rollback when the push short-wrote to zero (EAGAIN).  Gecko's IPC channel
+// (ipc_channel_posix.cc ProcessOutgoingMessages) attaches the shared-memory
+// chunk fds to the FIRST sendmsg of a large message and, on EAGAIN, retries the
+// same frame with the handles still attached.  Each retry re-queued the SAME
+// fds, so a single fd-bearing frame that hit a full ring left MULTIPLE batches
+// at the same stream offset.  The receiver (WebRender, which maps blob/font
+// shmem chunks positionally by SCM arrival order) then mapped the WRONG chunk
+// for a resource — a degenerate blob image (font bytes where the recording was
+// expected).  The fix defers the queue+refcount until ≥1 byte is accepted.
+//
+// The test drives the real sendmsg(2) syscall (nr=46) against a FULL recv ring
+// so the data push returns EAGAIN, and asserts:
+//   (1) the EAGAIN send queues NO batch (scm_pending_count stays 0);
+//   (2) a second EAGAIN retry still queues NO batch (no duplicate);
+//   (3) after the ring drains and the send succeeds, exactly ONE batch is
+//       queued and is deliverable at the frame's first byte.
+// Refs: sendmsg(2), recvmsg(2), unix(7) SCM_RIGHTS, IEEE 1003.1-2017.
+// ──────────────────────────────────────────────────────────────────────────────
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+fn test_295_scm_no_commit_without_byte() -> bool {
+    use crate::net::unix;
+    const NAME: &str = "sendmsg SCM_RIGHTS: no fd commit without a data byte (Test 295)";
+    test_header!(NAME);
+
+    let pid = crate::proc::current_pid_lockless();
+
+    // STREAM socketpair: A (sender) -> B (receiver).  B's recv ring is what we
+    // fill to force the EAGAIN.
+    let (id_a, id_b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if id_a == u64::MAX || id_b == u64::MAX {
+        test_fail!("scm_no_commit", "socketpair(STREAM) failed");
+        return false;
+    }
+    let fd_a = crate::syscall::alloc_unix_socket_fd(pid, id_a, false, false);
+    if fd_a < 0 {
+        test_fail!("scm_no_commit", "alloc_unix_socket_fd(A) = {}", fd_a);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // Helper to release the process fd + both unix ends.
+    let cleanup = |fa: i64| {
+        let _ = crate::syscall::dispatch_linux_kernel(3, fa as u64, 0, 0, 0, 0, 0);
+    };
+
+    // A passable fd: a sentinel regular-file descriptor in A's fd table.  Its
+    // identity is irrelevant — we assert on batch accounting, not the file.
+    let pass_fd = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let p = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => { drop(procs); cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+                      test_fail!("scm_no_commit", "current proc not in table"); return false; }
+        };
+        let slot = p.file_descriptors.iter().position(|f| f.is_none());
+        match slot {
+            Some(s) => {
+                p.file_descriptors[s] = Some(crate::vfs::FileDescriptor {
+                    inode: 0xBEEF, mount_idx: 0, offset: 0, flags: 0,
+                    file_type: crate::vfs::FileType::RegularFile,
+                    is_console: false, cloexec: false,
+                    open_path: alloc::string::String::new(),
+                });
+                s as u32
+            }
+            None => { drop(procs); cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+                      test_fail!("scm_no_commit", "no free fd slot for pass_fd"); return false; }
+        }
+    };
+
+    // Fill B's recv ring so the next push short-writes to zero (EAGAIN).  The
+    // ring caps at RECV_BUF_CAP-1 usable bytes; a single big write tops it up.
+    let filler = alloc::vec![0xCDu8; 64 * 1024]; // > RECV_BUF_CAP (32 KiB)
+    let _ = unix::write(id_a, &filler);
+    // The ring is now full: a further 1-byte write must return EAGAIN.
+    if unix::write(id_a, b"X") != -11 {
+        // Not full enough — top up until full.
+        for _ in 0..4 { let _ = unix::write(id_a, &filler); }
+    }
+    let baseline = crate::syscall::scm_pending_count(id_b);
+
+    // Build a kernel-stack msghdr with one 1-byte iovec + an SCM_RIGHTS cmsg
+    // carrying `pass_fd`.  dispatch_linux_kernel bypasses the user-ptr check so
+    // kernel-VA pointers are accepted (same pattern as the recvmsg tests).
+    // x86_64 struct msghdr: off16 msg_iov, off24 msg_iovlen, off32 msg_control,
+    // off40 msg_controllen.  cmsghdr: len(u64) @0, level(i32) @8, type(i32) @12,
+    // then the fd array (i32) @16.
+    let databyte = [0x5Au8; 1];
+    let mut iov: [u64; 2] = [databyte.as_ptr() as u64, 1];
+    // cmsg buffer: 16-byte cmsghdr + 4-byte fd.
+    let mut cmsg = [0u64; 3]; // 24 bytes (room for hdr + one i32 fd + pad)
+    cmsg[0] = 20u64;                              // cmsg_len = 16 + 4
+    cmsg[1] = (1u64 /*SOL_SOCKET*/) | (1u64 << 32); // level=1, type=SCM_RIGHTS(1)
+    cmsg[2] = pass_fd as u64;                     // fd[0] at offset 16
+    let mut hdr = [0u64; 7];
+    hdr[2] = iov.as_mut_ptr() as u64; // msg_iov
+    hdr[3] = 1u64;                    // msg_iovlen
+    hdr[4] = cmsg.as_mut_ptr() as u64; // msg_control
+    hdr[5] = 20u64;                  // msg_controllen
+
+    // ── (1) First sendmsg into the FULL ring → EAGAIN, NO batch committed ──
+    let r1 = crate::syscall::dispatch_linux_kernel(
+        46, fd_a as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let after1 = crate::syscall::scm_pending_count(id_b);
+    if r1 != -11 {
+        test_println!("  NOTE: first sendmsg returned {} (expected -11 EAGAIN)", r1);
+    }
+    if after1 != baseline {
+        test_fail!("scm_no_commit",
+            "sendmsg returned EAGAIN ({}) but queued an fd batch: pending {}->{} \
+             (fds committed WITHOUT their first byte)", r1, baseline, after1);
+        cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    test_println!("  EAGAIN send #1: no batch committed (pending={}) ✓", after1);
+
+    // ── (2) Retry the SAME frame (still full) → still NO batch / no dup ──
+    let r2 = crate::syscall::dispatch_linux_kernel(
+        46, fd_a as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let after2 = crate::syscall::scm_pending_count(id_b);
+    if after2 != baseline {
+        test_fail!("scm_no_commit",
+            "retry after EAGAIN ({}) accumulated batches: pending {}->{} \
+             (duplicate fd batch — the WebRender chunk-mapping desync)", r2, baseline, after2);
+        cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    test_println!("  EAGAIN send #2 (retry): still no batch (pending={}) ✓", after2);
+
+    // ── (3) Drain B's ring, then a successful send commits EXACTLY ONE batch ──
+    // Drain everything queued in B.
+    let mut drain = alloc::vec![0u8; 64 * 1024];
+    loop {
+        match unix::read_msg(id_b, &mut drain) {
+            Ok((n, _)) if n > 0 => continue,
+            _ => break,
+        }
+    }
+    let off_pre = unix::enqueue_offset_for(id_b);
+    let r3 = crate::syscall::dispatch_linux_kernel(
+        46, fd_a as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let after3 = crate::syscall::scm_pending_count(id_b);
+    if r3 != 1 {
+        test_fail!("scm_no_commit", "successful send returned {} (want 1 byte)", r3);
+        cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    if after3 != baseline + 1 {
+        test_fail!("scm_no_commit",
+            "successful 1-byte send queued {} batches (want exactly 1): pending {}->{}",
+            after3 - baseline, baseline, after3);
+        cleanup(fd_a); unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // The batch must be deliverable once the reader pops the frame's first byte
+    // (bound to off_pre + 1).  Before any read it must be WITHHELD.
+    let consumed_pre = unix::recv_consumed(id_b);
+    if crate::syscall::has_scm_deliverable(id_b, consumed_pre) && off_pre != 0 {
+        test_println!("  NOTE: batch deliverable before first byte read (off_pre={})", off_pre);
+    }
+    test_println!("  successful send: exactly ONE batch committed with the data byte ✓");
+
+    // ── Cleanup: drain the delivered byte + batch, free fds. ──
+    let _ = unix::read_msg(id_b, &mut drain);
+    let _ = crate::syscall::scm_dequeue(id_b, unix::recv_consumed(id_b));
+    cleanup(fd_a);
+    unix::close(id_a);
+    unix::close(id_b);
+
+    test_pass!(NAME);
+    true
+}
+
 fn test_280_scm_control_only_readiness() -> bool {
     use crate::net::unix;
     use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};

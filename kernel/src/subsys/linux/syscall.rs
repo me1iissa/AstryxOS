@@ -2255,6 +2255,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // with at least one non-empty iovec is data-bearing.
             let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
             let mut total = 0usize;
+            // If an SCM_RIGHTS batch is queued ahead of the data push (below) and
+            // the push then accepts ZERO data bytes (recv ring full → EAGAIN), the
+            // batch must be revoked: per unix(7) / recvmsg(2) SCM_RIGHTS,
+            // ancillary fds are delivered with the message bytes they accompany —
+            // a zero-byte send carries no bytes and so commits no fds.  Without
+            // revoke, a sender that retries the same EAGAIN'd frame (the gecko IPC
+            // channel does exactly this) re-queues the SAME fds, leaving duplicate
+            // batches at one stream offset; the WebRender receiver then maps the
+            // wrong shmem chunk for a resource (a degenerate blob image).  Track
+            // the queued batch's bind-peer + offset so the zero-byte return paths
+            // can roll it back.  Only set when frame_has_data (a control-only
+            // frame legitimately commits its fds with no data byte).
+            let mut scm_queued: Option<(u64, u64)> = None; // (receiver_id, byte_offset)
             // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
             // bytes are pushed into the peer's recv ring.  The data push and the
             // batch enqueue are separate critical sections (net::unix TABLE lock
@@ -2422,6 +2435,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     scm_bind_offset
                                 };
                                 crate::syscall::scm_queue(peer_id, bind_offset, sender_fds);
+                                // A data-bearing frame's batch is only valid once
+                                // ≥1 byte is pushed; record it so a zero-byte
+                                // EAGAIN below can revoke it.  A control-only frame
+                                // (no data) commits its fds unconditionally (it has
+                                // no byte to ride with), so it is NOT tracked.
+                                if frame_has_data {
+                                    scm_queued = Some((peer_id, bind_offset));
+                                }
                                 // Wake any poller/epoll_wait parked on the peer
                                 // fd so it re-evaluates and discovers the new
                                 // readable (ancillary) message immediately,
@@ -2479,6 +2500,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             // A surfaced error after a partial success is reported
                             // as the prefix; an error before any bytes is the error.
                             if total > 0 { return total as i64; }
+                            // Zero bytes accepted: revoke the SCM batch we queued
+                            // ahead of the push (the fds never rode any byte).
+                            if let Some((rid, off)) = scm_queued.take() {
+                                if let Some(fds) = crate::syscall::scm_revoke(rid, off) {
+                                    crate::syscall::scm_drop_fds(fds);
+                                }
+                            }
                             return e;
                         }
                     }
@@ -2495,6 +2523,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     }
                 }
                 if short_write { break; } // contiguous-prefix contract — stop
+            }
+            // Final safety net: if the whole frame accepted zero data bytes (every
+            // iovec short-wrote to 0, or the only iovec hit a full ring without a
+            // hard error), revoke the queued batch so the fds are not committed
+            // without a byte (the duplicate-batch / wrong-chunk hazard above).
+            if total == 0 {
+                if let Some((rid, off)) = scm_queued.take() {
+                    if let Some(fds) = crate::syscall::scm_revoke(rid, off) {
+                        crate::syscall::scm_drop_fds(fds);
+                    }
+                    // No byte was accepted and no hard error surfaced: report
+                    // EAGAIN so the caller retries the whole frame (with its fds).
+                    return -11;
+                }
             }
             total as i64
         }
