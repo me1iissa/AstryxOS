@@ -1289,6 +1289,7 @@ fn show_net() {
     crate::kprintln!("  DNS:    {}.{}.{}.{}", dns[0], dns[1], dns[2], dns[3]);
     crate::kprintln!("  RX:     {} packets, {} bytes", rx_p, rx_b);
     crate::kprintln!("  TX:     {} packets, {} bytes", tx_p, tx_b);
+    crate::kprintln!("  RX overruns: {}", crate::net::rx_overruns());
 }
 
 fn show_interrupts() {
