@@ -1183,8 +1183,14 @@ pub fn inject_ack(port: u16, ack_num: u32, window: u16) {
 
 pub fn has_data(port: u16) -> bool {
     TCP_CONNECTIONS.lock().iter()
+        // `CloseWait` is included alongside `Established`: a peer FIN moves
+        // the TCB to CloseWait but does NOT discard receive bytes that
+        // arrived before it (RFC 9293 §3.10.3 — the FIN only marks the end
+        // of the peer's byte stream).  The application must still be able
+        // to drain that buffered tail, so it remains readable until the
+        // local side closes.
         .any(|c| c.local_port == port
-                 && c.state == TcpState::Established
+                 && matches!(c.state, TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
@@ -1200,7 +1206,9 @@ pub fn has_data_for(local_port: u16,
         .any(|c| c.local_port  == local_port
                  && c.remote_ip   == remote_ip
                  && c.remote_port == remote_port
-                 && c.state       == TcpState::Established
+                 // See `has_data`: a half-closed (CloseWait) TCB still has a
+                 // readable receive tail (RFC 9293 §3.10.3).
+                 && matches!(c.state, TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
@@ -1222,7 +1230,13 @@ pub fn has_data_for(local_port: u16,
 pub fn read(port: u16, max_len: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
-        .find(|c| c.local_port == port && c.state == TcpState::Established)
+        // A peer FIN advances the TCB to CloseWait but does not discard the
+        // receive bytes that preceded it (RFC 9293 §3.10.3): the buffered
+        // tail must stay readable until the local side closes, otherwise a
+        // peer that sends a body and then half-closes (Connection: close)
+        // would have its final octets silently dropped on the read side.
+        .find(|c| c.local_port == port
+                  && matches!(c.state, TcpState::Established | TcpState::CloseWait))
     {
         drain_recv(conn, max_len)
     } else {
@@ -1401,7 +1415,11 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
         c.local_port  == local_port
             && c.remote_ip   == remote_ip
             && c.remote_port == remote_port
-            && c.state       == TcpState::Established
+            // See `read`: CloseWait keeps the pre-FIN receive tail readable
+            // (RFC 9293 §3.10.3).  A server reading a body from a peer that
+            // half-closes (Connection: close) must still drain that tail —
+            // gating on Established alone races the FIN and loses the bytes.
+            && matches!(c.state, TcpState::Established | TcpState::CloseWait)
     }) {
         drain_recv(conn, max_len)
     } else {
