@@ -1248,3 +1248,126 @@ pub fn alloc_shadow_recorded_count() -> u64 {
 pub fn alloc_shadow_displaced_count() -> u64 {
     ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
+
+// ── FONT-RECYCLE catch (Wikipedia re/fonts blob slice-panic) ────────────────
+//
+// The targeted catch for the deterministic SMP=1 Wikipedia render crash: a
+// Rust slice-range panic in WebRender's blob path whose garbage end-index
+// 0x73746e6f662f6572 decodes to the ASCII bytes "re/fonts" — the trailing
+// region of a moz2d blob buffer holding a stale font-path string instead of
+// the blob's index offset.  The blob is produced and consumed in the SAME
+// render process (BlobWriter::finish writes the trailing usize index offset;
+// BlobReader::new reads &buf[index_offset..len-8]), so the corruption is a
+// single-address-space hazard, not a cross-process one.
+//
+// Two sub-hypotheses, both catchable at frame-install time:
+//   H_ZERO  — a frame whose previous content was a font path ("…/fonts/…")
+//             is recycled into a writable user anonymous/heap mapping WITHOUT
+//             zeroing, so the consumer reads stale font-path bytes.
+//   H_ALIAS — the producer's write landed on a different frame than the
+//             consumer reads (PTE updated, local TLB not invalidated).  On a
+//             single CPU this requires a user-VA PTE swap with no following
+//             local `invlpg`; the PTE_CHANGE_RING above already records every
+//             such swap for correlation.
+//
+// `frame_content_is_fontpath` scans a freshly-selected physical frame for the
+// "/fonts" byte run (covers "re/fonts", "share/fonts", a fontconfig cache
+// path, etc.).  `fontpath_install_check` is called from each kernel arm that
+// publishes a frame into a *writable user* mapping; it fires a loud
+// `[W215/FONT-RECYCLE]` line iff the frame still carries that signature at
+// the moment of install — i.e. the install path skipped zeroing.  A safe arm
+// (one that zeroes before install) never trips it.
+//
+// Public spec citations: Intel SDM Vol. 3A §4.10.4 (TLB / paging caches);
+// POSIX mmap(2) MAP_ANONYMOUS — anonymous mappings are zero-filled on first
+// reference.
+
+const PHYS_OFF_FONT: u64 = 0xFFFF_8000_0000_0000;
+
+/// Number of frames that, at user-mapping install time, still carried a
+/// font-path signature.  Non-zero ⇒ at least one recycled font-path frame was
+/// published into a user mapping via a non-zeroing arm (H_ZERO red-handed).
+static FONT_RECYCLE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of install-time scans performed (denominator for the hit
+/// rate).  Bounds confidence: a high scan count with zero hits is a strong
+/// refutation of H_ZERO.
+static FONT_RECYCLE_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// Scan a 4 KiB physical frame for the byte run "/fonts".  Returns the offset
+/// of the match (so the caller can report where in the frame the stale path
+/// sits) or `None`.  Read-only access through the higher-half identity map;
+/// safe from the PFH and any lock context.
+#[inline]
+pub fn frame_content_is_fontpath(phys: u64) -> Option<usize> {
+    if phys == 0 { return None; }
+    const NEEDLE: &[u8; 6] = b"/fonts";
+    // SAFETY: `phys` is a frame the caller just obtained from the PMM; the
+    // higher-half identity map covers all of physical RAM, so the 4 KiB read
+    // is in-bounds.  Read-only.
+    let base = (PHYS_OFF_FONT + phys) as *const u8;
+    let page = unsafe { core::slice::from_raw_parts(base, 4096) };
+    // Simple windowed scan; 4 KiB × 6-byte needle is cheap and only runs on
+    // the (rare) recycle paths that opt in to the check.
+    let n = page.len();
+    let mut i = 0usize;
+    while i + NEEDLE.len() <= n {
+        if &page[i..i + NEEDLE.len()] == NEEDLE {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Site identifiers for `fontpath_install_check`, so a fire names the exact
+/// kernel arm that published the un-zeroed frame.
+pub const FONT_SITE_ANON_PREZERO: u8   = 1; // idt.rs anon arm, BEFORE zero-fill
+pub const FONT_SITE_RAW_MAP_PAGE: u8   = 2; // a raw map_page_in user install
+
+/// Called from a kernel arm that is about to publish `phys` into a writable
+/// user mapping at `install_va`.  If the frame still carries a font-path
+/// signature, emit `[W215/FONT-RECYCLE]` with the FREE→install chain.
+///
+/// `pre_zero` distinguishes the two call shapes:
+///   - `pre_zero = true`  — called BEFORE the arm's own zero-fill (anon arm).
+///     A hit here is *informational*: it proves a recycled font frame reached
+///     the anon path, but the following zero-fill neutralises it.  Counts the
+///     scan, emits a `kind=neutralised` line for the first few.
+///   - `pre_zero = false` — called from a NON-zeroing install arm.  A hit here
+///     is the H_ZERO smoking gun: the stale font bytes survive into the user
+///     mapping.  Emits `kind=LIVE` loudly and bumps `FONT_RECYCLE_HITS`.
+pub fn fontpath_install_check(phys: u64, install_va: u64, install_rip: u64, site: u8, pre_zero: bool) {
+    FONT_RECYCLE_SCANS.fetch_add(1, Ordering::Relaxed);
+    let off = match frame_content_is_fontpath(phys) {
+        Some(o) => o,
+        None => return,
+    };
+    let (free_tick, free_rip) = free_shadow_lookup(phys).unwrap_or((0, 0));
+    if pre_zero {
+        // Informational: neutralised by the arm's own zero-fill.
+        let n = FONT_RECYCLE_SCANS.load(Ordering::Relaxed);
+        if n <= 32 || n % 4096 == 0 {
+            crate::serial_println!(
+                "[W215/FONT-RECYCLE] kind=neutralised site={} phys={:#x} \
+                 fontpath_off={:#x} install_va={:#x} install_rip={:#x} \
+                 free_tick={} free_rip={:#x}",
+                site, phys, off, install_va, install_rip,
+                free_tick, free_rip,
+            );
+        }
+    } else {
+        let hits = FONT_RECYCLE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::serial_println!(
+            "[W215/FONT-RECYCLE] kind=LIVE site={} phys={:#x} \
+             fontpath_off={:#x} install_va={:#x} install_rip={:#x} \
+             free_tick={} free_rip={:#x} hits={}",
+            site, phys, off, install_va, install_rip,
+            free_tick, free_rip, hits,
+        );
+    }
+}
+
+/// Counters for kdb introspection / harness assertion.
+pub fn font_recycle_hits() -> u64 { FONT_RECYCLE_HITS.load(Ordering::Relaxed) }
+pub fn font_recycle_scans() -> u64 { FONT_RECYCLE_SCANS.load(Ordering::Relaxed) }
