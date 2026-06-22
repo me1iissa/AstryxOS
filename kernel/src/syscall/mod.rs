@@ -490,10 +490,16 @@ pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDe
 /// Removes the MOST-RECENTLY-queued matching `(receiver_id, byte_offset)` batch
 /// and returns its descriptors so the caller can balance the per-object
 /// reference / inode pin it took at enqueue time (via [`scm_drop_fds`]).
-/// Returns `None` if no matching batch is queued (it was already delivered or
-/// drained — see the safety note in the sendmsg path: a zero-byte send cannot
-/// have advanced the peer's read position past `byte_offset`, so the batch is
-/// guaranteed still present and un-delivered).
+/// Returns `None` if no matching batch is queued — and the `None` case is
+/// load-bearing, not just a teardown nicety.  In the common single-sender case a
+/// zero-byte send has not advanced the peer's read position, so the batch is
+/// still present; but under SMP a *concurrent* sender's byte (pushed into the
+/// slot this send could not fill) can be popped by the receiver, satisfying the
+/// deliver predicate and letting a `recvmsg` dequeue this batch before the
+/// revoke runs.  In that race the fds were legitimately delivered (the receiver
+/// now owns them); `None` then correctly skips the ref-balancing drop, so no
+/// double-free occurs — the only effect is that the duplicate-prevention did not
+/// fire that once (a missed optimisation, never a safety bug).
 ///
 /// The "most recent" tie-break matters because the gecko IPC channel retries an
 /// EAGAIN'd frame with the SAME fds: without revoke each retry would push a
