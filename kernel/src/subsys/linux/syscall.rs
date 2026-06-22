@@ -5548,8 +5548,63 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 270: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
         270 => sys_select_linux(arg1, arg2, arg3, arg4, arg5),
-        // 285: fallocate(fd, mode, offset, len) — stub success
-        285 => 0,
+        // 285: fallocate(fd, mode, offset, len)
+        //
+        // Per fallocate(2) / posix_fallocate(3): with the default mode (0),
+        // the call MUST ensure that disk space is allocated for the byte range
+        // [offset, offset+len), and if offset+len exceeds the current file
+        // size the file is GROWN to offset+len (the new bytes read as zero).
+        // posix_fallocate(3) is the way glibc/musl-linked applications request
+        // a sized anonymous shared buffer (memfd_create → posix_fallocate →
+        // mmap MAP_SHARED), so a no-op stub leaves the backing inode at size 0
+        // and any cache-miss read of the buffer returns zeros instead of the
+        // mapped contents.  Implement the GROW for regular files by delegating
+        // to the ftruncate path (which also reconciles the page cache per
+        // POSIX ftruncate(2)).
+        //
+        // Modes we honour:
+        //   * mode 0                     → grow file to max(size, offset+len).
+        //   * FALLOC_FL_KEEP_SIZE (0x01) → reserve space without changing the
+        //     file size; on a RAM-backed FS there is nothing to reserve, so
+        //     this is a no-op success.
+        // Any other mode bit (PUNCH_HOLE, COLLAPSE_RANGE, ZERO_RANGE, …) is
+        // not supported here and returns success without altering the file,
+        // preserving the prior conservative behaviour.
+        285 => {
+            const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+            let mode = arg2;
+            let offset = arg3;
+            let len = arg4;
+            if mode == 0 && len > 0 {
+                let pid = crate::proc::current_pid_lockless();
+                let new_min = offset.saturating_add(len);
+                let cur_size = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid)
+                        .and_then(|p| p.file_descriptors.get(arg1 as usize))
+                        .and_then(|f| f.as_ref())
+                        .map(|f| (f.mount_idx, f.inode))
+                }.and_then(|(m, ino)| crate::vfs::fs_at(m)
+                    .and_then(|(fs, _)| fs.stat(ino).ok().map(|s| s.size)));
+                match cur_size {
+                    Some(sz) if new_min > sz => {
+                        match crate::vfs::fd_truncate(pid, arg1 as usize, new_min) {
+                            Ok(()) => 0,
+                            Err(e) => crate::subsys::linux::errno::vfs_err(e),
+                        }
+                    }
+                    // Already large enough, or fd is not a regular file we can
+                    // size (console/socket/etc.): nothing to do.
+                    Some(_) => 0,
+                    // fd not found / not file-backed → EBADF per fallocate(2).
+                    None => -9,
+                }
+            } else if mode & FALLOC_FL_KEEP_SIZE != 0 {
+                0 // space reservation is a no-op on a RAM-backed FS
+            } else {
+                0 // unsupported mode: preserve prior conservative success
+            }
+        }
         // 295: preadv(fd, iov, iovcnt, offset_lo, offset_hi)
         // Scatter-gather positioned read; offset = (offset_hi << 32) | offset_lo on x86-64
         // but Linux x86_64 passes the offset as a single i64 in arg4 (lo) with arg5=0.
