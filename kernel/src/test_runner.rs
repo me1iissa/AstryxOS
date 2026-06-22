@@ -53628,13 +53628,12 @@ fn test_641_crossproc_mapshared_memfd_visibility() -> bool {
     //    the producer's write to still be visible.
     // ════════════════════════════════════════════════════════════════════
     // Frame currently holds the sentinel (from B).  Evict the cache entry —
-    // the consumer's next fault will be a MISS and go to fs.read.
+    // the consumer's next fault will be a MISS and go to fs.read.  `evict`
+    // drops the cache's reference and hands ownership of the frame to us; with
+    // no other holder its refcount is now 0, so we must return it to the PMM
+    // (per the evict(2)-style contract documented on cache::evict).
     if let Some(evp) = crate::mm::cache::evict(mount, inode, foff) {
-        // After evict, the cache's ref is dropped.  Whoever still references
-        // it (nobody here) keeps it; refcount may hit 0 → routed to free.  We
-        // must NOT touch evp after this point; the consumer will fault a fresh
-        // frame.
-        let _ = evp;
+        crate::mm::pmm::free_page(evp);
     }
     let cons_phys_c = match fault_in(mount, inode, foff) {
         Some(p) => p,
@@ -53669,6 +53668,12 @@ fn test_641_crossproc_mapshared_memfd_visibility() -> bool {
                        (inert on SMP=1 FF render path) ⚠");
     } else {
         test_println!("  C eviction-then-remap: producer write survived eviction ✓");
+    }
+    // Reclaim the consumer's freshly-faulted frame: evict its cache entry
+    // (drops the cache ref → rc 0) and return it to the PMM, so the test
+    // leaves no leaked frame and no stale (mount,inode,foff) cache entry.
+    if let Some(p) = crate::mm::cache::evict(mount, inode, foff) {
+        crate::mm::pmm::free_page(p);
     }
     let _ = crate::vfs::remove(path);
 
