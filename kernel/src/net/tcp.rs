@@ -986,6 +986,98 @@ pub fn get_state(port: u16) -> Option<TcpState> {
         .map(|c| c.state)
 }
 
+/// Per-connection state lookup keyed by the full 4-tuple.
+///
+/// `get_state` matches by local port alone and so can return the wrong
+/// connection's state when several sessions share one listening port
+/// (RFC 9293 §3.4 demultiplexing).  The poll readiness path needs the
+/// state of *this* socket's exact flow, so it uses the 4-tuple form.
+pub fn get_state_for(local_port: u16, remote_ip: Ipv4Address,
+                     remote_port: u16) -> Option<TcpState> {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port  == local_port
+                  && c.remote_ip   == remote_ip
+                  && c.remote_port == remote_port)
+        .map(|c| c.state)
+}
+
+/// True once the peer's FIN has been received for this 4-tuple — i.e. the
+/// read direction is at end-of-stream.  Per RFC 9293 §3.3.2 the peer FIN
+/// drives the local TCB into CLOSE-WAIT (and onward to LAST-ACK), or, if we
+/// FINned first, FIN-WAIT-1/2 → TIME-WAIT.  Of those, the states that mean
+/// "we have *seen* the peer's FIN" (RCV side closed) are CLOSE-WAIT,
+/// LAST-ACK, TIME-WAIT, and CLOSED.  FIN-WAIT-1/2 mean *we* closed but the
+/// peer's FIN has not yet arrived, so they are NOT read-closed.
+///
+/// A vanished TCB (`None`) is also read-closed: the flow is gone, so a
+/// further recv returns EOF rather than blocking.  This is the
+/// `EPOLLRDHUP` / `POLLRDHUP` predicate (read-side half-close), per
+/// `man 2 poll` and `epoll(7)`.
+pub fn peer_fin_received(local_port: u16, remote_ip: Ipv4Address,
+                         remote_port: u16) -> bool {
+    match get_state_for(local_port, remote_ip, remote_port) {
+        Some(st) => matches!(st,
+            TcpState::CloseWait | TcpState::LastAck
+            | TcpState::TimeWait | TcpState::Closed),
+        None => true,
+    }
+}
+
+/// True when the connection is fully torn down — both directions closed or
+/// the TCB has reached CLOSED (RFC 9293 §3.3.2).  This is the `POLLHUP` /
+/// `EPOLLHUP` predicate: a full hang-up, which `man 2 poll` defines as an
+/// unmaskable event reported independently of the requested `events`.
+///
+/// Note that CLOSE-WAIT and FIN-WAIT-2 are deliberately NOT a full hang-up:
+/// in CLOSE-WAIT the local write direction is still open (the app may still
+/// send before it close()s), and in FIN-WAIT-2 the read direction is still
+/// open (the peer may still send).  Reporting `POLLHUP` for those would, per
+/// the POSIX rule that `POLLHUP` is mutually exclusive with `POLLOUT`,
+/// wrongly tell a writer the connection is dead while it can still send —
+/// the classic "poll() on write() in CLOSE-WAIT" hazard.  A vanished TCB
+/// (`None`) is treated as a full hang-up.
+pub fn is_fully_closed(local_port: u16, remote_ip: Ipv4Address,
+                       remote_port: u16) -> bool {
+    matches!(get_state_for(local_port, remote_ip, remote_port),
+             Some(TcpState::Closed) | None)
+}
+
+/// True when a `send(2)` on this 4-tuple would make progress without
+/// blocking — i.e. the send buffer has room below the socket's send-buffer
+/// limit (`sndbuf`).  This is the `POLLOUT` / `EPOLLOUT` backpressure
+/// predicate: advertising writable only when there is space, so a producer
+/// parked in `poll(POLLOUT)` on a full send buffer is not woken to a
+/// `send()` that would merely re-block (the stuck-producer pattern
+/// `man 2 poll` exists to avoid).
+///
+/// Returns `true` (writable) for an unknown/vanished TCB so a `send()` is
+/// allowed to surface its own error (RFC 9293 §3.10.2 SEND on a closed
+/// connection) rather than the poller hanging.  Only ESTABLISHED and
+/// CLOSE-WAIT (peer-FINned but our write direction still open) can buffer
+/// new outbound data; in any later state the write side is closed and a
+/// `send()` returns immediately (it never blocks), so they too report
+/// writable.
+pub fn send_space_available(local_port: u16, remote_ip: Ipv4Address,
+                            remote_port: u16) -> bool {
+    let conns = TCP_CONNECTIONS.lock();
+    match conns.iter().find(|c| c.local_port  == local_port
+                                && c.remote_ip   == remote_ip
+                                && c.remote_port == remote_port)
+    {
+        Some(c) => {
+            if matches!(c.state, TcpState::Established | TcpState::CloseWait) {
+                // Room remains below the send-buffer high-water mark.
+                (c.send_buffer.len() as u32) < c.sndbuf
+            } else {
+                // Write side is closed/closing: send() returns without
+                // blocking, so the socket is "writable" for poll purposes.
+                true
+            }
+        }
+        None => true,
+    }
+}
+
 /// Returns true if any TCB on `port` is in the Listen state — used by
 /// the socket-layer ephemeral-port allocator to probe for collisions.
 pub fn is_listening(port: u16) -> bool {
@@ -1174,6 +1266,28 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         accepted:    false,
         close_pending: false,
     });
+    Ok(())
+}
+
+/// Test-only: overwrite the `send_buffer` and `sndbuf` of an Established (or
+/// CloseWait) TCB so a test can drive the `send_space_available` POLLOUT
+/// backpressure predicate without pushing real data through `send_data`
+/// (which would attempt e1000 transmission).  `buffered` is the number of
+/// pending octets to simulate; `sndbuf` is the high-water mark to compare
+/// against.  Returns `Err` if the 4-tuple is not present.  Gated on `kdb`.
+#[cfg(feature = "kdb")]
+pub fn test_set_send_buffer(local_port: u16, remote_ip: Ipv4Address,
+                            remote_port: u16, buffered: usize, sndbuf: u32)
+    -> Result<(), &'static str>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+        .ok_or("4-tuple not present")?;
+    conn.send_buffer = alloc::vec![0u8; buffered];
+    conn.sndbuf = sndbuf;
     Ok(())
 }
 

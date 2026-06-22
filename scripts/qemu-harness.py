@@ -1521,7 +1521,7 @@ def _build(features: str) -> bool:
     return r3.returncode == 0
 
 
-def _check(features: str) -> tuple[int, str]:
+def _check(features: str, root: str = "") -> tuple[int, str]:
     """
     Run `cargo +nightly check` against the kernel package for `features`.
 
@@ -1531,10 +1531,20 @@ def _check(features: str) -> tuple[int, str]:
 
     `features` is passed VERBATIM (comma-separated, e.g. "test-mode,kdb").
     Empty string → no `--features` flag (default desktop kernel).
+
+    `root`, if non-empty, overrides the checkout directory the check runs in
+    (the cwd and the `--target` spec are resolved relative to it).  This lets
+    a caller type-check an *isolated git worktree* without mutating the shared
+    checkout — additive, defaults to the shared ROOT when omitted.
     """
     wt = _get_watch_test()
-    ROOT = wt.ROOT
-    KERNEL_TARGET = wt.KERNEL_TARGET
+    if root:
+        import pathlib
+        ROOT = pathlib.Path(root)
+        KERNEL_TARGET = ROOT / "kernel" / "x86_64-astryx.json"
+    else:
+        ROOT = wt.ROOT
+        KERNEL_TARGET = wt.KERNEL_TARGET
 
     cmd = ["cargo", "+nightly", "check",
            "--package", "astryx-kernel",
@@ -3152,10 +3162,11 @@ def cmd_check(args):
     verdict.  No QEMU is launched.  Useful for sweeping feature-flag matrices
     after a code change.
     """
-    rc, tail = _check(args.features or "")
+    rc, tail = _check(args.features or "", getattr(args, "root", "") or "")
     out = {
         "ok": rc == 0,
         "features": args.features or "",
+        "root": getattr(args, "root", "") or "",
         "rc": rc,
     }
     if rc != 0:
@@ -13491,6 +13502,10 @@ def main():
     p_check.add_argument("--features", default="", metavar="FLAGS",
                           help="Feature flags passed VERBATIM to cargo. "
                                "Empty string → default desktop kernel.")
+    p_check.add_argument("--root", default="", metavar="DIR",
+                          help="Override the checkout dir to type-check "
+                               "(e.g. an isolated git worktree). Defaults to "
+                               "the shared checkout when omitted.")
 
     p_build = sub.add_parser("build",
                               help="Run the REAL kernel build (codegen+link+ESP "

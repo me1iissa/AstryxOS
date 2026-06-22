@@ -4425,8 +4425,38 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     } else if is_socket_fd(pid, fd) {
         let sid = get_socket_id(pid, fd);
         let mut rev = 0u16;
-        if crate::net::socket::socket_has_data(sid) { rev |= events & POLLIN; }
-        rev |= events & POLLOUT;
+        // POLLIN is the data-OR-EOF superset (`socket_read_ready`), not the
+        // data-only `socket_has_data`: a TCP connection whose peer FINned
+        // with an empty receive buffer (CLOSE-WAIT etc.) must be reported
+        // readable so the next recv() returns 0 (EOF) instead of the poller
+        // blocking forever (RFC 9293 §3.5 orderly close; `man 2 poll`).
+        if crate::net::socket::socket_read_ready(sid) { rev |= events & POLLIN; }
+        // `poll(2)` distinguishes a read-side half-close from a full hang-up
+        // (mirroring the `epoll(7)` EPOLLRDHUP / EPOLLHUP split and the
+        // AF_UNIX branch above).
+        let (rdhup, hup) = crate::net::socket::socket_hangup_status(sid);
+        if rdhup {
+            // Peer FIN received (or local SHUT_RD): read side at EOF.  Raise
+            // POLLRDHUP when requested and force POLLIN so a draining reader
+            // observes the EOF.  POLLOUT is unaffected — the write direction
+            // may still be valid.
+            rev |= events & POLLRDHUP;
+            rev |= events & POLLIN;
+        }
+        if hup {
+            // Full hang-up: POLLHUP is reported unconditionally (independent
+            // of the requested events) and coexists with a draining POLLIN.
+            // It is mutually exclusive with POLLOUT, so do not advertise
+            // writable for a fully-closed connection.
+            rev |= POLLHUP;
+            rev |= events & POLLIN;
+        } else if crate::net::socket::socket_write_ready(sid) {
+            // POLLOUT only when a send() would make progress: the send
+            // buffer has room (or the write side can no longer block).  A
+            // full send buffer clears POLLOUT so a producer is not woken to
+            // a send() that would merely re-block (`man 2 poll`).
+            rev |= events & POLLOUT;
+        }
         rev
     } else if is_pipe_fd(pid, fd) {
         let pipe_id = get_pipe_id(pid, fd);

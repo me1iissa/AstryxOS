@@ -754,6 +754,92 @@ pub fn socket_read_ready(id: u64) -> bool {
     }
 }
 
+/// Per-bit poll(2) hang-up classification for a socket fd, returning
+/// `(rdhup, hup)`:
+///
+///   * `rdhup` — the read side is at end-of-stream because the peer
+///     half-closed (`shutdown(SHUT_WR)` → TCP FIN received, or we did
+///     `shutdown(SHUT_RD)` locally).  Maps to `POLLRDHUP` / `EPOLLRDHUP`
+///     and forces `POLLIN` so the reader observes the EOF.  The write
+///     direction may still be valid (it is NOT a full hang-up).
+///   * `hup`   — the connection is a full hang-up: both directions closed
+///     (`shutdown(SHUT_RDWR)`) or the TCP TCB has reached CLOSED.  Maps to
+///     `POLLHUP` / `EPOLLHUP`, which `man 2 poll` reports unconditionally
+///     (independent of the requested events) and which is mutually
+///     exclusive with `POLLOUT`.
+///
+/// Connectionless (UDP) and unbound/listener sockets never hang up:
+/// returns `(false, false)`.  Mirrors the AF_UNIX `read_shutdown` /
+/// `fully_hung_up` split and the TCP poll mapping in RFC 9293 §3.3.2.
+pub fn socket_hangup_status(id: u64) -> (bool, bool) {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return (false, false),
+    };
+    // A local SHUT_RDWR is a full hang-up; a local SHUT_RD alone is a
+    // read-side half-close.
+    let local_rd_closed = sock.shut_rd;
+    let local_full      = sock.shut_rd && sock.shut_wr;
+    match sock.socket_type {
+        // UDP is connectionless: no peer-FIN / RST notion.  Only an
+        // explicit local shutdown registers.
+        SocketType::Udp => (local_rd_closed, local_full),
+        SocketType::Tcp => {
+            if sock.connected && sock.remote_port != 0 {
+                let rdhup = local_rd_closed
+                    || super::tcp::peer_fin_received(sock.local_port,
+                                                     sock.remote_ip,
+                                                     sock.remote_port);
+                let hup = local_full
+                    || super::tcp::is_fully_closed(sock.local_port,
+                                                   sock.remote_ip,
+                                                   sock.remote_port);
+                (rdhup, hup)
+            } else {
+                // Listener / unconnected: no peer to hang up.
+                (local_rd_closed, local_full)
+            }
+        }
+    }
+}
+
+/// True when a `send(2)`/`write(2)` on this socket would make progress
+/// without blocking — the `POLLOUT` / `EPOLLOUT` readiness gate.
+///
+/// For a connected TCP socket this is "the send buffer has room below the
+/// `sndbuf` high-water mark" (RFC 9293 §3.7 flow/buffer management); a full
+/// send buffer clears `POLLOUT` so a producer parked on it is not woken to a
+/// `send()` that would merely re-block (`man 2 poll`).  A write-shut or
+/// not-yet-connected socket is reported writable because the `send()`
+/// returns immediately (`-EPIPE` / `-ENOTCONN`) rather than blocking.  UDP
+/// and AF_UNIX (handled elsewhere) are connectionless / ring-buffered and
+/// are writable whenever they can accept a datagram; UDP here is always
+/// writable (it never blocks on send, only drops on a full queue).
+pub fn socket_write_ready(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return true, // unknown fd: let the eventual send() error
+    };
+    // SHUT_WR: send() returns -EPIPE without blocking → "writable".
+    if sock.shut_wr { return true; }
+    match sock.socket_type {
+        SocketType::Udp => true,
+        SocketType::Tcp => {
+            if sock.connected && sock.remote_port != 0 {
+                super::tcp::send_space_available(sock.local_port,
+                                                 sock.remote_ip,
+                                                 sock.remote_port)
+            } else {
+                // Not connected (listener / fresh socket): a send() does
+                // not block; report writable so the eventual error surfaces.
+                true
+            }
+        }
+    }
+}
+
 /// Close a socket.
 ///
 /// For TCP, the underlying close path depends on whether this socket
