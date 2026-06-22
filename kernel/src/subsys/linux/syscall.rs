@@ -5912,7 +5912,12 @@ fn sys_select_linux(
                 || crate::syscall::has_scm_deliverable(
                     uid, crate::net::unix::recv_consumed(uid))
         } else if crate::syscall::is_socket_fd(pid, fd) {
-            crate::net::socket::socket_has_data(crate::syscall::get_socket_id(pid, fd))
+            // data-OR-EOF: a peer-FINned TCP connection (CLOSE-WAIT) with an
+            // empty buffer is select(2)-readable so the next recv returns 0
+            // (EOF) rather than the caller blocking (RFC 9293 §3.5;
+            // `man 2 select`).  Matches the authoritative `poll_revents`
+            // rescan below.
+            crate::net::socket::socket_read_ready(crate::syscall::get_socket_id(pid, fd))
         } else if crate::syscall::is_timerfd_fd(pid, fd) {
             crate::ipc::timerfd::is_readable(crate::syscall::get_timerfd_id(pid, fd))
         } else if crate::syscall::is_signalfd_fd(pid, fd) {
@@ -10865,9 +10870,34 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     }
                     ev
                 } else {
-                    let mut ev = EPOLLOUT;
-                    if crate::net::socket::socket_has_data(inode) {
+                    // AF_INET/AF_INET6.  Mirror the AF_UNIX split above and
+                    // the canonical `poll_revents` TCP mapping:
+                    //
+                    //   * EPOLLIN  — data-OR-EOF (`socket_read_ready`), so a
+                    //     peer-FINned CLOSE-WAIT connection with an empty
+                    //     buffer is readable (the next recv returns 0 / EOF)
+                    //     instead of the poller blocking (RFC 9293 §3.5).
+                    //   * EPOLLRDHUP — read-side half-close (peer FIN / local
+                    //     SHUT_RD); delivered only when subscribed, gated by
+                    //     the `subscribed & ready_ev` intersection in
+                    //     `epoll_filter_events` (`epoll(7)`).
+                    //   * EPOLLHUP — full hang-up (both directions closed or
+                    //     TCB CLOSED); reported regardless of interest mask
+                    //     and mutually exclusive with EPOLLOUT.
+                    //   * EPOLLOUT — only when the send buffer has room
+                    //     (`socket_write_ready`); a full buffer clears it so
+                    //     a producer is not spun on epoll_wait→send→EAGAIN.
+                    let mut ev = 0u32;
+                    if crate::net::socket::socket_read_ready(inode) {
                         ev |= EPOLLIN;
+                    }
+                    let (rdhup, hup) =
+                        crate::net::socket::socket_hangup_status(inode);
+                    if rdhup { ev |= EPOLLIN | EPOLLRDHUP; }
+                    if hup {
+                        ev |= EPOLLHUP | EPOLLIN;
+                    } else if crate::net::socket::socket_write_ready(inode) {
+                        ev |= EPOLLOUT;
                     }
                     ev
                 }
