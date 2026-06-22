@@ -600,7 +600,15 @@ pub fn poll() {
       for (i, sl) in s.clients.iter().enumerate() {
           if let Some(c) = sl {
               let hd = unix::has_data(c.fd);
-              #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+              // [X11POLL] is a per-poll high-frequency emitter: it fires on every
+              // X11 service-poll pass while a client has buffered data, which under
+              // Firefox load is thousands of lines that saturate the serial
+              // transport (~7 KB/s) and throttle the whole system — slow enough to
+              // starve the 60 Hz software-vsync cadence the compositor needs.  It
+              // belongs in the trace profile, not the functional `firefox-test-core`
+              // fast profile (Cargo.toml documents core as "the fast, low-serial
+              // profile").
+              #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
               if hd { crate::serial_println!("[X11POLL] svc_fd={} has_data=true avail={}", c.fd, unix::bytes_available(c.fd)); }
               if hd { pending[i] = c.fd; }
           }
@@ -651,7 +659,12 @@ fn service_fd(fd: u64) {
             break;
         }
         recv.extend_from_slice(&chunk[..n]);
-        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+        // [X11SVC] read-chunk trace: one line per 4 KiB chunk drained from a
+        // client fd.  Under Firefox (which streams MOZ_LOG over its stderr fd
+        // through the in-kernel X11 server) this is the single largest serial
+        // consumer — tens of thousands of lines per boot.  Trace profile only;
+        // see the [X11POLL] note above for the cadence-starvation rationale.
+        #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
         crate::serial_println!("[X11SVC] fd={} read {} bytes (buffered={})", fd, n, recv.len());
     }
 
