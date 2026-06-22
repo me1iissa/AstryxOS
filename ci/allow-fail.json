@@ -55,6 +55,11 @@
       "name": "alias_test",
       "reason": "deterministic page-aliasing reproducer for W8 race; tolerated on TCG CI until W215 closure",
       "tracking": "#328"
+    },
+    {
+      "name": "test_522_tcp_rx_poll_bell",
+      "reason": "flaky test-isolation: intermittently 'data not buffered: read 0 bytes' on TCG CI. Confirmed pre-existing and change-independent — it also fails on the master run for the urandom-only #621 merge (a commit touching no TCP code). The test reuses TCP port 47018 (also used by the kdb-gated test_tcp_read_from_isolation) and reads the shared global TCP connection table, so accumulated cross-test state plus TCG timing intermittently makes its synchronous read observe 0 buffered bytes. Allow-listed to unblock unrelated PRs; real fix is to make the test hermetic (clear its 4-tuple/listener state at entry or use a unique port).",
+      "tracking": null
     }
   ]
 }
