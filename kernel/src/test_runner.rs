@@ -38467,10 +38467,10 @@ fn test_poll_bell_source_attribution() -> bool {
     }
 
     // Ring one of each tagged source.  Update the array length any time
-    // a new source variant lands in `PollBellSource` (currently 10 tagged
+    // a new source variant lands in `PollBellSource` (currently 11 tagged
     // variants — `Other` stays untagged by design so it can absorb
     // ad-hoc callers without skewing the per-source attribution).
-    let sources_to_ring: [PollBellSource; 10] = [
+    let sources_to_ring: [PollBellSource; 11] = [
         PollBellSource::Pipe,
         PollBellSource::Eventfd,
         PollBellSource::UnixWrite,
@@ -38481,6 +38481,7 @@ fn test_poll_bell_source_attribution() -> bool {
         PollBellSource::SignalInject,
         PollBellSource::InetRx,
         PollBellSource::UnixRead,
+        PollBellSource::InetTx,
     ];
     for s in &sources_to_ring {
         ring_poll_bell_for(*s);
