@@ -138,6 +138,11 @@ pub fn pump_input() {
     let buttons_changed = buttons != state.prev_buttons;
 
     if mouse_moved || buttons_changed {
+        // On-screen cursor position changed → owe a recomposite so the
+        // damage-driven compositor repaints the cursor.  `damage()` is a
+        // lock-free atomic (it never takes COMPOSITOR), so bumping it while
+        // INPUT_STATE is held is sound.
+        crate::gui::compositor::damage();
         process_mouse(&state, mx, my, buttons);
 
         // ── X11 mouse forwarding ───────────────────────────────────────

@@ -1403,6 +1403,18 @@ pub fn run() -> ! {
         if test_295b_proc_fd_sentinel_reopen_no_uaf() { passed += 1; }
     }
 
+    // ── Test 629: compositor rate-gate + damage-driven recompose ───────────
+    // The cooperative BSP poll loop calls the compositor at spin rate.  The
+    // rate gate (`compose_due_decision`) must (a) cap repaints to the minimum
+    // inter-frame interval regardless of call rate, and (b) skip the
+    // full-screen framebuffer-MMIO blit entirely when no on-screen content
+    // changed and the idle-refresh interval has not elapsed — on a single vCPU
+    // under KVM that spin-rate blit storm is a VM-exit storm that leaves the
+    // core no cycles for the rest of the poll loop.  Placed ahead of the heavy
+    // Firefox-launch oracle so it runs on every build.
+    total += 1;
+    if test_629_compositor_rate_gate() { passed += 1; }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -53261,6 +53273,74 @@ fn test_292_recvmsg_ctrunc_partial_scm_install() -> bool {
 // incoming connection (POLLIN under poll/select, but no EPOLLIN under
 // epoll_wait).  This verifies the parity fix: epoll_poll_events must report
 // EPOLLIN for a listening socket once a connection is queued, exactly as
+// ── Test 629: compositor rate-gate + damage-driven recompose ──────────────────
+//
+// `compositor::compose_due_decision(now, last_tick, cur_damage, last_damage)`
+// is the pure gating predicate that decides whether the spin-rate BSP poll
+// loop actually issues a full-screen framebuffer-MMIO blit.  It must:
+//   1. Cap the rate: return false until COMPOSE_MIN_INTERVAL_TICKS (2) have
+//      elapsed since the last composited frame, no matter how fast it is
+//      called — this is what tamed the VM-exit storm that suppressed the
+//      single-vCPU LAPIC timer.
+//   2. Be damage-driven: once the interval has elapsed, recompose only when
+//      on-screen content changed (damage advanced) ...
+//   3. ... or the bounded idle-refresh interval (COMPOSE_MAX_IDLE_TICKS, 100
+//      ≈ 1 s) has elapsed, so a stale frame is eventually refreshed.
+fn test_629_compositor_rate_gate() -> bool {
+    use crate::gui::compositor::compose_due_decision;
+    const NAME: &str = "compositor rate-gate (Test 629)";
+    test_header!(NAME);
+
+    // 1. Rate cap: within the minimum interval, never composite — even when
+    //    damage advanced every call (the spin-rate case).
+    if compose_due_decision(/*now*/ 1000, /*last*/ 1000, /*dmg*/ 5, /*last_dmg*/ 4) {
+        test_fail!(NAME, "composited at interval 0 (< MIN) despite damage");
+        return false;
+    }
+    if compose_due_decision(1001, 1000, 9, 4) {
+        test_fail!(NAME, "composited at interval 1 (< MIN=2) despite damage");
+        return false;
+    }
+
+    // 2. Interval elapsed + damage advanced → composite.
+    if !compose_due_decision(1002, 1000, 5, 4) {
+        test_fail!(NAME, "did NOT composite at interval 2 (>= MIN) with new damage");
+        return false;
+    }
+
+    // 3. Interval elapsed but NO damage and not idle → skip (the quiescent
+    //    desktop: zero framebuffer MMIO).
+    if compose_due_decision(1050, 1000, 4, 4) {
+        test_fail!(NAME, "composited with no damage before idle-refresh interval");
+        return false;
+    }
+
+    // 4. No damage but idle-refresh interval (>= 100) elapsed → composite
+    //    (stale-frame backstop).
+    if !compose_due_decision(1100, 1000, 4, 4) {
+        test_fail!(NAME, "did NOT composite after idle-refresh interval with no damage");
+        return false;
+    }
+
+    // 5. Wrapping arithmetic: get_ticks() is monotone (max of TICK_COUNT and
+    //    the TSC floor) so now >= last_tick always holds; wrapping_sub is then
+    //    just (now - last_tick).  The wrap-safe property we require is only
+    //    that the predicate never panics on any (now, last_tick) — verify the
+    //    extreme inputs evaluate without UB.  now == last_tick - 1 (the
+    //    pathological backwards step) wraps to a delta of u64::MAX, which is
+    //    >= COMPOSE_MAX_IDLE_TICKS, so it composites (a safe forced refresh
+    //    rather than a wedge).
+    let _ = compose_due_decision(0, u64::MAX, 4, 4); // delta wraps to 1: too soon, no panic
+    if !compose_due_decision(u64::MAX - 1, u64::MAX, 4, 4) {
+        // delta = wrapping_sub(MAX-1, MAX) = u64::MAX >= idle ⇒ composite
+        test_fail!(NAME, "backwards step (now=MAX-1, last=MAX) did not force a refresh");
+        return false;
+    }
+
+    test_pass!(NAME);
+    true
+}
+
 // poll_revents does.  A connected socketpair (backlog_len == 0) is unaffected.
 //
 // Refs: epoll(7), accept(2), poll(2), unix(7).

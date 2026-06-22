@@ -22,6 +22,124 @@ pub fn is_active() -> bool {
     COMPOSITOR_ACTIVE.load(Ordering::Relaxed)
 }
 
+use core::sync::atomic::AtomicU64;
+
+/// Monotone damage counter.  Bumped by every accessor that changes on-screen
+/// pixel content (X11 PutImage / fill / text, window move/resize, cursor move,
+/// `mark_dirty`).  `compose_if_due` only repaints + blits when this advanced
+/// since the last composited frame — so a quiescent desktop costs zero
+/// framebuffer MMIO.  See [`damage`].
+static DAMAGE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// The `DAMAGE_SEQ` value captured at the last *composited* frame.
+static LAST_COMPOSED_DAMAGE: AtomicU64 = AtomicU64::new(0);
+
+/// TSC-derived tick at which the last frame was composited.  Read via
+/// `irq::get_ticks()`, which is TSC-floored and therefore keeps advancing even
+/// when the LAPIC periodic interrupt is suppressed (the single-vCPU KVM case),
+/// so the rate gate never wedges with the hardware clock.
+static LAST_COMPOSE_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum ticks between composited frames.  At `TICK_HZ = 100` a value of 2
+/// caps the compositor at ~50 Hz — visually smooth, but ~2 orders of magnitude
+/// below the BSP poll loop's spin rate.  This is THE lever that stops the
+/// full-screen framebuffer-MMIO blit (a full backbuffer→VRAM copy + SVGA FIFO
+/// UPDATE + sync) from being issued millions of times under a busy GUI
+/// workload.  Each such blit is a burst of MMIO writes; under KVM those are
+/// VM-exits, so the unconditional spin-rate `compose()` turned the single vCPU
+/// into a VM-exit-bound machine that did almost no useful work.  Rate-gating
+/// converts the overwhelming majority of BSP-loop compose calls into a cheap
+/// skip (see `COMPOSE_SKIPPED`), freeing the vCPU for the actual poll/scheduler
+/// work and the userspace threads.  (Note: the kernel already survives a
+/// suppressed LAPIC tick via the TSC-floor soft-tick path in
+/// `arch::x86_64::irq::{get_ticks, idle_tick}`; this gate's win is the
+/// VM-exit/cycle reduction, not LAPIC-tick survival.)
+const COMPOSE_MIN_INTERVAL_TICKS: u64 = 2;
+
+/// Maximum ticks the compositor will skip even with no damage, so a stale
+/// frame (e.g. after a resolution/format change that did not route through a
+/// damage accessor) is eventually refreshed.  ~1 s at `TICK_HZ = 100`.
+const COMPOSE_MAX_IDLE_TICKS: u64 = 100;
+
+/// Record on-screen damage.  Lock-free; any code that mutates composited pixel
+/// content calls this so the next [`compose_if_due`] knows a repaint is owed.
+#[inline]
+pub fn damage() {
+    DAMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Rate-gated, damage-driven compositor entry point for the cooperative BSP
+/// poll loops.  Composites a frame only when BOTH a minimum interval has
+/// elapsed AND on-screen content changed since the last frame (or a bounded
+/// idle-refresh interval has elapsed).  Otherwise returns immediately without
+/// touching the framebuffer.
+///
+/// Replaces the unconditional spin-rate `compose()` call in the GUI/Firefox
+/// soak loops.  `compose()` itself is left intact for callers that need an
+/// unconditional repaint (e.g. one-shot screendump priming).
+pub fn compose_if_due() {
+    if !COMPOSITOR_ACTIVE.load(Ordering::Relaxed) {
+        // Compositor not yet primed: fall through to compose() so the first
+        // frame still establishes the backbuffer/active state.
+        compose();
+        return;
+    }
+    let now = crate::arch::x86_64::irq::get_ticks();
+    let last_tick = LAST_COMPOSE_TICK.load(Ordering::Relaxed);
+    let cur_damage = DAMAGE_SEQ.load(Ordering::Relaxed);
+    let last_damage = LAST_COMPOSED_DAMAGE.load(Ordering::Relaxed);
+    if !compose_due_decision(now, last_tick, cur_damage, last_damage) {
+        COMPOSE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    LAST_COMPOSED_DAMAGE.store(cur_damage, Ordering::Relaxed);
+    LAST_COMPOSE_TICK.store(now, Ordering::Relaxed);
+    COMPOSE_BLITTED.fetch_add(1, Ordering::Relaxed);
+    compose();
+}
+
+/// Cumulative count of `compose_if_due` calls that issued a full-screen
+/// repaint + framebuffer-MMIO blit (`compose()`), and of calls the rate/damage
+/// gate skipped.  The ratio quantifies the MMIO-VM-exit reduction the gate
+/// buys versus the previous spin-rate unconditional `compose()`: under a busy
+/// GUI workload the BSP loop spins millions of times, almost all of which the
+/// gate now turns into a cheap skip rather than a full VRAM blit.
+pub static COMPOSE_BLITTED: AtomicU64 = AtomicU64::new(0);
+pub static COMPOSE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of (blitted, skipped) compose-if-due counts.  Diagnostic only.
+pub fn compose_gate_stats() -> (u64, u64) {
+    (
+        COMPOSE_BLITTED.load(Ordering::Relaxed),
+        COMPOSE_SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Pure gating predicate for [`compose_if_due`] (extracted so it is unit
+/// testable without a live framebuffer/timer).  Returns `true` iff a frame is
+/// owed:
+///   * the minimum inter-frame interval has elapsed (`now - last_tick >=
+///     COMPOSE_MIN_INTERVAL_TICKS`) — the hard rate cap; **and**
+///   * either on-screen content changed (`cur_damage != last_damage`) or the
+///     bounded idle-refresh interval (`COMPOSE_MAX_IDLE_TICKS`) has elapsed.
+///
+/// All tick arithmetic is `wrapping_sub` so a `get_ticks()` wrap (TSC-derived,
+/// 64-bit — practically never, but free to be correct) cannot wedge the gate.
+#[inline]
+pub fn compose_due_decision(
+    now: u64,
+    last_tick: u64,
+    cur_damage: u64,
+    last_damage: u64,
+) -> bool {
+    let since = now.wrapping_sub(last_tick);
+    if since < COMPOSE_MIN_INTERVAL_TICKS {
+        return false;
+    }
+    let idle = since >= COMPOSE_MAX_IDLE_TICKS;
+    cur_damage != last_damage || idle
+}
+
 use crate::wm::decorator;
 use crate::wm::window::{WindowHandle, WindowState, WindowStyle};
 
@@ -1053,6 +1171,11 @@ pub fn mark_dirty(x: u32, y: u32, w: u32, h: u32) {
     if let Some(comp) = guard.as_mut() {
         expand_dirty(comp, x, y, w, h);
     }
+    // `damage()` is a single lock-free atomic; calling it under any lock is
+    // sound (it never reacquires COMPOSITOR).  Drop the guard first anyway so
+    // every damage()-bumping accessor follows the same shape.
+    drop(guard);
+    damage();
 }
 
 /// Fill a solid rectangle in the backbuffer. `color` is 0x00RRGGBB.
@@ -1073,6 +1196,8 @@ pub fn screen_fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
         }
     }
     expand_dirty(comp, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+    drop(guard);
+    damage();
 }
 
 /// Blit a 32-bpp BGRA/XRGB pixel buffer into the backbuffer.
@@ -1103,6 +1228,8 @@ pub fn screen_blit_pixels(x: i32, y: i32, w: u32, h: u32, pixels: &[u8]) {
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     expand_dirty(comp, x0, y0, w, h);
+    drop(guard);
+    damage();
 }
 
 /// Draw ASCII text using the embedded 8×16 VGA bitmap font.
@@ -1134,6 +1261,8 @@ pub fn screen_draw_text(x: i32, y: i32, text: &str, fg: u32, bg: u32) {
     }
     let tw = (text.len() as i32 * 8).max(0) as u32;
     expand_dirty(comp, x.max(0) as u32, y.max(0) as u32, tw, 16);
+    drop(guard);
+    damage();
 }
 
 /// Returns `true` if the compositor has been initialised.
