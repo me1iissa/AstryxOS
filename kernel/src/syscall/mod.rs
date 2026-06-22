@@ -481,6 +481,32 @@ pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDe
     PENDING_SCM.lock().push(ScmBatch { receiver_id, byte_offset, fds });
 }
 
+/// Revoke a *just-queued* `SCM_RIGHTS` batch that turned out to carry no data
+/// byte — the `sendmsg(2)` push short-wrote to zero (the peer recv ring was
+/// full → EAGAIN), so per `unix(7)` / `recvmsg(2)` SCM_RIGHTS ("ancillary data
+/// is delivered with the message data it accompanies") no fds were actually
+/// committed and the caller must roll the queue back.
+///
+/// Removes the MOST-RECENTLY-queued matching `(receiver_id, byte_offset)` batch
+/// and returns its descriptors so the caller can balance the per-object
+/// reference / inode pin it took at enqueue time (via [`scm_drop_fds`]).
+/// Returns `None` if no matching batch is queued (it was already delivered or
+/// drained — see the safety note in the sendmsg path: a zero-byte send cannot
+/// have advanced the peer's read position past `byte_offset`, so the batch is
+/// guaranteed still present and un-delivered).
+///
+/// The "most recent" tie-break matters because the gecko IPC channel retries an
+/// EAGAIN'd frame with the SAME fds: without revoke each retry would push a
+/// fresh duplicate batch at the same offset; with revoke, every EAGAIN return
+/// leaves the queue exactly as it was, so a retry that finally succeeds commits
+/// exactly one batch.
+pub fn scm_revoke(receiver_id: u64, byte_offset: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
+    let mut q = PENDING_SCM.lock();
+    // Search from the back for the latest matching batch (the one we just pushed).
+    let pos = q.iter().rposition(|b| b.receiver_id == receiver_id && b.byte_offset == byte_offset)?;
+    Some(q.remove(pos).fds)
+}
+
 /// Returns true if `receiver_id` has at least one `SCM_RIGHTS` batch that is
 /// already deliverable — its bound `byte_offset` has been reached by the
 /// reader (`consumed >= byte_offset`).  This is the readiness predicate that
@@ -493,6 +519,19 @@ pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDe
 pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
     let q = PENDING_SCM.lock();
     q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+}
+
+/// Test-only: number of `SCM_RIGHTS` batches currently queued for `receiver_id`.
+/// Used by the regression test that pins the "commit fds only with their first
+/// byte" invariant — a `sendmsg(2)` that accepts zero data bytes (the recv ring
+/// was full → EAGAIN) must NOT leave an fd batch in this queue, and a retry of
+/// the same frame must not accumulate duplicates.  Per `unix(7)` /
+/// `recvmsg(2)` SCM_RIGHTS, ancillary fds are delivered with the message bytes
+/// they accompany; a zero-byte send carries no bytes and therefore no fds.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn scm_pending_count(receiver_id: u64) -> usize {
+    let q = PENDING_SCM.lock();
+    q.iter().filter(|b| b.receiver_id == receiver_id).count()
 }
 
 /// Lowest pending `SCM_RIGHTS` batch bound-offset for `receiver_id` that the
