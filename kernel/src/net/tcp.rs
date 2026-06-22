@@ -42,7 +42,7 @@ const TIMEWAIT_TICKS: u64 = 200;
 /// outbound or accepted connection allocates one entry; without an
 /// upper bound, long-soak workloads (a periodic host-side probe loop,
 /// a retry-storming client, or simply many short-lived control flows)
-/// accumulate Closed entries on the kernel heap until the 128 MiB heap
+/// accumulate Closed entries on the kernel heap until the heap
 /// guard at `HEAP_START + HEAP_SIZE` fires (idt.rs page-fault handler).
 ///
 /// 1024 is generous for the in-kernel TCP stack — the demo workload has
@@ -941,7 +941,7 @@ pub fn tcp_timer_tick() {
         // long-soak `TCP_CONNECTIONS` growth: every accepted/connected flow
         // eventually transitions to `Closed`, and without this sweep the
         // entries (plus their `Vec` send/recv buffers) accumulate on the
-        // kernel heap until the 128 MiB heap guard fires.  Driven from the
+        // kernel heap until the heap guard fires.  Driven from the
         // 100 Hz timer tick — adds one O(n) retain per second.
         gc_closed_in(&mut conns, now);
     }

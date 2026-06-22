@@ -27,8 +27,37 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Kernel heap size: 128 MiB (sufficient for 1920×1080 GUI with multiple window surfaces).
-pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
+/// Kernel heap size: 384 MiB.
+///
+/// Sized for heavy *windowed* rendering, where the kernel heap carries the
+/// X11 per-window/pixmap backing stores, the compositor back-buffer, per-frame
+/// transient `Vec`/`String` churn, and the IPC transfer buffers all at once —
+/// a working set that comfortably exceeded the previous 128 MiB on a
+/// multi-window page render and risked exhaustion mid-frame.
+///
+/// ## Why 384 MiB is safe for the physical layout
+///
+/// The heap is RAM-backed: [`compute_heap_layout`] reserves a contiguous
+/// physical range `[phys_start, phys_start + HEAP_SIZE)` and `vmm::init` calls
+/// `pmm::reserve_range` over it before any other frame is handed out.  Default
+/// builds pin `phys_start = 0x80_0000` (8 MiB), so the heap occupies physical
+/// `0x80_0000 .. 0x1880_0000` (8 .. 392 MiB).  This is bounded on three sides:
+///
+/// * **Below the 1 GiB assertion** — [`init`] asserts `phys_end <= 0x4000_0000`
+///   (1 GiB); 392 MiB clears it with room to spare, and the assertion remains
+///   a loud build-misconfiguration tripwire for any future kernel grown so
+///   large that the heap would reach MMIO territory.
+/// * **Inside the mapped window** — the bootloader maps physical 0..4 GiB into
+///   the higher-half (PML4[256]) with 2 MiB huge pages, so every heap VA is
+///   backed by a present translation. See Intel SDM Vol. 3A §4.3.
+/// * **Within guest RAM** — the smallest boot profile provisions 1 GiB of
+///   guest RAM (heavier render profiles get 2 GiB), leaving the PMM well over
+///   half its frames after the heap reservation.
+///
+/// Raising this constant grows only the runtime physical *reservation*; it does
+/// not change the linker image or BSS size, so it cannot move the kernel image
+/// relative to the BootInfo handoff page (a distinct, image-size concern).
+pub const HEAP_SIZE: usize = 384 * 1024 * 1024;
 
 /// Minimum heap base virtual address — phys 8 MiB in the higher-half map.
 ///
@@ -191,7 +220,7 @@ const BLOCK_ALIGN: usize = core::mem::align_of::<FreeBlock>();
 
 /// Generous upper bound on the number of distinct free blocks the walk may
 /// visit before we declare the list corrupt (cycle / runaway chase).  The heap
-/// is 128 MiB and the minimum block is `MIN_BLOCK_SIZE` (16 B); the true block
+/// is `HEAP_SIZE` and the minimum block is `MIN_BLOCK_SIZE` (16 B); the true block
 /// count can never exceed `HEAP_SIZE / MIN_BLOCK_SIZE`.  We add headroom and
 /// cap at a fixed constant so the bound is independent of fragmentation.
 const MAX_WALK_ITERS: usize = (HEAP_SIZE / MIN_BLOCK_SIZE) + 16;
@@ -795,6 +824,56 @@ pub fn stats() -> (usize, usize, usize) {
     (alloc.total_bytes, alloc.allocated_bytes, free)
 }
 
+/// Non-blocking snapshot of `(total_bytes, allocated_bytes)` for use from the
+/// allocation-error path, which must never block on the heap lock.
+///
+/// `GlobalAlloc::alloc` drops its `MutexGuard` before returning the null
+/// pointer that triggers the runtime's allocation-error handler, so the lock is
+/// normally free here.  We nonetheless use `try_lock` and return `None` on
+/// contention (e.g. a second CPU mid-allocation) rather than risk a spin in the
+/// fault path.  Mirrors the bugcheck fault-immunity discipline in
+/// `crate::ke::bugcheck` (no blocking locks once the system is already failing).
+fn stats_nonblocking() -> Option<(usize, usize)> {
+    ALLOCATOR
+        .0
+        .try_lock()
+        .map(|alloc| (alloc.total_bytes, alloc.allocated_bytes))
+}
+
+/// Rust allocation-error handler.
+///
+/// The kernel is built with `panic = "abort"`, so without an explicit handler a
+/// failed kernel allocation (`alloc` returning null → the runtime invokes the
+/// allocation-error handler) would become a silent, undiagnosable whole-machine
+/// abort — fatal mid-render with no signal on the wire.  Routing it through
+/// [`crate::ke::ke_bugcheck`] with [`BUGCHECK_HEAP_EXHAUSTED`] turns heap
+/// exhaustion into a structured, greppable bugcheck banner that names the
+/// failed [`Layout`] (size + alignment) and the at-failure heap occupancy.
+///
+/// Registered via the `#[alloc_error_handler]` attribute (gated by
+/// `#![feature(alloc_error_handler)]` at the crate root).  The attribute is the
+/// supported interception point: it emits the `__rg_oom` symbol that the
+/// compiler-generated `__rust_alloc_error_handler` dispatcher forwards to in
+/// place of the default panicking handler.  The handler takes the failing
+/// [`core::alloc::Layout`] by value and diverges; see the Rust `core::alloc`
+/// allocation-error contract.
+///
+/// This handler is itself fault-immune: it does not allocate, and it reads the
+/// heap occupancy through a non-blocking `try_lock` ([`stats_nonblocking`]) so
+/// it can never deadlock on the very lock whose allocator just failed.
+#[alloc_error_handler]
+fn kernel_alloc_error_handler(layout: Layout) -> ! {
+    // Best-effort occupancy snapshot (sentinel u64::MAX if the lock is held).
+    let (total, allocated) = stats_nonblocking().unwrap_or((usize::MAX, usize::MAX));
+    crate::ke::bugcheck::ke_bugcheck(
+        crate::ke::bugcheck::BUGCHECK_HEAP_EXHAUSTED,
+        layout.size() as u64,
+        layout.align() as u64,
+        total as u64,
+        allocated as u64,
+    );
+}
+
 /// Initialize the kernel heap.
 ///
 /// Computes the heap base from the linker's `__kernel_end` symbol so the
@@ -834,7 +913,7 @@ pub fn init() {
 /// # Guard layout
 /// ```
 /// heap_guard_below_va()         (not-present PTE)  ← underflow trap
-/// heap_start()                  (heap, 128 MiB)
+/// heap_start()                  (heap, HEAP_SIZE)
 /// heap_start() + HEAP_SIZE  (= heap_guard_above_va(), not-present PTE) ← overflow trap
 /// ```
 ///

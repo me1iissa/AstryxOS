@@ -1256,6 +1256,9 @@ pub fn run() -> ! {
     total += 1;
     if test_heap_guard_pte() { passed += 1; }
 
+    total += 1;
+    if test_heap_region_and_oom_bugcheck() { passed += 1; }
+
     // ── Test 106: po::shutdown driver-stop sweep (dry-run) ────────────────
 
     total += 1;
@@ -26586,6 +26589,87 @@ fn test_heap_guard_pte() -> bool {
         below_frame, above_frame);
 
     test_pass!("Heap guard pages — PTE present-bit + frame-reservation verification");
+    true
+}
+
+/// Heap-region sizing math + the HEAP_EXHAUSTED bugcheck wiring.
+///
+/// Guards the 384 MiB heap raise and the allocation-error handler that routes
+/// kernel OOM to a `HEAP_EXHAUSTED` bugcheck banner:
+///
+/// 1. `HEAP_SIZE` is exactly 384 MiB.
+/// 2. The computed physical layout is self-consistent
+///    (`phys_end == phys_start + HEAP_SIZE`) and lands in a valid free region:
+///    base at or above the historical 8 MiB floor, `phys_end <= 1 GiB` (the
+///    `heap::init` assertion bound — the heap stays inside the bootloader's
+///    0..4 GiB higher-half huge-page map and never reaches MMIO territory).
+/// 3. The VA base equals `phys_start + PHYS_OFF` (higher-half identity offset).
+/// 4. `BUGCHECK_HEAP_EXHAUSTED` resolves to the `"HEAP_EXHAUSTED"` name, so the
+///    bugcheck banner labels a real OOM rather than `UNKNOWN_BUGCHECK`.
+///
+/// This is a pure-arithmetic + table-lookup test — it never actually exhausts
+/// the heap (that would abort the whole run), it only certifies that an
+/// exhaustion *would* be diagnosable and that the region math is sound.
+fn test_heap_region_and_oom_bugcheck() -> bool {
+    test_header!("Heap region math (384 MiB) + HEAP_EXHAUSTED bugcheck wiring");
+
+    use crate::mm::heap::{compute_heap_layout, HEAP_SIZE};
+    use crate::ke::bugcheck::{bugcheck_name, BUGCHECK_HEAP_EXHAUSTED};
+
+    // 1. HEAP_SIZE is the intended 384 MiB.
+    const EXPECT_SIZE: usize = 384 * 1024 * 1024;
+    if HEAP_SIZE != EXPECT_SIZE {
+        test_fail!("heap_region",
+            "HEAP_SIZE={:#x} ({} MiB) — expected {:#x} (384 MiB)",
+            HEAP_SIZE, HEAP_SIZE / (1024 * 1024), EXPECT_SIZE);
+        return false;
+    }
+    test_println!("  HEAP_SIZE = {} MiB ✓", HEAP_SIZE / (1024 * 1024));
+
+    // 2. Layout self-consistency + free-region/bound checks.
+    const PHYS_OFF_T: u64 = 0xFFFF_8000_0000_0000;
+    const ONE_GIB: u64 = 0x4000_0000;
+    const FLOOR_8MIB: u64 = 0x80_0000;
+    let (va_start, phys_start, phys_end) = compute_heap_layout();
+
+    if phys_end != phys_start + HEAP_SIZE as u64 {
+        test_fail!("heap_region",
+            "phys_end={:#x} != phys_start({:#x}) + HEAP_SIZE({:#x})",
+            phys_end, phys_start, HEAP_SIZE);
+        return false;
+    }
+    if phys_start < FLOOR_8MIB {
+        test_fail!("heap_region",
+            "phys_start={:#x} below the 8 MiB floor {:#x}", phys_start, FLOOR_8MIB);
+        return false;
+    }
+    if phys_end > ONE_GIB {
+        test_fail!("heap_region",
+            "phys_end={:#x} exceeds 1 GiB ({:#x}) — would trip heap::init assertion \
+             and/or leave the bootloader's mapped window",
+            phys_end, ONE_GIB);
+        return false;
+    }
+    if va_start as u64 != phys_start + PHYS_OFF_T {
+        test_fail!("heap_region",
+            "va_start={:#x} != phys_start({:#x}) + PHYS_OFF({:#x})",
+            va_start, phys_start, PHYS_OFF_T);
+        return false;
+    }
+    test_println!("  layout phys=[{:#x}..{:#x}) va={:#x} — 8MiB<=base, phys_end<=1GiB ✓",
+        phys_start, phys_end, va_start);
+
+    // 3. The OOM bugcheck code is wired into the name table (not UNKNOWN).
+    let name = bugcheck_name(BUGCHECK_HEAP_EXHAUSTED);
+    if name != "HEAP_EXHAUSTED" {
+        test_fail!("heap_region",
+            "bugcheck_name({:#x}) = {:?} — expected \"HEAP_EXHAUSTED\"",
+            BUGCHECK_HEAP_EXHAUSTED, name);
+        return false;
+    }
+    test_println!("  bugcheck_name({:#x}) = {:?} ✓", BUGCHECK_HEAP_EXHAUSTED, name);
+
+    test_pass!("Heap region math + HEAP_EXHAUSTED bugcheck wiring");
     true
 }
 
