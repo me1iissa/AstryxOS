@@ -573,6 +573,28 @@ pub fn request_reschedule() {
     }
 }
 
+/// Non-consuming peek at this CPU's pending-preemption flag.
+///
+/// The timer ISR sets `NEED_RESCHEDULE` at each quantum boundary
+/// (`timer_tick_schedule`), but a long-running Ring-0 path is never preempted
+/// — the timer stub calls `check_reschedule()` only when it interrupted user
+/// mode (see the kernel-mode skip in the timer ISR).  A cooperative kernel loop
+/// that wants to be a good scheduling citizen can poll this and voluntarily
+/// `schedule()` when it returns `true`, the AstryxOS analogue of Linux's
+/// `cond_resched()` / `need_resched()` (kernel/sched/core.c): yield the CPU at a
+/// safe point when the scheduler has decided this thread's quantum is up, rather
+/// than monopolising the core across the whole operation.  Unlike
+/// `check_reschedule`, this does NOT clear the flag (the eventual `schedule()`
+/// clears it) and does NOT itself switch — it is a cheap relaxed read.
+#[inline]
+pub fn reschedule_pending() -> bool {
+    if !is_active() {
+        return false;
+    }
+    let cpu = cpu_index();
+    cpu < MAX_CPUS && NEED_RESCHEDULE[cpu].load(Ordering::Relaxed)
+}
+
 /// Check if a reschedule is pending (called after returning from interrupt).
 ///
 /// Returns immediately if the scheduler is not yet active — this avoids

@@ -1972,13 +1972,31 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
             return Err(BlockError::IoError);
         }
 
-        // Only yield for genuinely slow I/O (wait already > YIELD_AFTER_TICKS),
-        // and only when a real peer can take the core — never `schedule()` into
-        // the empty-run-queue hlt that would tick-stall the completion.  In the
-        // common early-slow window we keep polling, because yielding would cost
-        // a ~45 ms run-queue re-selection (see the doc comment) — far more than
-        // the few extra microseconds of polling.
-        if now >= yield_after && crate::sched::ready_depth() > 0 {
+        // Decide whether to yield the core this iteration.  Two reasons:
+        //
+        //  (a) cond_resched: the scheduler has decided our quantum is up
+        //      (`reschedule_pending()` — the timer ISR set NEED_RESCHEDULE at a
+        //      quantum boundary).  Ring-0 code is otherwise NOT preempted (the
+        //      timer stub only reschedules when it interrupts user mode), so a
+        //      tight disk poll would monopolise the core across the whole
+        //      request — back-to-back during a page-fault storm that is seconds
+        //      of non-yielding spin, starving the cooperatively-scheduled X11 /
+        //      compositor / network-poll BSP thread (the windowed-Firefox
+        //      content-composite stall).  Honouring the pending preemption here
+        //      makes this loop a good scheduling citizen, the AstryxOS analogue
+        //      of Linux's cond_resched() in long kernel paths (kernel/sched).
+        //      Bounded to at most once per quantum (TIME_SLICE ticks), so the
+        //      yield cost is amortised and the busy-poll still catches sub-
+        //      quantum completions without a switch.
+        //
+        //  (b) genuinely slow I/O: the wait already exceeds YIELD_AFTER_TICKS,
+        //      where the device latency dominates the re-selection cost.
+        //
+        // In both cases yield only when a real peer can take the core — never
+        // `schedule()` into the empty-run-queue hlt that would tick-stall the
+        // completion until the next 100 Hz tick.
+        let cond_resched = crate::sched::reschedule_pending();
+        if (cond_resched || now >= yield_after) && crate::sched::ready_depth() > 0 {
             crate::sched::schedule();
             yields = yields.saturating_add(1);
         } else {
