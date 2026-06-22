@@ -1179,35 +1179,58 @@ impl VmSpace {
         // storm.  Searching top-down from the fixed ceiling reuses freed gaps,
         // matching the top-down unmapped-area search every POSIX mmap relies on
         // (man 2 mmap / man 2 mremap MREMAP_MAYMOVE).
-        let mut candidate = MMAP_BASE;
+        // Lowest legal mmap base (page 0 is reserved as the NULL guard page).
+        const FLOOR: u64 = 0x1000;
 
-        // Walk down, jumping past each overlapping VMA.  Bound the iteration by
-        // the VMA count (+slack) rather than a fixed 1000: each step skips at
-        // least one VMA, so this visits every mapping at most once and never
-        // gives up spuriously while a usable gap still exists (the old 1000 cap
-        // could ENOMEM a process holding >1000 mappings — common for a browser).
-        let max_steps = self.areas.len() + 8;
-        for _ in 0..max_steps {
-            if candidate < size {
-                return None; // Ran out of address space
+        // Single descending sweep of the address-sorted VMA list — O(n), not the
+        // former O(n²) (a per-candidate `areas.iter().any(overlaps)` re-scan plus
+        // a per-step `areas.iter().rev().find(...)`).  Under a browser's mmap
+        // churn the VMA list grows into the thousands; the quadratic walk then
+        // ran for millions of `overlaps()` calls per mmap, and because mmap runs
+        // non-preemptibly in Ring 0 (the timer ISR does not preempt kernel mode)
+        // a single such call could monopolise the CPU for seconds, starving the
+        // compositor / poll threads and wedging interactive progress.  The
+        // sorted list lets us find the highest free gap in one pass.
+        //
+        // `self.areas` is maintained sorted ascending by `base` (see insert_vma),
+        // so iterating in reverse visits VMAs from highest to lowest.  `ceiling`
+        // tracks the top of the currently-considered free window, descending from
+        // the fixed MMAP_BASE ceiling past each mapping.  The first (highest) gap
+        // of at least `size` wins — the standard top-down unmapped-area search
+        // (man 2 mmap kernel-chosen VA semantics; matches the e1aa90d1 intent of
+        // reusing space freed by munmap, which sits above the running hint).
+        //
+        // VMAs at or above MMAP_BASE (e.g. thread stacks in the dedicated stack
+        // ASLR window, which starts at STACK_ASLR_MIN == MMAP_BASE) lie outside
+        // the search window and are simply skipped — `ceiling` is already capped
+        // at MMAP_BASE so they never constrain a candidate.
+        let mut ceiling = MMAP_BASE;
+        for vma in self.areas.iter().rev() {
+            // Skip mappings entirely above the ceiling (stack-window VMAs, or any
+            // VMA already above the descended ceiling): they cannot bound a gap
+            // inside [FLOOR, ceiling).
+            if vma.base >= ceiling {
+                continue;
             }
-
-            let base = candidate - size;
-            let overlaps = self.areas.iter().any(|vma| vma.overlaps(base, size));
-            if !overlaps && base >= 0x1000 {
-                // Found a free spot
-                return Some(base);
+            // Gap between this VMA's top and the current ceiling.  Clamp the
+            // VMA end into the window so a mapping that straddles MMAP_BASE does
+            // not produce a phantom gap above the ceiling.
+            let gap_top = ceiling;
+            let gap_bot = vma.end().min(ceiling).max(FLOOR);
+            if gap_top >= gap_bot && gap_top - gap_bot >= size {
+                // Highest fitting gap: place the allocation at its top.
+                return Some(gap_top - size);
             }
-
-            // Move candidate below the overlapping VMA
-            if let Some(vma) = self.areas.iter().rev().find(|v| v.base < candidate && v.end() > base) {
-                candidate = vma.base;
-            } else {
-                candidate -= size;
-            }
+            // Descend the ceiling below this VMA and continue.
+            ceiling = vma.base.min(ceiling);
         }
 
-        None
+        // Final gap: everything below the lowest VMA, down to the NULL guard.
+        if ceiling > FLOOR && ceiling - FLOOR >= size {
+            return Some(ceiling - size);
+        }
+
+        None // Ran out of address space
     }
 
     /// Adjust the program break (brk syscall).

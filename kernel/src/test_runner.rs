@@ -847,6 +847,14 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_map_event_sequence() { passed += 1; }
 
+    // ── Test 308: VmSpace::find_free_range top-down O(n) gap search ──────────
+    // Highest fitting gap wins; munmap'd gaps are reused; correct exhaustion;
+    // a large VMA population (browser-scale) is handled by a single sweep, not
+    // the former O(n²) walk that wedged mmap in non-preemptible Ring 0.
+
+    total += 1;
+    if test_find_free_range() { passed += 1; }
+
     // ── X11 server — TranslateCoordinates (opcode 40) ────────────────────────
 
     total += 1;
@@ -19212,6 +19220,165 @@ fn test_x11_map_event_sequence() -> bool {
 
     crate::net::unix::close(client);
     test_pass!("X11 map event sequence (MapNotify→Expose)");
+    true
+}
+
+// ── Test 308: VmSpace::find_free_range top-down O(n) gap search ───────────────
+//
+// `find_free_range` chooses a kernel-selected VA for mmap(NULL,...).  It must:
+//   (1) pick the HIGHEST free gap of at least `size` (top-down search, the
+//       standard POSIX unmapped-area policy — man 2 mmap kernel-chosen VA),
+//   (2) REUSE a gap freed by munmap even when it sits above lower mappings,
+//   (3) return None on genuine exhaustion,
+//   (4) do all of this in a single O(n) sweep of the address-sorted VMA list —
+//       NOT the former O(n²) per-candidate re-scan, which under a browser's
+//       multi-thousand-VMA churn ran for millions of overlap checks per call
+//       and, because mmap is non-preemptible in Ring 0, monopolised the CPU and
+//       starved the compositor/poll threads (the windowed-Firefox render wedge).
+//
+// The list is constructed already sorted ascending by base (insert_vma's
+// invariant), so the test drives `find_free_range` directly on hand-built
+// `areas` rather than issuing real mmaps.
+fn test_find_free_range() -> bool {
+    test_header!("[VMA] find_free_range top-down O(n) gap search (Test 308)");
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                         PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+
+    // The fixed mmap ceiling find_free_range descends from (mirrors the private
+    // `MMAP_BASE` in mm/vma.rs).  Stacks live at/above this; the mmap region is
+    // below it.
+    const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+    const PAGE: u64 = 0x1000;
+
+    // Helper: build a VmSpace from a pre-sorted list of (base, length) anon VMAs.
+    fn space_with(areas: alloc::vec::Vec<(u64, u64)>) -> VmSpace {
+        let vmas = areas.into_iter().map(|(base, length)| VmArea {
+            base, length,
+            prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous, name: "[mmap-anon]",
+        }).collect();
+        VmSpace {
+            cr3: 0,
+            mm_sem: crate::mm::vma::make_mm_sem_for_test(),
+            generation: crate::mm::vma::make_generation_for_test(),
+            areas: vmas,
+            mmap_hint: MMAP_BASE, stack_aslr_base: 0, brk: 0, brk_start: 0,
+        }
+    }
+
+    // (1) Empty space → allocation lands flush against the ceiling.
+    {
+        let sp = space_with(alloc::vec![]);
+        let got = sp.find_free_range(0x10 * PAGE);
+        if got != Some(MMAP_BASE - 0x10 * PAGE) {
+            test_fail!("[VMA] find_free_range",
+                "empty: expected {:#x}, got {:?}", MMAP_BASE - 0x10 * PAGE, got);
+            return false;
+        }
+        test_println!("  [1] empty space → {:#x} (flush against ceiling) ✓",
+            MMAP_BASE - 0x10 * PAGE);
+    }
+
+    // (2) One mapping flush against the ceiling → the next allocation lands
+    //     directly below it (top-down, no wasted gap).
+    {
+        let top = MMAP_BASE - 0x20 * PAGE; // an existing 0x20-page mapping at top
+        let sp = space_with(alloc::vec![(top, 0x20 * PAGE)]);
+        let got = sp.find_free_range(0x8 * PAGE);
+        if got != Some(top - 0x8 * PAGE) {
+            test_fail!("[VMA] find_free_range",
+                "below-top: expected {:#x}, got {:?}", top - 0x8 * PAGE, got);
+            return false;
+        }
+        test_println!("  [2] mapping at top → next below it at {:#x} ✓",
+            top - 0x8 * PAGE);
+    }
+
+    // (3) Gap REUSE: a hole punched between two mappings (the munmap case) is
+    //     reused when the request fits — and the HIGHEST fitting gap wins.
+    //     Layout (sorted ascending):
+    //       low   [0x1000_0000 .. +0x10 pg]
+    //       mid   [0x2000_0000 .. +0x10 pg]   gap above mid up to MMAP_BASE is huge
+    //     A request larger than the (mid, MMAP_BASE) span is impossible, but a
+    //     small one must take the top gap (above mid), not the (low, mid) hole.
+    {
+        let low = 0x1000_0000u64;
+        let mid = 0x2000_0000u64;
+        let sp = space_with(alloc::vec![(low, 0x10 * PAGE), (mid, 0x10 * PAGE)]);
+        // Small request: highest gap is above `mid`, flush against ceiling.
+        let got = sp.find_free_range(0x4 * PAGE);
+        if got != Some(MMAP_BASE - 0x4 * PAGE) {
+            test_fail!("[VMA] find_free_range",
+                "highest-gap: expected {:#x}, got {:?}", MMAP_BASE - 0x4 * PAGE, got);
+            return false;
+        }
+        test_println!("  [3] highest fitting gap wins (above mid) → {:#x} ✓",
+            MMAP_BASE - 0x4 * PAGE);
+    }
+
+    // (4) Reuse a hole that ONLY fits below a high mapping that spans the whole
+    //     top of the region — i.e. force the search past the top mapping into a
+    //     lower hole.  high mapping covers [MMAP_BASE-0x100pg .. MMAP_BASE);
+    //     directly below it is a free hole of exactly the requested size before
+    //     the next mapping.
+    {
+        let high_len = 0x100 * PAGE;
+        let high = MMAP_BASE - high_len;            // flush to ceiling
+        let req = 0x8 * PAGE;
+        let below = high - req;                      // the hole we expect to get
+        let next = below - 0x10 * PAGE;              // a mapping just under the hole
+        let sp = space_with(alloc::vec![(next, 0x10 * PAGE), (high, high_len)]);
+        let got = sp.find_free_range(req);
+        if got != Some(below) {
+            test_fail!("[VMA] find_free_range",
+                "below-high: expected {:#x}, got {:?}", below, got);
+            return false;
+        }
+        test_println!("  [4] hole below a ceiling-spanning mapping reused → {:#x} ✓",
+            below);
+    }
+
+    // (5) Exhaustion: a request larger than any available gap → None.
+    {
+        // Single mapping leaving only a tiny top gap and a tiny bottom gap.
+        let m = 0x4000u64;                           // base near the floor
+        let sp = space_with(alloc::vec![(m, MMAP_BASE - m - PAGE)]);
+        // Only PAGE of free space exists at the very top; ask for more.
+        let got = sp.find_free_range(0x10 * PAGE);
+        if got.is_some() {
+            test_fail!("[VMA] find_free_range",
+                "exhaustion: expected None, got {:?}", got);
+            return false;
+        }
+        test_println!("  [5] over-large request → None (exhaustion) ✓");
+    }
+
+    // (6) Scale: a browser-scale VMA population (1000 small mappings) must be
+    //     handled by the single O(n) sweep — and still pick the highest gap.
+    //     We pack mappings densely from a low base upward, leaving the entire
+    //     span above them free, so the allocation lands flush against the
+    //     ceiling.  (The old O(n²) walk would do ~1000×1000 overlap checks; the
+    //     point of this case is correctness at scale — the wedge it prevents is
+    //     measured by the live FF render, not a wall-clock assertion here.)
+    {
+        let mut areas = alloc::vec::Vec::with_capacity(1000);
+        let mut b = 0x1_0000_0000u64;
+        for _ in 0..1000 {
+            areas.push((b, 0x2 * PAGE));
+            b += 0x4 * PAGE; // 2-page mapping + 2-page hole
+        }
+        let sp = space_with(areas);
+        let got = sp.find_free_range(0x20 * PAGE);
+        if got != Some(MMAP_BASE - 0x20 * PAGE) {
+            test_fail!("[VMA] find_free_range",
+                "scale: expected {:#x}, got {:?}", MMAP_BASE - 0x20 * PAGE, got);
+            return false;
+        }
+        test_println!("  [6] 1000-VMA population, highest gap → {:#x} ✓",
+            MMAP_BASE - 0x20 * PAGE);
+    }
+
+    test_pass!("[VMA] find_free_range top-down O(n) gap search (Test 308)");
     true
 }
 
