@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use spin::Mutex;
 use super::Ipv4Address;
@@ -52,6 +52,26 @@ const TIMEWAIT_TICKS: u64 = 200;
 /// is conventional, not a correctness lever.
 const MAX_TCP_CONNECTIONS: usize = 1024;
 
+/// Maximum bytes buffered in the per-connection out-of-order reassembly
+/// queue (RFC 9293 §3.10.7.4).  Sized to the advertised receive window
+/// (we advertise 65535) so a single full window of reordered/gapped data
+/// can be held pending the missing segment.  OOO buffering is a "MAY" per
+/// the RFC, so exceeding this cap simply drops the surplus segment (the
+/// peer retransmits it) — never a correctness violation.
+const OOO_MAX_BYTES: usize = 65535;
+
+/// Maximum number of distinct out-of-order segments retained.  Bounds the
+/// per-segment insert/splice cost and caps memory amplification from many
+/// tiny reordered segments.  A real multi-stream HTTP(S) load reorders a
+/// handful of segments at a time; 64 holes is generous.
+const OOO_MAX_SEGS: usize = 64;
+
+/// Maximum SACK blocks emitted in one ACK (RFC 2018 §3).  TCP option space
+/// is 40 bytes; with the 2-NOP alignment prefix a SACK option of n blocks
+/// occupies `4 + 8n` bytes, so `4 + 8*4 = 36 ≤ 40` → at most 4 blocks fit
+/// when no other options (e.g. timestamps) are present.
+const SACK_MAX_BLOCKS: usize = 4;
+
 /// Grace period before a `Closed` connection is eligible for GC.
 ///
 /// Connections enter `Closed` either via TIME_WAIT expiry, a peer RST,
@@ -70,6 +90,31 @@ struct RetransmitEntry {
     sent_ticks: u64,
     rto:        u32,
     retries:    u8,
+}
+
+/// One out-of-order segment buffered past `recv_next`, awaiting the segment
+/// that fills the gap below it (RFC 9293 §3.10.7.4).  Stored in
+/// `TcpConnection::ooo_queue`, keyed by the segment's **window-relative
+/// offset** `seq.wrapping_sub(recv_next)` rather than the raw sequence
+/// number: every buffered segment lies within the (≤ 64 KiB) receive window
+/// of `recv_next`, so the offset is a small value whose plain numeric
+/// ordering is correct across the 32-bit sequence-number wrap (a raw-`u32`
+/// key would mis-sort at the 0xFFFFFFFF→0 boundary — RFC 1982 arithmetic).
+/// The map is rebased on every `recv_next` advance so keys never go stale.
+struct OooSeg {
+    /// Absolute starting sequence number of this segment's first data byte.
+    seq:  u32,
+    /// Payload bytes.  After overlap-trimming, `seq + data.len()` is the
+    /// segment's half-open end edge.
+    data: Vec<u8>,
+    /// True if this segment carried a FIN occupying sequence number
+    /// `seq + data.len()`.  The FIN is latent until `recv_next` reaches it.
+    fin:  bool,
+}
+
+impl OooSeg {
+    #[inline]
+    fn end(&self) -> u32 { self.seq.wrapping_add(self.data.len() as u32) }
 }
 
 /// TCP connection state (per RFC 793).
@@ -117,6 +162,26 @@ pub struct TcpConnection {
 
     // Flow control
     pub peer_window: u32,  // peer's advertised window
+
+    // Out-of-order reassembly (RFC 9293 §3.10.7.4)
+    /// Segments received in-window but ahead of `recv_next` (a sequence
+    /// hole below them).  Keyed by window-relative offset from `recv_next`
+    /// (see [`OooSeg`]); spliced into `recv_buffer` when the gap fills.
+    ooo_queue: BTreeMap<u32, OooSeg>,
+    /// Total payload bytes currently held in `ooo_queue`, bounded by
+    /// [`OOO_MAX_BYTES`].
+    ooo_bytes: usize,
+
+    // Selective acknowledgement (RFC 2018)
+    /// True once SACK-permitted was negotiated by **both** peers (we offer
+    /// it in our SYN/SYN-ACK; it is enabled only if the peer also offered).
+    /// Gates whether outbound ACKs carry SACK option blocks.
+    sack_permitted: bool,
+    /// Sequence number at which a latent FIN sits, if a FIN-bearing segment
+    /// arrived out of order (its data is in `ooo_queue`).  The FIN is
+    /// honoured only when `recv_next` reaches this value.  `None` = no
+    /// pending out-of-order FIN.
+    ooo_fin_seq: Option<u32>,
 
     // Socket options
     pub reuseaddr: bool,
@@ -209,6 +274,14 @@ pub fn connection_count() -> Option<usize> {
 fn mark_closed(conn: &mut TcpConnection) {
     conn.state = TcpState::Closed;
     conn.closed_tick = crate::arch::x86_64::irq::get_ticks().max(1);
+    // Release any buffered out-of-order data promptly on close (RST, abort,
+    // or LAST-ACK→CLOSED).  The TCB is GC'd later, but freeing the OOO queue
+    // now bounds heap held by a Closed-but-not-yet-reaped entry.
+    if !conn.ooo_queue.is_empty() {
+        conn.ooo_queue.clear();
+        conn.ooo_bytes = 0;
+    }
+    conn.ooo_fin_seq = None;
 }
 
 /// Drop entries whose Closed dwell exceeds `CLOSED_GC_GRACE_TICKS`.
@@ -261,28 +334,94 @@ fn tcp_checksum(src: Ipv4Address, dst: Ipv4Address, tcp: &[u8]) -> u16 {
     super::ipv4::checksum(&buf)
 }
 
-/// Build a TCP segment (header + payload), checksum filled.
+/// Build a TCP segment with explicit options (header + options + payload),
+/// checksum filled.  `options` MUST already be padded to a 4-byte boundary
+/// (RFC 9293 §3.1 — the data-offset field counts whole 32-bit words); the
+/// data-offset field is computed as `(20 + options.len()) / 4`.
+fn build_segment_opts(
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+    src_ip: Ipv4Address, dst_ip: Ipv4Address,
+    options: &[u8], payload: &[u8],
+) -> Vec<u8> {
+    debug_assert!(options.len() % 4 == 0, "TCP options must be 4-byte padded");
+    let hlen_words = (20 + options.len()) / 4;
+    let mut s = Vec::with_capacity(20 + options.len() + payload.len());
+    s.extend_from_slice(&src_port.to_be_bytes());
+    s.extend_from_slice(&dst_port.to_be_bytes());
+    s.extend_from_slice(&seq.to_be_bytes());
+    s.extend_from_slice(&ack.to_be_bytes());
+    s.push(((hlen_words as u8) & 0x0F) << 4); // data offset (32-bit words)
+    s.push(flags);
+    s.extend_from_slice(&65535u16.to_be_bytes()); // advertise full window
+    s.push(0); s.push(0);                    // checksum placeholder
+    s.push(0); s.push(0);                    // urgent pointer
+    s.extend_from_slice(options);
+    s.extend_from_slice(payload);
+    let ck = tcp_checksum(src_ip, dst_ip, &s);
+    s[16] = (ck >> 8) as u8;
+    s[17] = (ck & 0xFF) as u8;
+    s
+}
+
+/// Build a plain TCP segment (no options), checksum filled.
+#[inline]
 fn build_segment(
     src_port: u16, dst_port: u16,
     seq: u32, ack: u32, flags: u8,
     src_ip: Ipv4Address, dst_ip: Ipv4Address,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut s = Vec::with_capacity(20 + payload.len());
-    s.extend_from_slice(&src_port.to_be_bytes());
-    s.extend_from_slice(&dst_port.to_be_bytes());
-    s.extend_from_slice(&seq.to_be_bytes());
-    s.extend_from_slice(&ack.to_be_bytes());
-    s.push(5 << 4);                          // data offset = 5 dwords
-    s.push(flags);
-    s.extend_from_slice(&65535u16.to_be_bytes()); // advertise full window
-    s.push(0); s.push(0);                    // checksum placeholder
-    s.push(0); s.push(0);                    // urgent pointer
-    s.extend_from_slice(payload);
-    let ck = tcp_checksum(src_ip, dst_ip, &s);
-    s[16] = (ck >> 8) as u8;
-    s[17] = (ck & 0xFF) as u8;
-    s
+    build_segment_opts(src_port, dst_port, seq, ack, flags, src_ip, dst_ip, &[], payload)
+}
+
+/// Encode the receiver's currently-buffered out-of-order ranges as a TCP
+/// SACK option (RFC 2018 §3), prefixed by two NOPs for 4-byte alignment so
+/// each 32-bit block edge lands on a word boundary (RFC 2018 examples,
+/// RFC 9293 §3.1).  Returns an empty vec when there are no blocks (caller
+/// then sends a plain ACK).  Block order is most-recent-first (RFC 2018 §4):
+/// the first block reports the most recently arrived range.
+fn build_sack_option(blocks: &[(u32, u32)]) -> Vec<u8> {
+    if blocks.is_empty() { return Vec::new(); }
+    let n = blocks.len().min(SACK_MAX_BLOCKS);
+    // NOP, NOP, kind=5, len = 2 + 8n  → total 4 + 8n bytes (already 4-byte aligned).
+    let mut o = Vec::with_capacity(4 + 8 * n);
+    o.push(OPT_NOP);
+    o.push(OPT_NOP);
+    o.push(OPT_SACK);
+    o.push((2 + 8 * n) as u8);
+    for &(left, right) in &blocks[..n] {
+        o.extend_from_slice(&left.to_be_bytes());
+        o.extend_from_slice(&right.to_be_bytes());
+    }
+    o
+}
+
+/// Build a SYN/SYN-ACK segment, optionally carrying the SACK-permitted
+/// option (RFC 2018 §2: kind=4, len=2), 4-byte aligned with two leading
+/// NOPs.  `sack` selects whether to advertise SACK-permitted.
+fn build_syn_segment(
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+    src_ip: Ipv4Address, dst_ip: Ipv4Address,
+    sack: bool,
+) -> Vec<u8> {
+    let opts: &[u8] = if sack {
+        &[OPT_NOP, OPT_NOP, OPT_SACK_PERMITTED, 2]
+    } else {
+        &[]
+    };
+    build_segment_opts(src_port, dst_port, seq, ack, flags, src_ip, dst_ip, opts, &[])
+}
+
+/// Send a SYN or SYN-ACK, advertising SACK-permitted iff `sack`.
+fn send_syn_options(
+    src_ip: Ipv4Address, src_port: u16,
+    dst_ip: Ipv4Address, dst_port: u16,
+    seq: u32, ack: u32, flags: u8, sack: bool,
+) {
+    let s = build_syn_segment(src_port, dst_port, seq, ack, flags, src_ip, dst_ip, sack);
+    super::ipv4::send_ipv4(dst_ip, super::ipv4::PROTO_TCP, &s);
 }
 
 /// Send a flag-only TCP segment.
@@ -307,6 +446,284 @@ fn seq_le(a: u32, b: u32) -> bool {
 #[inline]
 fn seq_gt(a: u32, b: u32) -> bool {
     (b.wrapping_sub(a) as i32) < 0
+}
+
+/// `a < b` in sequence space.
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+/// `a >= b` in sequence space.
+#[inline]
+fn seq_ge(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) >= 0
+}
+
+// ── Out-of-order reassembly (RFC 9293 §3.10.7.4) ────────────────────────────────
+
+/// Insert one in-window out-of-order segment `[seq, seq+data.len())` into
+/// `conn.ooo_queue`, storing only the bytes not already buffered so the queue
+/// holds disjoint `[start,end)` ranges (no byte stored twice, no new byte
+/// lost — RFC 9293 §3.10.7.4 keeps received out-of-order data).
+///
+/// A single segment can bridge several existing holes, so the newcomer's
+/// coverage minus the union of residents may be *multiple* disjoint
+/// fragments; each surviving fragment is inserted separately.  Resident
+/// bytes are never displaced.  The caller must already have verified the
+/// segment is strictly above `recv_next` (a real hole) and at least partially
+/// within the receive window.  `fin` records a FIN that occupies
+/// `seq+data.len()`; it is latent until `recv_next` reaches it.  Returns true
+/// if any new bytes were buffered.
+fn ooo_insert(conn: &mut TcpConnection, seq: u32, data: Vec<u8>, fin: bool) -> bool {
+    let end = seq.wrapping_add(data.len() as u32);
+    let fin_seq = end; // sequence the FIN (if any) occupies
+
+    // Sequence-ordered snapshot of resident ranges (offset-keyed map already
+    // orders correctly, but copy so we can mutate the queue while iterating).
+    let residents: Vec<(u32, u32)> = conn.ooo_queue.values()
+        .map(|s| (s.seq, s.end())).collect();
+
+    // Walk `[seq, end)` left to right, emitting each maximal sub-range not
+    // covered by a resident.  Residents are in ascending order.
+    let mut cursor = seq;
+    let mut frags: Vec<(u32, u32)> = Vec::new(); // (start, end) of new bytes
+    for &(s1, e1) in &residents {
+        if seq_ge(cursor, end) { break; }
+        if seq_le(e1, cursor) { continue; }      // resident wholly behind cursor
+        if seq_ge(s1, end) { break; }            // resident starts past our end
+        if seq_lt(cursor, s1) {
+            // Gap [cursor, min(s1, end)) is new.
+            let gap_end = if seq_lt(s1, end) { s1 } else { end };
+            frags.push((cursor, gap_end));
+        }
+        // Skip past the resident's coverage.
+        if seq_gt(e1, cursor) { cursor = e1; }
+    }
+    if seq_lt(cursor, end) {
+        frags.push((cursor, end)); // trailing gap above the last resident
+    }
+    if frags.is_empty() { return false; } // wholly duplicate
+
+    let total_new: usize = frags.iter()
+        .map(|&(l, r)| r.wrapping_sub(l) as usize).sum();
+
+    // Enforce node-count and byte caps (RFC 9293 §3.10.7.4 permits dropping
+    // out-of-order data).  Evict from the highest sequence first — those are
+    // furthest from `recv_next` and least likely to be filled next; never
+    // evict the range adjacent to `recv_next`.  Use the lowest new fragment's
+    // offset as the "how close is the newcomer" gauge.
+    let new_off = frags[0].0.wrapping_sub(conn.recv_next);
+    while (conn.ooo_queue.len() + frags.len() > OOO_MAX_SEGS
+        || conn.ooo_bytes + total_new > OOO_MAX_BYTES)
+        && !conn.ooo_queue.is_empty()
+    {
+        let &hi_key = conn.ooo_queue.keys().next_back().unwrap();
+        if hi_key <= new_off {
+            // The newcomer's closest fragment is itself the furthest — drop
+            // the newcomer rather than a closer resident.
+            return false;
+        }
+        if let Some(ev) = conn.ooo_queue.remove(&hi_key) {
+            conn.ooo_bytes = conn.ooo_bytes.saturating_sub(ev.data.len());
+            if conn.ooo_fin_seq == Some(ev.end()) { conn.ooo_fin_seq = None; }
+        }
+    }
+    if conn.ooo_bytes + total_new > OOO_MAX_BYTES { return false; }
+
+    // Insert each new fragment, slicing the payload at the fragment offsets.
+    let mut buffered_any = false;
+    for &(l, r) in &frags {
+        let off = l.wrapping_sub(seq) as usize;
+        let flen = r.wrapping_sub(l) as usize;
+        let bytes = data[off..off + flen].to_vec();
+        // Carry the FIN only on the fragment that ends exactly at fin_seq.
+        let frag_fin = fin && r == fin_seq;
+        if frag_fin { conn.ooo_fin_seq = Some(fin_seq); }
+        conn.ooo_queue.insert(l.wrapping_sub(conn.recv_next),
+                              OooSeg { seq: l, data: bytes, fin: frag_fin });
+        conn.ooo_bytes += flen;
+        buffered_any = true;
+    }
+    buffered_any
+}
+
+/// After `recv_next` advances, splice any contiguous buffered out-of-order
+/// segments into `recv_buffer` and advance `recv_next` past them, in one
+/// forward pass (RFC 9293 §3.10.7.4).  Returns true if a latent FIN's
+/// sequence number was reached (the caller then performs the FIN state
+/// transition).  Rebases the offset-keyed map afterwards so keys stay valid.
+fn ooo_drain(conn: &mut TcpConnection) -> bool {
+    let mut fin_reached = false;
+    loop {
+        // Lowest-keyed segment = closest to recv_next.
+        let key = match conn.ooo_queue.keys().next().copied() {
+            Some(k) => k,
+            None => break,
+        };
+        let seg_seq = conn.ooo_queue[&key].seq;
+        let seg_end = conn.ooo_queue[&key].end();
+        if seq_gt(seg_seq, conn.recv_next) {
+            break; // a real gap remains below this segment
+        }
+        // Pop it.
+        let seg = conn.ooo_queue.remove(&key).unwrap();
+        conn.ooo_bytes = conn.ooo_bytes.saturating_sub(seg.data.len());
+        if seq_le(seg_end, conn.recv_next) {
+            // Wholly stale (already delivered) — drop.
+            if conn.ooo_fin_seq == Some(seg_end) { conn.ooo_fin_seq = None; }
+            continue;
+        }
+        // seg_seq <= recv_next < seg_end: append only the not-yet-delivered tail.
+        let skip = conn.recv_next.wrapping_sub(seg.seq) as usize;
+        conn.recv_buffer.extend_from_slice(&seg.data[skip..]);
+        conn.recv_next = seg_end;
+        if seg.fin && conn.ooo_fin_seq == Some(seg_end) {
+            fin_reached = true;
+            conn.ooo_fin_seq = None;
+        }
+    }
+    // Rebase keys: recv_next moved, so window-relative offsets shifted.
+    if !conn.ooo_queue.is_empty() {
+        let rn = conn.recv_next;
+        let drained: Vec<OooSeg> = core::mem::take(&mut conn.ooo_queue)
+            .into_values().collect();
+        for s in drained {
+            conn.ooo_queue.insert(s.seq.wrapping_sub(rn), s);
+        }
+    }
+    fin_reached
+}
+
+/// Build the receiver's SACK blocks (RFC 2018 §3–§4) from the current
+/// out-of-order queue.  Each contiguous run of buffered ranges becomes one
+/// block `[left, right)`; the run containing `most_recent_seq` (the segment
+/// that triggered this ACK) is placed first (RFC 2018 §4), the rest follow
+/// in descending-left order.  At most [`SACK_MAX_BLOCKS`] blocks.
+fn sack_blocks(conn: &TcpConnection, most_recent_seq: u32) -> Vec<(u32, u32)> {
+    if conn.ooo_queue.is_empty() { return Vec::new(); }
+    // Collect ranges in sequence order (offset-keyed map already orders them).
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for s in conn.ooo_queue.values() {
+        let (l, r) = (s.seq, s.end());
+        if let Some(last) = runs.last_mut() {
+            if last.1 == l { last.1 = r; continue; } // coalesce adjacent
+        }
+        runs.push((l, r));
+    }
+    // Move the run containing most_recent_seq to the front (RFC 2018 §4).
+    if let Some(pos) = runs.iter().position(|&(l, r)|
+        seq_ge(most_recent_seq, l) && seq_lt(most_recent_seq, r))
+    {
+        let first = runs.remove(pos);
+        runs.insert(0, first);
+    }
+    runs.truncate(SACK_MAX_BLOCKS);
+    runs
+}
+
+/// Build the ACK reply for an in-window data/dup segment.  Emits a SACK
+/// option carrying the receiver's buffered ranges when SACK was negotiated
+/// and a hole exists (RFC 2018); otherwise a plain cumulative ACK.
+/// `trigger_seq` is the arriving segment's sequence number (for SACK block
+/// ordering, RFC 2018 §4).
+fn build_ack_reply(conn: &TcpConnection, trigger_seq: u32) -> Vec<u8> {
+    let sn = conn.send_next;
+    let rn = conn.recv_next;
+    if conn.sack_permitted && !conn.ooo_queue.is_empty() {
+        let blocks = sack_blocks(conn, trigger_seq);
+        let opts = build_sack_option(&blocks);
+        if !opts.is_empty() {
+            return build_segment_opts(conn.local_port, conn.remote_port,
+                                      sn, rn, ACK,
+                                      conn.local_ip, conn.remote_ip, &opts, &[]);
+        }
+    }
+    build_segment(conn.local_port, conn.remote_port, sn, rn, ACK,
+                  conn.local_ip, conn.remote_ip, &[])
+}
+
+/// Receive segment text for a full-receive state (ESTABLISHED / FIN-WAIT-1 /
+/// FIN-WAIT-2 — RFC 9293 §3.10.7.4).  Handles in-order delivery + OOO splice,
+/// out-of-order buffering, duplicate/stale re-ACK, and latent-FIN tracking.
+///
+/// Returns whether the peer's FIN has now been consumed (its sequence number
+/// reached `recv_next`).  The caller performs the state transition.  Any ACK
+/// reply (cumulative, dup, or SACK-carrying) is pushed to `out`.
+fn receive_segment_data(conn: &mut TcpConnection, hdr: &TcpHeader,
+                        payload: &[u8], out: &mut Vec<OutSeg>) -> bool {
+    let rip = conn.remote_ip;
+    let seg_seq = hdr.seq_num;
+    let has_fin = hdr.flags & FIN != 0;
+    let seg_end = seg_seq.wrapping_add(payload.len() as u32);
+    let mut fin_consumed = false;
+
+    if payload.is_empty() {
+        // Pure FIN / pure ACK.
+        if has_fin && seg_seq == conn.recv_next {
+            conn.recv_next = conn.recv_next.wrapping_add(1);
+            fin_consumed = true;
+            out.push(OutSeg { remote_ip: rip, seg: build_ack_reply(conn, seg_seq) });
+        } else if has_fin {
+            // Out-of-order bare FIN — record its latent sequence; dup-ACK so
+            // the peer retransmits the gap (RFC 9293 §3.10.7.4).
+            conn.ooo_fin_seq = Some(seg_seq);
+            out.push(OutSeg { remote_ip: rip, seg: build_ack_reply(conn, seg_seq) });
+        }
+        return fin_consumed;
+    }
+
+    if seg_seq == conn.recv_next {
+        // In-order data: append, advance, then splice any buffered OOO tail.
+        conn.recv_buffer.extend_from_slice(payload);
+        conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+        let spliced_fin = ooo_drain(conn);
+        // This segment's own FIN (if any) sits at seg_end; consume it once
+        // recv_next has reached it (it equals recv_next iff no OOO followed,
+        // else the splice may have advanced past it).
+        if has_fin && conn.recv_next == seg_end {
+            conn.recv_next = conn.recv_next.wrapping_add(1);
+            fin_consumed = true;
+        }
+        if spliced_fin { fin_consumed = true; }
+        out.push(OutSeg { remote_ip: rip, seg: build_ack_reply(conn, seg_seq) });
+    } else if seq_lt(seg_seq, conn.recv_next) {
+        // Wholly or partly already-received (duplicate / stale).  If a tail
+        // extends past recv_next, take that as in-window OOO/in-order data.
+        if seq_gt(seg_end, conn.recv_next) {
+            // Overlapping segment whose tail is new and starts above recv_next.
+            let skip = conn.recv_next.wrapping_sub(seg_seq) as usize;
+            // Recurse-equivalent: treat the new tail as a fresh in-order seg.
+            conn.recv_buffer.extend_from_slice(&payload[skip..]);
+            conn.recv_next = seg_end;
+            let spliced_fin = ooo_drain(conn);
+            if has_fin && conn.recv_next == seg_end {
+                conn.recv_next = conn.recv_next.wrapping_add(1);
+                fin_consumed = true;
+            }
+            if spliced_fin { fin_consumed = true; }
+        }
+        // Always re-ACK (cumulative + any SACK) so the peer resyncs.
+        out.push(OutSeg { remote_ip: rip, seg: build_ack_reply(conn, seg_seq) });
+    } else {
+        // Out-of-order, strictly above recv_next: buffer in-window data and
+        // emit a dup-ACK (with SACK blocks) so the peer fast-retransmits the
+        // hole (RFC 5681 §3.2, RFC 2018).  Drop data wholly outside the
+        // receive window [recv_next, recv_next + 65535).
+        let win_end = conn.recv_next.wrapping_add(65535);
+        if seq_lt(seg_seq, win_end) {
+            // Trim the tail to the window edge if it straddles.
+            let mut buf = payload.to_vec();
+            if seq_gt(seg_end, win_end) {
+                let keep = win_end.wrapping_sub(seg_seq) as usize;
+                buf.truncate(keep);
+            }
+            let fin_in_window = has_fin && !seq_gt(seg_end, win_end);
+            ooo_insert(conn, seg_seq, buf, fin_in_window);
+        }
+        out.push(OutSeg { remote_ip: rip, seg: build_ack_reply(conn, seg_seq) });
+    }
+    fin_consumed
 }
 
 // ── ACK / congestion helpers ───────────────────────────────────────────────────
@@ -392,6 +809,46 @@ impl TcpHeader {
     pub fn header_len(&self) -> usize { (self.data_offset as usize) * 4 }
 }
 
+/// TCP option kinds we recognise (RFC 9293 §3.1, RFC 2018).
+const OPT_EOL: u8           = 0; // End of option list
+const OPT_NOP: u8           = 1; // No-op (1 byte, padding)
+const OPT_SACK_PERMITTED: u8 = 4; // SACK-permitted (kind 4, len 2) — SYN only
+const OPT_SACK: u8          = 5; // SACK blocks (kind 5)
+
+/// Scan the TCP option area (bytes between the fixed 20-byte header and the
+/// payload) for the SACK-permitted option (RFC 2018 §2: kind=4, length=2).
+///
+/// `segment` is the full TCP segment (header + options + payload);
+/// `data_offset` is the header's data-offset field (in 32-bit words).  The
+/// option area is `segment[20 .. data_offset*4]`.  Returns true iff a
+/// well-formed SACK-permitted option is present.  Malformed/truncated
+/// options terminate the scan defensively.
+fn syn_offers_sack(segment: &[u8], data_offset: u8) -> bool {
+    let hlen = (data_offset as usize) * 4;
+    if hlen <= 20 || hlen > segment.len() { return false; }
+    let opts = &segment[20..hlen];
+    let mut i = 0usize;
+    while i < opts.len() {
+        match opts[i] {
+            OPT_EOL => break,
+            OPT_NOP => { i += 1; }
+            OPT_SACK_PERMITTED => {
+                // kind(1) + len(1); len must be exactly 2.
+                if i + 1 < opts.len() && opts[i + 1] == 2 { return true; }
+                break; // malformed
+            }
+            _ => {
+                // Generic TLV option: kind(1) + len(1) + (len-2) data.
+                if i + 1 >= opts.len() { break; }
+                let len = opts[i + 1] as usize;
+                if len < 2 || i + len > opts.len() { break; }
+                i += len;
+            }
+        }
+    }
+    false
+}
+
 /// Handle an incoming TCP segment dispatched from the IPv4 layer.
 pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
     let hdr = match TcpHeader::parse(data) { Some(h) => h, None => return };
@@ -445,7 +902,11 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         // on SMP would stall a peer core spinning on the lock across the
         // unbounded transmit.  See `OutSeg`.
         let mut out: Vec<OutSeg> = Vec::new();
-        let readiness_edge = process_segment(&mut conns[i], &hdr, payload, &mut out);
+        // Detect SACK-permitted in this segment's options — only meaningful
+        // on the SYN-ACK that completes our active open (RFC 2018 §2).
+        let seg_offers_sack = syn_offers_sack(data, hdr.data_offset);
+        let readiness_edge =
+            process_segment(&mut conns[i], &hdr, payload, seg_offers_sack, &mut out);
         drop(conns);
         // Ring the poll bell AFTER dropping `TCP_CONNECTIONS` (lock-free,
         // exactly like the UDP receive path) so a thread parked in
@@ -474,6 +935,9 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         );
         if let Some(li) = listen_idx {
             let isn     = new_isn();
+            // SACK is enabled for this connection only if the peer offered
+            // SACK-permitted in its SYN (RFC 2018 §2 — both sides must agree).
+            let peer_sack = syn_offers_sack(data, hdr.data_offset);
             // Use the SYN's dst_ip as our local IP for the child TCB,
             // not the listener's stored `local_ip`.  The listener is
             // created at boot before DHCP runs, so its stored IP is
@@ -518,6 +982,10 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 ssthresh:    65535,
                 dup_acks:    0,
                 peer_window: hdr.window as u32,
+                ooo_queue:   BTreeMap::new(),
+                ooo_bytes:   0,
+                sack_permitted: peer_sack,
+                ooo_fin_seq: None,
                 reuseaddr:   false,
                 nodelay:     false,
                 rcvbuf:      87380,
@@ -528,7 +996,10 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 close_pending: false,
             });
             drop(conns);
-            send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
+            // Echo SACK-permitted in our SYN-ACK iff the peer offered it,
+            // completing the bilateral negotiation (RFC 2018 §2).
+            send_syn_options(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt,
+                             SYN | ACK, peer_sack);
         } else {
             drop(conns);
             send_flags(dst_ip, hdr.dst_port, src_ip, hdr.src_port,
@@ -557,7 +1028,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
 /// re-parks if nothing it watches is ready.
 #[must_use]
 fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
-                   out: &mut Vec<OutSeg>) -> bool {
+                   seg_offers_sack: bool, out: &mut Vec<OutSeg>) -> bool {
     conn.peer_window = hdr.window as u32;
 
     // Snapshot the poll-relevant fields before processing so we can detect
@@ -577,6 +1048,10 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                 conn.recv_next  = hdr.seq_num.wrapping_add(1);
                 conn.send_unack = hdr.ack_num;
                 drain_retransmit(conn, hdr.ack_num);
+                // SACK is enabled only if the peer's SYN-ACK echoed
+                // SACK-permitted, completing the bilateral negotiation we
+                // started in our SYN (RFC 2018 §2).
+                conn.sack_permitted = seg_offers_sack;
                 conn.state = TcpState::Established;
                 crate::serial_println!("[TCP] Established → {}:{}", rip[0], rp);
                 let sn = conn.send_next;
@@ -599,47 +1074,14 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            // In-order data: accept only when the segment begins exactly at
-            // recv_next (RFC 9293 §3.10.7.4 — a segment is processed in
-            // sequence-number order).
-            let in_order = !payload.is_empty() && hdr.seq_num == conn.recv_next;
-            if in_order {
-                conn.recv_buffer.extend_from_slice(payload);
-                conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
-            } else if !payload.is_empty() && hdr.seq_num != conn.recv_next {
-                // Out-of-order in-window data (a sequence hole).  Drop the
-                // payload but emit an immediate duplicate ACK re-acking
-                // recv_next so the peer fast-retransmits the missing segment
-                // (RFC 5681 §3.2) instead of waiting a full RTO.  Without
-                // this, a single reordered/lost segment in a multi-segment
-                // HTTP(S) response stalls for seconds.
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
-            }
-            // FIN from peer.  Consume the FIN (advance recv_next, transition to
-            // CloseWait) ONLY when it sits exactly at recv_next — i.e. the
-            // segment's data has been delivered in order and the FIN occupies
-            // the next sequence number (RFC 9293 §3.10.7.4 / RFC 793 §3.5: a
-            // FIN is processed only after all preceding data).  An out-of-order
-            // segment that carries data+FIN must NOT prematurely close the
-            // connection on a truncated body — its FIN is honored only once the
-            // gap is filled and recv_next reaches it (on the peer's
-            // retransmission).
-            let fin_at_nxt = (hdr.flags & FIN != 0)
-                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
-            if fin_at_nxt {
-                conn.recv_next = conn.recv_next.wrapping_add(1);
+            // Receive in-order/out-of-order text via the shared receive engine
+            // (in-order append + OOO splice + buffering + SACK-aware ACK).  The
+            // peer's FIN is consumed only when its sequence number reaches
+            // recv_next (RFC 9293 §3.10.7.4 / RFC 793 §3.5) — never on a
+            // truncated body delivered ahead of a gap.
+            let fin_consumed = receive_segment_data(conn, hdr, payload, out);
+            if fin_consumed {
                 conn.state = TcpState::CloseWait;
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
 
@@ -647,38 +1089,32 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            // Honor the peer's FIN only when it sits exactly at recv_next
-            // (RFC 9293 §3.10.7.4 / RFC 793 §3.5) — an out-of-order data+FIN
-            // segment must not prematurely close.
-            let fin_at_nxt = (hdr.flags & FIN != 0)
-                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
-            if fin_at_nxt {
-                // Simultaneous close or ACK+FIN in same segment.
-                conn.recv_next = conn.recv_next.wrapping_add(1);
+            // FIN-WAIT-1 is a full receive state: deliver in-order text and
+            // process the peer's FIN exactly as in ESTABLISHED (RFC 9293
+            // §3.10.7.4).  A data-bearing FIN must be ACKed and its text
+            // queued, not dropped.
+            let fin_consumed = receive_segment_data(conn, hdr, payload, out);
+            if fin_consumed {
+                // Simultaneous close / our FIN may still be unACKed → TIME-WAIT
+                // (this stack has no CLOSING state; a peer FIN here folds
+                // straight to TIME-WAIT).
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
             } else if hdr.flags & ACK != 0 {
-                // Pure ACK (no in-order FIN): move to FinWait2.
+                // Pure ACK (no in-order FIN): our FIN was acknowledged → move
+                // to FIN-WAIT-2 (matches the prior behaviour; handle_ack above
+                // already advanced send_unack).
                 conn.state = TcpState::FinWait2;
             }
         }
 
         TcpState::FinWait2 => {
-            // Honor the peer's FIN only when it sits exactly at recv_next.
-            let fin_at_nxt = (hdr.flags & FIN != 0)
-                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
-            if fin_at_nxt {
-                conn.recv_next = conn.recv_next.wrapping_add(1);
+            // FIN-WAIT-2 still receives in-order text and the peer's FIN
+            // (RFC 9293 §3.10.7.4).
+            let fin_consumed = receive_segment_data(conn, hdr, payload, out);
+            if fin_consumed {
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
 
@@ -1311,6 +1747,10 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         ssthresh:    65535,
         dup_acks:    0,
         peer_window: 65535,
+        ooo_queue:   BTreeMap::new(),
+        ooo_bytes:   0,
+        sack_permitted: false,
+        ooo_fin_seq: None,
         reuseaddr:   false,
         nodelay:     false,
         rcvbuf:      87380,
@@ -1377,7 +1817,7 @@ pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
     let mut out: Vec<OutSeg> = Vec::new();
     // The readiness-edge return is irrelevant to this state-inspection
     // helper (no poller is parked in the in-kernel test path); discard it.
-    let _ = process_segment(conn, &hdr, payload, &mut out);
+    let _ = process_segment(conn, &hdr, payload, false, &mut out);
     Some((conn.state, conn.recv_buffer.len()))
 }
 
@@ -1392,6 +1832,65 @@ pub fn test_recv_next(local_port: u16, remote_ip: Ipv4Address,
         && c.remote_ip   == remote_ip
         && c.remote_port == remote_port)
         .map(|c| c.recv_next)
+}
+
+/// Test-only: force the `sack_permitted` flag on a synthetic TCB so the
+/// SACK block-generation path can be exercised without a real SYN exchange.
+#[cfg(feature = "kdb")]
+pub fn test_set_sack_permitted(local_port: u16, remote_ip: Ipv4Address,
+                                remote_port: u16, val: bool) {
+    let mut conns = TCP_CONNECTIONS.lock();
+    if let Some(c) = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        c.sack_permitted = val;
+    }
+}
+
+/// Test-only: report `(out-of-order segment count, out-of-order byte count)`
+/// for a TCB, so a test can verify OOO buffering / splice / eviction.
+#[cfg(feature = "kdb")]
+pub fn test_ooo_state(local_port: u16, remote_ip: Ipv4Address,
+                       remote_port: u16) -> Option<(usize, usize)> {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+        .map(|c| (c.ooo_queue.len(), c.ooo_bytes))
+}
+
+/// Test-only: feed a synthetic segment via the real `process_segment` path
+/// and return the **bytes of the last ACK reply** the receive engine emitted
+/// (so a test can decode the SACK option), along with `(state, recv_len)`.
+/// Returns `None` if no matching TCB or no reply was produced.
+#[cfg(feature = "kdb")]
+pub fn test_feed_segment_reply(local_port: u16, remote_ip: Ipv4Address,
+                                remote_port: u16, seq: u32, payload: &[u8],
+                                fin: bool)
+    -> Option<(TcpState, usize, Vec<u8>)>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)?;
+    let hdr = TcpHeader {
+        src_port:    remote_port,
+        dst_port:    local_port,
+        seq_num:     seq,
+        ack_num:     conn.send_next,
+        data_offset: 5,
+        flags:       ACK | if fin { FIN } else { 0 },
+        window:      65535,
+        checksum:    0,
+    };
+    let mut out: Vec<OutSeg> = Vec::new();
+    let _ = process_segment(conn, &hdr, payload, false, &mut out);
+    let reply = out.last().map(|o| o.seg.clone())?;
+    Some((conn.state, conn.recv_buffer.len(), reply))
 }
 
 /// Drain the receive buffer of the established TCB identified by the full
@@ -1518,6 +2017,10 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         ssthresh:    65535,
         dup_acks:    0,
         peer_window: 65535,
+        ooo_queue:   BTreeMap::new(),
+        ooo_bytes:   0,
+        sack_permitted: false,
+        ooo_fin_seq: None,
         reuseaddr:   false,
         nodelay:     false,
         rcvbuf:      87380,
@@ -1564,6 +2067,12 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             ssthresh:    65535,
             dup_acks:    0,
             peer_window: 65535,
+            ooo_queue:   BTreeMap::new(),
+            ooo_bytes:   0,
+            // We advertise SACK-permitted in our SYN; the flag is confirmed
+            // (or cleared) when the SYN-ACK is processed (RFC 2018 §2).
+            sack_permitted: true,
+            ooo_fin_seq: None,
             reuseaddr:   false,
             nodelay:     false,
             rcvbuf:      87380,
@@ -1574,7 +2083,9 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             close_pending: false,
         });
     }
-    send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
+    // Advertise SACK-permitted in our active-open SYN (RFC 2018 §2); whether
+    // SACK is actually used is decided when the SYN-ACK echoes it back.
+    send_syn_options(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN, true);
     Ok(local_port)
 }
 

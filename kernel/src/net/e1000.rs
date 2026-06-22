@@ -40,6 +40,17 @@ const REG_RAL0: u32     = 0x5400; // Receive Address Low (MAC bytes 0-3)
 const REG_RAH0: u32     = 0x5404; // Receive Address High (MAC bytes 4-5) + AV bit
 const REG_MTA: u32      = 0x5200; // Multicast Table Array (128 entries)
 
+// ── Statistics registers (read-to-clear) ────────────────────────────────────
+//
+// Per the 82540EM datasheet (§13, Statistics Register Descriptions) these
+// counters latch hardware events and clear on read.  MPC counts packets the
+// receiver had to discard because no RX descriptor was available — i.e. the
+// RX ring overran.  Reading it periodically turns silent QEMU/SLIRP drops
+// (which otherwise present only as TCP RTO-stall retransmits) into an
+// observable metric.
+
+const REG_MPC: u32      = 0x4010; // Missed Packets Count (RX no-descriptor drops)
+
 // ── Control bits ────────────────────────────────────────────────────────────
 
 const CTRL_ASDE: u32    = 1 << 5;  // Auto-Speed Detection Enable
@@ -73,7 +84,13 @@ const RDESC_STA_EOP: u8  = 1 << 1; // End of Packet
 
 // ── Descriptor ring sizes ───────────────────────────────────────────────────
 
-const NUM_RX_DESC: usize = 32;
+// RX ring depth.  32 descriptors (64 KiB of 2 KiB buffers) overruns under a
+// CPU-bound composite/decode burst: when the polling core is momentarily
+// starved from draining the ring, 3-8 parallel MSS-sized flows fill all 32
+// slots, the NIC drops the surplus (counted in MPC), and the peers fall into
+// 2 s RTO-stall retransmits.  256 descriptors (512 KiB) gives ~8x the burst
+// headroom; the ring is allocated once at init from contiguous physical pages.
+const NUM_RX_DESC: usize = 256;
 const NUM_TX_DESC: usize = 32;
 const RX_BUF_SIZE: usize = 2048;
 
@@ -150,6 +167,38 @@ static TX_BUFS: Mutex<u64> = Mutex::new(0);
 static TX_TAIL: Mutex<u16> = Mutex::new(0);
 /// Current RX tail (last index we gave to hardware)
 static RX_CUR: Mutex<u16> = Mutex::new(0);
+
+/// Accumulated RX overrun count.  MPC (Missed Packets Count) is a
+/// read-to-clear hardware statistic that increments whenever the receiver
+/// drops a packet because no RX descriptor was free (the ring overran).
+/// We drain MPC into this running total so overruns are observable in the
+/// net stats instead of presenting silently as TCP retransmit stalls.
+static RX_OVERRUNS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Drain the hardware MPC register into [`RX_OVERRUNS`].  MPC clears on read
+/// (82540EM datasheet §13), so each call captures the overruns since the
+/// previous read.  Cheap (one MMIO read); called from the throttled
+/// once-per-tick flush path in `poll_rx`, not per descriptor.
+fn drain_overrun_stat() {
+    let missed = mmio_read(REG_MPC) as u64;
+    if missed != 0 {
+        RX_OVERRUNS.fetch_add(missed, Ordering::Relaxed);
+    }
+}
+
+/// Total RX-ring overruns observed since boot.  Exposed through the net
+/// stats surface (`net::stats`) for observability.
+pub fn rx_overruns() -> u64 {
+    RX_OVERRUNS.load(Ordering::Relaxed)
+}
+
+/// RX ring depth (number of descriptors).  Exposed for the ring-constant
+/// sanity test.
+pub fn rx_ring_depth() -> usize { NUM_RX_DESC }
+
+/// Per-descriptor RX buffer size in bytes.  Exposed for the sanity test.
+pub fn rx_buf_size() -> usize { RX_BUF_SIZE }
 
 /// Timestamp of the last host-to-guest RX-ring flush nudge.  Used by
 /// `poll_rx()` to periodically force QEMU's SLIRP backend to deliver any
@@ -422,14 +471,19 @@ fn eeprom_read(addr: u8) -> u16 {
 // ── RX setup ────────────────────────────────────────────────────────────────
 
 fn init_rx() -> bool {
-    // Allocate descriptor ring: NUM_RX_DESC * 16 bytes each, needs 128-byte alignment
-    // We'll allocate a full page (4096) which is more than enough for 32 * 16 = 512 bytes
-    let desc_phys = match crate::mm::pmm::alloc_page() {
+    // Allocate descriptor ring: NUM_RX_DESC * 16 bytes each, needs 16-byte
+    // alignment (RDLEN must also be a multiple of 128 bytes per the datasheet).
+    // 256 * 16 = 4096 = exactly one page; allocate enough pages to hold the
+    // ring so the constant can grow without silently overflowing a single page.
+    let desc_phys = match crate::mm::pmm::alloc_pages(
+        (NUM_RX_DESC * 16 + 4095) / 4096) {
         Some(p) => p,
         None => return false,
     };
 
-    // Allocate buffer space: NUM_RX_DESC * RX_BUF_SIZE = 32 * 2048 = 64 KB = 16 pages
+    // Allocate buffer space: NUM_RX_DESC * RX_BUF_SIZE = 256 * 2048 = 512 KiB
+    // = 128 contiguous pages.  alloc_pages runs early at init before the PMM
+    // fragments, so the contiguous run is available.
     let bufs_phys = match crate::mm::pmm::alloc_pages(NUM_RX_DESC * RX_BUF_SIZE / 4096) {
         Some(p) => p,
         None => return false,
@@ -440,7 +494,8 @@ fn init_rx() -> bool {
     // descriptor's `.addr` field below carries the BUFFER's PHYSICAL
     // address because the hardware DMAs against it.
     unsafe {
-        core::ptr::write_bytes(phys_to_virt(desc_phys) as *mut u8, 0, 4096);
+        let ring_bytes = ((NUM_RX_DESC * 16 + 4095) / 4096) * 4096;
+        core::ptr::write_bytes(phys_to_virt(desc_phys) as *mut u8, 0, ring_bytes);
     }
 
     // Initialize each RX descriptor with a buffer address.
@@ -757,6 +812,10 @@ pub fn poll_rx() {
         if now != *last {
             *last = now;
             drop(last);
+            // Drain the read-to-clear overrun counter on the same throttle as
+            // the flush nudge (≤ once per PIT tick) so MPC sampling costs at
+            // most one extra MMIO read per 10 ms, never one per descriptor.
+            drain_overrun_stat();
             rx_flush_nudge();
         }
     }

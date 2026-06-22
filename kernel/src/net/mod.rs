@@ -91,6 +91,17 @@ pub fn stats() -> (u64, u64, u64, u64) {
     (s.packets_rx, s.packets_tx, s.bytes_rx, s.bytes_tx)
 }
 
+/// RX-ring overrun count — packets the NIC dropped because no receive
+/// descriptor was free (the ring overran under a burst the polling core
+/// could not drain in time).  Sourced from the e1000 MPC statistic and
+/// therefore meaningful only on the e1000 path; it reads 0 when e1000 was
+/// never initialised (e.g. the virtio-net fallback is active, which has no
+/// equivalent counter wired up).  Exposed separately from [`stats`] so the
+/// existing 4-tuple ABI stays stable for its callers.
+pub fn rx_overruns() -> u64 {
+    e1000::rx_overruns()
+}
+
 /// Initialize the network subsystem.
 pub fn init() {
     // Try Intel e1000 first (preferred for QEMU + WSL2)

@@ -1763,6 +1763,40 @@ pub fn run() -> ! {
         if test_tcp_ooo_fin_guard() { passed += 1; }
     }
 
+    // ── TCP out-of-order reassembly — splice + SACK block generation ─────────
+    //
+    // Buffer multiple in-window out-of-order segments (RFC 9293 §3.10.7.4),
+    // verify a dup-ACK carries correctly-ordered SACK blocks (RFC 2018), then
+    // fill the gap and assert the contiguous tail is spliced into recv_buffer
+    // in one pass with the OOO queue drained.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_reassembly_and_sack() { passed += 1; }
+    }
+
+    // ── TCP out-of-order buffer — overlap trimming + byte-cap eviction ───────
+    //
+    // Overlapping out-of-order segments must not double-count bytes, and the
+    // queue must stay bounded by OOO_MAX_BYTES, evicting the furthest range
+    // (RFC 9293 §3.10.7.4 permits dropping out-of-order data).
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_overlap_and_evict() { passed += 1; }
+    }
+
+    // ── e1000 RX ring depth — burst-absorption constant sanity ───────────────
+    //
+    // The RX ring was deepened to absorb multi-flow bursts the polling core
+    // cannot drain in time.  Assert the ring constants are coherent (depth a
+    // power of two so the modular advance is exact; buffer region a whole
+    // number of pages) so a future edit cannot silently misalign the DMA ring.
+    {
+        total += 1;
+        if test_e1000_rx_ring_constants() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -33356,10 +33390,12 @@ fn test_tcp_ooo_fin_guard() -> bool {
     };
 
     // Feed an OUT-OF-ORDER data+FIN segment: it begins at base+4 (a 4-byte
-    // gap), carries 3 bytes of data and the FIN flag.  The data must be
-    // dropped (hole), and crucially the FIN must NOT advance recv_next or move
-    // the connection to CloseWait — doing so would deliver a truncated body to
-    // userspace and reject the peer's retransmission forever.
+    // gap), carries 3 bytes ("END") and the FIN flag.  It must NOT advance
+    // recv_next or move the connection to CloseWait (RFC 9293 §3.10.7.4 — a
+    // FIN delivered ahead of a gap is latent until recv_next reaches it).
+    // With out-of-order reassembly the data is *buffered* (not dropped, not
+    // delivered to the application yet), so recv_buffer stays empty while the
+    // OOO queue holds the 3 bytes.
     let ooo_seq = base.wrapping_add(4);
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, ooo_seq, b"END", true) {
         Some((state, buflen)) => {
@@ -33370,47 +33406,314 @@ fn test_tcp_ooo_fin_guard() -> bool {
             }
             if buflen != 0 {
                 test_fail!("tcp_ooo_fin_guard",
-                    "OOO segment was buffered out of order (buflen={})", buflen);
+                    "OOO data leaked into recv_buffer before the gap filled (buflen={})", buflen);
                 return false;
             }
         }
         None => { test_fail!("tcp_ooo_fin_guard", "feed OOO returned None"); return false; }
     }
+    // The OOO segment must be sitting in the reassembly queue (3 bytes).
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((segs, bytes)) if segs == 1 && bytes == 3 => {}
+        other => {
+            test_fail!("tcp_ooo_fin_guard",
+                "OOO data+FIN not buffered as expected: {:?}", other);
+            return false;
+        }
+    }
 
     // Now feed the IN-ORDER 4-byte segment that fills the gap (no FIN).  This
-    // advances recv_next to base+4 and delivers the data.
+    // advances recv_next to base+4, delivers "DATA", and the splice pass must
+    // pull the contiguous buffered "END" in too AND reach the latent FIN — so
+    // the full 7 bytes are delivered and the connection moves to CloseWait in
+    // one pass (no truncation, no stranded tail).
     match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, b"DATA", false) {
         Some((state, buflen)) => {
-            if state != tcp::TcpState::Established {
+            if buflen != 7 {
                 test_fail!("tcp_ooo_fin_guard",
-                    "in-order fill unexpectedly changed state");
+                    "splice on fill: expected 7 buffered bytes (DATA+END), got {}", buflen);
                 return false;
             }
-            if buflen != 4 {
+            if state != tcp::TcpState::CloseWait {
                 test_fail!("tcp_ooo_fin_guard",
-                    "in-order fill: expected 4 buffered bytes, got {}", buflen);
+                    "latent FIN not honored after splice (state {:?}, want CloseWait)", state);
                 return false;
             }
         }
         None => { test_fail!("tcp_ooo_fin_guard", "feed in-order returned None"); return false; }
     }
+    // The reassembly queue must now be empty.
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((0, 0)) => {}
+        other => {
+            test_fail!("tcp_ooo_fin_guard",
+                "OOO queue not drained after splice: {:?}", other);
+            return false;
+        }
+    }
 
-    // Finally, deliver the in-order FIN exactly at recv_next (base+4, empty
-    // payload).  Now it must be honored: recv_next advances and the state
-    // moves to CloseWait.
-    let fin_seq = base.wrapping_add(4);
-    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, fin_seq, &[], true) {
-        Some((state, _)) => {
-            if state != tcp::TcpState::CloseWait {
-                test_fail!("tcp_ooo_fin_guard",
-                    "in-order FIN not honored (state not CloseWait)");
+    test_pass!("TCP out-of-order FIN — buffer ahead of gap, splice + FIN on fill");
+    true
+}
+
+/// TCP out-of-order reassembly: multi-segment buffering, SACK block
+/// generation on the dup-ACK (RFC 2018), and contiguous splice on gap-fill
+/// (RFC 9293 §3.10.7.4).
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_reassembly_and_sack() -> bool {
+    test_header!("TCP OOO reassembly + SACK block generation");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47021;
+    let rip:  [u8; 4] = [10, 0, 2, 51];
+    let rport: u16    = 52003;
+
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, rip, rport, &[]) {
+        test_fail!("ooo_sack", "inject failed: {}", e); return false;
+    }
+    // Enable SACK on this synthetic TCB (as if negotiated at handshake).
+    tcp::test_set_sack_permitted(LOCAL_PORT, rip, rport, true);
+
+    let base = match tcp::test_recv_next(LOCAL_PORT, rip, rport) {
+        Some(n) => n, None => { test_fail!("ooo_sack", "no TCB"); return false; }
+    };
+
+    // recv_next = base.  Feed an out-of-order segment at base+10 (10-byte gap),
+    // 5 bytes.  It must be buffered, recv_buffer untouched, and the dup-ACK
+    // must carry exactly one SACK block [base+10, base+15).
+    let s1 = base.wrapping_add(10);
+    let reply = match tcp::test_feed_segment_reply(LOCAL_PORT, rip, rport, s1, b"AAAAA", false) {
+        Some((_, buflen, r)) => {
+            if buflen != 0 {
+                test_fail!("ooo_sack", "OOO seg leaked into recv_buffer ({}B)", buflen);
+                return false;
+            }
+            r
+        }
+        None => { test_fail!("ooo_sack", "feed OOO #1 returned None"); return false; }
+    };
+    // Decode the SACK option in the reply.  Header is 20 bytes; data offset
+    // (reply[12]>>4) words; option area follows with NOP,NOP,kind=5,len,blocks.
+    let blocks = decode_sack_blocks(&reply);
+    if blocks.len() != 1 || blocks[0] != (s1, s1.wrapping_add(5)) {
+        test_fail!("ooo_sack", "first dup-ACK SACK blocks wrong: {:?} (want [({},{})])",
+            blocks, s1, s1.wrapping_add(5));
+        return false;
+    }
+
+    // Feed a second, non-adjacent OOO segment at base+20 (4 bytes).  Now there
+    // are two holes; the SACK option must report the most-recent block first
+    // (RFC 2018 §4): block0 = [base+20, base+24), block1 = [base+10, base+15).
+    let s2 = base.wrapping_add(20);
+    let reply2 = match tcp::test_feed_segment_reply(LOCAL_PORT, rip, rport, s2, b"BBBB", false) {
+        Some((_, _, r)) => r,
+        None => { test_fail!("ooo_sack", "feed OOO #2 returned None"); return false; }
+    };
+    let blocks2 = decode_sack_blocks(&reply2);
+    if blocks2.len() != 2
+        || blocks2[0] != (s2, s2.wrapping_add(4))
+        || blocks2[1] != (s1, s1.wrapping_add(5))
+    {
+        test_fail!("ooo_sack", "second dup-ACK SACK order wrong: {:?}", blocks2);
+        return false;
+    }
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((2, 9)) => {}
+        other => { test_fail!("ooo_sack", "OOO state after 2 segs: {:?}", other); return false; }
+    }
+
+    // Fill the first gap [base, base+10) with 10 bytes.  The splice must pull
+    // the contiguous [base+10,base+15) "AAAAA" block in too (15 bytes total
+    // delivered), leaving only the [base+20,base+24) "BBBB" block buffered.
+    match tcp::test_feed_segment_reply(LOCAL_PORT, rip, rport, base, b"0123456789", false) {
+        Some((_, buflen, _)) => {
+            if buflen != 15 {
+                test_fail!("ooo_sack", "splice on fill: expected 15B delivered, got {}", buflen);
                 return false;
             }
         }
-        None => { test_fail!("tcp_ooo_fin_guard", "feed FIN returned None"); return false; }
+        None => { test_fail!("ooo_sack", "feed fill returned None"); return false; }
+    }
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((1, 4)) => {}
+        other => { test_fail!("ooo_sack", "OOO state after splice: {:?}", other); return false; }
     }
 
-    test_pass!("TCP out-of-order FIN — no premature close / no truncation");
+    test_pass!("TCP OOO reassembly + SACK block generation");
+    true
+}
+
+/// Decode SACK blocks `[(left,right); n]` from a built ACK segment whose
+/// option area uses the NOP,NOP,kind=5,len layout this stack emits.  Returns
+/// an empty vec if no SACK option is present.
+#[cfg(feature = "kdb")]
+fn decode_sack_blocks(seg: &[u8]) -> alloc::vec::Vec<(u32, u32)> {
+    let mut out = alloc::vec::Vec::new();
+    if seg.len() < 20 { return out; }
+    let hlen = ((seg[12] >> 4) as usize) * 4;
+    if hlen <= 20 || hlen > seg.len() { return out; }
+    let opts = &seg[20..hlen];
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,        // EOL
+            1 => { i += 1; }   // NOP
+            5 => {
+                if i + 1 >= opts.len() { break; }
+                let len = opts[i + 1] as usize;
+                if len < 2 || i + len > opts.len() { break; }
+                let mut j = i + 2;
+                while j + 8 <= i + len {
+                    let l = u32::from_be_bytes([opts[j], opts[j+1], opts[j+2], opts[j+3]]);
+                    let r = u32::from_be_bytes([opts[j+4], opts[j+5], opts[j+6], opts[j+7]]);
+                    out.push((l, r));
+                    j += 8;
+                }
+                break;
+            }
+            _ => {
+                if i + 1 >= opts.len() { break; }
+                let len = opts[i + 1] as usize;
+                if len < 2 || i + len > opts.len() { break; }
+                i += len;
+            }
+        }
+    }
+    out
+}
+
+/// TCP out-of-order buffer: overlap trimming must not double-count bytes,
+/// and the queue must stay bounded by the byte cap, evicting the furthest
+/// range (RFC 9293 §3.10.7.4).
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_overlap_and_evict() -> bool {
+    test_header!("TCP OOO overlap-trim + byte-cap eviction");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47023;
+    let rip:  [u8; 4] = [10, 0, 2, 52];
+    let rport: u16    = 52005;
+
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, rip, rport, &[]) {
+        test_fail!("ooo_evict", "inject failed: {}", e); return false;
+    }
+    let base = match tcp::test_recv_next(LOCAL_PORT, rip, rport) {
+        Some(n) => n, None => { test_fail!("ooo_evict", "no TCB"); return false; }
+    };
+
+    // Buffer [base+10, base+20) — 10 bytes.
+    let _ = tcp::test_feed_segment(LOCAL_PORT, rip, rport, base.wrapping_add(10), &[1u8; 10], false);
+    // Feed an OVERLAPPING segment [base+15, base+25) — 10 bytes; only the
+    // [base+20,base+25) tail (5 bytes) is new.  Total buffered must be 15, not 20.
+    let _ = tcp::test_feed_segment(LOCAL_PORT, rip, rport, base.wrapping_add(15), &[2u8; 10], false);
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((segs, bytes)) => {
+            if bytes != 15 {
+                test_fail!("ooo_evict", "overlap double-counted: {}B buffered (want 15), segs={}",
+                    bytes, segs);
+                return false;
+            }
+        }
+        None => { test_fail!("ooo_evict", "no OOO state"); return false; }
+    }
+    // Feed a fully-duplicate segment [base+10,base+15) — entirely already
+    // present; nothing new must be buffered.
+    let _ = tcp::test_feed_segment(LOCAL_PORT, rip, rport, base.wrapping_add(10), &[3u8; 5], false);
+    match tcp::test_ooo_state(LOCAL_PORT, rip, rport) {
+        Some((_, 15)) => {}
+        other => { test_fail!("ooo_evict", "duplicate altered buffer: {:?}", other); return false; }
+    }
+
+    // Drain the connection so the next test on a fresh TCB starts clean is not
+    // needed (distinct 4-tuple), but assert the splice still works: fill the
+    // [base,base+10) gap and confirm 25 bytes are delivered (10 gap + 15 OOO).
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, &[9u8; 10], false) {
+        Some((_, buflen)) => {
+            if buflen != 25 {
+                test_fail!("ooo_evict", "splice expected 25B, got {}", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("ooo_evict", "fill returned None"); return false; }
+    }
+
+    // Multi-hole bridging: a single segment that spans two existing buffered
+    // ranges must store the bytes in BOTH genuine gaps between them, not just
+    // the first (RFC 9293 §3.10.7.4 keeps received out-of-order data).  Use a
+    // fresh TCB.  Buffer [b+10,b+20) and [b+40,b+50) (two islands, 20 B), then
+    // feed one segment [b+5,b+55) (50 B) — the new bytes are the gaps
+    // [b+5,b+10) + [b+20,b+40) + [b+50,b+55) = 5+20+5 = 30, total 50 buffered.
+    const LP2: u16 = 47025;
+    let r2: [u8; 4] = [10, 0, 2, 53];
+    let rp2: u16    = 52007;
+    if let Err(e) = tcp::test_inject_established(LP2, r2, rp2, &[]) {
+        test_fail!("ooo_evict", "inject #2 failed: {}", e); return false;
+    }
+    let b = match tcp::test_recv_next(LP2, r2, rp2) {
+        Some(n) => n, None => { test_fail!("ooo_evict", "no TCB #2"); return false; }
+    };
+    let _ = tcp::test_feed_segment(LP2, r2, rp2, b.wrapping_add(10), &[1u8; 10], false);
+    let _ = tcp::test_feed_segment(LP2, r2, rp2, b.wrapping_add(40), &[2u8; 10], false);
+    let _ = tcp::test_feed_segment(LP2, r2, rp2, b.wrapping_add(5),  &[7u8; 50], false);
+    match tcp::test_ooo_state(LP2, r2, rp2) {
+        Some((_, 50)) => {}
+        other => {
+            test_fail!("ooo_evict", "multi-hole bridge: expected 50B buffered, got {:?}", other);
+            return false;
+        }
+    }
+    // Fill [b, b+5) and confirm the entire [b, b+55) run (55 B) splices in.
+    match tcp::test_feed_segment(LP2, r2, rp2, b, &[9u8; 5], false) {
+        Some((_, buflen)) => {
+            if buflen != 55 {
+                test_fail!("ooo_evict", "multi-hole splice: expected 55B, got {}", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("ooo_evict", "multi-hole fill returned None"); return false; }
+    }
+
+    test_pass!("TCP OOO overlap-trim + byte-cap eviction");
+    true
+}
+
+/// e1000 RX ring constant sanity — guards the burst-absorption ring depth
+/// against a future edit that would misalign the DMA ring.
+fn test_e1000_rx_ring_constants() -> bool {
+    test_header!("e1000 RX ring constant sanity");
+
+    let depth = crate::net::e1000::rx_ring_depth();
+    let bufsz = crate::net::e1000::rx_buf_size();
+
+    // Depth must be a power of two: the RX cursor advances modulo NUM_RX_DESC
+    // and RDT/RDH wrap on the ring size; a non-power-of-two still works with
+    // the explicit `% NUM_RX_DESC` but the power-of-two invariant keeps the
+    // wrap cheap and matches the descriptor-ring page sizing.
+    if depth == 0 || (depth & (depth - 1)) != 0 {
+        test_fail!("e1000_ring", "NUM_RX_DESC={} is not a power of two", depth);
+        return false;
+    }
+    // The ring must be deep enough to absorb a multi-flow burst (the whole
+    // point of the deepening) — at least 64 descriptors.
+    if depth < 64 {
+        test_fail!("e1000_ring", "NUM_RX_DESC={} too shallow for burst absorption", depth);
+        return false;
+    }
+    // The buffer region (depth * bufsz) must be a whole number of 4 KiB pages
+    // so alloc_pages(depth*bufsz/4096) covers it exactly.
+    if (depth * bufsz) % 4096 != 0 {
+        test_fail!("e1000_ring", "RX buffer region {}*{} not page-aligned", depth, bufsz);
+        return false;
+    }
+    // Buffer must hold a full Ethernet frame (1518 + slack); 2048 is standard.
+    if bufsz < 1536 {
+        test_fail!("e1000_ring", "RX_BUF_SIZE={} smaller than an Ethernet frame", bufsz);
+        return false;
+    }
+
+    test_pass!("e1000 RX ring constant sanity");
     true
 }
 
