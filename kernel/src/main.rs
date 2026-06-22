@@ -15,6 +15,11 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+// Enables the `#[alloc_error_handler]` attribute (mm/heap.rs) so a failed
+// kernel heap allocation routes to a HEAP_EXHAUSTED bugcheck banner instead of
+// the default silent panic-abort.  See the Rust `core::alloc` allocation-error
+// contract.
+#![feature(alloc_error_handler)]
 #![allow(dead_code, unused_imports)]
 
 // The crate root needs `alloc` in scope for the firefox-test launch path,

@@ -2094,8 +2094,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 let span_bytes =
                     (window_pages * 0x1000).min(span_by_file) as usize;
                 // Scratch holding the contiguous extent.  Heap-backed (the
-                // kernel heap is physically contiguous and 128 MiB); the
-                // 128 KiB worst case is negligible.  `None` means the bulk read
+                // kernel heap is physically contiguous); the 128 KiB worst
+                // case is negligible.  `None` means the bulk read
                 // was skipped or failed → the per-page loop falls back to an
                 // individual `fs.read` for every page, preserving old behaviour.
                 let mut bulk: Option<alloc::vec::Vec<u8>> = None;

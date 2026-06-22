@@ -89,6 +89,17 @@ pub const BUGCHECK_KERNEL_GPF: u32 = 0xDEAD_0007;
 /// PTE on the PMM-recycled frame (the residual aliasing class behind
 /// W215).  P1=phys, P2=mount_idx, P3=inode, P4=page_offset.
 pub const BUGCHECK_W215_INSERT_WRONG_CONTENT: u32 = 0xDEAD_0008;
+/// AstryxOS: a kernel heap allocation failed (the global allocator returned
+/// null and the Rust runtime invoked the allocation-error handler).  Without
+/// this code the build's `panic = "abort"` strategy turns a failed
+/// `alloc`/`Box::new`/`Vec::push` into a silent whole-machine abort with no
+/// diagnostic — fatal mid-render and invisible.  Routing it through the
+/// bugcheck banner names the failure with the requested `Layout`.
+/// P1 = requested size in bytes, P2 = requested alignment in bytes,
+/// P3 = total heap bytes under management, P4 = currently-allocated bytes
+/// (P3/P4 give the at-failure occupancy without re-locking the allocator).
+/// See the Rust `core::alloc::{GlobalAlloc, Layout}` allocation-error contract.
+pub const BUGCHECK_HEAP_EXHAUSTED: u32 = 0xDEAD_0009;
 
 /// Human-readable bug-check name, returned as a `&'static str` from a
 /// match against rodata literals.  This MUST NOT allocate — the
@@ -107,6 +118,7 @@ pub fn bugcheck_name(code: u32) -> &'static str {
         BUGCHECK_KERNEL_PAGE_FAULT   => "KERNEL_PAGE_FAULT",
         BUGCHECK_KERNEL_GPF          => "KERNEL_GPF",
         BUGCHECK_W215_INSERT_WRONG_CONTENT => "W215_INSERT_WRONG_CONTENT",
+        BUGCHECK_HEAP_EXHAUSTED      => "HEAP_EXHAUSTED",
         _                            => "UNKNOWN_BUGCHECK",
     }
 }
