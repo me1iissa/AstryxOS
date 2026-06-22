@@ -804,6 +804,12 @@ pub fn tcp_timer_tick() {
     }
     let mut jobs:     Vec<SendJob> = Vec::new();
     let mut aborted:  Vec<u16>    = Vec::new(); // local_ports that hit MAX_RETRIES
+    // True once any connection's send buffer crosses the *rising* write-space
+    // edge below — set under the lock, acted on after it is dropped.  Ringing
+    // the poll bell here makes a producer parked in `poll(POLLOUT)` /
+    // `epoll_wait(EPOLLOUT)` / `select(writefds)` on a previously-full send
+    // buffer re-check immediately rather than only on the ~1 s resync floor.
+    let mut write_space_edge = false;
 
     {
         let mut conns = TCP_CONNECTIONS.lock();
@@ -868,6 +874,26 @@ pub fn tcp_timer_tick() {
                 if eff_window > in_flight {
                     let can  = (eff_window - in_flight) as usize;
                     let take = can.min(conn.send_buffer.len()).min(MSS as usize);
+                    // Detect the *rising* write-space edge (RFC 9293 §3.7): if
+                    // the send buffer was at/over the `sndbuf` high-water mark
+                    // before this drain — so the NDE-24 backpressure gate had
+                    // de-asserted POLLOUT (see `send_space_available`) — and
+                    // dropping `take` octets puts it back below the mark, a
+                    // parked `poll(POLLOUT)` producer must be woken.  Ringing
+                    // only on this rising edge (not on every drain of an
+                    // already-non-full buffer) avoids a wake storm on a busy
+                    // connection.  Mirrors the AF_UNIX recv-side write-space
+                    // wake and the POSIX rule that a `send(2)` that would no
+                    // longer block makes the socket writable.  Gated on the
+                    // two states that can buffer outbound app data (the same
+                    // states `send_space_available` evaluates for POLLOUT).
+                    if matches!(conn.state,
+                                TcpState::Established | TcpState::CloseWait)
+                        && (conn.send_buffer.len() as u32) >= conn.sndbuf
+                        && ((conn.send_buffer.len() - take) as u32) < conn.sndbuf
+                    {
+                        write_space_edge = true;
+                    }
                     let chunk: Vec<u8> = conn.send_buffer.drain(..take).collect();
                     let seq = conn.send_next;
                     conn.retransmit_queue.push_back(RetransmitEntry {
@@ -918,6 +944,20 @@ pub fn tcp_timer_tick() {
         // kernel heap until the 128 MiB heap guard fires.  Driven from the
         // 100 Hz timer tick — adds one O(n) retain per second.
         gc_closed_in(&mut conns, now);
+    }
+
+    // Ring the poll bell AFTER dropping `TCP_CONNECTIONS` (lock-free, exactly
+    // like the RX data-arrival edge in `handle_tcp` and the AF_UNIX recv-side
+    // write-space wake) so a producer parked in `poll(POLLOUT)` /
+    // `epoll_wait(EPOLLOUT)` / `select(writefds)` on a previously-full send
+    // buffer re-evaluates its mask immediately rather than only on the ~1 s
+    // resync floor.  Rung before the transmit below so the wake is not delayed
+    // by the (unbounded, I/O-bearing) `send_ipv4` calls, and exactly once per
+    // tick regardless of how many connections crossed the edge (the bell is a
+    // broadcast — every parked poller re-scans its own fd set).
+    if write_space_edge {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::InetTx);
     }
 
     for job in jobs {
