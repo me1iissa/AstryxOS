@@ -2156,8 +2156,8 @@ impl BlockDevice for VirtioBlkBlockDevice {
 /// 2048 sectors = 1 MiB per request.  Larger values further amortise the
 /// per-request overhead (one KVM/MMIO round trip, one doorbell write, one
 /// IRQ delivery) but require the caller's buffer to be physically
-/// contiguous over the same span.  1 MiB stays well within the 128 MiB
-/// kernel heap.
+/// contiguous over the same span.  1 MiB stays well within the kernel
+/// heap (`HEAP_SIZE`).
 fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockError> {
     if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
         return Err(BlockError::IoError);

@@ -1530,7 +1530,7 @@ fn op_tlb_stats(out: &mut String) {
 //
 // Snapshots the kernel-heap allocator plus the few growable collections
 // that have been observed to leak over a long firefox-test soak.  The
-// 6-minute heap-guard panic at `HEAP_START + 128 MiB` (idt.rs page-fault
+// heap-guard panic at `HEAP_START + HEAP_SIZE` (idt.rs page-fault
 // handler) is, by definition, a slow-leak class — this op makes the
 // rate visible so a sampling caller can identify which collection is
 // climbing linearly with wall-clock.
