@@ -3160,6 +3160,19 @@ pub fn run() -> ! {
         if test_287_wake_boost_preempts_runnable_peer() { passed += 1; }
     }
 
+    // ── Test 290: BSP poll reactor (PRIORITY_IDLE) not starved by a NORMAL ──
+    // storm. Regression for the SMP=1 windowed-Firefox plateau — TID 0 (the
+    // net/x11/compositor pump) must climb past a saturated PRIORITY_NORMAL
+    // userspace workload on score alone, and has a far tighter force-deadline
+    // than the global ceiling so the pump runs at a healthy cadence. Pure
+    // scoring/constant arithmetic. Cite POSIX sched(7) + virtual-deadline fair
+    // scheduling (early-yielding latency task owed an earlier deadline).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_290_bsp_reactor_not_starved() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -49023,8 +49036,21 @@ fn test_285_anti_starvation_aging() -> bool {
             "wait-age cap {} does not exceed max wake-boost differential {}", cap, boost_diff);
         return false;
     }
-    test_println!("  curve: 0 below age 20, escalates, caps at {} (> boost-diff {}) ✓",
-        cap, boost_diff);
+    // Stronger: the cap must exceed the FULL base-priority span so a
+    // sufficiently-aged thread out-scores ANY runnable peer regardless of base
+    // priority (the monotone wait-time → eligibility guarantee).  The largest
+    // possible base-score gap between two threads is PRIORITY_MAX*4 plus up to
+    // +2 affinity for the competitor; the aged thread's bonus must beat that.
+    let full_span = (crate::proc::PRIORITY_MAX as u16) * 4 + 2;
+    if cap <= full_span {
+        test_fail!("test285",
+            "wait-age cap {} does not exceed full base-priority span {} — \
+             an aged low-priority thread cannot overtake a high-priority storm",
+            cap, full_span);
+        return false;
+    }
+    test_println!("  curve: 0 below age 20, escalates, caps at {} (> full-span {}) ✓",
+        cap, full_span);
 
     // ── Property 2: aged NORMAL thread overtakes a continuously-boosted peer ─
     // Boosted peer: NORMAL + BOOST_WAIT, +2 affinity (best case for the peer),
@@ -49083,6 +49109,108 @@ fn test_285_anti_starvation_aging() -> bool {
     test_println!("  no-contention ordering preserved (priority > affinity, affinity tie-breaks) ✓");
 
     test_pass!("anti-starvation aging frees an out-scored Ready thread");
+    true
+}
+
+// ── Test 290: BSP poll reactor (PRIORITY_IDLE) is not starved by a NORMAL
+// userspace storm ───────────────────────────────────────────────────────────
+//
+// Regression for the SMP=1 windowed-Firefox plateau: the BSP main thread
+// (TID 0) drives net::poll / x11::poll / compositor::compose at PRIORITY_IDLE
+// (base score 0), so against a ~50-thread PRIORITY_NORMAL userspace workload
+// (base score 32, often wake-boosted to 40) it could be out-scored on every
+// tick and only ever rescued by the coarse ~1 s force ceiling — stalling the
+// network/compositor pump so a page load never completed and content never
+// composited.
+//
+// The fix is twofold and this test pins both contractual properties using the
+// SAME picker score formula as `sched::schedule` (priority*4 + affinity +
+// wait_age_bonus):
+//
+//   (1) the widened, monotone wait-age bonus lets a PRIORITY_IDLE reactor climb
+//       past a continuously-boosted PRIORITY_NORMAL storm on SCORE ALONE within
+//       a bounded wait — wait-time → eligibility, so the force backstop is no
+//       longer the routine rescue path;
+//   (2) the BSP-specific force-deadline is far tighter than the global ceiling
+//       (STARVE_FORCE_TICKS_BSP < STARVE_FORCE_TICKS), so even in the worst case
+//       the reactor's run-queue latency is bounded at ~80 ms, not ~1 s.
+//
+// Pure arithmetic / constant comparison — deterministic, no spawning, no
+// scheduler races.  Cite POSIX sched(7) (SCHED_OTHER: every runnable thread
+// eventually runs) and the proportional-share / virtual-deadline fair-scheduler
+// guarantee that an early-yielding latency-sensitive task is owed an earlier
+// deadline than compute-bound peers.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_290_bsp_reactor_not_starved() -> bool {
+    use crate::proc::{PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_BOOST_WAIT};
+    use crate::sched::wait_age_bonus;
+
+    test_header!("BSP poll reactor (PRIORITY_IDLE) is not starved by a NORMAL storm");
+
+    fn picker_score(priority: u8, affinity: u16, age: u64) -> u16 {
+        (priority as u16) * 4 + affinity + wait_age_bonus(age)
+    }
+
+    // ── Property 1: PRIORITY_IDLE reactor overtakes a boosted NORMAL storm ──
+    // The worst case the reactor competes against: a NORMAL peer that is
+    // continuously wake-boosted (NORMAL + BOOST_WAIT) AND cache-warm/pinned
+    // (+2 affinity), with age ~0 (it just woke, so it never accrues a bonus).
+    let storm_peer = picker_score(PRIORITY_NORMAL + PRIORITY_BOOST_WAIT, 2, 0);
+    // The reactor: PRIORITY_IDLE (base score 0), no affinity match (+0) — the
+    // least favourable position for TID 0.
+    if picker_score(PRIORITY_IDLE, 0, 0) >= storm_peer {
+        test_fail!("test290",
+            "PRIORITY_IDLE reactor out-scores the storm with no wait (age 0) — \
+             would falsely pre-empt real work");
+        return false;
+    }
+    // Sweep increasing age; the reactor MUST eventually win on score alone.
+    let mut win_age: Option<u64> = None;
+    for age in 0..=4000u64 {
+        if picker_score(PRIORITY_IDLE, 0, age) > storm_peer {
+            win_age = Some(age);
+            break;
+        }
+    }
+    match win_age {
+        Some(age) => {
+            test_println!(
+                "  PRIORITY_IDLE reactor overtakes boosted NORMAL storm (score {}) \
+                 on score alone at age={} ticks ✓",
+                storm_peer, age);
+        }
+        None => {
+            test_fail!("test290",
+                "PRIORITY_IDLE reactor NEVER overtakes the NORMAL storm (score {}) within \
+                 4000 ticks — the pump would stall indefinitely on score", storm_peer);
+            return false;
+        }
+    }
+
+    // ── Property 2: the BSP force-deadline is tighter than the global one ────
+    // The reactor's worst-case run-queue latency must be bounded well below the
+    // ~1 s global ceiling that applies to compute-bound workers.  This is the
+    // hard latency guarantee the public force-deadline pair encodes.
+    let bsp = crate::sched::bsp_force_deadline_ticks();
+    let global = crate::sched::global_force_deadline_ticks();
+    if !(bsp < global) {
+        test_fail!("test290",
+            "BSP force-deadline {} is not tighter than the global ceiling {} — \
+             the reactor would only be rescued at the coarse ceiling", bsp, global);
+        return false;
+    }
+    // Sanity: the tighter deadline must still be a positive, sub-second bound.
+    if bsp == 0 || bsp > 50 {
+        test_fail!("test290",
+            "BSP force-deadline {} ticks is out of the expected sub-second reactor \
+             latency budget (1..=50)", bsp);
+        return false;
+    }
+    test_println!(
+        "  BSP force-deadline {} ticks (~{} ms) << global ceiling {} ticks (~{} ms) ✓",
+        bsp, bsp * 10, global, global * 10);
+
+    test_pass!("BSP poll reactor is not starved by a NORMAL storm");
     true
 }
 

@@ -252,19 +252,38 @@ pub fn starvation_count() -> u64 {
 //
 //   * Once a thread's wait-age reaches `STARVE_AGE_TICKS` it earns an
 //     escalating score bonus — one point per `STARVE_AGE_QUANTUM` ticks beyond
-//     the threshold, capped at `STARVE_AGE_BONUS_MAX`.  The cap is chosen to
-//     dominate the largest possible wake-boost differential (`PRIORITY_BOOST_WAIT
-//     * 4`), so a sufficiently-aged thread is guaranteed to out-score any
-//     wake-boosted peer at the same base priority.
+//     the threshold, saturating at `STARVE_AGE_BONUS_MAX`.  The cap is sized to
+//     exceed the FULL base-priority span (`PRIORITY_MAX * 4`), not merely a
+//     same-base-priority wake-boost differential.  This is the central fairness
+//     property: wait-time MONOTONICALLY raises selection priority until a
+//     sufficiently-aged thread out-scores ANY runnable peer regardless of base
+//     priority — the published "wait-time → eligibility" guarantee of a fair
+//     run-queue scheduler (POSIX sched(7) SCHED_OTHER; the proportional-share /
+//     virtual-deadline family of fair schedulers).  A starved thread therefore
+//     climbs past a heavy higher-priority population WELL BEFORE the hard
+//     force-ceiling, so the force backstop fires only in genuinely pathological
+//     edge cases rather than as the routine rescue path.
+//
+//   * The BSP main thread (TID 0) is the kernel's latency-critical poll reactor
+//     (net::poll / x11::poll / compositor::compose).  Like an interactive task
+//     in a virtual-deadline scheduler it consumes very little CPU and yields
+//     early every iteration, so it is owed an EARLIER deadline than the
+//     compute-bound workers it competes with.  It is granted a much tighter
+//     per-thread force-deadline (`STARVE_FORCE_TICKS_BSP`) so the reactor runs
+//     at a healthy cadence (tens of Hz) even when the run-queue is saturated by
+//     a 50+-thread userspace workload, instead of being rescued only at the
+//     coarse ~1 s global ceiling.  This mirrors the latency-deadline treatment a
+//     virtual-deadline fair scheduler gives an early-yielding interactive task.
 //
 //   * As an absolute backstop, a thread whose wait-age reaches
 //     `STARVE_FORCE_TICKS` is force-selected this tick regardless of score
 //     (the oldest such thread wins, mirroring an NT balance-set-manager
-//     force-boost / a CFS eligibility deadline).  This bounds worst-case
-//     run-queue latency to ~`STARVE_FORCE_TICKS` ticks even against a
-//     pathological mix of priorities.
+//     force-boost / a fair-scheduler eligibility deadline).  This bounds
+//     worst-case run-queue latency even against a pathological mix of
+//     priorities.  With the widened monotone aging above it is now a true
+//     last-resort safety net, not the routine rescue mechanism.
 //
-// All three terms are inert in the common case: a thread that runs within
+// All terms are inert in the common case: a thread that runs within
 // `STARVE_AGE_TICKS` of becoming Ready never accrues any bonus, so quiet or
 // lightly-loaded systems keep their existing priority ordering exactly.
 
@@ -276,23 +295,55 @@ pub fn starvation_count() -> u64 {
 const STARVE_AGE_TICKS: u64 = 20;
 
 /// Ticks of additional wait per +1 of escalating wait-age bonus once past
-/// `STARVE_AGE_TICKS`.  At 10 ticks (≈100 ms) per point the bonus climbs one
-/// step every ~100 ms of continued starvation.
-const STARVE_AGE_QUANTUM: u64 = 10;
+/// `STARVE_AGE_TICKS`.  At 2 ticks (≈20 ms) per point the bonus climbs one step
+/// every ~20 ms of continued starvation.  This slope is deliberately steep: a
+/// run-queue-starved thread must climb the FULL base-priority span (see
+/// `STARVE_AGE_BONUS_MAX`) and overtake a heavy higher-priority population
+/// *before* the hard force-ceiling, so the score-based aging — not the backstop
+/// — is what rescues it.  A worker out-scored by a wake-boosted peer (needing
+/// ~11 bonus points) wins at age ≈ 40 ticks — well before the ~100-tick global
+/// ceiling.  (The `PRIORITY_IDLE` BSP reactor's deficit is far larger, so it
+/// climbs the full span only after ~100 ticks; that is why the reactor is
+/// primarily rescued by its tighter per-thread deadline, not by this score
+/// path — see `STARVE_FORCE_TICKS_BSP`.)
+const STARVE_AGE_QUANTUM: u64 = 2;
 
-/// Maximum wait-age score bonus.  Must exceed the largest wake-boost score
-/// differential — `PRIORITY_BOOST_WAIT * 4 = 8` (a peer boosted two priority
-/// levels) plus the +2 affinity bonus — so a fully-aged thread is guaranteed
-/// to out-score any same-base-priority wake-boosted peer.  16 gives comfortable
-/// headroom (it also covers a +2 priority gap between distinct base
-/// priorities: `2 * 4 = 8`).
-const STARVE_AGE_BONUS_MAX: u16 = 16;
+/// Maximum wait-age score bonus.  Sized to exceed the FULL base-priority span,
+/// not merely a same-base-priority wake-boost differential: `PRIORITY_MAX * 4 =
+/// 124` is the largest possible base score gap between two threads, and `+4`
+/// covers the affinity-bonus headroom (a competitor's +2 plus our own deficit).
+/// At 128 a fully-aged Ready thread is guaranteed to out-score ANY runnable peer
+/// regardless of base priority — the monotone "wait-time → eligibility"
+/// guarantee.  This bounds every thread's worst-case score-path latency even a
+/// `PRIORITY_IDLE` thread (TID 0, base score ≈ 0..2) eventually out-scores a
+/// saturated `PRIORITY_NORMAL`+ population rather than relying solely on the
+/// force backstop — though for the BSP reactor specifically the tighter
+/// `STARVE_FORCE_TICKS_BSP` deadline rescues it first (its full-span climb takes
+/// ~100 ticks).  Cf. POSIX sched(7) (SCHED_OTHER: every runnable thread
+/// eventually runs).
+const STARVE_AGE_BONUS_MAX: u16 = 128;
 
 /// Hard ceiling: a Ready thread that has waited this many ticks (≈1 s) is
 /// force-selected on the current CPU regardless of score, bypassing the normal
 /// strict-max comparison.  This is the absolute anti-starvation guarantee that
 /// bounds worst-case run-queue latency independent of any priority arithmetic.
+/// With the widened monotone aging above, the score-based path almost always
+/// rescues a starved thread first, so this backstop is now a true last-resort
+/// safety net rather than the routine rescue mechanism.
 const STARVE_FORCE_TICKS: u64 = 100;
+
+/// Tighter force-deadline for the BSP main thread (TID 0) only — the kernel's
+/// latency-critical poll reactor (net::poll / x11::poll / compositor::compose).
+/// Like an interactive task in a virtual-deadline fair scheduler, TID 0 spends
+/// almost no CPU and yields early every iteration, so it is owed a much earlier
+/// deadline than the compute-bound workers it competes with.  8 ticks (≈80 ms,
+/// at TICK_HZ = 100) keeps the reactor running at ~10+ Hz even when a 50+-thread
+/// userspace workload saturates the run-queue, so the network/compositor pump
+/// keeps draining and a page load can actually complete and composite.  The
+/// score-based aging usually selects TID 0 even sooner; this deadline bounds the
+/// reactor's worst-case latency well below the coarse `STARVE_FORCE_TICKS`
+/// global ceiling.
+const STARVE_FORCE_TICKS_BSP: u64 = 8;
 
 /// Throttle factor for the `[SCHED/STARVE] force-select` diagnostic: the line
 /// is emitted on the first force and then once per this many force-selects.
@@ -310,6 +361,19 @@ pub static SCHED_STARVE_FORCE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Snapshot of [`SCHED_STARVE_FORCE_TOTAL`].
 pub fn starve_force_count() -> u64 {
     SCHED_STARVE_FORCE_TOTAL.load(Ordering::Relaxed)
+}
+
+/// The BSP poll-reactor (TID 0) force-deadline in 100 Hz ticks.  Exposed for
+/// the scheduler regression test to assert the latency guarantee without
+/// reaching into the private constant.
+pub fn bsp_force_deadline_ticks() -> u64 {
+    STARVE_FORCE_TICKS_BSP
+}
+
+/// The global last-resort force-deadline in 100 Hz ticks (applies to
+/// compute-bound worker threads).  Exposed for the scheduler regression test.
+pub fn global_force_deadline_ticks() -> u64 {
+    STARVE_FORCE_TICKS
 }
 
 /// Pure helper: the anti-starvation score bonus for a Ready thread that has
@@ -1420,14 +1484,22 @@ was_emergency_4k={}",
         let mut best_score: u16 = 0;
         let mut idle_best_idx: Option<usize> = None;
         let mut idle_best_score: u16 = 0;
-        // Anti-starvation backstop: the schedulable-on-this-CPU Ready peer with
-        // the oldest run-queue wait, and that wait age in ticks.  If the oldest
-        // reaches `STARVE_FORCE_TICKS` it is force-selected below regardless of
-        // score.  Idle threads (TID >= 0x1000) are deliberately excluded — they
-        // are the schedule-of-last-resort and must never pre-empt real work via
-        // the backstop.
+        // Anti-starvation backstop: the schedulable-on-this-CPU Ready peer that
+        // is the most OVERDUE relative to its own force-deadline.  Each thread
+        // has a per-thread deadline — `STARVE_FORCE_TICKS_BSP` for the BSP poll
+        // reactor (TID 0), `STARVE_FORCE_TICKS` for everyone else — so the
+        // latency-critical reactor becomes force-eligible far sooner than a
+        // compute-bound worker.  We track the candidate with the largest
+        // `wait_age - deadline` (its overdue margin); a non-overdue thread has a
+        // negative margin and is never the force pick.  `force_age` records that
+        // winner's raw wait age for the diagnostic.  Idle threads (TID >=
+        // 0x1000) are deliberately excluded — they are the schedule-of-last-
+        // resort and must never pre-empt real work via the backstop.
         let mut force_idx: Option<usize> = None;
         let mut force_age: u64 = 0;
+        // Most-overdue margin seen so far (`wait_age - deadline`), as a signed
+        // value.  `i64::MIN` means "no overdue candidate yet".
+        let mut force_margin: i64 = i64::MIN;
         // Run-queue depth: count of non-idle Ready peers considered this pass.
         // Published lock-free into READY_DEPTH after the scan so disk-I/O
         // waiters (and the wait-amplification histogram) can read, without the
@@ -1481,8 +1553,23 @@ was_emergency_4k={}",
             // of last resort.  See `wait_age_bonus` / `STARVE_*`.
             if !is_idle_thread {
                 score += wait_age_bonus(wait_age);
-                // Track the oldest real Ready peer for the hard backstop.
-                if wait_age > force_age || force_idx.is_none() {
+                // Track the most-overdue real Ready peer for the hard backstop,
+                // each measured against its OWN force-deadline.  The BSP poll
+                // reactor (TID 0) gets the tighter `STARVE_FORCE_TICKS_BSP`
+                // deadline so it becomes force-eligible (and wins the most-
+                // overdue comparison) well before any worker on the coarse
+                // global ceiling.  `margin = wait_age - deadline`; positive ⇒
+                // overdue.  Comparing margins (not raw ages) means a worker that
+                // has waited longer in absolute terms does not steal the force
+                // pick from a reactor that is further past its own deadline.
+                let deadline: u64 = if t.tid == 0 {
+                    STARVE_FORCE_TICKS_BSP
+                } else {
+                    STARVE_FORCE_TICKS
+                };
+                let margin = wait_age as i64 - deadline as i64;
+                if margin > force_margin {
+                    force_margin = margin;
                     force_age = wait_age;
                     force_idx = Some(idx);
                 }
@@ -1531,22 +1618,41 @@ was_emergency_4k={}",
             best_score = idle_best_score;
         }
 
-        // Anti-starvation backstop (hard guarantee): if the oldest real Ready
-        // peer on this CPU has been waiting at least `STARVE_FORCE_TICKS`
-        // (~1 s), force-select it this tick regardless of score.  The
-        // escalating `wait_age_bonus` already wins the score comparison long
-        // before this in almost all cases; the backstop bounds worst-case
-        // run-queue latency even against a pathological priority mix where the
-        // capped bonus cannot overcome a much-higher-base-priority storm.  This
-        // mirrors the balance-set-manager force-boost of starved Ready threads
-        // and the CFS/EEVDF guarantee that the longest-waiting runnable task
-        // eventually runs.  Only fires when the forced thread is not already the
-        // best pick (avoids a redundant override) and is non-idle (tracked that
-        // way in `force_idx`).
-        if force_age >= STARVE_FORCE_TICKS {
+        // Anti-starvation backstop (hard guarantee): if the most-overdue real
+        // Ready peer on this CPU is at or past its OWN force-deadline
+        // (`force_margin >= 0` ⇔ `wait_age >= deadline`), force-select it this
+        // tick regardless of score.
+        //
+        // For ordinary same-base-priority contention the widened, escalating
+        // `wait_age_bonus` (cap = full base-priority span) wins the score
+        // comparison first, so a starved worker is rescued by score-aging well
+        // before this backstop — the backstop is then a true last resort.
+        //
+        // For the `PRIORITY_IDLE` BSP poll reactor (TID 0) the split is
+        // deliberate: its score-bonus can only overtake a continuously
+        // wake-boosted `PRIORITY_NORMAL` storm after ~100 ticks of aging, so the
+        // reactor is intentionally rescued by its TIGHT per-thread deadline
+        // (`STARVE_FORCE_TICKS_BSP`, ~80 ms) — the score path is its backstop's
+        // backstop, not its primary rescue.  The tight deadline is exactly the
+        // virtual-deadline treatment a fair scheduler gives an early-yielding
+        // latency-sensitive task, bounding the net/x11/compositor pump's
+        // run-queue latency at ~80 ms instead of the ~1 s global ceiling that
+        // applies to compute-bound workers.
+        //
+        // This mirrors the balance-set-manager force-boost of starved Ready
+        // threads and the virtual-deadline guarantee that the longest-overdue
+        // runnable task eventually runs.  Only fires when the forced thread is
+        // not already the best pick (avoids a redundant override) and is
+        // non-idle (tracked that way in `force_idx`).
+        if force_margin >= 0 {
             if let Some(fidx) = force_idx {
                 if best_idx != Some(fidx) {
                     let n = SCHED_STARVE_FORCE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    let deadline: u64 = if threads[fidx].tid == 0 {
+                        STARVE_FORCE_TICKS_BSP
+                    } else {
+                        STARVE_FORCE_TICKS
+                    };
                     // Throttle the diagnostic: emit the first force-select and
                     // then one per `STARVE_FORCE_LOG_EVERY` thereafter.  Under
                     // sustained contention (e.g. a busy poll thread that
@@ -1558,7 +1664,7 @@ was_emergency_4k={}",
                         crate::serial_println!(
                             "[SCHED/STARVE] force-select tid={} (waited {} ticks >= {}) on cpu={} \
                              total={} — anti-starvation backstop",
-                            threads[fidx].tid, force_age, STARVE_FORCE_TICKS, cpu, n + 1,
+                            threads[fidx].tid, force_age, deadline, cpu, n + 1,
                         );
                     }
                     best_idx = Some(fidx);
