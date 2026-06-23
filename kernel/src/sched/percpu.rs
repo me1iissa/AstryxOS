@@ -247,30 +247,58 @@ fn target_cpu_for(affinity: Option<u8>, last_cpu: u8) -> usize {
     if c < MAX_CPUS { c } else { 0 }
 }
 
+/// True iff `t` belongs to the mirrored non-idle runnable pool: a `Ready`
+/// thread that is NOT an idle-class thread.
+///
+/// "Idle class" matches the authoritative picker EXACTLY: `is_idle_thread =
+/// t.tid >= 0x1000` (super::schedule, the AP idle threads).  TID 0 — the BSP
+/// poll reactor — is DELIBERATELY a non-idle `PRIORITY_IDLE` peer, NOT idle, in
+/// both the picker (which warns that classifying TID 0 as idle would starve the
+/// net/x11/compositor polls) and here, so the mirror tracks the picker's
+/// non-idle pool faithfully.  Phase 2 switches the pick to read this pool;
+/// excluding TID 0 here would silently drop the latency-critical reactor from
+/// the runnable set, so this predicate is load-bearing.
+#[inline]
+fn is_mirrored_runnable(t: &proc::Thread) -> bool {
+    t.state == ThreadState::Ready && t.tid < 0x1000
+}
+
 /// Phase-1 mirror rebuild + self-verify, called from the authoritative picker
 /// while `THREAD_TABLE` is held.
 ///
 /// Rebuilds every CPU's runqueue from the locked thread table so the structure,
-/// bitmap and `nr_running` reflect the current Ready set, then verifies two
-/// properties and records any break in the monotone failure counters:
+/// bitmap and `nr_running` reflect the current non-idle Ready set, then
+/// verifies two properties and records any break in the monotone failure
+/// counters:
 ///
 ///   1. **Structural invariants** — for each rebuilt runqueue, the bitmap and
 ///      `nr_running` agree with the lists ([`PerCpuRq::invariants_hold`]).
-///   2. **Membership** — the multiset of (tid) mirrored across all CPUs equals
-///      the set of Ready, non-idle threads in the table (idle threads, TID
-///      ≥ `0x1000` and the BSP reactor TID 0, are excluded exactly as the
-///      authoritative pass-1 picker excludes them from the non-idle pool).
+///   2. **Membership** — the number of thread IDs mirrored across all CPUs
+///      equals the authoritative non-idle Ready count ([`is_mirrored_runnable`],
+///      the same `tid < 0x1000` non-idle pool the picker's `ready_peers`
+///      counts).  This `expected` count is derived in an INDEPENDENT pass over
+///      the table (not folded into the enqueue loop), so a bug that drops a
+///      thread during enqueue/target-selection/clamp is actually caught rather
+///      than silently agreeing with itself.
 ///
 /// This is the heart of "behaviour-preserving scaffold": it touches no thread
 /// state and changes no decision; it only proves the new structure tracks the
-/// old ready-set, on every scheduling pass, so phases 2+ can switch the picker
-/// over to it with confidence.
+/// authoritative ready-set, on every scheduling pass, so phases 2+ can switch
+/// the picker over to it with confidence.
 ///
 /// `threads` is the already-locked thread table (the caller in
 /// `super::schedule` holds `THREAD_TABLE`).  Cheap relative to the picker's own
-/// table walk it piggybacks on: one pass to rebuild, one short pass per CPU to
-/// verify.
+/// table walk it piggybacks on: one independent count pass, one rebuild pass,
+/// one short verify pass per CPU.
 pub fn mirror_rebuild_and_verify(threads: &[proc::Thread]) {
+    // Independent expected count FIRST, before any enqueue — this is the
+    // authoritative non-idle Ready population the mirror must reproduce.
+    // Deriving it separately (rather than incrementing alongside the enqueue)
+    // makes the membership check a genuine cross-check: if the rebuild loop
+    // drops a thread (lost clamp, missing guard, target bug), the two counts
+    // diverge and the failure is recorded.
+    let expected_runnable = threads.iter().filter(|t| is_mirrored_runnable(t)).count() as u32;
+
     // Take all runqueue locks for the duration of the rebuild.  Lock order is
     // honoured (we already hold THREAD_TABLE; RQS is the leaf), and the locks
     // are acquired in ascending CPU index order — the same order phase-3
@@ -286,21 +314,14 @@ pub fn mirror_rebuild_and_verify(threads: &[proc::Thread]) {
         guards[cpu] = Some(g);
     }
 
-    // Rebuild: place every Ready, non-idle thread onto its target CPU's queue.
-    // Idle threads are excluded to match the authoritative pass-1 picker, whose
-    // non-idle pool drives ordinary selection (idle is the schedule-of-last-
-    // resort handled separately).  TID 0 (the BSP poll reactor) and AP idle
-    // threads (TID ≥ 0x1000) are the idle class here.
-    let mut expected_nonidle_ready = 0u32;
+    // Rebuild: place every non-idle Ready thread onto its target CPU's queue.
+    // The idle class (AP idle threads, TID ≥ 0x1000) is excluded exactly as the
+    // authoritative picker excludes it; TID 0 (the BSP poll reactor) is a
+    // non-idle peer and IS mirrored — see `is_mirrored_runnable`.
     for t in threads.iter() {
-        if t.state != ThreadState::Ready {
+        if !is_mirrored_runnable(t) {
             continue;
         }
-        if t.tid == 0 || t.tid >= 0x1000 {
-            // Idle class — excluded from the mirrored non-idle ready-set.
-            continue;
-        }
-        expected_nonidle_ready += 1;
         let cpu = target_cpu_for(t.cpu_affinity, t.last_cpu);
         if let Some(g) = guards[cpu].as_mut() {
             g.enqueue(t.tid, t.priority);
@@ -322,11 +343,10 @@ pub fn mirror_rebuild_and_verify(threads: &[proc::Thread]) {
         MIRROR_INVARIANT_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Verify (2): membership total matches the authoritative non-idle Ready
-    // count.  Because we *built* the mirror from the table, a mismatch can only
-    // mean a scaffold bug (e.g. an enqueue lost to a clamp), so this is a
-    // genuine self-check, not a race window.
-    if mirrored_total != expected_nonidle_ready {
+    // Verify (2): the mirrored total matches the INDEPENDENTLY-derived
+    // authoritative non-idle Ready count.  A mismatch means the rebuild dropped
+    // or duplicated a thread relative to the table — a genuine scaffold bug.
+    if mirrored_total != expected_runnable {
         MIRROR_MEMBERSHIP_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 

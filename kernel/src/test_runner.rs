@@ -48986,7 +48986,11 @@ fn test_645_percpu_runqueue_scaffold() -> bool {
     // ── Live mirror health ───────────────────────────────────────────────
     // The phase-1 mirror has been rebuilt from THREAD_TABLE on every
     // scheduling pass since boot.  In a behaviour-preserving scaffold it must
-    // never have detected a structural-invariant or membership break.
+    // never have detected a structural-invariant or membership break.  The
+    // membership counter is a genuine cross-check: the mirror's total is
+    // compared against an INDEPENDENTLY-derived non-idle Ready count, so a
+    // rebuild that dropped or duplicated a thread relative to the table would
+    // increment it.
     let inv = percpu::mirror_invariant_failures();
     let mem = percpu::mirror_membership_failures();
     if inv != 0 || mem != 0 {
