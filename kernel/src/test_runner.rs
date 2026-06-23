@@ -58620,34 +58620,32 @@ fn test_641_crossproc_mapshared_memfd_visibility() -> bool {
     };
     let c_visible = frame_has_sentinel(cons_phys_c);
     if !c_visible {
-        // KNOWN LATENT GAP (documented, NON-FATAL): the producer's MAP_SHARED
-        // write does NOT survive cache eviction → ramfs/tmpfs dual-storage
-        // incoherence.  An mmap MAP_SHARED+PROT_WRITE store lands ONLY in the
-        // page-cache frame; ramfs keeps a SEPARATE inode Vec that is the
-        // authoritative source for fs.read.  After eviction the consumer's
-        // cache-miss fs.read returns the (never-updated) Vec → zeros.
-        //
-        // This gap is INERT on the single-CPU Firefox render path: there is no
-        // LRU/pressure eviction, and on SMP=1 there are no concurrent-fault
-        // insert-collisions, so a live mmap-written memfd page is never evicted
-        // — the consumer always cache-HITs the producer's resident frame (A/B).
-        // It becomes reachable under SMP concurrent-fault insert-collisions,
-        // ftruncate-shrink-then-regrow, or a future cache-pressure evictor.
-        //
-        // Recorded (not asserted) so the regression guard documents the gap
-        // without failing CI; the forward fix is page-cache writeback on
-        // eviction for ramfs/tmpfs (or making the cache frame authoritative for
-        // ramfs reads).  POSIX mmap(2) MAP_SHARED coherence.
+        // ramfs/tmpfs dual-storage incoherence (the FF Wikipedia blob/display-
+        // list render gate): a MAP_SHARED+PROT_WRITE store lands ONLY in the
+        // page-cache frame, while ramfs keeps a SEPARATE inode buffer that is
+        // the source for fs.read.  If a cache-miss fs.read after eviction
+        // returns zeros, the producer's mmap write was LOST — exactly the gate
+        // (the parent reads a degenerate, mostly-zero blob → BlobReader::new
+        // crashes).  The fix (mm::cache writeback-on-eviction to the inode
+        // buffer) MUST make this read coherent.  POSIX.1-2017 mmap(2)
+        // MAP_SHARED: a write "shall change the underlying file object" and be
+        // visible to a subsequent read(2).  Reclaim the leaked frame before
+        // failing so a fail leaves no PMM leak / stale cache entry.
         crate::serial_println!(
-            "[T641/DUAL-STORAGE] KNOWN-LATENT: producer MAP_SHARED write LOST across \
+            "[T641/DUAL-STORAGE] FAIL: producer MAP_SHARED write LOST across \
              cache eviction — consumer cache-miss fs.read returned zeros \
-             (mount={} inode={} foff={}); inert on SMP=1 FF path (no eviction)",
+             (mount={} inode={} foff={})",
             mount, inode, foff);
-        test_println!("  C eviction-then-remap: KNOWN-LATENT dual-storage gap recorded \
-                       (inert on SMP=1 FF render path) ⚠");
-    } else {
-        test_println!("  C eviction-then-remap: producer write survived eviction ✓");
+        if let Some(p) = crate::mm::cache::evict(mount, inode, foff) {
+            crate::mm::pmm::free_page(p);
+        }
+        test_fail!(NAME, "C: producer MAP_SHARED write LOST across eviction \
+                          (ramfs/tmpfs dual-storage incoherence)");
+        let _ = crate::vfs::remove(path);
+        return false;
     }
+    test_println!("  C eviction-then-remap: producer write survived eviction \
+                   via writeback-to-inode ✓");
     // Reclaim the consumer's freshly-faulted frame: evict its cache entry
     // (drops the cache ref → rc 0) and return it to the PMM, so the test
     // leaves no leaked frame and no stale (mount,inode,foff) cache entry.
@@ -58696,9 +58694,11 @@ fn test_641_crossproc_mapshared_memfd_visibility() -> bool {
     }
     test_println!("  D fallocate(0,{}): backing inode grown to {} ✓", PAGE, dsize);
 
-    // A and B (the on-path no-eviction visibility contract) and D (fallocate
-    // sizing) are the gating assertions; all passed if we reach here.  C is a
-    // documented latent gap (non-fatal, inert on the SMP=1 FF render path).
+    // A, B (no-eviction visibility), C (eviction dual-storage coherence via
+    // writeback-to-inode) and D (fallocate sizing) are ALL gating assertions;
+    // all passed if we reach here.  C is the FF Wikipedia render gate and is
+    // now a hard must-pass (was a documented latent gap before the
+    // mm::cache writeback-on-eviction fix).
     test_pass!(NAME);
     true
 }
