@@ -1300,6 +1300,16 @@ pub fn run() -> ! {
         if test_644_teardown_skips_nonrefcountable_pte() { passed += 1; }
     }
 
+    // ── Test 645: per-CPU/per-priority runqueue scaffold (Perf P2 phase 1) ──
+    // Pure-logic exercise of the new sched::percpu::PerCpuRq API + a live-mirror
+    // health check.  Behaviour-preserving scaffold; available in both the
+    // automated suite and the firefox-test ladder.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_645_percpu_runqueue_scaffold() { passed += 1; }
+    }
+
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
     // Non-destructive: verifies that guard PTEs are not-present and that the
     // first heap page is present.  Does NOT trigger the guard fault (which would
@@ -48840,6 +48850,157 @@ fn test_644_teardown_skips_nonrefcountable_pte() -> bool {
     test_println!("  real frame phys={:#x} decremented once + freed; \
                    phys=0 PTE skipped (no underflow)", real_phys);
     test_pass!("teardown dec skips non-refcountable (phys=0) PTEs");
+    true
+}
+
+/// Test 645 — per-CPU/per-priority runqueue scaffold (Perf P2 phase 1).
+///
+/// Exercises the new [`sched::percpu::PerCpuRq`] structure directly: the
+/// per-priority FIFOs, the O(1) non-empty-priority bitmap, the `nr_running`
+/// accounting, the O(1) `highest()` pick, and the structural invariants — all
+/// without spinning real threads, so it is deterministic.  Then confirms the
+/// LIVE phase-1 mirror (rebuilt from `THREAD_TABLE` on every scheduling pass)
+/// has recorded no invariant or membership break since boot, proving the
+/// scaffold tracks the authoritative ready-set in the running system.
+fn test_645_percpu_runqueue_scaffold() -> bool {
+    use crate::sched::percpu::{self, PerCpuRq, NPRIO};
+    use crate::proc::{PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_HIGH, PRIORITY_MAX};
+    const NAME: &str = "[SCHED/P2] per-CPU runqueue scaffold (Test 645)";
+    test_header!(NAME);
+
+    // The bitmap is 32 bits wide — it must cover every priority level.
+    if NPRIO != 32 {
+        test_fail!(NAME, "NPRIO={} expected 32 (bitmap width)", NPRIO);
+        return false;
+    }
+
+    let mut rq = PerCpuRq::new_for_test();
+
+    // Empty runqueue: nothing to pick, clean bitmap, zero running, invariants.
+    if rq.highest().is_some() || rq.bitmap() != 0 || rq.nr_running() != 0 {
+        test_fail!(NAME, "fresh runqueue not empty");
+        return false;
+    }
+    if !rq.invariants_hold() {
+        test_fail!(NAME, "empty runqueue failed invariants");
+        return false;
+    }
+
+    // Enqueue across three priority levels.  FIFO order within a level, the
+    // bitmap marks exactly those levels, nr_running is the total.
+    rq.enqueue(101, PRIORITY_NORMAL);
+    rq.enqueue(102, PRIORITY_NORMAL); // same level, behind 101 (FIFO)
+    rq.enqueue(103, PRIORITY_HIGH);   // higher level
+    rq.enqueue(104, PRIORITY_IDLE);   // lowest level
+
+    if rq.nr_running() != 4 {
+        test_fail!(NAME, "nr_running={} expected 4", rq.nr_running());
+        return false;
+    }
+    let expect_bitmap = (1u32 << PRIORITY_NORMAL)
+        | (1u32 << PRIORITY_HIGH)
+        | (1u32 << PRIORITY_IDLE);
+    if rq.bitmap() != expect_bitmap {
+        test_fail!(NAME, "bitmap={:#x} expected {:#x}", rq.bitmap(), expect_bitmap);
+        return false;
+    }
+    if !rq.invariants_hold() {
+        test_fail!(NAME, "invariants broke after enqueue");
+        return false;
+    }
+
+    // O(1) pick = head of the highest non-empty level → tid 103 (PRIORITY_HIGH).
+    if rq.highest() != Some(103) {
+        test_fail!(NAME, "highest()={:?} expected Some(103)", rq.highest());
+        return false;
+    }
+
+    // Remove the HIGH thread; pick now falls to the head of NORMAL (FIFO: 101
+    // before 102), and the HIGH bitmap bit clears (level emptied).
+    if !rq.dequeue(103, PRIORITY_HIGH) {
+        test_fail!(NAME, "dequeue(103) reported not present");
+        return false;
+    }
+    if (rq.bitmap() & (1u32 << PRIORITY_HIGH)) != 0 {
+        test_fail!(NAME, "HIGH bitmap bit still set after emptying the level");
+        return false;
+    }
+    if rq.highest() != Some(101) {
+        test_fail!(NAME, "highest()={:?} expected Some(101) (FIFO)", rq.highest());
+        return false;
+    }
+    if rq.nr_running() != 3 || !rq.invariants_hold() {
+        test_fail!(NAME, "state wrong after dequeue: nr={}", rq.nr_running());
+        return false;
+    }
+
+    // Dequeue of an absent tid is a no-op that reports false and preserves
+    // every invariant and count.
+    if rq.dequeue(999, PRIORITY_NORMAL) {
+        test_fail!(NAME, "dequeue of absent tid reported present");
+        return false;
+    }
+    if rq.nr_running() != 3 || !rq.invariants_hold() {
+        test_fail!(NAME, "absent-dequeue mutated state");
+        return false;
+    }
+
+    // Drain the remaining NORMAL level in FIFO order (101 then 102); the bit
+    // clears only when the level is fully empty.
+    if !rq.dequeue(101, PRIORITY_NORMAL) {
+        test_fail!(NAME, "dequeue(101) not present");
+        return false;
+    }
+    if (rq.bitmap() & (1u32 << PRIORITY_NORMAL)) == 0 {
+        test_fail!(NAME, "NORMAL bit cleared while 102 still queued");
+        return false;
+    }
+    if !rq.dequeue(102, PRIORITY_NORMAL) {
+        test_fail!(NAME, "dequeue(102) not present");
+        return false;
+    }
+    if (rq.bitmap() & (1u32 << PRIORITY_NORMAL)) != 0 {
+        test_fail!(NAME, "NORMAL bit set after fully draining the level");
+        return false;
+    }
+
+    // Only the IDLE-level thread remains; it is now the highest (and only) pick.
+    if rq.highest() != Some(104) || rq.nr_running() != 1 {
+        test_fail!(NAME, "tail state wrong: highest={:?}", rq.highest());
+        return false;
+    }
+
+    // Top of the priority range (PRIORITY_MAX) must enqueue without clamping
+    // into a lower level and must out-rank everything below it.
+    rq.enqueue(200, PRIORITY_MAX);
+    if rq.highest() != Some(200) {
+        test_fail!(NAME, "PRIORITY_MAX thread did not become the top pick");
+        return false;
+    }
+    rq.clear();
+    if rq.nr_running() != 0 || rq.bitmap() != 0 || !rq.invariants_hold() {
+        test_fail!(NAME, "clear() did not reset to empty");
+        return false;
+    }
+
+    // ── Live mirror health ───────────────────────────────────────────────
+    // The phase-1 mirror has been rebuilt from THREAD_TABLE on every
+    // scheduling pass since boot.  In a behaviour-preserving scaffold it must
+    // never have detected a structural-invariant or membership break.  The
+    // membership counter is a genuine cross-check: the mirror's total is
+    // compared against an INDEPENDENTLY-derived non-idle Ready count, so a
+    // rebuild that dropped or duplicated a thread relative to the table would
+    // increment it.
+    let inv = percpu::mirror_invariant_failures();
+    let mem = percpu::mirror_membership_failures();
+    if inv != 0 || mem != 0 {
+        test_fail!(NAME,
+            "live mirror failures: invariant={} membership={}", inv, mem);
+        return false;
+    }
+    test_println!("  live mirror clean (invariant=0 membership=0); rq API + bitmap O(1) pick verified");
+
+    test_pass!(NAME);
     true
 }
 
