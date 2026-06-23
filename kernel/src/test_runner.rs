@@ -49329,6 +49329,20 @@ fn test_648_percpu_pick_equivalence() -> bool {
         // threads pinned to APs; none are eligible on the BSP, so the legacy
         // idle-pool fallback selects nothing the per-CPU path (which omits idle)
         // would miss. Scenario 7 documents this invariant explicitly.
+        //
+        // COVERAGE NOTE (SMP=1-specific): this models per-CPU membership as
+        // *affinity-eligibility* (affinity None or Some(cpu)). The LIVE path
+        // places a thread on `RQS[target_cpu_for(affinity, last_cpu)]` =
+        // `affinity` if set else `last_cpu`. These two models coincide ONLY
+        // because on SMP=1 `last_cpu` is always 0 (no AP ever stamps a nonzero
+        // last_cpu, and no nonzero-affinity / idle-class BSP-eligible thread is
+        // ever created). When SMP=2 is promoted, an `affinity=None,
+        // last_cpu!=cpu` thread would be routed to RQS[last_cpu] (omitted from
+        // RQS[0]) while the legacy whole-table walk would still score it on
+        // cpu0 — so this test's membership model must be revisited then (the
+        // live `sched-pick-xcheck` cross-check catches any such real divergence
+        // regardless). Phase 2b's authoritative pick remains the legacy walk, so
+        // this gap is inert here.
         let runnable: alloc::vec::Vec<Tid> = threads.iter()
             .filter(|t| t.state == ThreadState::Ready && t.tid < 0x1000)
             .filter(|t| t.cpu_affinity.is_none() || t.cpu_affinity == Some(cpu))
