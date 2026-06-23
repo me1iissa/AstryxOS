@@ -369,6 +369,13 @@ fn arm_at_cr3_idx(cr3: u64, va: u64, auto_idx: usize) -> Result<(), &'static str
     let new_pte = new_phys | flags | vmm::PAGE_WRITABLE;
     vmm::write_pte(cr3, page, new_pte);
     vmm::invlpg(page);
+    // Refcount bookkeeping: the PTE now references `new_phys` (set its ref to 1,
+    // mirroring the demand-paging private-copy install) and no longer references
+    // `old_phys` (release the mapping ref we displaced).  Without this the old
+    // shared/cache frame leaks and `new_phys` underflows its refcount at process
+    // teardown (still freed correctly, but it bumps the underflow diagnostic).
+    crate::mm::refcount::page_ref_set(new_phys, 1);
+    let _ = crate::mm::refcount::page_ref_dec(old_phys);
     let off = (va & (PAGE_SIZE - 1)) as usize;
     let byte_ptr = (PHYS_OFF + new_phys + off as u64) as *mut u8;
     let orig = unsafe { core::ptr::read_volatile(byte_ptr) };
@@ -436,6 +443,13 @@ pub fn arm(pid: u64, va: u64) -> Result<(u64, u64, u8), &'static str> {
     let new_pte = new_phys | flags | vmm::PAGE_WRITABLE;
     vmm::write_pte(cr3, page, new_pte);
     vmm::invlpg(page);
+    // Refcount bookkeeping: the PTE now references `new_phys` (set its ref to 1,
+    // mirroring the demand-paging private-copy install) and no longer references
+    // `old_phys` (release the mapping ref we displaced).  Without this the old
+    // shared/cache frame leaks and `new_phys` underflows its refcount at process
+    // teardown (still freed correctly, but it bumps the underflow diagnostic).
+    crate::mm::refcount::page_ref_set(new_phys, 1);
+    let _ = crate::mm::refcount::page_ref_dec(old_phys);
 
     // Plant the int3.
     let off = (va & (PAGE_SIZE - 1)) as usize;
@@ -704,9 +718,9 @@ fn capture(cr3: u64, bp_va: u64, frame_rsp: u64, gpr: &Gprs) {
         snap.win_len[2] = n;
         snap.win_bytes[2] = buf;
     }
-    // Stash the blob length in the unused-at-entry field so the dump shows it.
-    // (We overload `rsp` is needed; instead add a dedicated field via win_va[2]
-    // already = ptr; blob_len is logged below.)
+    // The decoded blob length is logged to serial (window 2's va already carries
+    // the blob ptr); this keeps the blob ptr+len visible even when the KDB pump
+    // is starved under heavy Firefox load and `ubreak dump` cannot be reached.
     if blob_len != 0 {
         crate::serial_println!(
             "[UBREAK] capture blob: rip={:#x} data(rdx)={:#x} blob_ptr={:#x} blob_len={}",
