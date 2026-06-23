@@ -5,6 +5,17 @@ edition.workspace = true
 
 [features]
 default = []
+# `sched-pick-xcheck` — Perf P2 phase 2b live pick-equivalence cross-check. On
+# every scheduling pass (SMP=1 only) the per-CPU runqueue pick is computed
+# alongside the authoritative legacy table-scan pick and any divergence is
+# logged + counted (`sched::percpu::PICK_DIVERGENCES`). The legacy result still
+# drives the switch, so this is observation-only — the live half of the Test
+# 648 proof. Off by default and NOT pulled into `test-mode` (it does per-sample
+# heap allocation off the schedule() path, which must stay allocation-free in
+# the default kernel); enable explicitly for a dedicated equivalence soak. The
+# deterministic Test 648 is the authoritative merge gate; this is supplementary
+# live evidence.
+sched-pick-xcheck = []
 # `heap-canary` — fence every live kernel-heap allocation with front/rear
 # magic red-zone words (validated on free) so an out-of-bounds write that
 # clobbers free-list metadata is caught at free-time, naming the victim

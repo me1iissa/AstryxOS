@@ -365,6 +365,30 @@ pub fn rq_nr_running(cpu: usize) -> u32 {
     RQS[cpu].lock().nr_running()
 }
 
+/// Snapshot every Tid queued on CPU `cpu`'s runqueue, in bitmap order (highest
+/// priority level first, FIFO within a level).  Used by the phase-2b per-CPU
+/// pick to build its candidate set; the caller re-imposes the picker's rotation
+/// order on the result, so the per-level order here is not load-bearing for the
+/// selection (only membership is).  Takes the single `RQS[cpu]` leaf lock.
+#[cfg(feature = "sched-pick-xcheck")]
+pub fn rq_snapshot_tids(cpu: usize) -> alloc::vec::Vec<Tid> {
+    if cpu >= MAX_CPUS {
+        return alloc::vec::Vec::new();
+    }
+    let g = RQS[cpu].lock();
+    let mut out = alloc::vec::Vec::with_capacity(g.nr_running() as usize);
+    // Highest priority level first (mirrors `highest()`'s bitmap walk).
+    let mut bm = g.bitmap;
+    while bm != 0 {
+        let p = 31 - bm.leading_zeros() as usize;
+        for &tid in g.lists[p].iter() {
+            out.push(tid);
+        }
+        bm &= !(1u32 << p);
+    }
+    out
+}
+
 /// Decide which CPU's runqueue a Ready thread is mirrored onto.
 ///
 /// Phase-1 placement policy (mirror only): a thread is mirrored onto the CPU it
@@ -438,6 +462,43 @@ pub static MIRROR_AUDIT_FAILURES: AtomicU32 = AtomicU32::new(0);
 /// Snapshot of [`MIRROR_AUDIT_FAILURES`].
 pub fn mirror_audit_failures() -> u32 {
     MIRROR_AUDIT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Cumulative count of live scheduling passes (debug builds only) where the
+/// phase-2b per-CPU runqueue pick selected a DIFFERENT thread than the
+/// authoritative legacy table-scan pick.  Must stay zero on SMP=1: a non-zero
+/// value means the per-CPU candidate derivation or the `select_next`
+/// equivalence diverged from the legacy picker for some live ready-set the
+/// Test-648 constructed cases did not cover.  This is the live half of the
+/// pick-equivalence proof; the legacy result remains authoritative, so a
+/// divergence is observed, logged and counted but never acted on.  Monotone
+/// since boot; surfaced via [`pick_divergences`].
+pub static PICK_DIVERGENCES: AtomicU32 = AtomicU32::new(0);
+
+/// Record one live per-CPU-vs-legacy pick divergence (phase-2b cross-check).
+#[inline]
+pub fn note_pick_divergence() {
+    PICK_DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sample gate for the live pick cross-check: returns `true` once every
+/// `PICK_XCHECK_SAMPLE` scheduling passes, so the cross-check's per-sample heap
+/// allocation and O(n) candidate rebuild never dominate the pick hot path.  The
+/// cross-check still catches a divergence within `PICK_XCHECK_SAMPLE` passes of
+/// it first arising, which is ample for a live equivalence soak.
+#[cfg(feature = "sched-pick-xcheck")]
+pub fn pick_xcheck_sample_due() -> bool {
+    /// Sample one pick in this many passes.  Power of two so the modulo is a
+    /// mask; large enough that the cross-check is a negligible amortized cost.
+    const PICK_XCHECK_SAMPLE: u32 = 256;
+    static PASS: AtomicU32 = AtomicU32::new(0);
+    let n = PASS.fetch_add(1, Ordering::Relaxed);
+    n % PICK_XCHECK_SAMPLE == 0
+}
+
+/// Snapshot of [`PICK_DIVERGENCES`].
+pub fn pick_divergences() -> u32 {
+    PICK_DIVERGENCES.load(Ordering::Relaxed)
 }
 
 /// The runqueue membership a thread SHOULD have right now: `None` if it is not a

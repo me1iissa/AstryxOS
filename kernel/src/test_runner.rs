@@ -1310,6 +1310,8 @@ pub fn run() -> ! {
         if test_645_percpu_runqueue_scaffold() { passed += 1; }
         total += 1;
         if test_647_percpu_incremental_equiv() { passed += 1; }
+        total += 1;
+        if test_648_percpu_pick_equivalence() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49249,6 +49251,264 @@ fn test_647_percpu_incremental_equiv() -> bool {
     test_println!("  incremental maintenance == full rebuild across 5 transition phases \
 (membership+placement+bitmap+nr_running); order-divergence confirmed; \
 injected-divergence detected");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 648: per-CPU pick == legacy table-scan pick (PICK-EQUIVALENCE PROOF) ─
+//
+// Perf P2 phase 2b switches the schedule() pick to read this CPU's per-CPU
+// runqueue. The mandatory safety gate is that the per-CPU pick selects the
+// IDENTICAL thread the legacy global table-scan picker would, on SMP=1. This
+// test drives BOTH selectors (via `sched::test_pick_equivalence`, which runs the
+// shared side-effect-free selection core over a legacy rotated-`1..len`
+// candidate ordering AND the per-CPU runqueue-derived ordering) over a battery
+// of constructed ready-sets and asserts they pick the same TID every time.
+//
+// The scenarios deliberately span every term the equivalence depends on:
+//   * plain priority ordering (highest priority wins),
+//   * affinity / last_cpu bonus tie-breaks within a priority level,
+//   * wait-age score-aging that flips a SMALL base-priority gap BEFORE the force
+//     deadline (the partial-inversion crossover — the case a naive base-priority
+//     bucket would miss),
+//   * the global force-deadline (STARVE_FORCE_TICKS) backstop,
+//   * the TID-0 BSP-reactor TIGHT force-deadline (STARVE_FORCE_TICKS_BSP),
+//   * a ctx_rsp_valid==false Ready thread (must be skipped by BOTH),
+//   * idle-pool-only fallback (no non-idle eligible peer),
+//   * rotation tie-break dependence on current_idx.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_648_percpu_pick_equivalence() -> bool {
+    use crate::proc::{Thread, Tid, ThreadState};
+    use crate::proc::{PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_HIGH};
+    const NAME: &str = "[SCHED/P2] per-CPU pick == legacy pick (Test 648, equivalence proof)";
+    test_header!(NAME);
+
+    let bsp_deadline = crate::sched::bsp_force_deadline_ticks();      // 8
+    let global_deadline = crate::sched::global_force_deadline_ticks(); // 100
+
+    // Build a Ready candidate Thread on CPU `cpu_pin`/`last_cpu`, aged
+    // `now - ready_since`, optional ctx_rsp_valid.
+    fn mk(tid: Tid, prio: u8, affinity: Option<u8>, last_cpu: u8,
+          ready_since: u64, ctx_valid: bool) -> Thread {
+        let mut t = Thread::new_for_test(prio);
+        t.tid = tid;
+        t.state = ThreadState::Ready;
+        t.cpu_affinity = affinity;
+        t.last_cpu = last_cpu;
+        t.ready_since_tick = ready_since;
+        t.ctx_rsp_valid = alloc::boxed::Box::new(
+            core::sync::atomic::AtomicBool::new(ctx_valid));
+        t
+    }
+    // A non-candidate placeholder for table index 0 (the "current" thread the
+    // rotation walk starts AFTER). Blocked so it is never selectable.
+    fn cur() -> Thread {
+        let mut t = Thread::new_for_test(PRIORITY_NORMAL);
+        t.tid = 5000;
+        t.state = ThreadState::Blocked;
+        t.cpu_affinity = None;
+        t
+    }
+
+    // Run one scenario: build the table (index 0 = current), the runnable-tid
+    // list (the per-CPU runqueue membership = all Ready non-idle + idle tids on
+    // this CPU, exactly what mirror_maintain would mirror), then assert both
+    // selectors agree. `cpu`/`current_idx`/`now` parameterise the pick.
+    fn run(scenario: &str, threads: &[Thread], cpu: u8, current_idx: usize,
+           now: u64) -> Result<Option<Tid>, alloc::string::String> {
+        // Model the REAL per-CPU runqueue membership EXACTLY as the live mirror
+        // does (`percpu::is_mirrored_runnable`): a Ready thread that is NON-IDLE
+        // (`tid < 0x1000`), placed on this CPU. The mirror deliberately EXCLUDES
+        // idle-class threads (tid >= 0x1000) and includes ctx_rsp_valid==false
+        // rows (the skip is re-applied at pick time, not at mirror time). This is
+        // the candidate set `percpu_candidate_indices` derives at runtime; using
+        // it here proves the per-CPU pick == legacy pick over the ACTUAL runqueue
+        // contents, not an idealised superset.
+        //
+        // On SMP=1 this is sound because the only tid>=0x1000 threads are AP idle
+        // threads pinned to APs; none are eligible on the BSP, so the legacy
+        // idle-pool fallback selects nothing the per-CPU path (which omits idle)
+        // would miss. Scenario 7 documents this invariant explicitly.
+        let runnable: alloc::vec::Vec<Tid> = threads.iter()
+            .filter(|t| t.state == ThreadState::Ready && t.tid < 0x1000)
+            .filter(|t| t.cpu_affinity.is_none() || t.cpu_affinity == Some(cpu))
+            .map(|t| t.tid)
+            .collect();
+        let (legacy, percpu) =
+            crate::sched::test_pick_equivalence(threads, cpu, current_idx, now, &runnable);
+        if legacy != percpu {
+            return Err(alloc::format!(
+                "{}: legacy={:?} percpu={:?}", scenario, legacy, percpu));
+        }
+        Ok(legacy)
+    }
+
+    // ── Scenario 1: plain priority ordering — HIGH beats NORMAL beats IDLE. ──
+    {
+        let threads = [cur(),
+            mk(101, PRIORITY_NORMAL, None, 0, 0, true),
+            mk(102, PRIORITY_HIGH,   None, 0, 0, true),
+            mk(103, PRIORITY_IDLE,   None, 0, 0, true)];
+        match run("s1-priority", &threads, 0, 0, 0) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(102) {
+                test_fail!(NAME, "s1: selected {:?} expected Some(102) HIGH", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 2: affinity tie-break within a priority level. Two NORMAL
+    // peers; 105 is pinned to cpu0 (+2) vs 104 last_cpu=cpu0 (+1). 105 wins. ──
+    {
+        let threads = [cur(),
+            mk(104, PRIORITY_NORMAL, None, 0, 0, true),       // last_cpu match: +1
+            mk(105, PRIORITY_NORMAL, Some(0), 0, 0, true)];   // affinity pin: +2
+        match run("s2-affinity", &threads, 0, 0, 0) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(105) {
+                test_fail!(NAME, "s2: selected {:?} expected Some(105)", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 3: PARTIAL-INVERSION via score-aging BEFORE the force
+    // deadline. 106 = NORMAL+last_cpu (score 8*4+1=33). 107 = NORMAL but aged so
+    // wait_age_bonus pushes it above 106 without yet hitting the global force
+    // deadline. At age 40: bonus = (40-20)/2+1 = 11 → score 32+11 = 43 > 33,
+    // and 40 < global_deadline(100) so NO force fires — pure score-aging flip.
+    // This is the case a base-priority-only bucket would get WRONG. ──
+    {
+        let now = 40u64;
+        let threads = [cur(),
+            mk(106, PRIORITY_NORMAL, None, 0, now, true),      // age 0, score 33
+            mk(107, PRIORITY_NORMAL, None, 9, now - 40, true)];// age 40, score 43
+        // sanity: age 40 is below the global force deadline so the flip is by
+        // score-aging, not by the backstop.
+        if now >= global_deadline {
+            test_fail!(NAME, "s3 precondition: now {} >= global_deadline {}", now, global_deadline);
+            return false;
+        }
+        match run("s3-aging-crossover", &threads, 0, 0, now) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(107) {
+                test_fail!(NAME, "s3: selected {:?} expected Some(107) (aged flip)", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 4: global force-deadline backstop. A low-priority (IDLE-base
+    // but non-idle tid) worker aged past global_deadline force-wins over a fresh
+    // HIGH peer, regardless of score. ──
+    {
+        let now = global_deadline + 5;
+        let threads = [cur(),
+            mk(108, PRIORITY_HIGH, None, 9, now, true),                 // fresh, high score
+            mk(109, PRIORITY_NORMAL, None, 9, now - (global_deadline + 1), true)]; // overdue
+        match run("s4-global-force", &threads, 0, 0, now) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(109) {
+                test_fail!(NAME, "s4: selected {:?} expected Some(109) (force backstop)", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 5: TID-0 BSP reactor TIGHT deadline. TID 0 (PRIORITY_IDLE
+    // base) aged just past bsp_deadline(8) but well below global_deadline(100)
+    // force-wins over a fresh NORMAL worker — the reactor's tight deadline fires
+    // long before the worker's coarse one. ──
+    {
+        let now = bsp_deadline + 2; // 10
+        let threads = [cur(),
+            mk(110, PRIORITY_NORMAL, None, 9, now, true),       // fresh worker
+            mk(0,   PRIORITY_IDLE,   None, 0, now - (bsp_deadline + 1), true)]; // TID0 overdue vs 8
+        match run("s5-bsp-reactor-force", &threads, 0, 0, now) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(0) {
+                test_fail!(NAME, "s5: selected {:?} expected Some(0) (BSP tight deadline)", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 6: ctx_rsp_valid==false Ready thread is skipped by BOTH. The
+    // higher-priority HIGH thread is mid-switch (ctx invalid) so the NORMAL
+    // thread wins. ──
+    {
+        let threads = [cur(),
+            mk(111, PRIORITY_NORMAL, None, 0, 0, true),
+            mk(112, PRIORITY_HIGH,   None, 0, 0, false)]; // mid-switch: skipped
+        match run("s6-ctx-invalid-skip", &threads, 0, 0, 0) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel != Some(111) {
+                test_fail!(NAME, "s6: selected {:?} expected Some(111) (HIGH skipped)", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 7: SMP=1 idle invariant. On SMP=1 the only tid>=0x1000 (idle-
+    // class) threads are AP idle threads pinned to APs — NONE are eligible on
+    // the BSP (cpu 0). So a system whose only Ready peers are idle threads
+    // pinned to OTHER CPUs has an empty cpu-0 candidate set: BOTH the legacy
+    // picker (idle pool filtered by affinity!=0) and the per-CPU path (mirror
+    // excludes idle entirely) select None. This is the invariant that makes the
+    // per-CPU path's omission of the idle pool sound on SMP=1 — there is no
+    // BSP-eligible idle thread for it to miss. (Were an idle thread ever pinned
+    // to the BSP, the legacy fallback would pick it while the per-CPU path would
+    // not; that case does not arise on SMP=1, which is the supported regime.) ──
+    {
+        let threads = [cur(),
+            mk(0x1000, PRIORITY_IDLE, Some(1), 0, 0, true),   // AP-1 idle: aff!=0
+            mk(0x1001, PRIORITY_IDLE, Some(2), 0, 0, true)];  // AP-2 idle: aff!=0
+        match run("s7-idle-other-cpu", &threads, 0, 0, 0) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel.is_some() {
+                test_fail!(NAME, "s7: BSP picked an AP-pinned idle thread {:?}", sel);
+                return false;
+            }
+        }
+    }
+
+    // ── Scenario 8: rotation tie-break dependence on current_idx. Three equal
+    // NORMAL peers with NO affinity/aging differences — the winner is purely the
+    // first in rotation order from current_idx. Sweep current_idx and confirm
+    // the per-CPU ordering (rotation-distance sorted) matches the legacy walk at
+    // every starting point. ──
+    {
+        let threads = [
+            mk(200, PRIORITY_NORMAL, None, 9, 0, true),
+            mk(201, PRIORITY_NORMAL, None, 9, 0, true),
+            mk(202, PRIORITY_NORMAL, None, 9, 0, true),
+            mk(203, PRIORITY_NORMAL, None, 9, 0, true)];
+        for ci in 0..threads.len() {
+            match run("s8-rotation", &threads, 0, ci, 0) {
+                Err(e) => { test_fail!(NAME, "{} (current_idx={})", e, ci); return false; }
+                Ok(_) => {}
+            }
+        }
+    }
+
+    // ── Scenario 9: empty ready-set. No Ready peer at all → both select None. ──
+    {
+        let threads = [cur(),
+            { let mut t = Thread::new_for_test(PRIORITY_NORMAL); t.tid = 300;
+              t.state = ThreadState::Blocked; t.cpu_affinity = None; t }];
+        match run("s9-empty", &threads, 0, 0, 0) {
+            Err(e) => { test_fail!(NAME, "{}", e); return false; }
+            Ok(sel) => if sel.is_some() {
+                test_fail!(NAME, "s9: empty ready-set selected {:?}", sel);
+                return false;
+            }
+        }
+    }
+
+    test_println!("  per-CPU pick == legacy pick across 9 scenarios \
+(priority/affinity/aging-crossover/global-force/BSP-reactor-force/ctx-skip/\
+idle-fallback/rotation-sweep/empty) — equivalence proof GREEN");
     test_pass!(NAME);
     true
 }

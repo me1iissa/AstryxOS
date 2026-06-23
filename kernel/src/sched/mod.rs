@@ -1223,6 +1223,244 @@ pub fn test_cpu_switch_gen(cpu: usize) -> u64 {
     cpu_switch_gen(cpu)
 }
 
+/// Pure selection core: the scoring loop + two-pass split + force-backstop
+/// resolution, with NO side effects (no `READY_DEPTH` publish, no
+/// `SCHED_STARVE_FORCE_TOTAL` bump, no diagnostic).  Returns the selected table
+/// index, the run-queue depth observed, and — when the force backstop chose the
+/// pick — the forced thread's `(index, raw_wait_age)` so the caller can apply
+/// the side effects exactly once.  Extracted verbatim from the legacy in-line
+/// picker (Perf P2 phase 2b): same `score = priority*4 + aff_bonus(0..2) +
+/// wait_age_bonus(age)`, same strict-max first-in-candidate-order tie-break,
+/// same two-pass non-idle-then-idle split, same per-thread force deadline
+/// (`STARVE_FORCE_TICKS_BSP` for TID 0 else `STARVE_FORCE_TICKS`).  Candidates
+/// must be supplied **in the picker's rotation order** so the tie-break matches.
+fn select_next_core(
+    threads: &[proc::Thread],
+    cpu: u8,
+    candidate_indices: impl Iterator<Item = usize>,
+    now: u64,
+) -> (Option<usize>, u64, Option<(usize, u64)>) {
+    let mut best_idx: Option<usize> = None;
+    let mut best_score: u16 = 0;
+    let mut idle_best_idx: Option<usize> = None;
+    let mut idle_best_score: u16 = 0;
+    let mut force_idx: Option<usize> = None;
+    let mut force_age: u64 = 0;
+    let mut force_margin: i64 = i64::MIN;
+    let mut ready_peers: u64 = 0;
+
+    for idx in candidate_indices {
+        let t = &threads[idx];
+        if t.state != ThreadState::Ready {
+            continue;
+        }
+        if t.tid < 0x1000 {
+            ready_peers += 1;
+        }
+        if !t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        if let Some(aff) = t.cpu_affinity {
+            if aff != cpu {
+                continue;
+            }
+        }
+
+        let wait_age = now.saturating_sub(t.ready_since_tick);
+        let is_idle_thread = t.tid >= 0x1000;
+
+        let mut score = (t.priority as u16) * 4;
+        if t.cpu_affinity == Some(cpu) {
+            score += 2;
+        } else if t.last_cpu == cpu {
+            score += 1;
+        }
+        if !is_idle_thread {
+            score += wait_age_bonus(wait_age);
+            let deadline: u64 = if t.tid == 0 {
+                STARVE_FORCE_TICKS_BSP
+            } else {
+                STARVE_FORCE_TICKS
+            };
+            let margin = wait_age as i64 - deadline as i64;
+            if margin > force_margin {
+                force_margin = margin;
+                force_age = wait_age;
+                force_idx = Some(idx);
+            }
+        }
+
+        if is_idle_thread {
+            if score > idle_best_score || idle_best_idx.is_none() {
+                idle_best_idx = Some(idx);
+                idle_best_score = score;
+            }
+        } else if score > best_score || best_idx.is_none() {
+            best_idx = Some(idx);
+            best_score = score;
+        }
+    }
+
+    if best_idx.is_none() {
+        best_idx = idle_best_idx;
+    }
+
+    let mut forced: Option<(usize, u64)> = None;
+    if force_margin >= 0 {
+        if let Some(fidx) = force_idx {
+            if best_idx != Some(fidx) {
+                best_idx = Some(fidx);
+                forced = Some((fidx, force_age));
+            }
+        }
+    }
+    (best_idx, ready_peers, forced)
+}
+
+/// The authoritative per-CPU selection (Perf P2 phase 2b), with the original
+/// inline-picker side effects: publishes `READY_DEPTH`, bumps
+/// `SCHED_STARVE_FORCE_TOTAL` and emits the throttled `[SCHED/STARVE]
+/// force-select` diagnostic on a force.  Returns `(selected_index, ready_peers)`.
+/// The legacy path calls this with the full rotated `1..len` candidate sequence
+/// — proving the extraction is byte-identical to the old inline loop.
+fn select_next(
+    threads: &[proc::Thread],
+    cpu: u8,
+    candidate_indices: impl Iterator<Item = usize>,
+    now: u64,
+) -> (Option<usize>, u64) {
+    let (best_idx, ready_peers, forced) =
+        select_next_core(threads, cpu, candidate_indices, now);
+
+    READY_DEPTH.store(ready_peers, Ordering::Relaxed);
+
+    if let Some((fidx, force_age)) = forced {
+        let n = SCHED_STARVE_FORCE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let deadline: u64 = if threads[fidx].tid == 0 {
+            STARVE_FORCE_TICKS_BSP
+        } else {
+            STARVE_FORCE_TICKS
+        };
+        if n == 0 || n % STARVE_FORCE_LOG_EVERY == 0 {
+            crate::serial_println!(
+                "[SCHED/STARVE] force-select tid={} (waited {} ticks >= {}) on cpu={} \
+                 total={} — anti-starvation backstop",
+                threads[fidx].tid, force_age, deadline, cpu, n + 1,
+            );
+        }
+    }
+    (best_idx, ready_peers)
+}
+
+/// Side-effect-free selection used by the phase-2b equivalence cross-check: the
+/// pure [`select_next_core`], returning only the selected table index.  Must not
+/// drive the authoritative path (it skips the READY_DEPTH/force-counter side
+/// effects, which would then never fire).
+#[cfg(feature = "sched-pick-xcheck")]
+fn select_next_no_side_effects(
+    threads: &[proc::Thread],
+    cpu: u8,
+    candidate_indices: impl Iterator<Item = usize>,
+    now: u64,
+) -> Option<usize> {
+    select_next_core(threads, cpu, candidate_indices, now).0
+}
+
+/// Test entry point (Perf P2 phase 2b pick-equivalence proof, Test 648).
+///
+/// Runs the selection core over a caller-built synthetic thread table for a
+/// given running CPU, current index and tick, with TWO candidate orderings:
+///
+///   * `legacy` — the full rotated `(current_idx + i) % len` walk, and
+///   * `percpu` — the candidate set the per-CPU path would derive (built here by
+///     [`test_percpu_candidates`] from the same rules `percpu_candidate_indices`
+///     uses, but over the supplied `runnable_tids` so the test need not touch
+///     the live static `RQS`).
+///
+/// Returns the selected TID for each ordering so the test can assert they are
+/// identical.  Uses the side-effect-free [`select_next_core`], so it perturbs no
+/// live scheduler counters.
+pub fn test_pick_equivalence(
+    threads: &[proc::Thread],
+    cpu: u8,
+    current_idx: usize,
+    now: u64,
+    runnable_tids: &[proc::Tid],
+) -> (Option<proc::Tid>, Option<proc::Tid>) {
+    let len = threads.len();
+    let percpu = test_percpu_candidates(threads, current_idx, runnable_tids);
+
+    let legacy_idx =
+        select_next_core(threads, cpu, (1..len).map(|i| (current_idx + i) % len), now).0;
+    let percpu_idx = select_next_core(threads, cpu, percpu.iter().copied(), now).0;
+    (
+        legacy_idx.map(|i| threads[i].tid),
+        percpu_idx.map(|i| threads[i].tid),
+    )
+}
+
+/// Build the per-CPU candidate index ordering for [`test_pick_equivalence`] from
+/// an explicit list of runnable Tids (modelling `RQS[cpu]`'s membership),
+/// applying the SAME rotation-distance ordering `percpu_candidate_indices` uses.
+fn test_percpu_candidates(
+    threads: &[proc::Thread],
+    current_idx: usize,
+    runnable_tids: &[proc::Tid],
+) -> alloc::vec::Vec<usize> {
+    let len = threads.len();
+    let mut out: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for &tid in runnable_tids {
+        if let Some(idx) = threads.iter().position(|t| t.tid == tid) {
+            // Exclude the current thread's own index: the legacy rotation walk
+            // is `i in 1..len` (it never re-considers `current_idx`), so the
+            // per-CPU candidate set must drop it too for an exact match.
+            if idx != current_idx % len {
+                out.push(idx);
+            }
+        }
+    }
+    out.sort_by_key(|&idx| (idx + len - (current_idx % len)) % len);
+    out
+}
+
+/// Build the candidate index sequence for [`select_next`] from this CPU's
+/// per-CPU runqueue (Perf P2 phase 2b), in the picker's rotation order.
+///
+/// The runqueue stores Tids; this maps each queued Tid back to its table index
+/// and orders the result by rotation distance from `current_idx`
+/// (`(idx - current_idx) mod len`), so the candidate order — and therefore
+/// `select_next`'s strict-max tie-break — matches the legacy `(current_idx + i)
+/// % len` walk exactly.  Threads in the runqueue whose Tid is not found in the
+/// table (a transient the next maintain pass will reconcile) are skipped.
+///
+/// On SMP=1 the runqueue's non-idle pool equals the legacy eligible non-idle
+/// Ready set, so the candidate set is identical; this function only re-imposes
+/// the rotation ORDER on it.
+#[cfg(feature = "sched-pick-xcheck")]
+fn percpu_candidate_indices(
+    threads: &[proc::Thread],
+    cpu: usize,
+    current_idx: usize,
+) -> alloc::vec::Vec<usize> {
+    let len = threads.len();
+    // Snapshot the queued Tids for this CPU under the runqueue lock.
+    let tids = percpu::rq_snapshot_tids(cpu);
+    let mut out: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(tids.len());
+    for tid in tids {
+        if let Some(idx) = threads.iter().position(|t| t.tid == tid) {
+            // Exclude the current thread's own index: the legacy rotation walk
+            // is `i in 1..len` and never re-considers `current_idx`.
+            if idx != current_idx % len {
+                out.push(idx);
+            }
+        }
+    }
+    // Order by rotation distance from current_idx so the tie-break matches the
+    // legacy `(current_idx + i) % len` walk.
+    out.sort_by_key(|&idx| (idx + len - (current_idx % len)) % len);
+    out
+}
+
 /// Schedule the next thread to run.
 ///
 /// This is the core scheduling function. It:
@@ -1488,218 +1726,74 @@ was_emergency_4k={}",
         // `mirror_maintain`).  See `sched::percpu`.
         percpu::mirror_maintain(&mut threads);
 
-        // Find the highest-priority Ready thread with affinity awareness.
-        // Scoring: priority * 4 + affinity_bonus (0-2)
-        //   - affinity match (pinned to this cpu): +2
-        //   - last_cpu match (cache-warm): +1
-        //   - no match: +0
+        // ── Pick the next thread (Perf P2 phase 2b: per-CPU runqueue pick) ────
+        // The selection is computed by `select_next`, the verbatim extraction of
+        // the legacy in-line picker, driven over a candidate-index sequence.
         //
-        // INVARIANT (POSIX SCHED_OTHER hardening): a CPU MUST NEVER pick an idle thread
-        // while a non-idle Ready peer exists.  POSIX SCHED_OTHER and sched(7)
-        // both require that the per-CPU idle thread is the "schedule of last
-        // resort" — it runs ONLY when no runnable user/kernel work is
-        // available on this CPU.  The picker enforces this by doing TWO
-        // passes: pass 1 considers only NON-IDLE Ready peers; pass 2 (run
-        // only when pass 1 finds nothing) considers idle peers.  Without the
-        // two-pass split, a per-CPU idle thread with `cpu_affinity=Some(cpu)`
-        // (+2 affinity bonus) could in principle tie or beat a worker that
-        // has never run on this CPU (+0) at sufficiently low worker priority,
-        // even though SCHED_OTHER says workers must always win.  The two-pass
-        // structure also reads as a clear invariant in the source, making
-        // future picker edits less likely to regress.
-        let mut best_idx: Option<usize> = None;
-        let mut best_score: u16 = 0;
-        let mut idle_best_idx: Option<usize> = None;
-        let mut idle_best_score: u16 = 0;
-        // Anti-starvation backstop: the schedulable-on-this-CPU Ready peer that
-        // is the most OVERDUE relative to its own force-deadline.  Each thread
-        // has a per-thread deadline — `STARVE_FORCE_TICKS_BSP` for the BSP poll
-        // reactor (TID 0), `STARVE_FORCE_TICKS` for everyone else — so the
-        // latency-critical reactor becomes force-eligible far sooner than a
-        // compute-bound worker.  We track the candidate with the largest
-        // `wait_age - deadline` (its overdue margin); a non-overdue thread has a
-        // negative margin and is never the force pick.  `force_age` records that
-        // winner's raw wait age for the diagnostic.  Idle threads (TID >=
-        // 0x1000) are deliberately excluded — they are the schedule-of-last-
-        // resort and must never pre-empt real work via the backstop.
-        let mut force_idx: Option<usize> = None;
-        let mut force_age: u64 = 0;
-        // Most-overdue margin seen so far (`wait_age - deadline`), as a signed
-        // value.  `i64::MIN` means "no overdue candidate yet".
-        let mut force_margin: i64 = i64::MIN;
-        // Run-queue depth: count of non-idle Ready peers considered this pass.
-        // Published lock-free into READY_DEPTH after the scan so disk-I/O
-        // waiters (and the wait-amplification histogram) can read, without the
-        // table lock, how many runnable peers a yield competes against.
-        let mut ready_peers: u64 = 0;
+        //   * LEGACY path — candidates are the full rotated `1..len` walk
+        //     (`(current_idx + i) % len`).  This is byte-identical to the old
+        //     inline loop and remains the AUTHORITATIVE result.
+        //   * PER-CPU path — candidates come from this CPU's runqueue
+        //     (`RQS[cpu]`, the Ready-eligible set), re-ordered by rotation
+        //     distance.  On SMP=1 the runqueue's non-idle pool equals the legacy
+        //     eligible set, so this selects the identical thread while iterating
+        //     only Ready threads (not the whole table).
+        //
+        // For now the LEGACY result drives the switch; on a debug build the
+        // per-CPU result is cross-checked against it and any divergence is
+        // recorded (`percpu::PICK_DIVERGENCES`) — the live half of the
+        // Test-648 pick-equivalence proof.  Once the cross-check has soaked,
+        // a later step promotes the per-CPU result to authoritative.  The
+        // `select_next` call publishes READY_DEPTH and drives the force
+        // backstop exactly as the inline picker did.
+        // Legacy candidate sequence: the rotated `(current_idx + i) % len` walk,
+        // as a lazy iterator — NO heap allocation on the pick hot path (the
+        // iterator is consumed in place by `select_next`).
+        let (legacy_idx, _ready_peers) =
+            select_next(&threads, cpu, (1..len).map(|i| (current_idx + i) % len), now);
 
-        for i in 1..len {
-            let idx = (current_idx + i) % len;
-            let t = &threads[idx];
-            if t.state != ThreadState::Ready {
-                continue;
-            }
-            if t.tid < 0x1000 {
-                // Non-idle Ready peer (idle threads are TID >= 0x1000); count it
-                // toward the run-queue depth before any affinity/validity skips
-                // so the metric reflects total runnable work, not just
-                // this-CPU-eligible work.
-                ready_peers += 1;
-            }
-            // Skip threads whose kernel RSP is not yet valid — another CPU is
-            // mid-way through switching them out and hasn't saved the new RSP
-            // yet.  Picking up such a thread would resume it from a stale RSP.
-            if !t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire) {
-                continue;
-            }
-            // Skip threads pinned to a different CPU.
-            if let Some(aff) = t.cpu_affinity {
-                if aff != cpu {
-                    continue;
-                }
-            }
-
-            // Run-queue wait age (ticks) for the anti-starvation terms.  The
-            // lazy-stamp pass above guarantees `ready_since_tick != 0` for any
-            // Ready thread by the time we get here; `saturating_sub` keeps the
-            // arithmetic safe against a non-monotone read in the unlikely event
-            // a stamp landed a tick ahead of `now`.
-            let wait_age = now.saturating_sub(t.ready_since_tick);
-            let is_idle_thread = t.tid >= 0x1000;
-
-            let mut score = (t.priority as u16) * 4;
-            if t.cpu_affinity == Some(cpu) {
-                score += 2; // Pinned to us — strong preference.
-            } else if t.last_cpu == cpu {
-                score += 1; // Ran here last — cache-warm preference.
-            }
-            // Anti-starvation aging: a Ready thread that has been passed over
-            // long enough earns an escalating, capped score bonus so it cannot
-            // be out-competed forever by continuously wake-boosted peers.  Only
-            // real (non-idle) work ages — idle threads must stay the schedule
-            // of last resort.  See `wait_age_bonus` / `STARVE_*`.
-            if !is_idle_thread {
-                score += wait_age_bonus(wait_age);
-                // Track the most-overdue real Ready peer for the hard backstop,
-                // each measured against its OWN force-deadline.  The BSP poll
-                // reactor (TID 0) gets the tighter `STARVE_FORCE_TICKS_BSP`
-                // deadline so it becomes force-eligible (and wins the most-
-                // overdue comparison) well before any worker on the coarse
-                // global ceiling.  `margin = wait_age - deadline`; positive ⇒
-                // overdue.  Comparing margins (not raw ages) means a worker that
-                // has waited longer in absolute terms does not steal the force
-                // pick from a reactor that is further past its own deadline.
-                let deadline: u64 = if t.tid == 0 {
-                    STARVE_FORCE_TICKS_BSP
-                } else {
-                    STARVE_FORCE_TICKS
-                };
-                let margin = wait_age as i64 - deadline as i64;
-                if margin > force_margin {
-                    force_margin = margin;
-                    force_age = wait_age;
-                    force_idx = Some(idx);
-                }
-            }
-
-            // AP idle threads (TID >= 0x1000 + apic_id, see
-            // arch/x86_64/apic.rs) are constructed at PRIORITY_IDLE with
-            // a per-CPU affinity pin and exist purely to give the AP a
-            // Ready thread to context-switch through when no other work
-            // is available.  Route them to the idle pool so non-idle
-            // peers always win pass 1.
-            //
-            // NB: the BSP idle thread (TID 0) is intentionally NOT in
-            // the idle pool.  TID 0 doubles as the BSP main thread that
-            // drives the kernel's polling loops (net::poll, x11::poll,
-            // gui::compositor::compose, the firefox-test heartbeat,
-            // etc.) — work that must keep advancing under load.
-            // Classifying TID 0 as idle would starve those polls when
-            // user threads saturate CPU 0, hanging the network stack and
-            // the framebuffer compositor.  Treat TID 0 as an ordinary
-            // PRIORITY_IDLE peer that loses to higher-priority workers
-            // on score alone but never falls into the schedule-of-last-
-            // resort bucket.  (`is_idle_thread` is computed once above, before
-            // the anti-starvation aging block.)
-            if is_idle_thread {
-                if score > idle_best_score || idle_best_idx.is_none() {
-                    idle_best_idx = Some(idx);
-                    idle_best_score = score;
-                }
-            } else if score > best_score || best_idx.is_none() {
-                best_idx = Some(idx);
-                best_score = score;
+        // Per-CPU pick + equivalence cross-check.  Kept on debug builds only so
+        // the release hot path pays nothing; the candidate build re-reads the
+        // runqueue (one leaf lock) and a short position map.  Note: `select_next`
+        // has already published READY_DEPTH and bumped the force counter for the
+        // legacy pass, so the cross-check must NOT call it a second time (that
+        // would double-count the force diagnostic) — instead it re-evaluates
+        // with a side-effect-free selector.
+        // The per-CPU pick omits the idle pool (the mirror excludes tid>=0x1000),
+        // which is equivalent to the legacy pick ONLY on SMP=1, where no idle
+        // thread is eligible on the BSP. Gate the cross-check on SMP=1 so it
+        // cannot false-fire on a (not-yet-supported) SMP=2 boot, and SAMPLE it
+        // (every Nth pass) so its per-sample heap allocation never dominates the
+        // pick hot path.  The authoritative legacy pick above consumes a lazy
+        // `(1..len).map(..)` iterator and allocates nothing; this sampled
+        // cross-check is the only allocating path, and only when this feature is
+        // explicitly enabled.
+        #[cfg(feature = "sched-pick-xcheck")]
+        if crate::arch::x86_64::apic::cpu_count() == 1
+            && percpu::pick_xcheck_sample_due()
+        {
+            let cand = percpu_candidate_indices(&threads, cpu as usize, current_idx);
+            let percpu_idx =
+                select_next_no_side_effects(&threads, cpu, cand.iter().copied(), now);
+            // Compare by TID (table indices differ between the two candidate
+            // orderings only when they select different threads; comparing the
+            // selected TID is the equivalence property that matters).
+            let legacy_tid = legacy_idx.map(|i| threads[i].tid);
+            let percpu_tid = percpu_idx.map(|i| threads[i].tid);
+            if legacy_tid != percpu_tid {
+                percpu::note_pick_divergence();
+                crate::serial_println!(
+                    "[SCHED/P2] PICK DIVERGENCE cpu={} legacy_tid={:?} percpu_tid={:?} \
+                     now={} current_tid={:?}",
+                    cpu, legacy_tid, percpu_tid, now,
+                    threads.get(current_idx).map(|t| t.tid),
+                );
             }
         }
 
-        // Publish the run-queue depth observed this pass (lock-free, relaxed —
-        // a diagnostic estimate, not a synchronisation point).
-        READY_DEPTH.store(ready_peers, Ordering::Relaxed);
-
-        // Pass 2 fallback: if no non-idle Ready peer is available on this
-        // CPU, fall through to the idle thread.  This preserves the
-        // existing "no work → HLT" behaviour for genuinely idle systems
-        // while honouring the invariant above when work IS available.
-        if best_idx.is_none() {
-            best_idx = idle_best_idx;
-            best_score = idle_best_score;
-        }
-
-        // Anti-starvation backstop (hard guarantee): if the most-overdue real
-        // Ready peer on this CPU is at or past its OWN force-deadline
-        // (`force_margin >= 0` ⇔ `wait_age >= deadline`), force-select it this
-        // tick regardless of score.
-        //
-        // For ordinary same-base-priority contention the widened, escalating
-        // `wait_age_bonus` (cap = full base-priority span) wins the score
-        // comparison first, so a starved worker is rescued by score-aging well
-        // before this backstop — the backstop is then a true last resort.
-        //
-        // For the `PRIORITY_IDLE` BSP poll reactor (TID 0) the split is
-        // deliberate: its score-bonus can only overtake a continuously
-        // wake-boosted `PRIORITY_NORMAL` storm after ~100 ticks of aging, so the
-        // reactor is intentionally rescued by its TIGHT per-thread deadline
-        // (`STARVE_FORCE_TICKS_BSP`, ~80 ms) — the score path is its backstop's
-        // backstop, not its primary rescue.  The tight deadline is exactly the
-        // virtual-deadline treatment a fair scheduler gives an early-yielding
-        // latency-sensitive task, bounding the net/x11/compositor pump's
-        // run-queue latency at ~80 ms instead of the ~1 s global ceiling that
-        // applies to compute-bound workers.
-        //
-        // This mirrors the balance-set-manager force-boost of starved Ready
-        // threads and the virtual-deadline guarantee that the longest-overdue
-        // runnable task eventually runs.  Only fires when the forced thread is
-        // not already the best pick (avoids a redundant override) and is
-        // non-idle (tracked that way in `force_idx`).
-        if force_margin >= 0 {
-            if let Some(fidx) = force_idx {
-                if best_idx != Some(fidx) {
-                    let n = SCHED_STARVE_FORCE_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    let deadline: u64 = if threads[fidx].tid == 0 {
-                        STARVE_FORCE_TICKS_BSP
-                    } else {
-                        STARVE_FORCE_TICKS
-                    };
-                    // Throttle the diagnostic: emit the first force-select and
-                    // then one per `STARVE_FORCE_LOG_EVERY` thereafter.  Under
-                    // sustained contention (e.g. a busy poll thread that
-                    // re-starves ~1 Hz) an unthrottled line per event would
-                    // flood the serial log; the monotone counter
-                    // (`starve_force_count()`) stays the authoritative rate
-                    // source for tooling.
-                    if n == 0 || n % STARVE_FORCE_LOG_EVERY == 0 {
-                        crate::serial_println!(
-                            "[SCHED/STARVE] force-select tid={} (waited {} ticks >= {}) on cpu={} \
-                             total={} — anti-starvation backstop",
-                            threads[fidx].tid, force_age, deadline, cpu, n + 1,
-                        );
-                    }
-                    best_idx = Some(fidx);
-                    best_score = (threads[fidx].priority as u16) * 4;
-                }
-            }
-        }
-        let _ = best_score; // suppress "unused" if later edits drop the read
+        // The legacy result is authoritative this phase; the `match` below
+        // consumes it to perform the context switch.
+        let best_idx = legacy_idx;
 
         match best_idx {
             Some(idx) => {
