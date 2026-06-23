@@ -1286,7 +1286,7 @@ pub fn run() -> ! {
     total += 1;
     if test_execve_no_pmm_leak() { passed += 1; }
 
-    // ── Test 264: address-space teardown skips non-refcountable PTEs ───────
+    // ── Test 644: address-space teardown skips non-refcountable PTEs ───────
     // Regression for proc::free_process_memory / proc::free_vm_space: a present
     // PTE that masks to phys 0 (or other non-managed-RAM addresses) must be
     // skipped so it does not underflow the refcount slot for the reserved
@@ -1297,7 +1297,7 @@ pub fn run() -> ! {
     #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
-        if test_264_teardown_skips_nonrefcountable_pte() { passed += 1; }
+        if test_644_teardown_skips_nonrefcountable_pte() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -48695,7 +48695,7 @@ fn test_261_page_ref_dec_underflow_safety() -> bool {
     true
 }
 
-// ── Test 264: address-space teardown skips non-refcountable PTEs ────────────
+// ── Test 644: address-space teardown skips non-refcountable PTEs ────────────
 //
 // Regression for the process-exit memory-reclaim path
 // (`proc::free_process_memory` / `proc::free_vm_space`).  The teardown walk
@@ -48719,7 +48719,7 @@ fn test_261_page_ref_dec_underflow_safety() -> bool {
 // Cite: Intel SDM Vol. 3A §4.10.5 (paging-structure changes must be visible
 // before a frame is repurposed); POSIX mmap(2) (mapping content validity).
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
-fn test_264_teardown_skips_nonrefcountable_pte() -> bool {
+fn test_644_teardown_skips_nonrefcountable_pte() -> bool {
     test_header!("teardown dec skips non-refcountable (phys=0) PTEs");
     use crate::mm::vma::{VmSpace, VmArea, VmBacking, PROT_READ, PROT_WRITE,
                          MAP_PRIVATE, MAP_ANONYMOUS};
