@@ -1630,6 +1630,9 @@ fn op_tlb_stats(out: &mut String) {
     // ── H2 diagnostic counters ─────────────────────────────────────────────
     let _ = write!(out, r#""shootdown_clean_ack_late":{},"#, s.clean_ack_late);
     let _ = write!(out, r#""shootdown_unclean_total":{},"#,  s.unclean_total);
+    // ── Deferred force-flush (timeout self-healing) ────────────────────────
+    let _ = write!(out, r#""force_flush_posted":{},"#,    s.force_flush_posted);
+    let _ = write!(out, r#""force_flush_serviced":{},"#,  s.force_flush_serviced);
     let _ = write!(out, r#""pmm_alloc_recent_free":{}"#,     pmm_recent);
     out.push('}');
 }

@@ -215,6 +215,49 @@ pub(crate) static STAT_UNCLEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHOOTDOWN_DONE_FLAGS: [AtomicU8; apic::MAX_CPUS] =
     [const { AtomicU8::new(0) }; apic::MAX_CPUS];
 
+/// Per-CPU "deferred force-flush" request, indexed by `cpu_index()`.
+///
+/// Set to 1 by a *sender* that timed out waiting for this CPU to acknowledge a
+/// shootdown (the target was IF-masked in a critical section that is neither the
+/// ack-spin nor able to take the `TLB_SHOOTDOWN_VECTOR` IPI).  A timed-out
+/// shootdown abandons its per-CPU slot, so when the masked CPU later becomes
+/// serviceable and takes some *other* IPI, the slot no longer names the range
+/// that was abandoned — the stale TLB entry for that range would otherwise
+/// survive until the next CR3 reload (context switch or timer tick).
+///
+/// On a CPU whose LAPIC periodic timer has gone silent (a KVM failure mode),
+/// the per-tick `on_cpu_tick` full flush never runs, so that fallback is
+/// *unavailable* for exactly the CPU most likely to be the timeout target.
+/// Without an explicit retirement the stale-but-present entry persists until
+/// the CPU happens to reload CR3 — and x86-64 does **not** re-fault a
+/// present-but-stale TLB entry (Intel SDM Vol. 3A §4.10.2.3), so the CPU
+/// silently reads the old frame: a wrong-content read (a CoW page whose private
+/// copy it never saw, a make-writable transition, an `mprotect` permission
+/// change, a MAP_SHARED write-through, a shm detach), surfacing as a torn
+/// object or a not-present read of an apparently-present code page.
+///
+/// The flag is drained — a full TLB flush via CR3 reload, then clear — by
+/// [`drain_pending_force_flush`], called from [`handle_shootdown_ipi`] (the
+/// frequent serviceable point a dead-timer CPU reaches whenever it next takes a
+/// shootdown IPI) and from [`on_cpu_tick`].  Whichever the CPU reaches first
+/// retires the stale entry, bounding the staleness window to "until the masked
+/// CPU is next interruptible" rather than "until the masked CPU's possibly-dead
+/// timer next fires".
+///
+/// Per Intel SDM Vol. 3A §4.10.4.1 (MOV to CR3 invalidates all non-global TLB
+/// entries; AstryxOS uses PCID 0 so this is a complete drop) the flush is
+/// strictly conservative: it retires *every* entry on the CPU, so it covers the
+/// abandoned range regardless of which range the timeout was for.
+static FORCE_FLUSH_PENDING: [AtomicU8; apic::MAX_CPUS] =
+    [const { AtomicU8::new(0) }; apic::MAX_CPUS];
+
+/// Statistic: number of deferred force-flush requests posted (sender side, one
+/// per unacked target CPU per timeout).
+static STAT_FORCE_FLUSH_POSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Statistic: number of deferred force-flushes actually serviced (target side).
+static STAT_FORCE_FLUSH_SERVICED: AtomicU64 = AtomicU64::new(0);
+
 // ── Quarantine-free ring ─────────────────────────────────────────────────────
 //
 // Physical frames that cannot be immediately returned to the PMM because
@@ -601,6 +644,17 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
             SHOOTDOWN_SLOTS[bit].pending.store(0, Ordering::Release);
             tgt_count += 1;
         }
+        // Post a deferred force-flush to every CPU that did not ack.  The slot
+        // we just cleared no longer names the abandoned range, so when this
+        // masked target later becomes serviceable it must retire the stale
+        // entry explicitly — otherwise (x86-64 does NOT re-fault a present-but-
+        // stale TLB entry, Intel SDM Vol. 3A §4.10.2.3) it silently reads the
+        // old frame for a CoW / make-writable / mprotect / MAP_SHARED
+        // write-through / shm-detach transition: a wrong-content read.
+        // Frame-FREEING callers additionally route the affected frame through
+        // `quarantine_free` (return value below); this force-flush makes the
+        // NON-freeing callers (which ignore the return value) equally safe.
+        post_force_flush(remaining);
         crate::serial_println!(
             "[TLB/TIMEOUT] cpu={} target_mask={:#x} unacked_cpus={} \
              va=[{:#x}..{:#x}) iters={} total_timeouts={}",
@@ -797,6 +851,27 @@ pub fn on_cpu_tick(current_tick: u64) {
     let cpu = apic::cpu_index();
     if cpu < apic::MAX_CPUS {
         CPU_LAST_TICK[cpu].store(current_tick, Ordering::Relaxed);
+        // The unconditional `flush_tlb()` above already retired every stale
+        // entry on this CPU, so a deferred force-flush request posted to us is
+        // satisfied: clear it (counting the service) without a redundant second
+        // CR3 reload.
+        //
+        // SOUNDNESS INVARIANT (coupled to `post_force_flush`): this clear-only
+        // path is correct ONLY because a force-flush post always *trails* the
+        // PTE mutation that motivated it — the post happens in the timeout
+        // branch of `shootdown_range_inner`, after the ~10 ms `ACK_BOUND` spin,
+        // so by the time the flag could be set the motivating store is long
+        // since globally visible and the `flush_tlb()` above has already retired
+        // its stale entry.  If `post_force_flush` is ever moved earlier (e.g.
+        // posted speculatively before the ack-spin completes) or `ACK_BOUND` is
+        // shrunk toward sub-flush latencies, this clear-only drain must become a
+        // full `drain_pending_force_flush(cpu)` (flush + clear) instead.
+        if FORCE_FLUSH_PENDING[cpu]
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            STAT_FORCE_FLUSH_SERVICED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // Fast path: quarantine ring is empty.
@@ -850,6 +925,62 @@ pub fn on_cpu_tick(current_tick: u64) {
     }
     if nfree > 0 {
         STAT_QUARANTINE_RELEASED.fetch_add(nfree as u64, Ordering::Relaxed);
+    }
+}
+
+/// Post a deferred force-flush request to every CPU named in `mask`.
+///
+/// Called by a sender from the timeout branch of [`shootdown_range_inner`] for
+/// the set of CPUs that failed to acknowledge.  Each target retires the flag —
+/// with a full TLB flush — the next time it reaches [`drain_pending_force_flush`]
+/// (a shootdown IPI or a timer tick).  Idempotent: a CPU already carrying a
+/// pending request is left as-is (a single full flush retires every stale entry
+/// regardless of how many timeouts targeted it).
+#[inline]
+fn post_force_flush(mask: u64) {
+    let mut r = mask;
+    while r != 0 {
+        let bit = r.trailing_zeros() as usize;
+        r &= r - 1;
+        if bit >= apic::MAX_CPUS {
+            continue;
+        }
+        // Release so the target's Acquire drain observes this post.  A prior
+        // unserviced request remaining set is harmless — one flush covers all.
+        if FORCE_FLUSH_PENDING[bit].swap(1, Ordering::Release) == 0 {
+            STAT_FORCE_FLUSH_POSTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Drain this CPU's deferred force-flush request, if any.
+///
+/// If a sender previously timed out waiting for `cpu` to acknowledge a
+/// shootdown, this performs a full TLB flush (CR3 reload) and clears the flag,
+/// retiring any stale-but-present entry the abandoned shootdown left behind.
+///
+/// Safe to call with interrupts disabled: it takes no locks and performs no IPI
+/// sends — only a `compare_exchange` on the per-CPU flag and (on a hit) a CR3
+/// reload.  Per Intel SDM Vol. 3A §4.10.4.1 the MOV-to-CR3 invalidates all
+/// non-global TLB entries (PCID 0 → complete drop), so the single flush covers
+/// the abandoned range whatever it was.  Called from [`handle_shootdown_ipi`]
+/// and [`on_cpu_tick`].
+#[inline]
+fn drain_pending_force_flush(cpu: usize) {
+    if cpu >= apic::MAX_CPUS {
+        return;
+    }
+    // Acquire pairs with the sender's Release in `post_force_flush`.  Only the
+    // winner of the 1→0 transition does the (single, idempotent) flush; a
+    // concurrent drain on the same CPU is impossible (the flag is per-CPU and
+    // drained only by that CPU), but the compare_exchange keeps the bookkeeping
+    // exact under a racing post.
+    if FORCE_FLUSH_PENDING[cpu]
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::mm::vmm::flush_tlb();
+        STAT_FORCE_FLUSH_SERVICED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -907,7 +1038,76 @@ pub extern "C" fn handle_shootdown_ipi() {
         }
     }
 
+    // Retire any deferred force-flush a sender posted to us after a prior
+    // shootdown to this CPU timed out (we were IF-masked then and missed it).
+    // This is the frequent serviceable point a dead-LAPIC-timer CPU reaches:
+    // whenever it next becomes interruptible and takes ANY shootdown IPI — not
+    // necessarily one that names our own slot — the abandoned range's stale
+    // entry is retired here, bounding the staleness window to "until this CPU
+    // is next interruptible" instead of "until its (possibly dead) periodic
+    // timer next fires".
+    drain_pending_force_flush(cpu);
+
     apic::lapic_eoi();
+}
+
+/// Test-only harness for the deferred force-flush self-healing path.
+///
+/// Posts a force-flush request to THIS CPU (as a timed-out sender would), then
+/// drains it twice via [`drain_pending_force_flush`] — the same code path the
+/// IPI handler runs.  Returns `(first_serviced, second_serviced)` where
+/// `first_serviced` must be `true` (the posted request was retired exactly
+/// once, with a real CR3 reload) and `second_serviced` must be `false`
+/// (idempotent — a cleared flag is a no-op).  Exercises the fix for the
+/// non-freeing-shootdown-timeout stale-translation hazard without needing a
+/// genuinely masked second CPU.
+///
+/// Interrupts are masked across the publish + double-drain so a real
+/// cross-CPU force-flush post cannot race the synthetic one on this slot.
+#[doc(hidden)]
+pub fn test_force_flush_post_drain() -> (bool, bool) {
+    // Mask interrupts FIRST so the subsequent `cpu_index()` read cannot be torn
+    // by a migration between reading the CPU and the post/drain on its slot.
+    let prior_flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq", "pop {f}", "cli",
+            f = out(reg) prior_flags,
+            options(nomem, preserves_flags),
+        );
+    }
+
+    let cpu = apic::cpu_index();
+    if cpu >= apic::MAX_CPUS {
+        if prior_flags & (1 << 9) != 0 {
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+        }
+        return (true, false);
+    }
+
+    let serviced_before = STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed);
+
+    // Post a force-flush to our own CPU (a real sender posts to the unacked
+    // SIBLING set, never self; here we post directly to exercise the drain).
+    post_force_flush(1u64 << (cpu as u64));
+
+    // First drain must service it (CR3 reload + counter advance); second must
+    // observe the flag already cleared and no-op.
+    drain_pending_force_flush(cpu);
+    let serviced_mid = STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed);
+    drain_pending_force_flush(cpu);
+    let serviced_after = STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed);
+
+    // Leave the flag pristine for any real shootdown timeout to this CPU.
+    FORCE_FLUSH_PENDING[cpu].store(0, Ordering::Release);
+
+    if prior_flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+    }
+
+    let first = serviced_mid.wrapping_sub(serviced_before) >= 1;
+    let second = serviced_after != serviced_mid;
+    (first, second)
 }
 
 /// Diagnostic snapshot for kdb / introspection.
@@ -931,6 +1131,15 @@ pub struct Stats {
     /// (unclean → quarantine).  Baseline rate for the above counter.
     /// Always 0 in non-firefox-test builds.
     pub unclean_total: u64,
+    /// Deferred force-flush requests posted (one per unacked target CPU per
+    /// timeout).  A non-zero value means at least one shootdown timed out and a
+    /// stale-entry retirement was deferred to the target's next serviceable
+    /// point — the safety net for the non-freeing PTE-mutation callers.
+    pub force_flush_posted: u64,
+    /// Deferred force-flushes serviced (target side).  Should track
+    /// `force_flush_posted`; a persistent gap means a target is not reaching any
+    /// drain point (a wedged, never-interruptible CPU).
+    pub force_flush_serviced: u64,
 }
 
 /// Return a snapshot of the running shootdown statistics.
@@ -951,5 +1160,7 @@ pub fn stats() -> Stats {
         unclean_total: STAT_UNCLEAN_TOTAL.load(Ordering::Relaxed),
         #[cfg(not(feature = "firefox-test-core"))]
         unclean_total: 0,
+        force_flush_posted: STAT_FORCE_FLUSH_POSTED.load(Ordering::Relaxed),
+        force_flush_serviced: STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed),
     }
 }
