@@ -2451,6 +2451,10 @@ fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
         }
         let old_phys = pte & ADDR_MASK;
         let flags = (pte & !ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        // This site only runs for the clone(2) clear_child_tid target, which is
+        // guaranteed a private anonymous libc global (never MAP_SHARED), so the
+        // refcount-keyed copy-vs-flip decision below is safe here and need not
+        // route through mm::vma::write_fault_action (which keys on MAP_SHARED).
         if crate::mm::refcount::page_ref_count(old_phys) > 1 {
             // Shared frame — copy to a private one.
             let new_phys = match crate::mm::pmm::alloc_page() {

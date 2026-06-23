@@ -1474,6 +1474,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
             crate::mm::tlb::shootdown_page(cr3, page_addr);
+            // NOTE: this does not set the PTE dirty bit nor mark the backing
+            // page-cache frame dirty.  Inert today (VFS writeback is not yet
+            // implemented; shared/memfd reads come back through the same
+            // frame), but once disk-backed MAP_SHARED writeback (msync/munmap
+            // flush) lands, an mmap-written-but-never-write(2)'d page would be
+            // skipped by a dirty-driven flush — mark the frame dirty here then.
             return true;
         }
 
