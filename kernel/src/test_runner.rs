@@ -2206,6 +2206,16 @@ pub fn run() -> ! {
     total += 1;
     if test_tlb_shootdown_coalesced_w133() { passed += 1; }
 
+    // ── Test 646: TLB shootdown timeout → deferred force-flush self-healing ──
+    // A timed-out non-freeing shootdown (CoW / make-writable / mprotect /
+    // MAP_SHARED write-through / shm-detach) posts a force-flush that the
+    // masked target retires at its next drain point, closing the
+    // stale-translation window x86-64's no-re-fault-on-present-stale semantics
+    // (Intel SDM Vol. 3A §4.10.2.3) would otherwise leave open.  Unit-exercises
+    // post → drain → idempotent redrain.
+    total += 1;
+    if test_646_tlb_timeout_force_flush() { passed += 1; }
+
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
     //   1. open(/proc/<target>/maps) from a different caller PID succeeds
@@ -43522,6 +43532,60 @@ fn test_tlb_shootdown_coalesced_w133() -> bool {
     tlb::forget_cr3(fake_cr3);
 
     test_pass!("TLB shootdown coalesced over range (W133)");
+    true
+}
+
+// ── Test 646: TLB shootdown timeout → deferred force-flush self-healing ──────
+//
+// On a true-dual-core system a cross-CPU shootdown can time out when the target
+// CPU is IF-masked in a critical section that is neither the ACK-spin nor able
+// to take the shootdown IPI (the recurring KVM dead-LAPIC-timer profile).  The
+// timed-out shootdown abandons its per-CPU slot, so the stale-but-present TLB
+// entry it failed to invalidate would otherwise survive until the next CR3
+// reload — and x86-64 does NOT re-fault a present-but-stale entry (Intel SDM
+// Vol. 3A §4.10.2.3), so a CoW / make-writable / mprotect / MAP_SHARED
+// write-through / shm-detach transition silently reads the old frame.  The fix
+// posts a deferred force-flush to each unacked CPU; that CPU retires the stale
+// entry with a full CR3 reload the next time it reaches a drain point (a
+// shootdown IPI or a tick).
+//
+// This test exercises the post → drain → idempotent-redrain cycle on the local
+// CPU without needing a genuinely masked sibling: it asserts the first drain
+// services the request (counter advances) and the second is a no-op.
+fn test_646_tlb_timeout_force_flush() -> bool {
+    test_header!("TLB shootdown timeout deferred force-flush self-healing");
+
+    use crate::mm::tlb;
+
+    let s_before = tlb::stats();
+    let (first, second) = tlb::test_force_flush_post_drain();
+    let s_after = tlb::stats();
+
+    if !first {
+        test_fail!("tlb/force-flush", "first drain did not service the posted request");
+        return false;
+    }
+    if second {
+        test_fail!("tlb/force-flush", "second drain re-serviced a cleared flag (not idempotent)");
+        return false;
+    }
+    // A post must have been recorded, and a service must have advanced.  Both
+    // are ≥1 monotonic bounds (a concurrent real timeout on another CPU could
+    // add more).
+    let posted_delta = s_after.force_flush_posted.wrapping_sub(s_before.force_flush_posted);
+    if posted_delta < 1 {
+        test_fail!("tlb/force-flush",
+                   "force_flush_posted did not advance (delta={})", posted_delta);
+        return false;
+    }
+    let serviced_delta = s_after.force_flush_serviced.wrapping_sub(s_before.force_flush_serviced);
+    if serviced_delta < 1 {
+        test_fail!("tlb/force-flush",
+                   "force_flush_serviced did not advance (delta={})", serviced_delta);
+        return false;
+    }
+
+    test_pass!("TLB shootdown timeout deferred force-flush self-healing");
     true
 }
 
