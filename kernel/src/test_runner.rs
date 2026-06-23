@@ -54142,11 +54142,118 @@ fn test_641_crossproc_mapshared_memfd_visibility() -> bool {
     }
     test_println!("  D fallocate(0,{}): backing inode grown to {} ✓", PAGE, dsize);
 
-    // A, B (no-eviction visibility), C (eviction dual-storage coherence via
-    // writeback-to-inode) and D (fallocate sizing) are ALL gating assertions;
-    // all passed if we reach here.  C is the FF Wikipedia render gate and is
-    // now a hard must-pass (was a documented latent gap before the
-    // mm::cache writeback-on-eviction fix).
+    // ════════════════════════════════════════════════════════════════════
+    // E. Production collision-eviction writeback.  Case C drives the
+    //    standalone `cache::evict` writeback; the path that actually fires in
+    //    production is the collision eviction inside `cache::insert` (two
+    //    inserts on the SAME (mount,inode,off) key — the second evicts the
+    //    first).  Reproduce it: fault-in a frame, store the sentinel into it
+    //    (the mmap write), then `cache::insert` a DIFFERENT frame on the same
+    //    key.  The collision eviction must write the OLD frame's sentinel back
+    //    to the inode buffer so a later cache-miss fs.read still sees it.
+    // ════════════════════════════════════════════════════════════════════
+    let epath = "/tmp/.crossvis641e";
+    let _ = crate::vfs::remove(epath);
+    if crate::vfs::create_file(epath).is_err() {
+        test_fail!(NAME, "E: create_file({}) failed", epath); return false;
+    }
+    if crate::vfs::truncate_path(epath, PAGE as u64).is_err() {
+        test_fail!(NAME, "E: truncate_path failed"); let _ = crate::vfs::remove(epath); return false;
+    }
+    let (emount, einode) = match crate::vfs::resolve_path(epath) {
+        Ok(t) => t,
+        Err(e) => { test_fail!(NAME, "E: resolve_path {:?}", e); let _ = crate::vfs::remove(epath); return false; }
+    };
+    let e_old = match fault_in(emount, einode, foff) {
+        Some(p) => p,
+        None => { test_fail!(NAME, "E: fault_in OOM"); let _ = crate::vfs::remove(epath); return false; }
+    };
+    producer_store(e_old); // mmap write lands only in the cache frame
+    // A different frame for the same key → collision eviction of e_old, which
+    // must writeback e_old's sentinel to the inode buffer.
+    let e_new = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!(NAME, "E: alloc_page OOM"); let _ = crate::vfs::remove(epath); return false; }
+    };
+    unsafe { core::ptr::write_bytes((PHYS_OFF + e_new) as *mut u8, 0, PAGE); }
+    crate::mm::cache::insert(emount, einode, foff, e_new); // evicts e_old → writeback e_old
+    // Read the inode buffer DIRECTLY now — BEFORE evicting e_new — to prove the
+    // collision writeback of e_old reached the inode.  (Evicting e_new first
+    // would itself write e_new's zero bytes back over the inode, masking the
+    // collision writeback under test: every in-memory eviction writes back,
+    // and the last one wins.  That ordering is correct in production — the
+    // resident frame is authoritative — but here it would defeat the probe.)
+    let e_inode_bytes = {
+        let mut scratch = [0u8; 64];
+        if let Some((fs, _)) = crate::vfs::fs_at(emount) {
+            let _ = fs.read(einode, sent_off as u64, &mut scratch);
+        }
+        scratch[..sentinel.len()] == sentinel[..]
+    };
+    // Cleanup: evict e_new (drops cache ref → rc 0) and free it; e_old was
+    // already retired via quarantine by the collision eviction above.
+    if let Some(p) = crate::mm::cache::evict(emount, einode, foff) {
+        crate::mm::pmm::free_page(p);
+    }
+    let _ = crate::vfs::remove(epath);
+    if !e_inode_bytes {
+        test_fail!(NAME, "E: collision-eviction did NOT write the sentinel back to the inode buffer");
+        return false;
+    }
+    test_println!("  E collision-eviction: production cache::insert eviction wrote sentinel back to inode ✓");
+
+    // ════════════════════════════════════════════════════════════════════
+    // F. fd_read cache-authoritative overlay.  A resident cache frame holds
+    //    an mmap write the inode buffer never received.  `read(2)` (fd_read)
+    //    on an in-memory FS must observe the frame's bytes, not the stale
+    //    inode buffer.  Build a real fd, fault a frame in, store the sentinel
+    //    into the RESIDENT frame, then fd_read and assert the overlay.
+    // ════════════════════════════════════════════════════════════════════
+    let fpath = "/tmp/.crossvis641f";
+    let _ = crate::vfs::remove(fpath);
+    if crate::vfs::create_file(fpath).is_err() {
+        test_fail!(NAME, "F: create_file failed"); return false;
+    }
+    if crate::vfs::truncate_path(fpath, PAGE as u64).is_err() {
+        test_fail!(NAME, "F: truncate_path failed"); let _ = crate::vfs::remove(fpath); return false;
+    }
+    let (fmount, finode) = match crate::vfs::resolve_path(fpath) {
+        Ok(t) => t,
+        Err(e) => { test_fail!(NAME, "F: resolve_path {:?}", e); let _ = crate::vfs::remove(fpath); return false; }
+    };
+    let f_phys = match fault_in(fmount, finode, foff) {
+        Some(p) => p,
+        None => { test_fail!(NAME, "F: fault_in OOM"); let _ = crate::vfs::remove(fpath); return false; }
+    };
+    producer_store(f_phys); // mmap write into the RESIDENT frame only
+    let fpid = crate::proc::current_pid_lockless();
+    let ffd = match crate::vfs::open(fpid, fpath, crate::vfs::flags::O_RDONLY) {
+        Ok(fd) => fd,
+        Err(e) => {
+            test_fail!(NAME, "F: open {:?}", e);
+            if let Some(p) = crate::mm::cache::evict(fmount, finode, foff) { crate::mm::pmm::free_page(p); }
+            let _ = crate::vfs::remove(fpath); return false;
+        }
+    };
+    let mut fbuf = [0u8; PAGE];
+    let fn_read = crate::vfs::fd_read(fpid, ffd, fbuf.as_mut_ptr(), PAGE).unwrap_or(0);
+    let f_overlay_ok = fn_read >= sent_off + sentinel.len()
+        && fbuf[sent_off..sent_off + sentinel.len()] == sentinel[..];
+    let _ = crate::syscall::dispatch_linux_kernel(3, ffd as u64, 0, 0, 0, 0, 0); // close(ffd)
+    if let Some(p) = crate::mm::cache::evict(fmount, finode, foff) { crate::mm::pmm::free_page(p); }
+    let _ = crate::vfs::remove(fpath);
+    if !f_overlay_ok {
+        test_fail!(NAME, "F: fd_read did NOT overlay the resident frame's mmap write (read {} bytes)", fn_read);
+        return false;
+    }
+    test_println!("  F fd_read overlay: read(2) observed the resident frame's mmap write ✓");
+
+    // A, B (no-eviction visibility), C (standalone evict writeback), D
+    // (fallocate sizing), E (production collision-eviction writeback) and F
+    // (fd_read cache-authoritative overlay) are ALL gating assertions; all
+    // passed if we reach here.  C/E/F are the ramfs/tmpfs MAP_SHARED↔read
+    // coherence guards (were latent/absent before the mm::cache
+    // writeback-on-eviction + fd_read overlay fix).
     test_pass!(NAME);
     true
 }
