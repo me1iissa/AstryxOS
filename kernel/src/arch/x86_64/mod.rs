@@ -9,6 +9,10 @@ pub mod gdt;
 pub mod idt;
 pub mod irq;
 pub mod smap;
+// CoW-private userspace execution breakpoints (debug-only).  Gated behind
+// `kdb` since the only consumer is the KDB `ubreak` op surface.
+#[cfg(feature = "kdb")]
+pub mod ubreak;
 
 /// Initialize all x86_64 architecture components.
 pub fn init() {

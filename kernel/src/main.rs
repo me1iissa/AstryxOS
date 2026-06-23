@@ -1527,6 +1527,20 @@ user_pref("security.sandbox.content.level", 0);
             crate::gui::terminal::FF_GUI_MODE
                 .store(gui_mode, core::sync::atomic::Ordering::Release);
             serial_println!("[FFTEST] launch mode: {}", if gui_mode { "GUI/X11" } else { "headless" });
+            // Debug-only: arm a CoW-private userspace breakpoint at
+            // libxul_load_base + <astryx.ubreak=offset> for every Linux process
+            // the moment it demand-faults that page (auto-arm, KDB-independent).
+            // See arch::x86_64::ubreak::maybe_auto_arm + the PF-install hook.
+            #[cfg(feature = "kdb")]
+            if let Some((entries, n)) = boot_config::ubreak_offsets() {
+                for e in entries.iter().take(n) {
+                    crate::arch::x86_64::ubreak::set_auto_arm_offset_sig(e.offset, e.sig);
+                    serial_println!(
+                        "[UBREAK] auto-arm enabled at libxul offset {:#x} sig={:#010x}",
+                        e.offset, e.sig
+                    );
+                }
+            }
             let cmdline_base = if musl_132_stat.is_ok() {
                 if gui_mode { CMDLINE_MUSL_132_GUI } else { CMDLINE_MUSL_132_BASE }
             } else if musl_esr_stat.is_ok() {
