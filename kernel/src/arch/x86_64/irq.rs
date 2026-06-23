@@ -295,10 +295,14 @@ pub fn relative_ns_to_wake_tick(ns: u64) -> u64 {
 
     // ns → TSC cycles: cycles = ns * tsc_per_tick / 10_000_000  (10 ms/tick).
     // Use u128 for the intermediate product so a multi-second timeout cannot
-    // overflow before the divide (tsc_per_tick is ~10^7 on a 1 GHz part, ns
-    // can be up to ~10^18 for the legal tv_sec range).
-    let ns_cycles =
-        ((ns as u128).saturating_mul(tsc_per_tick as u128) / 10_000_000u128) as u64;
+    // overflow before the divide (tsc_per_tick is ~10^7 on a 1 GHz part).
+    // Clamp the quotient to u64::MAX before narrowing: a pathologically large
+    // `ns` (e.g. a saturated tv_sec) would otherwise truncate on the `as u64`
+    // cast and produce a deadline SHORTER than requested — clamping makes it
+    // saturate to the far future instead, preserving the never-under-shoot
+    // invariant for every input.
+    let ns_cycles = ((ns as u128).saturating_mul(tsc_per_tick as u128) / 10_000_000u128)
+        .min(u64::MAX as u128) as u64;
 
     let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
     let elapsed_now = rdtsc().wrapping_sub(tsc_at_boot);
