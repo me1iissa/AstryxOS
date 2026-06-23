@@ -1447,7 +1447,7 @@ pub fn run() -> ! {
         total += 1;
         if test_640_frame_recycle_zeroing_invariant() { passed += 1; }
         total += 1;
-        if test_642_bucket_a_classifier_content_aware() { passed += 1; }
+        if test_643_bucket_a_classifier_content_aware() { passed += 1; }
     }
 
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
@@ -53983,7 +53983,7 @@ fn test_640_frame_recycle_zeroing_invariant() -> bool {
     true
 }
 
-/// Test 642 — [FAULT/CACHE-KEY] bucket-A classifier is content/CR2-aware.
+/// Test 643 — [FAULT/CACHE-KEY] bucket-A classifier is content/CR2-aware.
 ///
 /// The W215 bucket classifier decides "bucket=A (same-key in-place corruption)"
 /// when the faulting RIP frame's page-cache key matches its installed phys.
@@ -53998,9 +53998,9 @@ fn test_640_frame_recycle_zeroing_invariant() -> bool {
 /// Cite: Intel SDM Vol. 3A §4.7 (#PF — CR2 holds the faulting linear address;
 /// the error code describes the access).
 #[cfg(feature = "firefox-test-core")]
-fn test_642_bucket_a_classifier_content_aware() -> bool {
+fn test_643_bucket_a_classifier_content_aware() -> bool {
     use crate::signal::{classify_key_match, KeyMatchVerdict};
-    const NAME: &str = "[FAULT/CACHE-KEY] bucket-A CR2-aware classifier (Test 642)";
+    const NAME: &str = "[FAULT/CACHE-KEY] bucket-A CR2-aware classifier (Test 643)";
     test_header!(NAME);
 
     // A real libxul-style code RIP (page-aligned 0x...000 + in-page offset).
