@@ -3894,16 +3894,30 @@ def cmd_start(args):
     # opt/astryx/cmdline fw_cfg blob (fw_cfg permits one entry per name), so
     # assemble a single space-separated token string and emit one -fw_cfg.
     ff_gui = bool(getattr(args, "ff_gui", False))
+    ubreak = getattr(args, "ubreak", None)
     cmdline_tokens = []
     if ff_url:
         cmdline_tokens.append(f"astryx.ff_url={ff_url}")
     if ff_gui:
         cmdline_tokens.append("astryx.ff_gui=1")
+    if ubreak:
+        # Debug-only: auto-arm a CoW-private userspace breakpoint at
+        # libxul_load_base + <ubreak> for every Linux process the moment it
+        # demand-faults that page.  Value is a hex ELF offset (kdb feature).
+        cmdline_tokens.append(f"astryx.ubreak={ubreak}")
+        print(f"[HARNESS] ubreak auto-arm at libxul offset {ubreak}", file=sys.stderr)
     if cmdline_tokens:
         blob = " ".join(cmdline_tokens)
+        # QEMU's `-fw_cfg name=...,string=...` parses commas as option
+        # separators; a literal comma in the value (e.g. a multi-offset
+        # `astryx.ubreak=0xA,0xB`) must be escaped as `,,` or QEMU truncates
+        # the blob and the guest reads garbage.  Escape AFTER joining so only
+        # value commas (never our space token separator) are doubled.  The
+        # kernel-side fw_cfg reader sees the original single commas.
+        blob_q = blob.replace(",", ",,")
         extra_qemu_args += [
             "-fw_cfg",
-            f"name=opt/astryx/cmdline,string={blob}",
+            f"name=opt/astryx/cmdline,string={blob_q}",
         ]
         if ff_url:
             print(f"[HARNESS] ff-url override: {ff_url}", file=sys.stderr)
@@ -7009,8 +7023,41 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "procmaps":
         # Terse file-backed VMA map for ASLR-base / addr2line symbolication.
         # Emits one JSON object per VMA with first_page_phys via PML4 walk.
+        # Optional 2nd arg `min_x=<bytes>` (or a bare integer): emit ONLY
+        # executable VMAs >= that size — returns just the big code regions
+        # (libxul base) in a small, always-parseable response.
         if not rest: raise ValueError("procmaps requires <pid>")
-        return {"op": "procmaps", "pid": int(rest[0], 0)}
+        d = {"op": "procmaps", "pid": int(rest[0], 0)}
+        if len(rest) > 1:
+            tok = rest[1]
+            if tok.startswith("min_x="):
+                tok = tok.split("=", 1)[1]
+            d["min_x"] = int(tok, 0)
+        return d
+    if op == "ubreak":
+        # CoW-private userspace execution breakpoints.  Sub-ops:
+        #   kdb <sid> ubreak set <pid> <addr>     — plant a private int3
+        #   kdb <sid> ubreak clear <pid> <addr>   — restore the byte
+        #   kdb <sid> ubreak clear-all            — restore all
+        #   kdb <sid> ubreak list                 — armed breakpoints + hits
+        #   kdb <sid> ubreak dump                 — captured snapshots (JSON)
+        # `addr` is a RUNTIME VA (libxul base + ELF symbol offset).
+        if not rest:
+            raise ValueError("ubreak requires <sub> (set|clear|clear-all|list|dump)")
+        sub = rest[0]
+        if sub == "set":
+            if len(rest) < 3:
+                raise ValueError("ubreak set requires <pid> <addr>")
+            return {"op": "ubreak", "sub": "set",
+                    "pid": int(rest[1], 0), "addr": int(rest[2], 0)}
+        if sub == "clear":
+            if len(rest) < 3:
+                raise ValueError("ubreak clear requires <pid> <addr>")
+            return {"op": "ubreak", "sub": "clear",
+                    "pid": int(rest[1], 0), "addr": int(rest[2], 0)}
+        if sub in ("clear-all", "list", "dump"):
+            return {"op": "ubreak", "sub": sub}
+        raise ValueError(f"ubreak: unknown sub {sub!r}")
     if op == "proc-tree":
         pid = int(rest[0], 0) if rest else 1
         return {"op": "proc-tree", "pid": pid}
@@ -12547,6 +12594,18 @@ def main():
                                "with `screendump <sid> <out.png>`.  No rebuild "
                                "needed (same firefox-test-core build serves "
                                "both modes).")
+    p_start.add_argument("--ubreak", dest="ubreak", default=None, metavar="HEXOFF",
+                          help="[debug, kdb feature] Auto-arm a CoW-private "
+                               "userspace breakpoint at libxul_load_base + HEXOFF "
+                               "(an ELF vaddr, e.g. 0x6e36c70 for "
+                               "Moz2dBlobImageHandler::add) for every Linux "
+                               "process the moment it demand-faults that page.  "
+                               "Removes the host-side timing race (planted at "
+                               "page-install, before the code runs) and works "
+                               "under KDB starvation.  Read captures with "
+                               "`kdb <sid> ubreak dump`.  Appended to the "
+                               "opt/astryx/cmdline fw_cfg blob as "
+                               "astryx.ubreak=<hex>.")
     p_start.add_argument("--pcap", action="store_true", dest="pcap",
                           help="FORCE host-side packet capture ON for this "
                                "boot, even a non-FF one.  Captures ALL guest "
@@ -12804,6 +12863,9 @@ def main():
         "cond-autopsy",
         # Terse file-backed VMA map; one entry per VMA with first_page_phys.
         "procmaps",
+        # CoW-private userspace execution breakpoints (set|clear|clear-all|
+        # list|dump).  See arch::x86_64::ubreak + op_ubreak.
+        "ubreak",
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
         # See subsys/linux/futex_cluster.rs.
         "futex-stats", "futex-set-cluster-wake",

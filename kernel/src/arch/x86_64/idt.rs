@@ -270,6 +270,48 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         }
     }
 
+    // CoW-private userspace breakpoint (debug-only).  A #BP (vector 3) from
+    // Ring 3 may be a planted `int3` belonging to a registered userspace
+    // breakpoint (see `arch::x86_64::ubreak`).  Match the faulting
+    // `(CR3, RIP-1)`; on a hit, capture the register/memory snapshot, restore
+    // the original byte (one-shot), rewind RIP so the original instruction
+    // re-executes, and return WITHOUT any serial output (so an investigator
+    // can break on a hot path without flooding the log).  Per Intel SDM
+    // Vol. 2A (INT3), the saved RIP points one byte past the 0xCC.
+    #[cfg(feature = "kdb")]
+    if vector == 3 && frame.cs & 3 == 3 {
+        let cr3_raw: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_raw, options(nomem, nostack)); }
+        // Mask to the page-frame bits (drop PCID / PWT / PCD low bits) so the
+        // comparison matches the masked CR3 stored at arm time (proc.cr3).
+        let cr3 = cr3_raw & 0x000F_FFFF_FFFF_F000;
+        let gpr = unsafe {
+            let base = frame as *const InterruptFrame as *const u64;
+            crate::arch::x86_64::ubreak::read_gprs_from_frame(base)
+        };
+        let mut new_rip = frame.rip;
+        let matched = crate::arch::x86_64::ubreak::on_breakpoint(
+            cr3, frame.rip, frame.rsp, &gpr, &mut new_rip,
+        );
+        if matched {
+            frame.rip = new_rip;
+            return;
+        }
+        // Unmatched #BP from Ring 3 with auto-arm enabled: emit one bounded
+        // diagnostic so a mismatch (cr3/va) can be diagnosed, then fall through.
+        {
+            static UB_MISS: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let n = UB_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                crate::serial_println!(
+                    "[UBREAK/miss] #BP live_cr3={:#x} rip={:#x} bp_va={:#x}",
+                    cr3, frame.rip, frame.rip.wrapping_sub(1));
+                crate::arch::x86_64::ubreak::list_serial();
+            }
+        }
+    }
+
     // Debug trace for non-page-fault exceptions from user mode.
     if frame.cs & 3 == 3 && vector != 14 {
         crate::serial_println!(
@@ -1528,14 +1570,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
         // get the per-process COW copy that protects the cache from GOT/PLT
         // relocations bleeding between independent loads of the same .so.
         let file_info = match &vma.backing {
-            crate::mm::vma::VmBacking::File { mount_idx, inode, offset, .. } => {
+            crate::mm::vma::VmBacking::File { mount_idx, inode, offset, elf_load_delta } => {
                 let is_shared = vma.flags & crate::mm::vma::MAP_SHARED != 0;
-                Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length, is_shared))
+                Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length, is_shared, *elf_load_delta))
             }
             _ => None,
         };
 
-        if let Some((mount_idx, inode, file_base_offset, vma_base, vma_end, is_shared)) = file_info {
+        if let Some((mount_idx, inode, file_base_offset, vma_base, vma_end, is_shared, elf_load_delta)) = file_info {
             // Release PROCESS_TABLE to avoid deadlock with MOUNTS.
             drop(procs);
 
@@ -1547,6 +1589,31 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
 
             let page_offset_in_vma = page_addr - vma_base;
             let file_page_offset = file_base_offset + page_offset_in_vma;
+
+            // Debug-only userspace-breakpoint auto-arm: compute the ELF load
+            // base for this file-backed mapping so the ubreak hook can plant a
+            // breakpoint at `load_base + <astryx.ubreak=offset>` once that
+            // page is installed.  Per ELF-64 §3: vaddr_in_elf = file_offset +
+            // elf_load_delta, so load_base = page_va - vaddr_in_elf.  Cheap
+            // single-atomic fast-path when auto-arm is disabled.  See
+            // arch::x86_64::ubreak::maybe_auto_arm.  Called at the install-
+            // success epilogue below (after the PTE is mapped).
+            #[cfg(feature = "kdb")]
+            let ubreak_load_base: u64 = {
+                let vaddr_in_elf = file_page_offset.wrapping_add(elf_load_delta);
+                page_addr.wrapping_sub(vaddr_in_elf)
+            };
+            #[cfg(not(feature = "kdb"))]
+            let _ = elf_load_delta; // only consumed by the kdb auto-arm hook
+            // Per-fault scan: on ANY file-backed (libxul) demand-fault, try to
+            // arm the target offset if its page is already present in this CR3.
+            // This catches targets that were demand-faulted before the offset
+            // was set, brought in via readahead, or sit in a hot pre-faulted
+            // page (the install-time `maybe_auto_arm` below only fires when the
+            // freshly-faulted page IS itself a target).  Cheap early-out when
+            // auto-arm is disabled.
+            #[cfg(feature = "kdb")]
+            crate::arch::x86_64::ubreak::maybe_auto_arm_scan(ubreak_load_base, cr3);
 
             #[cfg(feature = "firefox-test-core")]
             {
@@ -1772,6 +1839,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                             // holds its own independent reference to
                             // `cached_phys`, so this dec will not free the frame.
                             let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                            // Debug-only: auto-arm a userspace breakpoint if this
+                            // freshly-installed libxul code page is the requested
+                            // target (no-op when auto-arm is disabled).
+                            #[cfg(feature = "kdb")]
+                            crate::arch::x86_64::ubreak::maybe_auto_arm(
+                                cr3, ubreak_load_base, page_addr);
                             return true;
                         }
                         // Lost the race: a sibling CPU already published a PTE
@@ -1925,9 +1998,20 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                         }
                         let _ = crate::mm::refcount::page_ref_dec(cached_phys);
                         crate::mm::vmm::invlpg(page_addr);
+                        #[cfg(feature = "kdb")]
+                        crate::arch::x86_64::ubreak::maybe_auto_arm(
+                            cr3, ubreak_load_base, page_addr);
                         return true;
                     }
                 }
+                // Debug-only: auto-arm a userspace breakpoint if this freshly-
+                // installed cache-backed page (read-only code alias OR the
+                // private-copy win that fell through to here) is the requested
+                // target.  Covers libxul r-x code pages (which take the RO-alias
+                // arm, not the writable private-copy arm).  No-op when disabled.
+                #[cfg(feature = "kdb")]
+                crate::arch::x86_64::ubreak::maybe_auto_arm(
+                    cr3, ubreak_load_base, page_addr);
                 #[cfg(feature = "firefox-test-core")]
                 {
                     static PF_CACHED_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

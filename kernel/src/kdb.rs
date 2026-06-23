@@ -376,6 +376,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
         "uread"          => op_uread(req, out),
+        // ubreak: CoW-private userspace execution breakpoints.  See
+        // arch::x86_64::ubreak.  Sub-ops via "sub": set | clear | clear-all |
+        // list | dump.
+        "ubreak"         => op_ubreak(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
         // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
@@ -995,6 +999,85 @@ fn op_uread(req: &str, out: &mut String) {
     j_kv_str(out, "hex", &hex);
     j_trim_comma(out);
     out.push('}');
+}
+
+// ── ubreak ────────────────────────────────────────────────────────────────────
+//
+// CoW-private userspace execution breakpoints.  Plants a process-private int3
+// at a userspace VA so an investigator can break on a hot library routine in
+// ONE process without corrupting the shared (CoW) library code page or relying
+// on the debug registers (which the kernel re-programs for its own diagnostic).
+// See arch::x86_64::ubreak for the mechanism.
+//
+//   {"op":"ubreak","sub":"set","pid":1,"addr":"0x...6e36ec5"}
+//   {"op":"ubreak","sub":"clear","pid":1,"addr":"0x...6e36ec5"}
+//   {"op":"ubreak","sub":"clear-all"}
+//   {"op":"ubreak","sub":"list"}
+//   {"op":"ubreak","sub":"dump"}
+//
+// `addr` is a RUNTIME virtual address (libxul base + symbol offset); the host
+// computes it from the ASLR base reported in the boot's [BOOT] / procmaps lines.
+#[cfg(feature = "kdb")]
+fn op_ubreak(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let sub = extract_field(req, "sub").unwrap_or_else(|| alloc::string::String::from("list"));
+    match sub.as_str() {
+        "set" => {
+            let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+                Some(p) => p,
+                None => { out.push_str(r#"{"error":"missing 'pid'"}"#); return; }
+            };
+            let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+                Some(a) => a,
+                None => { out.push_str(r#"{"error":"missing 'addr'"}"#); return; }
+            };
+            match crate::arch::x86_64::ubreak::arm(pid, addr) {
+                Ok((cr3, phys, orig)) => {
+                    let _ = write!(
+                        out,
+                        r#"{{"ok":true,"pid":{},"addr":"{:#x}","cr3":"{:#x}","private_phys":"{:#x}","orig_byte":"{:#x}"}}"#,
+                        pid, addr, cr3, phys, orig
+                    );
+                }
+                Err(e) => {
+                    out.push_str(r#"{"ok":false,"error":""#);
+                    out.push_str(e);
+                    out.push_str(r#""}"#);
+                }
+            }
+        }
+        "clear" => {
+            let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+                Some(p) => p,
+                None => { out.push_str(r#"{"error":"missing 'pid'"}"#); return; }
+            };
+            let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+                Some(a) => a,
+                None => { out.push_str(r#"{"error":"missing 'addr'"}"#); return; }
+            };
+            // Resolve cr3 the same way arm() did.
+            let cr3 = {
+                let pt = match try_lock_brief(&PROCESS_TABLE) {
+                    Some(g) => g,
+                    None => { out.push_str(r#"{"busy":"PROCESS_TABLE held"}"#); return; }
+                };
+                let c = pt.iter().find(|p| p.pid == pid).map(|p| p.cr3);
+                drop(pt);
+                match c { Some(c) => c, None => { out.push_str(r#"{"error":"pid not found"}"#); return; } }
+            };
+            let cleared = crate::arch::x86_64::ubreak::disarm(cr3, addr);
+            let _ = write!(out, r#"{{"ok":{},"cleared":{}}}"#, cleared, cleared);
+        }
+        "clear-all" => {
+            let n = crate::arch::x86_64::ubreak::disarm_all();
+            let _ = write!(out, r#"{{"ok":true,"cleared":{}}}"#, n);
+        }
+        "list" => crate::arch::x86_64::ubreak::list_json(out),
+        "dump" => crate::arch::x86_64::ubreak::dump_json(out),
+        _ => {
+            out.push_str(r#"{"error":"unknown ubreak sub (set|clear|clear-all|list|dump)"}"#);
+        }
+    }
 }
 
 // ── read-file ───────────────────────────────────────────────────────────────
@@ -3861,6 +3944,12 @@ fn op_procmaps(req: &str, out: &mut String) {
         Some(p) => p,
         None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
     };
+    // Optional filter: when `min_x=<bytes>` is set, emit ONLY executable (r-x)
+    // VMAs at least that many bytes long.  The full VMA list of a Firefox
+    // process overflows MAX_RESP_BYTES (truncating mid-record); this filter
+    // returns just the large code regions (libxul is the only >50 MiB r-x
+    // mapping), giving the ASLR base in a small, always-parseable response.
+    let min_x: u64 = extract_field(req, "min_x").and_then(|s| parse_u64(&s)).unwrap_or(0);
 
     struct VmaRow {
         base: u64, end: u64, prot: u32, name: alloc::string::String, phys: Option<u64>,
@@ -3899,8 +3988,15 @@ fn op_procmaps(req: &str, out: &mut String) {
 
     out.push('{');
     let _ = write!(out, r#""pid":{},"cr3":"{:#x}","vmas":["#, pid, cr3);
-    for (i, r) in rows.iter().take(512).enumerate() {
-        if i > 0 { out.push(','); }
+    let mut emitted = 0usize;
+    for r in rows.iter().take(512) {
+        if min_x != 0 {
+            let is_x = r.prot & crate::mm::vma::PROT_EXEC != 0;
+            let sz = r.end.saturating_sub(r.base);
+            if !is_x || sz < min_x { continue; }
+        }
+        if emitted > 0 { out.push(','); }
+        emitted += 1;
         out.push('{');
         j_str(out, "base"); out.push(':'); j_hex(out, r.base); out.push(',');
         j_str(out, "end");  out.push(':'); j_hex(out, r.end);  out.push(',');

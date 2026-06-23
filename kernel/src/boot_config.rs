@@ -86,6 +86,15 @@ const FF_URL_KEY: &[u8] = b"astryx.ff_url=";
 /// the in-kernel Xastryx server on `DISPLAY=:0` and paints into a real window.
 const FF_GUI_KEY: &[u8] = b"astryx.ff_gui=1";
 
+/// Key for the debug-only userspace-breakpoint auto-arm token.  When present as
+/// `astryx.ubreak=<hex_elf_offset>` in the cmdline blob, the kernel auto-arms a
+/// one-shot CoW-private userspace breakpoint at `libxul_load_base + <offset>`
+/// for every Linux process the moment it demand-faults the page containing that
+/// offset (see `arch::x86_64::ubreak`).  This removes the host-side timing race
+/// (the breakpoint is planted at page-install, before the code executes) and
+/// works even when the KDB pump is starved under heavy Firefox load.
+const UBREAK_KEY: &[u8] = b"astryx.ubreak=";
+
 /// Read the QEMU `opt/astryx/cmdline` fw_cfg blob and extract a validated
 /// `astryx.ff_url=<url>` value.  Returns `None` when the blob is missing,
 /// the token is absent, or the value fails validation — callers fall back to
@@ -149,6 +158,97 @@ pub fn ff_gui_mode() -> bool {
 /// Exposed for unit tests; see [`self_tests`].
 fn parse_ff_gui(buf: &[u8]) -> bool {
     find_token(buf, FF_GUI_KEY).is_some()
+}
+
+/// Max comma-separated `astryx.ubreak=` offsets we accept.
+pub const MAX_UBREAK_OFFSETS: usize = 4;
+
+/// One parsed auto-arm entry: a libxul-relative ELF offset and an optional
+/// 4-byte instruction signature (the first 4 code bytes expected at that
+/// offset, little-endian; 0 = no check).
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct UbreakEntry {
+    pub offset: u64,
+    pub sig: u32,
+}
+
+/// Read the debug-only `astryx.ubreak=<hex>[/<sig8>][,<hex>[/<sig8>]...]` token
+/// from the cmdline blob.  Each entry is an ELF offset and an optional 4-byte
+/// instruction signature after a `/` (8 hex digits, little-endian byte order =
+/// the raw on-disk bytes).  Returns the parsed entries packed into a fixed
+/// array with a count, or `None` when the token is absent.  Stack-only.
+#[cfg(all(feature = "kdb", feature = "firefox-test-core"))]
+pub fn ubreak_offsets() -> Option<([UbreakEntry; MAX_UBREAK_OFFSETS], usize)> {
+    let mut sig = [0u8; 4];
+    unsafe {
+        fw_cfg_select(FW_CFG_SIG_SEL);
+        for b in sig.iter_mut() {
+            *b = crate::hal::inb(FW_CFG_PORT_DATA);
+        }
+    }
+    if sig != FW_CFG_SIG_MAGIC {
+        return None;
+    }
+    let mut buf = [0u8; MAX_CMDLINE_LEN];
+    let n = fw_cfg_read_file(b"opt/astryx/cmdline", &mut buf)?;
+    parse_ubreak_offsets(&buf[..n])
+}
+
+/// Parse one optional-`0x`-prefixed hex integer starting at `*p`; advances `*p`
+/// past it.  Returns the value and whether any digit was consumed.
+fn parse_hex_at(buf: &[u8], p: &mut usize) -> (u64, bool) {
+    if *p + 1 < buf.len() && buf[*p] == b'0' && (buf[*p + 1] == b'x' || buf[*p + 1] == b'X') {
+        *p += 2;
+    }
+    let mut val: u64 = 0;
+    let mut any = false;
+    while *p < buf.len() {
+        let d = match buf[*p] {
+            c @ b'0'..=b'9' => (c - b'0') as u64,
+            c @ b'a'..=b'f' => (c - b'a' + 10) as u64,
+            c @ b'A'..=b'F' => (c - b'A' + 10) as u64,
+            _ => break,
+        };
+        val = val.wrapping_mul(16).wrapping_add(d);
+        any = true;
+        *p += 1;
+    }
+    (val, any)
+}
+
+/// Parse the `astryx.ubreak=` value into (offset, sig) entries.  Grammar:
+/// `<hex>[ / <sig8hex> ] ( , <hex>[ / <sig8hex> ] )*`.  The value runs to the
+/// first whitespace / control byte / NUL.  Exposed for unit tests.
+fn parse_ubreak_offsets(buf: &[u8]) -> Option<([UbreakEntry; MAX_UBREAK_OFFSETS], usize)> {
+    let start = find_token(buf, UBREAK_KEY)?;
+    let mut p = start + UBREAK_KEY.len();
+    let mut out = [UbreakEntry::default(); MAX_UBREAK_OFFSETS];
+    let mut count = 0usize;
+    loop {
+        let (off, any) = parse_hex_at(buf, &mut p);
+        if !any {
+            break;
+        }
+        // optional /sig
+        let mut sig: u32 = 0;
+        if p < buf.len() && buf[p] == b'/' {
+            p += 1;
+            let (s, sany) = parse_hex_at(buf, &mut p);
+            if sany {
+                sig = s as u32;
+            }
+        }
+        if count < MAX_UBREAK_OFFSETS {
+            out[count] = UbreakEntry { offset: off, sig };
+            count += 1;
+        }
+        if p < buf.len() && buf[p] == b',' && count < MAX_UBREAK_OFFSETS {
+            p += 1;
+            continue;
+        }
+        break;
+    }
+    if count > 0 { Some((out, count)) } else { None }
 }
 
 /// Extract and validate the `astryx.ff_url=` value from a cmdline blob.
@@ -342,6 +442,49 @@ pub fn self_tests() -> usize {
     );
     check!(!parse_ff_gui(b"astryx.ff_url=https://lite.cnn.com"), "gui token absent");
     check!(!parse_ff_gui(b"astryx.ff_gui=0"), "gui token explicitly off");
+
+    // ubreak auto-arm offset parsing (debug-only, kdb feature).
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x6e36c70")
+            .map(|(o, c)| (o[0].offset, o[0].sig, c)) == Some((0x6e36c70, 0, 1)),
+        "ubreak single 0x offset, no sig"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=6e36c70")
+            .map(|(o, c)| (o[0].offset, c)) == Some((0x6e36c70, 1)),
+        "ubreak single offset no 0x prefix"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x6e36c70/55415741")
+            .map(|(o, c)| (o[0].offset, o[0].sig, c)) == Some((0x6e36c70, 0x55415741, 1)),
+        "ubreak offset with /sig"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=6e36c70/55415741,773fda0/50488b05,6e36ec5/488d155c")
+            .map(|(o, c)| (o[0].offset, o[0].sig, o[1].offset, o[1].sig, o[2].offset, c))
+            == Some((0x6e36c70, 0x55415741, 0x773fda0, 0x50488b05, 0x6e36ec5, 3)),
+        "ubreak three offset/sig pairs"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ff_gui=1 astryx.ubreak=0x1234 quiet")
+            .map(|(o, c)| (o[0].offset, c)) == Some((0x1234, 1)),
+        "ubreak space-terminated after another token"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0xabc\0junk")
+            .map(|(o, c)| (o[0].offset, c)) == Some((0xabc, 1)),
+        "ubreak NUL-terminated"
+    );
+    check!(parse_ubreak_offsets(b"foo=bar").is_none(), "ubreak absent token");
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=").is_none(),
+        "ubreak empty value rejected"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x1,0x2,0x3,0x4,0x5")
+            .map(|(_, c)| c) == Some(MAX_UBREAK_OFFSETS),
+        "ubreak offset count clamped to MAX_UBREAK_OFFSETS"
+    );
 
     crate::serial_println!("[BOOTCFG/SELFTEST] PASS ({} asserts)", n);
     n
