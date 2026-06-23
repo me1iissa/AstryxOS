@@ -1308,6 +1308,8 @@ pub fn run() -> ! {
     {
         total += 1;
         if test_645_percpu_runqueue_scaffold() { passed += 1; }
+        total += 1;
+        if test_647_percpu_incremental_equiv() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49068,6 +49070,174 @@ fn test_645_percpu_runqueue_scaffold() -> bool {
     true
 }
 
+// ── Test 647: per-CPU runqueue incremental maintenance == full rebuild ──────
+//
+// Perf P2 phase 2a replaces the phase-1 per-pass full rebuild of the per-CPU
+// runqueue mirror with O(Δ) incremental enqueue/dequeue maintenance plus a
+// gated O(N) audit.  The equivalence the audit relies on — and that phase 2b's
+// pick will read — is that, after ANY sequence of membership transitions, the
+// incrementally-maintained runqueues hold the SAME threads in the SAME (cpu,
+// priority) buckets as a from-scratch rebuild from the table.  Intra-level
+// ORDER may legitimately differ (join order vs table order; see
+// `PerCpuRq::same_membership`), so the equivalence asserted here is membership +
+// placement + bitmap + nr_running, checked after every transition step.
+//
+// Deterministic and self-contained: it drives both algorithms over
+// caller-owned `PerCpuRq` instances and a synthetic thread table via the
+// `test_apply_incremental` / `test_full_rebuild` replicas, so the live static
+// `RQS` (shared with the running scheduler) is never disturbed.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_647_percpu_incremental_equiv() -> bool {
+    use crate::sched::percpu::{self, PerCpuRq, MirrorSlot};
+    use crate::proc::{Tid, PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_HIGH, PRIORITY_MAX};
+    const NAME: &str = "[SCHED/P2] per-CPU runqueue incremental==rebuild (Test 647)";
+    test_header!(NAME);
+
+    // Two CPUs' worth of runqueues for the incremental path and a parallel set
+    // for the from-scratch rebuild oracle.
+    const NCPU: usize = 2;
+    let mut inc: [PerCpuRq; NCPU] = core::array::from_fn(|_| PerCpuRq::new_for_test());
+    let mut reb: [PerCpuRq; NCPU] = core::array::from_fn(|_| PerCpuRq::new_for_test());
+
+    // Synthetic thread table: stable tids, a per-thread recorded slot (starts
+    // None — nothing mirrored yet), and a desired slot that the steps below
+    // mutate to model state transitions.
+    const N: usize = 6;
+    let tids: [Tid; N] = [10, 11, 12, 13, 14, 15];
+    let mut slots: [MirrorSlot; N] = [None; N];
+
+    // A transition step: set the desired slot per thread, run the incremental
+    // delta and a full rebuild, and assert membership equivalence + invariants
+    // on every CPU.  Returns false on the first mismatch.
+    //
+    // Closures can't easily borrow the arrays mutably across calls in this
+    // no_std test harness style, so the step is open-coded per phase below with
+    // a shared check via this helper over the two rq sets.
+    fn check(inc: &[PerCpuRq], reb: &[PerCpuRq]) -> Result<(), &'static str> {
+        for cpu in 0..inc.len() {
+            if !inc[cpu].invariants_hold() {
+                return Err("incremental rq broke its own bitmap/nr_running invariant");
+            }
+            if !reb[cpu].invariants_hold() {
+                return Err("rebuild rq broke its own invariant");
+            }
+            if !inc[cpu].same_membership(&reb[cpu]) {
+                return Err("incremental membership/placement diverged from full rebuild");
+            }
+        }
+        Ok(())
+    }
+
+    // Step 1: all six threads become Ready on CPU 0/1 at assorted priorities.
+    //   10@N cpu0, 11@N cpu0 (same level, FIFO), 12@HIGH cpu0,
+    //   13@N cpu1, 14@IDLE cpu1, 15@MAX cpu1.
+    let desired: [MirrorSlot; N] = [
+        Some((0, PRIORITY_NORMAL)),
+        Some((0, PRIORITY_NORMAL)),
+        Some((0, PRIORITY_HIGH)),
+        Some((1, PRIORITY_NORMAL)),
+        Some((1, PRIORITY_IDLE)),
+        Some((1, PRIORITY_MAX)),
+    ];
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired);
+    percpu::test_full_rebuild(&mut reb, &tids, &desired);
+    if let Err(e) = check(&inc, &reb) { test_fail!(NAME, "step1: {}", e); return false; }
+    // On this first build the join order equals table order, so the STRICT
+    // ordered equality must also hold — locks in that the FIFO append order is
+    // identical when nothing has been re-queued yet.
+    for cpu in 0..NCPU {
+        if !inc[cpu].equals(&reb[cpu]) {
+            test_fail!(NAME, "step1: strict order diverged on first build (cpu {})", cpu);
+            return false;
+        }
+    }
+
+    // Step 2: thread 12 blocks (leaves the runqueue); thread 13 migrates from
+    // cpu1 to cpu0 (affinity change); thread 11's priority is boosted N->HIGH
+    // (a same-CPU bucket move).  This is the case that distinguishes incremental
+    // from rebuild: 11 leaves the NORMAL level and joins the HIGH level at the
+    // tail, while the rebuild re-derives HIGH in table order.  Membership must
+    // still match.
+    let desired: [MirrorSlot; N] = [
+        Some((0, PRIORITY_NORMAL)),         // 10 unchanged
+        Some((0, PRIORITY_HIGH)),           // 11 boosted N->HIGH (bucket move)
+        None,                               // 12 blocked (removed)
+        Some((0, PRIORITY_NORMAL)),         // 13 migrated cpu1->cpu0
+        Some((1, PRIORITY_IDLE)),           // 14 unchanged
+        Some((1, PRIORITY_MAX)),            // 15 unchanged
+    ];
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired);
+    percpu::test_full_rebuild(&mut reb, &tids, &desired);
+    if let Err(e) = check(&inc, &reb) { test_fail!(NAME, "step2: {}", e); return false; }
+    // The HIGH level on cpu0 now holds {11, 12-is-gone... actually 11} plus any
+    // residual — assert the specific membership the transition implies: cpu0
+    // HIGH must contain 11, cpu0 NORMAL must contain {10, 13}, and 12 must be
+    // gone everywhere.
+    if inc[0].nr_running() != 3 {
+        test_fail!(NAME, "step2: cpu0 nr_running={} expected 3", inc[0].nr_running());
+        return false;
+    }
+
+    // Step 3: a no-op pass — desired unchanged from step 2.  The incremental
+    // path must perform ZERO queue mutations (every have==want) and remain
+    // equivalent.  We can't directly count mutations here, but equivalence after
+    // a no-op pass proves the have==want fast path doesn't corrupt state.
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired);
+    percpu::test_full_rebuild(&mut reb, &tids, &desired);
+    if let Err(e) = check(&inc, &reb) { test_fail!(NAME, "step3 (no-op): {}", e); return false; }
+
+    // Step 4: everything blocks / exits — the runqueues drain to empty.  Both
+    // paths must reach the same empty state with clean bitmaps.
+    let desired: [MirrorSlot; N] = [None; N];
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired);
+    percpu::test_full_rebuild(&mut reb, &tids, &desired);
+    if let Err(e) = check(&inc, &reb) { test_fail!(NAME, "step4 (drain): {}", e); return false; }
+    for cpu in 0..NCPU {
+        if inc[cpu].nr_running() != 0 || inc[cpu].bitmap() != 0 {
+            test_fail!(NAME, "step4: cpu {} not empty after drain", cpu);
+            return false;
+        }
+    }
+    // Recorded slots must all be cleared (the delta wrote None back).
+    if slots.iter().any(|s| s.is_some()) {
+        test_fail!(NAME, "step4: a recorded mirror_slot survived the drain");
+        return false;
+    }
+
+    // Step 5: re-add in a DIFFERENT order than step 1 to exercise the join-order
+    // vs table-order divergence head-on: thread 15 (last in the array) joins the
+    // NORMAL level on cpu0 first, then 10 joins the same level.  Incremental tail
+    // order is [15, 10]; rebuild (table order) is [10, 15].  same_membership must
+    // still hold even though strict order now differs — and we assert it DOES
+    // differ, proving the order-insensitive audit is the correct contract.
+    let desired_a: [MirrorSlot; N] = [
+        None, None, None, None, None,
+        Some((0, PRIORITY_NORMAL)),   // 15 joins NORMAL first
+    ];
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired_a);
+    let desired_b: [MirrorSlot; N] = [
+        Some((0, PRIORITY_NORMAL)),   // 10 joins NORMAL second (tail)
+        None, None, None, None,
+        Some((0, PRIORITY_NORMAL)),   // 15 still present
+    ];
+    percpu::test_apply_incremental(&mut inc, &mut slots, &tids, &desired_b);
+    percpu::test_full_rebuild(&mut reb, &tids, &desired_b);
+    if let Err(e) = check(&inc, &reb) { test_fail!(NAME, "step5: {}", e); return false; }
+    // Confirm the orders genuinely diverged (incremental join order != rebuild
+    // table order), validating that membership-equality, not strict equality, is
+    // the right audit contract for phase 2a.
+    if inc[0].equals(&reb[0]) {
+        test_fail!(NAME,
+            "step5: expected intra-level order to differ (join vs table) but strict equals held");
+        return false;
+    }
+
+    test_println!("  incremental maintenance == full rebuild across 5 transition phases \
+(membership+placement+bitmap+nr_running); order-divergence case confirmed");
+    test_pass!(NAME);
+    true
+}
+
 // ── Test 259: OB refcount + handle-table integration (cycle-3 hardening) ────
 //
 // Standalone driver for the refcount-aware OB API added in this cycle.
@@ -50463,6 +50633,7 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            mirror_slot: None,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,
@@ -50753,6 +50924,7 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            mirror_slot: None,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,

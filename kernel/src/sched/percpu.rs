@@ -164,6 +164,58 @@ impl PerCpuRq {
         self.lists[top].front().copied()
     }
 
+    /// Strict structural equality against another runqueue: identical `bitmap`,
+    /// `nr_running`, and identical per-level FIFO contents (same tids in the
+    /// SAME order at every priority level).  Used by the unit test (Test 647)
+    /// where the intra-level order is deterministic and must be checked exactly.
+    pub fn equals(&self, other: &PerCpuRq) -> bool {
+        if self.bitmap != other.bitmap || self.nr_running != other.nr_running {
+            return false;
+        }
+        for p in 0..NPRIO {
+            if self.lists[p] != other.lists[p] {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Order-insensitive membership equality against another runqueue: identical
+    /// `bitmap`, `nr_running`, and the same SET of tids at every priority level,
+    /// regardless of intra-level order.  Used by the phase-2a maintainer's
+    /// audit.
+    ///
+    /// The audit compares the incrementally-maintained runqueue against a
+    /// from-scratch table-rebuild image.  Both contain exactly the same threads
+    /// in exactly the same (cpu, level) buckets, but they can legitimately differ
+    /// in the *order within a level*: the rebuild appends in table-iteration
+    /// order, while the incremental path appends a thread at the moment it
+    /// transitions into the level (its join order).  Phase 2a does not yet define
+    /// a canonical intra-level order — the legacy picker's round-robin is
+    /// rotation-over-the-table, not a persistent per-level FIFO — so the audit's
+    /// correctness property is *membership + placement*, not order.  (Phase 3,
+    /// which makes the runqueue the authoritative round-robin source, will pin
+    /// the intra-level order and tighten this back to ordered equality.)
+    pub fn same_membership(&self, other: &PerCpuRq) -> bool {
+        if self.bitmap != other.bitmap || self.nr_running != other.nr_running {
+            return false;
+        }
+        for p in 0..NPRIO {
+            if self.lists[p].len() != other.lists[p].len() {
+                return false;
+            }
+            // Same length and small queues — O(k²) set check is cheap and
+            // allocation-free.  Every tid in self's level must appear (with
+            // multiplicity 1 — tids are unique) in other's level.
+            for &tid in self.lists[p].iter() {
+                if !other.lists[p].iter().any(|&o| o == tid) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Self-check the structural invariants of this runqueue:
     ///   * `bitmap` bit `p` is set iff `lists[p]` is non-empty, and
     ///   * `nr_running` equals the total number of queued IDs.
@@ -184,6 +236,65 @@ impl PerCpuRq {
     }
 }
 
+/// Test-facing exact replica of the maintainer's two reconciliation algorithms,
+/// operating on caller-owned structures so the live static `RQS` (shared with
+/// the running scheduler) is never disturbed.
+///
+/// `slots` is the per-thread recorded mirror slot (the `Thread::mirror_slot`
+/// shadow), `desired` is each thread's [`desired_slot`] for the current pass,
+/// and `tids` are the thread IDs (parallel arrays, one entry per thread).  This
+/// applies the SAME O(Δ) delta `mirror_maintain` applies — dequeue from the old
+/// recorded bucket, enqueue into the new desired bucket, update the recorded
+/// slot — to the caller's `rqs`, and updates `slots` in place.  Used by the
+/// equivalence test (Test 647) to drive a sequence of transitions through the
+/// incremental path and compare the result, pass by pass, against a
+/// from-scratch full rebuild ([`test_full_rebuild`]).
+#[doc(hidden)]
+pub fn test_apply_incremental(
+    rqs: &mut [PerCpuRq],
+    slots: &mut [MirrorSlot],
+    tids: &[Tid],
+    desired: &[MirrorSlot],
+) {
+    for i in 0..tids.len() {
+        let have = slots[i];
+        let want = desired[i];
+        if have == want {
+            continue;
+        }
+        if let Some((ocpu, oprio)) = have {
+            if (ocpu as usize) < rqs.len() {
+                rqs[ocpu as usize].dequeue(tids[i], oprio);
+            }
+        }
+        if let Some((ncpu, nprio)) = want {
+            if (ncpu as usize) < rqs.len() {
+                rqs[ncpu as usize].enqueue(tids[i], nprio);
+            }
+        }
+        slots[i] = want;
+    }
+}
+
+/// Test-facing exact replica of the maintainer's full table-derived rebuild
+/// (the gated audit's reference image): clear every runqueue, then enqueue each
+/// thread that has a `desired` slot, in array order (the same order the audit
+/// walks the table in).  Used by Test 647 as the from-scratch oracle the
+/// incremental path must match.
+#[doc(hidden)]
+pub fn test_full_rebuild(rqs: &mut [PerCpuRq], tids: &[Tid], desired: &[MirrorSlot]) {
+    for rq in rqs.iter_mut() {
+        rq.clear();
+    }
+    for i in 0..tids.len() {
+        if let Some((cpu, prio)) = desired[i] {
+            if (cpu as usize) < rqs.len() {
+                rqs[cpu as usize].enqueue(tids[i], prio);
+            }
+        }
+    }
+}
+
 /// One [`PerCpuRq`] per logical CPU, each behind its own leaf lock.
 ///
 /// # Lock order
@@ -197,16 +308,20 @@ impl PerCpuRq {
 pub static RQS: [spin::Mutex<PerCpuRq>; MAX_CPUS] =
     [const { spin::Mutex::new(PerCpuRq::new()) }; MAX_CPUS];
 
-/// Cumulative count of phase-1 mirror rebuilds that detected a structural
-/// invariant break (bitmap/`nr_running` desynchronised from the lists).  This
-/// must stay at zero; a non-zero value is a scaffold bug, surfaced to the test
-/// suite via [`mirror_invariant_failures`].  Monotone since boot.
+/// Cumulative count of audit passes that found a structural invariant break
+/// (bitmap/`nr_running` desynchronised from the lists) in an
+/// incrementally-maintained runqueue.  This must stay at zero; a non-zero value
+/// is a maintainer bug, surfaced to the test suite via
+/// [`mirror_invariant_failures`].  Bumped only by the gated audit in
+/// [`mirror_maintain`].  Monotone since boot.
 pub static MIRROR_INVARIANT_FAILURES: AtomicU32 = AtomicU32::new(0);
 
-/// Cumulative count of phase-1 mirror rebuilds where the per-CPU runqueue's
-/// ready membership disagreed with the authoritative `THREAD_TABLE` ready-set
-/// for that CPU.  Must stay zero in phase 1 (the mirror is *built from* the
-/// table, so it can only diverge on a real scaffold bug).  Monotone since boot.
+/// Cumulative count of audit passes where an incrementally-maintained per-CPU
+/// runqueue disagreed (membership, placement or FIFO order) with the
+/// authoritative `THREAD_TABLE`-derived image.  Must stay zero: the maintainer
+/// tracks the table, so it can only diverge on a real maintenance bug (a dropped
+/// delta, an unreflected off-path transition).  Bumped only by the gated audit
+/// in [`mirror_maintain`].  Monotone since boot.
 pub static MIRROR_MEMBERSHIP_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// Snapshot of [`MIRROR_INVARIANT_FAILURES`].
@@ -263,91 +378,172 @@ fn is_mirrored_runnable(t: &proc::Thread) -> bool {
     t.state == ThreadState::Ready && t.tid < 0x1000
 }
 
-/// Phase-1 mirror rebuild + self-verify, called from the authoritative picker
-/// while `THREAD_TABLE` is held.
+/// The per-thread mirror slot that the incremental maintainer records on the
+/// `Thread` record so a later pass can locate (and dequeue) the thread in O(1)
+/// without re-deriving its priority/target from scratch.
 ///
-/// Rebuilds every CPU's runqueue from the locked thread table so the structure,
-/// bitmap and `nr_running` reflect the current non-idle Ready set, then
-/// verifies two properties and records any break in the monotone failure
-/// counters:
-///
-///   1. **Structural invariants** — for each rebuilt runqueue, the bitmap and
-///      `nr_running` agree with the lists ([`PerCpuRq::invariants_hold`]).
-///   2. **Membership** — the number of thread IDs mirrored across all CPUs
-///      equals the authoritative non-idle Ready count ([`is_mirrored_runnable`],
-///      the same `tid < 0x1000` non-idle pool the picker's `ready_peers`
-///      counts).  This `expected` count is derived in an INDEPENDENT pass over
-///      the table (not folded into the enqueue loop), so a bug that drops a
-///      thread during enqueue/target-selection/clamp is actually caught rather
-///      than silently agreeing with itself.
-///
-/// This is the heart of "behaviour-preserving scaffold": it touches no thread
-/// state and changes no decision; it only proves the new structure tracks the
-/// authoritative ready-set, on every scheduling pass, so phases 2+ can switch
-/// the picker over to it with confidence.
-///
-/// `threads` is the already-locked thread table (the caller in
-/// `super::schedule` holds `THREAD_TABLE`).  Cheap relative to the picker's own
-/// table walk it piggybacks on: one independent count pass, one rebuild pass,
-/// one short verify pass per CPU.
-pub fn mirror_rebuild_and_verify(threads: &[proc::Thread]) {
-    // Independent expected count FIRST, before any enqueue — this is the
-    // authoritative non-idle Ready population the mirror must reproduce.
-    // Deriving it separately (rather than incrementing alongside the enqueue)
-    // makes the membership check a genuine cross-check: if the rebuild loop
-    // drops a thread (lost clamp, missing guard, target bug), the two counts
-    // diverge and the failure is recorded.
-    let expected_runnable = threads.iter().filter(|t| is_mirrored_runnable(t)).count() as u32;
+/// `None` ⇒ the thread is NOT currently in any per-CPU runqueue.  `Some((cpu,
+/// prio))` ⇒ the thread is enqueued on `RQS[cpu]` at priority level `prio`.
+/// Storing the level the thread was enqueued AT (rather than re-reading its
+/// live `priority`) is what makes dequeue exact even if the thread's priority
+/// changed since it was enqueued: we always remove from the bucket it actually
+/// occupies.
+pub type MirrorSlot = Option<(u8, u8)>;
 
-    // Take all runqueue locks for the duration of the rebuild.  Lock order is
-    // honoured (we already hold THREAD_TABLE; RQS is the leaf), and the locks
-    // are acquired in ascending CPU index order — the same order phase-3
-    // migration uses — so no two callers can deadlock on them.
-    //
-    // We hold them across the whole rebuild+verify so a concurrent reader on
-    // another CPU never observes a half-rebuilt mirror.
+/// Periodic full-rebuild audit cadence, in scheduling passes (picker
+/// iterations).  Every `AUDIT_EVERY_PASSES`-th pass the maintainer does the
+/// original O(N) clear-rebuild-from-table + independent cross-check; the other
+/// passes only apply the O(Δ) membership delta.  64 keeps the audit's amortized
+/// cost negligible (one full rebuild per ~64 picks) while still catching, within
+/// well under a second of wall-clock, any drift between the incrementally
+/// maintained runqueues and the authoritative table.
+const AUDIT_EVERY_PASSES: u64 = 64;
+
+/// Monotone counter of scheduling passes seen by [`mirror_maintain`]; drives the
+/// `AUDIT_EVERY_PASSES` audit cadence.  Picker passes always run with the owning
+/// CPU holding `THREAD_TABLE`, so a `Relaxed` non-atomic-RMW would suffice on
+/// SMP=1; it is an atomic so the cadence is well-defined if two CPUs ever drive
+/// the maintainer concurrently in a later phase.
+static MAINTAIN_PASSES: AtomicU32 = AtomicU32::new(0);
+
+/// Cumulative count of audit passes whose full table-derived rebuild disagreed
+/// with the incrementally-maintained runqueues (membership or per-CPU
+/// placement).  Must stay zero: a non-zero value means the incremental
+/// enqueue/dequeue maintenance dropped, duplicated or mis-placed a thread
+/// relative to the authoritative table.  Monotone since boot; surfaced to the
+/// test suite via [`mirror_audit_failures`].
+pub static MIRROR_AUDIT_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of [`MIRROR_AUDIT_FAILURES`].
+pub fn mirror_audit_failures() -> u32 {
+    MIRROR_AUDIT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// The runqueue membership a thread SHOULD have right now: `None` if it is not a
+/// mirrored-runnable thread, else `Some((target_cpu, priority))`.  This is the
+/// single definition of "where the mirror wants this thread", shared by the
+/// incremental delta and the audit so they cannot drift in interpretation.
+#[inline]
+fn desired_slot(t: &proc::Thread) -> MirrorSlot {
+    if is_mirrored_runnable(t) {
+        let cpu = target_cpu_for(t.cpu_affinity, t.last_cpu) as u8;
+        Some((cpu, t.priority))
+    } else {
+        None
+    }
+}
+
+/// Incremental per-CPU runqueue maintenance + gated audit (Perf P2 phase 2a),
+/// called from the authoritative picker while `THREAD_TABLE` is held.  Replaces
+/// the phase-1 [`mirror_rebuild_and_verify`] (a full O(N) clear-and-rebuild on
+/// EVERY pass) with O(Δ) maintenance on the hot path plus an amortized O(N)
+/// audit.
+///
+/// On every pass it walks the table once and, for each thread, compares its
+/// recorded `mirror_slot` (where it is currently enqueued) against its
+/// [`desired_slot`] (where it should be).  Only a thread whose membership
+/// actually changed since the previous pass costs an enqueue and/or dequeue — a
+/// quiescent ready-set costs zero queue mutations.  This is the behaviour the
+/// later phases need: the runqueue tracks the live ready-set continuously and
+/// cheaply, with no per-pass rebuild.
+///
+/// Every [`AUDIT_EVERY_PASSES`]-th pass it ADDITIONALLY rebuilds a throwaway
+/// view from the table and cross-checks it against the incrementally-maintained
+/// runqueues; any divergence (membership, placement, or a broken
+/// bitmap/`nr_running` invariant) bumps [`MIRROR_AUDIT_FAILURES`].  This is the
+/// safety net that catches an off-path state transition the incremental delta
+/// failed to reflect (a future wake site that never runs through the picker
+/// before the pick reads the mirror).
+///
+/// Still behaviour-preserving: it touches no scheduling DECISION (the legacy
+/// picker remains authoritative this PR) and only the new `mirror_slot` shadow
+/// field of `Thread`; SMP=1 selection stays bit-for-bit identical.
+///
+/// `threads` is the already-locked thread table.  Lock order is honoured
+/// (THREAD_TABLE held; the RQS locks are leaves taken in ascending CPU order
+/// inside this function).
+pub fn mirror_maintain(threads: &mut [proc::Thread]) {
+    let pass = MAINTAIN_PASSES.fetch_add(1, Ordering::Relaxed);
+    let audit_due = pass % (AUDIT_EVERY_PASSES as u32) == 0;
+
+    // Take all runqueue locks for the whole pass, in ascending CPU index order
+    // (the order phase-3 migration uses), so a concurrent reader on another CPU
+    // never observes a half-updated mirror and no path can deadlock on them.
     let mut guards: [Option<spin::MutexGuard<'_, PerCpuRq>>; MAX_CPUS] =
         [const { None }; MAX_CPUS];
     for cpu in 0..MAX_CPUS {
-        let mut g = RQS[cpu].lock();
-        g.clear();
-        guards[cpu] = Some(g);
+        guards[cpu] = Some(RQS[cpu].lock());
     }
 
-    // Rebuild: place every non-idle Ready thread onto its target CPU's queue.
-    // The idle class (AP idle threads, TID ≥ 0x1000) is excluded exactly as the
-    // authoritative picker excludes it; TID 0 (the BSP poll reactor) is a
-    // non-idle peer and IS mirrored — see `is_mirrored_runnable`.
-    for t in threads.iter() {
-        if !is_mirrored_runnable(t) {
+    // ── O(Δ) incremental delta ───────────────────────────────────────────────
+    // For each thread, reconcile its recorded slot with its desired slot.  A
+    // thread whose membership is unchanged (same cpu+prio, or still absent)
+    // performs no queue mutation.
+    for t in threads.iter_mut() {
+        let have = t.mirror_slot;
+        let want = desired_slot(t);
+        if have == want {
             continue;
         }
-        let cpu = target_cpu_for(t.cpu_affinity, t.last_cpu);
-        if let Some(g) = guards[cpu].as_mut() {
-            g.enqueue(t.tid, t.priority);
-        }
-    }
-
-    // Verify (1): structural invariants per CPU, and tally the mirrored total.
-    let mut mirrored_total = 0u32;
-    let mut invariant_ok = true;
-    for cpu in 0..MAX_CPUS {
-        if let Some(g) = guards[cpu].as_ref() {
-            if !g.invariants_hold() {
-                invariant_ok = false;
+        // Remove from the old bucket (if any) — using the level it was enqueued
+        // AT, not its (possibly changed) live priority.
+        if let Some((ocpu, oprio)) = have {
+            if let Some(g) = guards[ocpu as usize].as_mut() {
+                g.dequeue(t.tid, oprio);
             }
-            mirrored_total += g.nr_running();
         }
-    }
-    if !invariant_ok {
-        MIRROR_INVARIANT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        // Insert into the new bucket (if it should be present).
+        if let Some((ncpu, nprio)) = want {
+            if let Some(g) = guards[ncpu as usize].as_mut() {
+                g.enqueue(t.tid, nprio);
+            }
+        }
+        t.mirror_slot = want;
     }
 
-    // Verify (2): the mirrored total matches the INDEPENDENTLY-derived
-    // authoritative non-idle Ready count.  A mismatch means the rebuild dropped
-    // or duplicated a thread relative to the table — a genuine scaffold bug.
-    if mirrored_total != expected_runnable {
-        MIRROR_MEMBERSHIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+    // ── Gated audit ──────────────────────────────────────────────────────────
+    // Rebuild a throwaway image of every CPU's runqueue directly from the table
+    // and compare it, bucket-for-bucket, against the incrementally-maintained
+    // runqueues.  An independent derivation (not folded into the delta above) is
+    // what makes this a genuine cross-check rather than a self-confirming tally.
+    if audit_due {
+        let mut audit: [PerCpuRq; MAX_CPUS] = core::array::from_fn(|_| PerCpuRq::new());
+        for t in threads.iter() {
+            if let Some((cpu, prio)) = desired_slot(t) {
+                audit[cpu as usize].enqueue(t.tid, prio);
+            }
+        }
+        let mut invariant_ok = true;
+        let mut membership_ok = true;
+        for cpu in 0..MAX_CPUS {
+            if let Some(g) = guards[cpu].as_ref() {
+                // Structural invariant of the live (incrementally-maintained)
+                // runqueue: bitmap/nr_running agree with its own lists.
+                if !g.invariants_hold() {
+                    invariant_ok = false;
+                }
+                // Membership + placement match the table-derived image.
+                // Intra-level ORDER is intentionally not required here (see
+                // `same_membership`): phase 2a does not yet define a canonical
+                // per-level order, so requiring it would false-positive whenever
+                // a thread's join order differs from table-iteration order.
+                if !g.same_membership(&audit[cpu]) {
+                    membership_ok = false;
+                }
+            }
+        }
+        // Feed BOTH the long-standing phase-1 counters (so Test 645's
+        // zero-failure assertions remain a live signal under the new
+        // maintainer) AND the dedicated audit counter.
+        if !invariant_ok {
+            MIRROR_INVARIANT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        if !membership_ok {
+            MIRROR_MEMBERSHIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        if !invariant_ok || !membership_ok {
+            MIRROR_AUDIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // Guards drop here in declaration order, releasing every runqueue lock.

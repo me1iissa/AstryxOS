@@ -1469,16 +1469,18 @@ was_emergency_4k={}",
             }
         }
 
-        // ── Per-CPU runqueue mirror (Perf P2 phase 1, behaviour-preserving) ──
-        // Rebuild the per-CPU/per-priority runqueue structures from this locked
-        // snapshot of the ready-set and self-verify their bitmap/nr_running
-        // invariants and membership against the authoritative table.  This
+        // ── Per-CPU runqueue mirror (Perf P2 phase 2a, behaviour-preserving) ──
+        // Incrementally reconcile the per-CPU/per-priority runqueue structures
+        // with this locked snapshot of the ready-set: a thread whose runqueue
+        // membership is unchanged since the previous pass costs no queue
+        // mutation (O(Δ) on the hot path), and a full table-derived audit runs
+        // only once per `AUDIT_EVERY_PASSES` passes (amortized O(N)).  This
         // populates and continuously validates the new structure WITHOUT
         // influencing the pick below — the authoritative picker still selects
         // the next thread by scoring the table.  Lock order is respected
         // (THREAD_TABLE held here; the runqueue locks are leaves taken inside
-        // `mirror_rebuild_and_verify`).  See `sched::percpu`.
-        percpu::mirror_rebuild_and_verify(&threads);
+        // `mirror_maintain`).  See `sched::percpu`.
+        percpu::mirror_maintain(&mut threads);
 
         // Find the highest-priority Ready thread with affinity awareness.
         // Scoring: priority * 4 + affinity_bonus (0-2)

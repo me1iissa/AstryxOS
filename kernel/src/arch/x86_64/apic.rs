@@ -1153,6 +1153,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            mirror_slot: None,
             ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: 0,
             fork_user_regs: crate::proc::ForkUserRegs::default(),
