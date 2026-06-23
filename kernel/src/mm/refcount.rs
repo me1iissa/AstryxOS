@@ -84,6 +84,43 @@ fn pfn(phys_addr: u64) -> usize {
     (phys_addr / 4096) as usize
 }
 
+/// End (exclusive) of the reserved low-memory region, in bytes.
+///
+/// The first 1 MiB of physical address space holds the real-mode IVT, BIOS
+/// data area, legacy VGA framebuffer and option-ROM shadow.  The PMM marks
+/// these 256 frames reserved at init and never hands them out as user pages
+/// (`pmm::init` reserves frames `0..256`), so no PTE that backs a refcounted
+/// user mapping ever masks down into this range.  A masked physical address
+/// below this bound therefore does NOT name a frame the refcount table is
+/// permitted to account for — frame 0 in particular is the slot for the
+/// real-mode IVT, not a user page.
+const RESERVED_LOW_END: u64 = 0x10_0000; // 1 MiB
+
+/// Does `phys_addr` name a frame whose reference count this table tracks?
+///
+/// A frame is refcountable iff its masked physical address lies in managed
+/// RAM that the PMM hands out as user pages: at or above the reserved low
+/// 1 MiB, and within the `MAX_PAGES` window the refcount table covers.
+///
+/// Teardown / unmap paths walk page tables and decrement one reference per
+/// *present* PTE.  But a PTE may be present-bit-set yet mask down to a
+/// physical address that does not back a refcounted frame — a masked phys of
+/// 0 (a zeroed-but-present or otherwise special leaf entry), legacy
+/// low-memory, or an address beyond tracked RAM.  Decrementing the refcount
+/// slot for such an address corrupts unrelated bookkeeping (a masked phys of
+/// 0 underflows slot 0, the real-mode-IVT frame's slot).  Callers on the
+/// teardown dec path MUST gate `page_ref_dec` on this predicate so that only
+/// genuinely backed user frames are accounted for — mirroring the
+/// "normal page" gate that put_page-style reclaim applies on POSIX systems.
+///
+/// This is purely a SKIP predicate: it never changes how many times a real
+/// backed frame is decremented (every such frame returns `true` and is
+/// decremented exactly once per present PTE, as before).
+#[inline]
+pub fn is_refcountable_frame(phys_addr: u64) -> bool {
+    phys_addr >= RESERVED_LOW_END && pfn(phys_addr) < MAX_PAGES
+}
+
 /// Increment the reference count for a physical page.
 /// Called when a new page table references this page (e.g., CoW fork).
 pub fn page_ref_inc(phys_addr: u64) {

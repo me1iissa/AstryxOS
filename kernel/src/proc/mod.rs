@@ -1797,9 +1797,22 @@ pub fn free_process_memory(pid: Pid) {
         let mut addr = vma.base;
         while addr < vma.base + vma.length {
             let pte = vmm::read_pte(cr3, addr);
+            // Only decrement frames the refcount table actually tracks.  A PTE
+            // can be present-bit-set yet mask down to a physical address that
+            // does not back a refcounted user frame — a masked phys of 0 (a
+            // zeroed-but-present / special leaf entry, observed during the
+            // teardown of a process that took a SIGSEGV), legacy low memory,
+            // or an address beyond tracked RAM.  Decrementing slot 0 for such
+            // a PTE underflows the real-mode-IVT frame's refcount.  The guard
+            // mirrors the "normal page" gate that put_page-style reclaim
+            // applies on POSIX systems and the bounds check in
+            // refcount::page_ref_dec; it never skips a genuinely backed user
+            // frame (those always mask to >= 1 MiB managed RAM).
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
-                if refcount::page_ref_dec(phys) == 0 {
+                if refcount::is_refcountable_frame(phys)
+                    && refcount::page_ref_dec(phys) == 0
+                {
                     // If the shootdown did not receive all ACKs, defer the
                     // PMM release until every CPU has passed through a
                     // quiescent state (timer ISR tick), guaranteeing TLB
@@ -1897,9 +1910,15 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
         let mut addr = vma.base;
         while addr < vma.base + vma.length {
             let pte = vmm::read_pte(cr3, addr);
+            // See free_process_memory: gate the dec on a refcountable frame so
+            // a present PTE with a masked phys of 0 / low-memory / out-of-range
+            // does not underflow an untracked refcount slot.  Real backed user
+            // frames always mask to >= 1 MiB managed RAM and dec exactly once.
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
-                if refcount::page_ref_dec(phys) == 0 {
+                if refcount::is_refcountable_frame(phys)
+                    && refcount::page_ref_dec(phys) == 0
+                {
                     if shootdown_clean {
                         pmm::free_page(phys);
                     } else {
