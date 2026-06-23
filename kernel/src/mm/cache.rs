@@ -639,7 +639,7 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
         return;
     }
     const PAGE: u64 = 4096;
-    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+    // PHYS_OFFSET is the module-level const (mm/cache.rs).
 
     let start = offset;
     let end = offset.saturating_add(data.len() as u64);
@@ -728,7 +728,7 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
 /// the cache lock is released to preserve the cache → TLB → PMM lock order.
 pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64) {
     const PAGE: u64 = 4096;
-    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+    // PHYS_OFFSET is the module-level const (mm/cache.rs).
 
     // The lowest offset whose page contents are stale after the resize.
     let boundary = core::cmp::min(old_size, new_size);
