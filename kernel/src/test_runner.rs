@@ -778,6 +778,15 @@ pub fn run() -> ! {
     total += 1;
     if test_proc_metrics_net_recvmsg() { passed += 1; }
 
+    // ── Test 296: relative futex timeout must not return before its deadline ─
+    // Regression for the tick-quantization off-by-one in the FUTEX_WAIT
+    // relative-timeout path: `get_ticks() + ceil(ns/10ms)` could fire up to a
+    // whole 10 ms tick EARLY (a ~95 % early return for a 10 ms wait) because
+    // `get_ticks()` floors the TSC clock. The deadline is now built at TSC
+    // precision so the observed sleep is always >= the requested interval.
+    total += 1;
+    if test_relative_futex_timeout_no_undershoot() { passed += 1; }
+
     // ── AF_UNIX POLLOUT writable-gate + recv-drain write-space wake ────────
     total += 1;
     if test_unix_pollout_writable_gate() { passed += 1; }
@@ -54448,5 +54457,111 @@ fn test_proc_metrics_net_recvmsg() -> bool {
     }
 
     test_pass!("proc_metrics net_r_bytes via recvmsg(2) — counter advances correctly");
+    true
+}
+
+// ── Test 296: relative futex timeout must not return before its deadline ─────
+//
+// The FUTEX_WAIT relative-timeout path builds its wake deadline from
+// `arch::x86_64::irq::relative_ns_to_wake_tick(ns)`. The scheduler's due-wake
+// scan fires a parked thread when `get_ticks() >= wake_tick`, and `get_ticks()`
+// returns the FLOOR of the TSC-derived tick (it discards the 0–10 ms already
+// elapsed inside the current tick). A naive `get_ticks() + ceil(ns/10ms)`
+// therefore under-counts by the fractional part of the current tick, so a 10 ms
+// `pthread_cond_timedwait` could wake up to a whole tick (~10 ms, ~95 %) early.
+//
+// POSIX (`man 2 futex` TIMEOUTS, `man 2 clock_nanosleep`) permits a timed wait
+// to over-shoot its deadline but NEVER to return before the requested interval
+// has elapsed. This test asserts that invariant deterministically, without
+// actually parking a thread: it computes the earliest real TSC at which the
+// returned `wake_tick` could possibly fire and proves that instant is at or
+// beyond the absolute deadline (`tsc_at_call + ns`).
+fn test_relative_futex_timeout_no_undershoot() -> bool {
+    test_header!("relative futex timeout — no early wake (tick-quantization regression)");
+
+    use core::sync::atomic::Ordering;
+
+    let rdtsc = || -> u64 {
+        let (lo, hi): (u32, u32);
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    };
+
+    let tsc_per_tick = crate::arch::x86_64::irq::TSC_PER_TICK.load(Ordering::Acquire);
+    let tsc_at_boot  = crate::arch::x86_64::irq::TSC_AT_BOOT.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        // No TSC epoch yet — the precise path is unreachable in this build
+        // state; the coarse fallback (round-up + 1) trivially never
+        // under-shoots, so there is nothing to falsify. Skip rather than
+        // assert against an unavailable clock.
+        test_println!("  TSC not calibrated (tsc_per_tick==0) — precise path unavailable, skipping ✓");
+        test_pass!("relative futex timeout — no early wake (skipped: TSC uncalibrated)");
+        return true;
+    }
+
+    // Exercise a spread of relative intervals, including the 10 ms wait that
+    // musl's pthread_cond_timedwait issues (the GObject-registration trigger).
+    const CASES_NS: [u64; 5] = [
+        1_000_000,    // 1 ms  (sub-tick: most exposed to the floor error)
+        5_000_000,    // 5 ms  (sub-tick)
+        10_000_000,   // 10 ms (one full tick — the musl cond-timedwait case)
+        15_000_000,   // 15 ms (1.5 ticks)
+        100_000_000,  // 100 ms (10 ticks)
+    ];
+
+    for &ns in CASES_NS.iter() {
+        // Bracket the conversion with TSC reads. The deadline the kernel
+        // builds is anchored at the rdtsc() it reads INSIDE the helper, which
+        // is at or after `tsc_before`; using `tsc_before` for the assertion is
+        // the most conservative (hardest-to-pass) anchor.
+        let tsc_before = rdtsc();
+        let wake_tick  = crate::arch::x86_64::irq::relative_ns_to_wake_tick(ns);
+
+        // The earliest real TSC at which `get_ticks() >= wake_tick` can become
+        // true is when the floored tick first reaches `wake_tick`, i.e. when
+        // `elapsed_since_boot >= wake_tick * tsc_per_tick`, i.e. at absolute
+        // TSC `tsc_at_boot + wake_tick * tsc_per_tick`.
+        let earliest_fire_tsc = tsc_at_boot
+            .saturating_add(wake_tick.saturating_mul(tsc_per_tick));
+
+        // The requested deadline in absolute TSC: at least `ns` of real time
+        // after the call. Convert ns → cycles with the same rounding the
+        // helper uses.
+        let ns_cycles = ((ns as u128).saturating_mul(tsc_per_tick as u128)
+            / 10_000_000u128) as u64;
+        let deadline_tsc = tsc_before.saturating_add(ns_cycles);
+
+        if earliest_fire_tsc < deadline_tsc {
+            // Under-shoot: the wait could fire before `ns` elapsed. Report the
+            // shortfall in ms for legibility.
+            let short_cycles = deadline_tsc - earliest_fire_tsc;
+            let short_ms = (short_cycles as u128).saturating_mul(10) / (tsc_per_tick as u128);
+            test_fail!("relative_futex_timeout_no_undershoot",
+                "ns={} would wake EARLY: earliest_fire_tsc={} < deadline_tsc={} \
+                 (short by ~{} ms; wake_tick={}, tsc_per_tick={})",
+                ns, earliest_fire_tsc, deadline_tsc, short_ms, wake_tick, tsc_per_tick);
+            return false;
+        }
+
+        // Sanity upper bound: over-shoot must be bounded by ~one tick + the
+        // sub-tick remainder (never an unbounded park). Allow 2 ticks of slack
+        // to absorb the bracket + the ceiling. A grossly larger value would
+        // indicate the conversion is parking far too long.
+        let overshoot_cycles = earliest_fire_tsc - deadline_tsc;
+        let max_overshoot = tsc_per_tick.saturating_mul(2);
+        if overshoot_cycles > max_overshoot {
+            test_fail!("relative_futex_timeout_no_undershoot",
+                "ns={} over-shoots by {} cycles (> 2 ticks = {}); wake_tick={} too far out",
+                ns, overshoot_cycles, max_overshoot, wake_tick);
+            return false;
+        }
+    }
+
+    test_println!("  all relative intervals (1/5/10/15/100 ms): wake_tick >= deadline, \
+                   over-shoot < 2 ticks ✓");
+    test_pass!("relative futex timeout — wake never precedes the requested interval (Test 296)");
     true
 }

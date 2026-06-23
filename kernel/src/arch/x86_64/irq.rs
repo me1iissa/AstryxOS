@@ -253,6 +253,63 @@ pub fn get_ticks() -> u64 {
     if tsc_floor > published { tsc_floor } else { published }
 }
 
+/// Convert a *relative* nanosecond timeout into the smallest scheduler tick
+/// at which the requested interval is GUARANTEED to have fully elapsed.
+///
+/// The scheduler's due-wake scan fires a sleeper when `get_ticks() >=
+/// wake_tick`.  Because [`get_ticks`] returns the **floor** of the TSC-derived
+/// tick (it discards the 0–10 ms already elapsed inside the current tick),
+/// naively computing `wake_tick = get_ticks() + ceil(ns / 10ms)` under-counts
+/// by the fractional part of the current tick: the wait can return up to one
+/// whole tick (~10 ms) EARLY.  For a 10 ms `pthread_cond_timedwait` that is a
+/// ~100 % early return, which trips timing-sensitive userspace state machines.
+///
+/// POSIX (`man 2 clock_nanosleep`, `man 2 futex` TIMEOUTS) permits a timed
+/// wait to over-shoot its deadline but never to return before the requested
+/// interval has elapsed.  To honour that, we build the deadline at the
+/// precision userspace measured against — the invariant TSC (Intel SDM Vol. 3B
+/// §17.17, constant-rate TSC) — rather than the coarse 10 ms tick:
+///
+///   1. `deadline_tsc = rdtsc() + ns_to_cycles(ns)`  (absolute TSC deadline).
+///   2. `wake_tick = ceil((deadline_tsc - tsc_at_boot) / tsc_per_tick)`.
+///
+/// The ceiling guarantees `get_ticks() >= wake_tick` cannot become true until
+/// the floored tick has advanced *past* the fractional deadline, so the
+/// observed sleep is always `>= ns` (over-shoot bounded by one tick, never
+/// under-shoot).  This eliminates the 10 ms quantization error entirely while
+/// reusing the existing `wake_tick` mechanism — no parallel deadline state on
+/// the scheduler hot path.
+///
+/// Before LAPIC calibration completes (`tsc_per_tick == 0`) there is no usable
+/// TSC epoch; fall back to the coarse tick arithmetic, but still round the tick
+/// count UP and add one so the wait never under-shoots in that early window.
+pub fn relative_ns_to_wake_tick(ns: u64) -> u64 {
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        // No TSC epoch yet (pre-calibration). Coarse fallback: round up and
+        // add one tick so the wait lasts AT LEAST the requested interval.
+        let now = get_ticks();
+        let delta_ticks = ns.div_ceil(10_000_000).saturating_add(1);
+        return now.saturating_add(delta_ticks);
+    }
+
+    // ns → TSC cycles: cycles = ns * tsc_per_tick / 10_000_000  (10 ms/tick).
+    // Use u128 for the intermediate product so a multi-second timeout cannot
+    // overflow before the divide (tsc_per_tick is ~10^7 on a 1 GHz part, ns
+    // can be up to ~10^18 for the legal tv_sec range).
+    let ns_cycles =
+        ((ns as u128).saturating_mul(tsc_per_tick as u128) / 10_000_000u128) as u64;
+
+    let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
+    let elapsed_now = rdtsc().wrapping_sub(tsc_at_boot);
+    let deadline_cycles = elapsed_now.saturating_add(ns_cycles);
+
+    // ceil(deadline_cycles / tsc_per_tick): the smallest tick whose floor is
+    // at or beyond the absolute deadline. `now >= wake_tick` then cannot fire
+    // before `elapsed >= deadline_cycles`, i.e. before `ns` has elapsed.
+    deadline_cycles.div_ceil(tsc_per_tick)
+}
+
 /// Number of times the BSP idle path detected a starved LAPIC timer and
 /// drove a scheduler tick from the TSC instead. Diagnostic-only; non-zero
 /// means the single-core LAPIC-suppression recovery path (see [`idle_tick`])

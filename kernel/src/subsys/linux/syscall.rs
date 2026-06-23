@@ -9754,12 +9754,23 @@ pub fn sys_futex_linux(
 
             let tid = crate::proc::current_tid();
 
-            // Compute the wake deadline (100 Hz tick → 10 ms per tick).
+            // Compute the wake deadline.
+            //
+            // The deadline is built at TSC precision, not at the coarse 10 ms
+            // tick: `get_ticks()` floors the TSC clock (discarding the 0–10 ms
+            // already elapsed in the current tick), so the old
+            // `get_ticks() + floor(ns / 10ms).max(1)` form could return up to a
+            // whole tick (~10 ms, a ~95 % early return for a 10 ms wait) BEFORE
+            // the requested interval had elapsed. `relative_ns_to_wake_tick`
+            // converts the relative ns to an absolute TSC deadline and returns
+            // the smallest tick that is guaranteed to be at or past it, so the
+            // observed sleep is always `>= ns` (over-shoot bounded by one tick,
+            // never under-shoot — POSIX permits over-shooting a timeout, never
+            // under-shooting; see `man 2 futex` TIMEOUTS, `man 2
+            // clock_nanosleep`).
             let wake_tick = match timeout_ns {
                 TimeoutNs::Relative(ns) => {
-                    let now = crate::arch::x86_64::irq::get_ticks();
-                    let delta_ticks = (ns / 10_000_000).max(1);
-                    now.saturating_add(delta_ticks)
+                    crate::arch::x86_64::irq::relative_ns_to_wake_tick(ns)
                 }
                 TimeoutNs::Indefinite => u64::MAX,
                 TimeoutNs::AlreadyExpired => {
