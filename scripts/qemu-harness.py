@@ -8644,13 +8644,25 @@ def cmd_fault_cache_keys(args):
     a = resp.get("bucket_a_same_key_inplace", -1)
     b = resp.get("bucket_b_cross_key_aliased", -1)
     c = resp.get("bucket_c_post_evict_stale_pte", -1)
+    # clean = key-matching RIP frame whose fault (CR2) did NOT implicate the
+    # frame (NULL-deref / fault off the code page).  NOT cache corruption.
+    # Older kernels lack this counter → default 0 so the verdict stays sound.
+    clean = resp.get("clean_userspace_access_fault", 0)
 
     if not all(isinstance(v, int) for v in [a, b, c]):
         resp["_verdict"] = "UNKNOWN: missing or malformed counter fields — check for error field"
     elif a == 0 and b == 0 and c == 0:
-        resp["_verdict"] = (
-            "INCONCLUSIVE — W215 cluster has not fired yet; re-run after a fault occurs"
-        )
+        if isinstance(clean, int) and clean > 0:
+            resp["_verdict"] = (
+                f"NO CACHE-CORRUPTION FAULTS — {clean} fault(s) had a key-matching RIP "
+                "frame but the fault address (CR2) did not implicate it (ordinary "
+                "NULL-deref / fault off the code page). NOT a W215 cache bug; look "
+                "elsewhere (userspace logic / unrelated access fault)."
+            )
+        else:
+            resp["_verdict"] = (
+                "INCONCLUSIVE — W215 cluster has not fired yet; re-run after a fault occurs"
+            )
     else:
         dom = max((a, "A"), (b, "B"), (c, "C"), key=lambda t: t[0])
         if dom[1] == "A":
