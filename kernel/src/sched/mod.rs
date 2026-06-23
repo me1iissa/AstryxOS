@@ -10,6 +10,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::proc::{self, ThreadState, THREAD_TABLE};
 use crate::arch::x86_64::apic::MAX_CPUS;
 
+/// Per-CPU / per-priority runqueue scaffold (Perf P2, phase 1).
+///
+/// Behaviour-preserving in phase 1: the structure is populated and continuously
+/// self-verified as a passive mirror of the authoritative `THREAD_TABLE`
+/// ready-set, but the authoritative picker below still makes every scheduling
+/// decision.  See [`percpu`] for the design and the phased plan.
+pub mod percpu;
+
 /// Whether the scheduler is active.
 static SCHEDULER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -1460,6 +1468,17 @@ was_emergency_4k={}",
                 t.ready_since_tick = 0;
             }
         }
+
+        // ── Per-CPU runqueue mirror (Perf P2 phase 1, behaviour-preserving) ──
+        // Rebuild the per-CPU/per-priority runqueue structures from this locked
+        // snapshot of the ready-set and self-verify their bitmap/nr_running
+        // invariants and membership against the authoritative table.  This
+        // populates and continuously validates the new structure WITHOUT
+        // influencing the pick below — the authoritative picker still selects
+        // the next thread by scoring the table.  Lock order is respected
+        // (THREAD_TABLE held here; the runqueue locks are leaves taken inside
+        // `mirror_rebuild_and_verify`).  See `sched::percpu`.
+        percpu::mirror_rebuild_and_verify(&threads);
 
         // Find the highest-priority Ready thread with affinity awareness.
         // Scoring: priority * 4 + affinity_bonus (0-2)
