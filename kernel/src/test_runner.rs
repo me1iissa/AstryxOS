@@ -1286,6 +1286,20 @@ pub fn run() -> ! {
     total += 1;
     if test_execve_no_pmm_leak() { passed += 1; }
 
+    // ── Test 644: address-space teardown skips non-refcountable PTEs ───────
+    // Regression for proc::free_process_memory / proc::free_vm_space: a present
+    // PTE that masks to phys 0 (or other non-managed-RAM addresses) must be
+    // skipped so it does not underflow the refcount slot for the reserved
+    // real-mode-IVT frame.  Deterministic (one teardown, no spin loops);
+    // placed beside Test 104 so it runs ahead of the flaky Firefox-launch
+    // oracle rather than after it.  Cite Intel SDM Vol. 3A §4.10.5; POSIX
+    // mmap(2).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_644_teardown_skips_nonrefcountable_pte() { passed += 1; }
+    }
+
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
     // Non-destructive: verifies that guard PTEs are not-present and that the
     // first heap page is present.  Does NOT trigger the guard fault (which would
@@ -48680,6 +48694,152 @@ fn test_261_page_ref_dec_underflow_safety() -> bool {
     crate::mm::pmm::free_page(phys);
     test_println!("  dec-at-zero stays at 0; inc-dec-dec stays at 0");
     test_pass!("page_ref_dec CAS-loop underflow safety");
+    true
+}
+
+// ── Test 644: address-space teardown skips non-refcountable PTEs ────────────
+//
+// Regression for the process-exit memory-reclaim path
+// (`proc::free_process_memory` / `proc::free_vm_space`).  The teardown walk
+// decrements one reference per *present* PTE.  A PTE can be present-bit-set
+// yet mask to a physical address that does NOT back a refcounted user frame —
+// most notably a masked phys of 0 (a zeroed-but-present / special leaf entry,
+// observed live during the teardown of a process that took a SIGSEGV).
+// Decrementing the refcount slot for phys 0 underflows slot 0 — the slot for
+// the reserved real-mode-IVT frame — corrupting unrelated PMM bookkeeping.
+//
+// The fix gates `page_ref_dec` on `refcount::is_refcountable_frame(phys)`,
+// mirroring the "normal page" gate that put_page-style reclaim applies on
+// POSIX systems.  This test pins BOTH halves of that contract by driving the
+// real `free_vm_space` teardown loop on an address space that holds one
+// genuinely-backed PTE and one present-but-phys-0 PTE:
+//   (a) the real backed frame is decremented EXACTLY once (rc 1 → 0) and
+//       returned to the PMM — the guard must NOT spuriously skip it; and
+//   (b) the present-phys-0 PTE is SKIPPED — no underflow is recorded against
+//       slot 0.
+//
+// Cite: Intel SDM Vol. 3A §4.10.5 (paging-structure changes must be visible
+// before a frame is repurposed); POSIX mmap(2) (mapping content validity).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_644_teardown_skips_nonrefcountable_pte() -> bool {
+    test_header!("teardown dec skips non-refcountable (phys=0) PTEs");
+    use crate::mm::vma::{VmSpace, VmArea, VmBacking, PROT_READ, PROT_WRITE,
+                         MAP_PRIVATE, MAP_ANONYMOUS};
+    use crate::mm::{vmm, refcount, pmm};
+
+    // First-principles guard predicate checks (cheap, no allocation): the
+    // bogus low addresses are rejected, real managed RAM is accepted.
+    if refcount::is_refcountable_frame(0) {
+        test_fail!("test264", "phys=0 must NOT be refcountable");
+        return false;
+    }
+    if refcount::is_refcountable_frame(0xB8000) {
+        test_fail!("test264", "legacy low-memory (0xB8000) must NOT be refcountable");
+        return false;
+    }
+
+    // Build a fresh user address space to tear down.
+    let mut vm = match VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("test264", "VmSpace::new_user() failed"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    // Two adjacent anonymous user pages within one VMA.
+    let base: u64 = 0x0000_3000_0000_0000;
+    let real_va = base;            // page 0: a genuinely-backed frame
+    let bogus_va = base + 0x1000;  // page 1: present, but masks to phys 0
+    vm.areas.push(VmArea {
+        base,
+        length: 0x2000,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_PRIVATE | MAP_ANONYMOUS,
+        backing: VmBacking::Anonymous,
+        name: "[test264]",
+    });
+
+    // Page 0: install a real PMM frame and take the one mapping reference the
+    // demand-fault path would have taken (map_page_in does NOT inc; the caller
+    // owns the pairing — see refcount::pte_share_count invariant).
+    let real_phys = match pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!("test264", "alloc_page returned None"); return false; }
+    };
+    // A PMM-allocated frame is always managed RAM at/above 1 MiB.
+    if !refcount::is_refcountable_frame(real_phys) {
+        pmm::free_page(real_phys);
+        test_fail!("test264",
+            "PMM frame phys={:#x} unexpectedly not refcountable", real_phys);
+        return false;
+    }
+    let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITABLE | vmm::PAGE_USER;
+    if !vmm::map_page_in(cr3, real_va, real_phys, flags) {
+        pmm::free_page(real_phys);
+        test_fail!("test264", "map_page_in(real_va) failed");
+        return false;
+    }
+    refcount::page_ref_inc(real_phys); // mapping ref: rc 0 → 1
+    if refcount::page_ref_count(real_phys) != 1 {
+        test_fail!("test264", "real frame rc != 1 after map+inc");
+        return false;
+    }
+
+    // Page 1: synthesise the captured hazard — a present leaf PTE whose masked
+    // physical address is 0.  map_page_in first (to build the PML4→PT levels),
+    // then overwrite the leaf with a present-phys-0 entry via write_pte.
+    if !vmm::map_page_in(cr3, bogus_va, real_phys, flags) {
+        test_fail!("test264", "map_page_in(bogus_va) failed");
+        return false;
+    }
+    // Present + writable + user, but phys field = 0.
+    vmm::write_pte(cr3, bogus_va, flags);
+    // Sanity: the leaf reads back present with masked phys 0.
+    match vmm::lookup_pte_in(cr3, bogus_va) {
+        Some(pte) if pte & vmm::PAGE_PRESENT != 0
+                  && (pte & 0x000F_FFFF_FFFF_F000) == 0 => {}
+        other => {
+            test_fail!("test264",
+                "bogus PTE not present-with-phys-0 as expected: {:?}", other);
+            return false;
+        }
+    }
+
+    let underflow_before = refcount::page_ref_dec_underflow_count();
+
+    // Drive the real teardown path.  free_vm_space consumes the VmSpace by
+    // value (the execve teardown counterpart of free_process_memory; identical
+    // guarded dec loop) — no PROCESS_TABLE dance required.
+    crate::proc::free_vm_space(vm);
+
+    // Half (b): the present-phys-0 PTE must NOT have decremented slot 0.
+    let underflow_after = refcount::page_ref_dec_underflow_count();
+    if underflow_after != underflow_before {
+        test_fail!("test264",
+            "teardown underflowed (count {} -> {}) — phys=0 PTE was decremented",
+            underflow_before, underflow_after);
+        return false;
+    }
+
+    // Half (a): the real backed frame was decremented exactly once (1 -> 0)
+    // and returned to the PMM.  rc back to 0 …
+    if refcount::page_ref_count(real_phys) != 0 {
+        test_fail!("test264",
+            "real frame rc={} after teardown (expected 0 — under/over-dec)",
+            refcount::page_ref_count(real_phys));
+        return false;
+    }
+    // … and the PMM bit is clear (frame freed, not leaked or quarantined).
+    let real_pfn = (real_phys / 4096) as usize;
+    if pmm::is_page_used_for_test(real_pfn) {
+        test_fail!("test264",
+            "real frame phys={:#x} still marked used after teardown (leaked)",
+            real_phys);
+        return false;
+    }
+
+    test_println!("  real frame phys={:#x} decremented once + freed; \
+                   phys=0 PTE skipped (no underflow)", real_phys);
+    test_pass!("teardown dec skips non-refcountable (phys=0) PTEs");
     true
 }
 
