@@ -49232,8 +49232,23 @@ fn test_647_percpu_incremental_equiv() -> bool {
         return false;
     }
 
+    // Step 6 (negative): prove the equivalence check actually DETECTS a real
+    // divergence — otherwise `check` returning Ok above could be vacuous.
+    // Deliberately enqueue an extra phantom tid into one incremental runqueue
+    // (modelling a maintenance bug that strands a tid) and assert `check` now
+    // returns Err.  This is the safety-net's own regression: the gated audit in
+    // the live `mirror_maintain` uses the SAME `same_membership` predicate, so a
+    // green here means the audit can catch a stranded tid, not just bless a
+    // correct mirror.
+    inc[0].enqueue(999, PRIORITY_NORMAL); // phantom — not in the rebuild image
+    if check(&inc, &reb).is_ok() {
+        test_fail!(NAME, "step6: equivalence check failed to detect an injected divergence");
+        return false;
+    }
+
     test_println!("  incremental maintenance == full rebuild across 5 transition phases \
-(membership+placement+bitmap+nr_running); order-divergence case confirmed");
+(membership+placement+bitmap+nr_running); order-divergence confirmed; \
+injected-divergence detected");
     test_pass!(NAME);
     true
 }

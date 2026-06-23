@@ -236,6 +236,27 @@ impl PerCpuRq {
     }
 }
 
+/// Drop a thread from the per-CPU runqueues given its recorded mirror slot.
+///
+/// Called at the points that REMOVE a thread from `THREAD_TABLE` (reap, waitpid,
+/// orphan-zombie auto-reap), BEFORE the removal, so a thread that is still
+/// mirrored when its record disappears does not strand its tid (and a leaked
+/// `nr_running` / bitmap bit) in a runqueue the maintainer can never revisit.
+/// Without this, a thread reaped before a `mirror_maintain` pass observes it as
+/// non-runnable would dangle until the next gated audit notices the divergence.
+///
+/// `slot` is the thread's `Thread::mirror_slot` (read just before removal); a
+/// `None` slot is a no-op.  The caller MUST hold `THREAD_TABLE` (so the slot it
+/// read is the current one); this takes the single relevant `RQS[cpu]` leaf lock
+/// in the documented order.
+pub fn mirror_forget(slot: MirrorSlot, tid: Tid) {
+    if let Some((cpu, prio)) = slot {
+        if (cpu as usize) < MAX_CPUS {
+            RQS[cpu as usize].lock().dequeue(tid, prio);
+        }
+    }
+}
+
 /// Test-facing exact replica of the maintainer's two reconciliation algorithms,
 /// operating on caller-owned structures so the live static `RQS` (shared with
 /// the running scheduler) is never disturbed.
@@ -435,7 +456,7 @@ fn desired_slot(t: &proc::Thread) -> MirrorSlot {
 
 /// Incremental per-CPU runqueue maintenance + gated audit (Perf P2 phase 2a),
 /// called from the authoritative picker while `THREAD_TABLE` is held.  Replaces
-/// the phase-1 [`mirror_rebuild_and_verify`] (a full O(N) clear-and-rebuild on
+/// the phase-1 passive mirror (a full O(N) clear-and-rebuild on
 /// EVERY pass) with O(Δ) maintenance on the hot path plus an amortized O(N)
 /// audit.
 ///

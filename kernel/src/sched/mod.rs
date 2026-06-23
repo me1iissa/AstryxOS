@@ -725,6 +725,12 @@ fn reap_dead_threads_sched() {
                 (t.kernel_stack_size as usize + 4095) / 4096
             } else { 0 };
             let last_cpu = t.last_cpu as usize;
+            // Drop any still-mirrored entry from the per-CPU runqueues before
+            // the record disappears (Perf P2 phase 2a — see
+            // `percpu::mirror_forget`).  This reaper runs at the top of
+            // schedule(), BEFORE mirror_maintain in the same pass, so without
+            // this a thread mirrored on a prior pass would strand its tid.
+            percpu::mirror_forget(t.mirror_slot, t.tid);
             threads.swap_remove(idx);
             if base > 0 && pages > 0 {
                 out.push((base, pages, last_cpu));

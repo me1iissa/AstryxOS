@@ -2280,6 +2280,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     if !orphan_zombie_pids.is_empty() {
         let mut threads = THREAD_TABLE.lock();
         for (_cpid, tids) in &orphan_zombie_pids {
+            // Drop any still-mirrored removed thread from the per-CPU runqueues
+            // first, so its tid does not strand in a runqueue the maintainer can
+            // never revisit (Perf P2 phase 2a — see `percpu::mirror_forget`).
+            for t in threads.iter() {
+                if tids.contains(&t.tid) {
+                    crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
+                }
+            }
             threads.retain(|t| !tids.contains(&t.tid));
         }
         drop(threads);
@@ -4081,6 +4089,13 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
     // Step 2: Reap the child's threads (THREAD_TABLE only).
     {
         let mut threads = THREAD_TABLE.lock();
+        // Drop any still-mirrored reaped thread from the per-CPU runqueues
+        // first (Perf P2 phase 2a — see `percpu::mirror_forget`).
+        for t in threads.iter() {
+            if thread_tids.contains(&t.tid) {
+                crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
+            }
+        }
         threads.retain(|t| !thread_tids.contains(&t.tid));
     }
 
@@ -4315,6 +4330,12 @@ pub fn reap_dead_threads() -> usize {
             0
         };
         let tls = t.tls_base;
+
+        // Drop any still-mirrored entry from the per-CPU runqueues before the
+        // record disappears (Perf P2 phase 2a — see `percpu::mirror_forget`).
+        // A reapable thread is Dead, so a `mirror_maintain` pass would already
+        // have drained it; this closes the window where reap beats that pass.
+        crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
 
         // Remove from table
         threads.swap_remove(idx);
