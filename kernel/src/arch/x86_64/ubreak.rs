@@ -36,9 +36,34 @@
 //! byte, rewinds `RIP`, and lets execution continue (one-shot).  The snapshots
 //! are drained out-of-band over the KDB protocol (`ubreak dump`).
 //!
-//! One-shot is deliberate: the primary use is breaking on a *panic branch* that
-//! executes exactly once before the process aborts, so no single-step/re-arm
-//! machinery (which would collide with the kernel's own #DB usage) is needed.
+//! One-shot is the default: the primary use is breaking on a *panic branch* that
+//! executes exactly once before the process aborts.
+//!
+//! ## Re-arm mode (TF single-step)
+//!
+//! A breakpoint may instead be armed **re-armable** so it fires every time the
+//! VA executes (e.g. a copy loop that runs once per message until a *corrupt*
+//! one appears).  Re-arm uses the trap flag, not a second `0xCC`:
+//!
+//!   1. On the `#BP` hit the original byte is restored and `RIP` rewound, but the
+//!      slot is NOT disarmed.  Instead `RFLAGS.TF` (Intel SDM Vol. 3B §17.3.1.1,
+//!      single-step) is set in the saved interrupt frame and the slot is recorded
+//!      as "pending re-arm".
+//!   2. The CPU re-executes the original instruction and then raises `#DB`
+//!      (vector 1) — the single-step trap.  The vector-1 hook re-plants the
+//!      `0xCC` at the (now-stepped-past) VA, clears `TF`, and returns.
+//!
+//! There is a one-instruction window where the byte is absent.  On a
+//! single-process, SMP=1 target that window is safe: no other thread can fetch
+//! that VA in the gap.  Re-arm is therefore restricted to that configuration and
+//! to the `kdb` build (which does NOT enable `w215-diag`, so vector 1 / `#DB` is
+//! otherwise unused — Intel SDM Vol. 3B §17.2 debug registers are untouched by
+//! TF single-step).
+//!
+//! A re-armable breakpoint may carry a **capture gate** (`gate_len`): the
+//! snapshot is only recorded when `RDX == gate_len` at the hit (the copy length
+//! at the consumer copy-site), so a hot loop only banks the message size of
+//! interest and the 16-deep ring keeps the most recent matching hits.
 //!
 //! Feature-gated behind `kdb`; absent from production builds.
 
@@ -66,6 +91,12 @@ struct UBreak {
     // Index into AUTO_ARM_OFFSETS/CONSUMED, or usize::MAX for a manually-armed
     // (kdb `ubreak set`) breakpoint with no auto-arm offset.
     auto_idx: AtomicUsize,
+    // Re-armable: on a hit, single-step (TF) and re-plant the int3 instead of
+    // disarming one-shot.  See the module docs (re-arm mode).
+    rearm: AtomicBool,
+    // Capture gate for re-armable breakpoints: snapshot only when RDX == gate_len
+    // at the hit.  0 = always capture.
+    gate_len: AtomicU64,
 }
 
 impl UBreak {
@@ -78,6 +109,8 @@ impl UBreak {
             private_phys: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             auto_idx: AtomicUsize::new(usize::MAX),
+            rearm: AtomicBool::new(false),
+            gate_len: AtomicU64::new(0),
         }
     }
 }
@@ -166,6 +199,17 @@ static AUTO_ARM_OFFSETS: [AtomicU64; MAX_AUTO_ARM] = [
 static AUTO_ARM_SIGS: [AtomicU64; MAX_AUTO_ARM] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
+// Per-offset re-arm flag: true = re-armable (TF single-step re-plant), false =
+// one-shot.  A re-armable offset is NEVER marked consumed on a hit, so the scan
+// keeps it armed for the whole run.
+static AUTO_ARM_REARM: [AtomicBool; MAX_AUTO_ARM] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+// Per-offset capture gate length (0 = always capture; else only when RDX==len).
+static AUTO_ARM_GATELEN: [AtomicU64; MAX_AUTO_ARM] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
 // Per-offset "consumed" flags.  A one-shot breakpoint disarms its slot on the
 // first hit and restores the original byte.  Without this flag the per-fault
 // `maybe_auto_arm_scan` would immediately RE-arm the freed slot (re-planting
@@ -181,27 +225,56 @@ static AUTO_ARM_CONSUMED: [AtomicBool; MAX_AUTO_ARM] = [
 // (De-dup of already-armed (cr3, va) pairs is handled by `is_armed`.)
 static AUTO_ARM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+// ── Pending re-arm (TF single-step re-plant) ────────────────────────────────────
+//
+// When a re-armable breakpoint hits, its original byte is restored and the slot
+// is recorded here so the vector-1 (#DB) single-step trap can re-plant the int3
+// after the original instruction re-executes.  SMP=1 + single debugged process
+// means exactly one re-arm can be pending at a time; the sentinel is
+// `usize::MAX`.  These are written by the #BP path and read/cleared by the #DB
+// path on the SAME CPU (TF single-step traps on the next instruction of the same
+// thread), so a plain atomic is sufficient.
+static PENDING_REARM_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PENDING_REARM_CR3: AtomicU64 = AtomicU64::new(0);
+static PENDING_REARM_VA: AtomicU64 = AtomicU64::new(0);
+
 /// Enable auto-arm at the given libxul-relative ELF offset with a 4-byte
-/// instruction signature (the first 4 code bytes expected at that offset, as a
-/// little-endian u32 — i.e. byte[0] in bits 0..7).  `sig`==0 disables the check
-/// for that offset.  (0 offset disables the slot.)
-pub fn set_auto_arm_offset_sig(off: u64, sig: u32) {
+/// instruction signature, an optional re-arm flag, and an optional capture-gate
+/// length.
+///
+/// * `sig`==0 disables the signature check for that offset.
+/// * `rearm`==true makes the breakpoint re-armable (TF single-step re-plant)
+///   instead of one-shot.
+/// * `gate_len`!=0 limits captures of a re-armable breakpoint to hits where
+///   `RDX == gate_len` (the copy length at the consumer copy-site).
+///
+/// (0 offset disables the slot.)
+pub fn set_auto_arm_full(off: u64, sig: u32, rearm: bool, gate_len: u64) {
     if off == 0 {
         return;
     }
     AUTO_ARM_OFFSET.store(off, Ordering::Release);
-    for (s, sg) in AUTO_ARM_OFFSETS.iter().zip(AUTO_ARM_SIGS.iter()) {
-        if s.load(Ordering::Acquire) == 0 {
-            sg.store(sig as u64, Ordering::Release);
-            s.store(off, Ordering::Release);
+    for idx in 0..MAX_AUTO_ARM {
+        if AUTO_ARM_OFFSETS[idx].load(Ordering::Acquire) == 0 {
+            AUTO_ARM_SIGS[idx].store(sig as u64, Ordering::Release);
+            AUTO_ARM_REARM[idx].store(rearm, Ordering::Release);
+            AUTO_ARM_GATELEN[idx].store(gate_len, Ordering::Release);
+            // Publish the offset LAST so a concurrent scan never sees an offset
+            // before its sig/rearm/gate metadata.
+            AUTO_ARM_OFFSETS[idx].store(off, Ordering::Release);
             return;
         }
     }
 }
 
+/// Enable auto-arm with a signature check (one-shot, no gate).
+pub fn set_auto_arm_offset_sig(off: u64, sig: u32) {
+    set_auto_arm_full(off, sig, false, 0);
+}
+
 /// Back-compat: enable auto-arm with no signature check (legacy single-offset).
 pub fn set_auto_arm_offset(off: u64) {
-    set_auto_arm_offset_sig(off, 0);
+    set_auto_arm_full(off, 0, false, 0);
 }
 
 /// Read the first 4 bytes at `va` in `cr3` as a little-endian u32 (0 if any
@@ -249,10 +322,12 @@ pub fn maybe_auto_arm(cr3: u64, load_base: u64, faulted_page: u64) {
         if sig != 0 && read_sig4(cr3, target_va) != sig {
             continue;
         }
-        if arm_at_cr3_idx(cr3, target_va, idx).is_ok() {
+        let rearm = AUTO_ARM_REARM[idx].load(Ordering::Acquire);
+        let gate_len = AUTO_ARM_GATELEN[idx].load(Ordering::Acquire);
+        if arm_at_cr3_idx(cr3, target_va, idx, rearm, gate_len).is_ok() {
             crate::serial_println!(
-                "[UBREAK] auto-armed cr3={:#x} load_base={:#x} target={:#x} (off={:#x})",
-                cr3, load_base, target_va, off
+                "[UBREAK] auto-armed cr3={:#x} load_base={:#x} target={:#x} (off={:#x} rearm={} gate={})",
+                cr3, load_base, target_va, off, rearm, gate_len
             );
         }
     }
@@ -316,10 +391,12 @@ pub fn maybe_auto_arm_scan(load_base: u64, cr3: u64) {
         if sig != 0 && read_sig4(cr3, target_va) != sig {
             continue;
         }
-        if arm_at_cr3_idx(cr3, target_va, idx).is_ok() {
+        let rearm = AUTO_ARM_REARM[idx].load(Ordering::Acquire);
+        let gate_len = AUTO_ARM_GATELEN[idx].load(Ordering::Acquire);
+        if arm_at_cr3_idx(cr3, target_va, idx, rearm, gate_len).is_ok() {
             crate::serial_println!(
-                "[UBREAK] auto-armed (scan) cr3={:#x} load_base={:#x} target={:#x} (off={:#x})",
-                cr3, load_base, target_va, off
+                "[UBREAK] auto-armed (scan) cr3={:#x} load_base={:#x} target={:#x} (off={:#x} rearm={} gate={})",
+                cr3, load_base, target_va, off, rearm, gate_len
             );
         }
     }
@@ -328,11 +405,18 @@ pub fn maybe_auto_arm_scan(load_base: u64, cr3: u64) {
 /// Arm a one-shot breakpoint at `va` in an explicit `cr3` (used by the auto-arm
 /// PF hook, which already knows the CR3).  Same mechanism as [`arm`] minus the
 /// pid→cr3 resolution.  Page must be present (it just faulted in).
+#[allow(dead_code)]
 fn arm_at_cr3(cr3: u64, va: u64) -> Result<(), &'static str> {
-    arm_at_cr3_idx(cr3, va, usize::MAX)
+    arm_at_cr3_idx(cr3, va, usize::MAX, false, 0)
 }
 
-fn arm_at_cr3_idx(cr3: u64, va: u64, auto_idx: usize) -> Result<(), &'static str> {
+fn arm_at_cr3_idx(
+    cr3: u64,
+    va: u64,
+    auto_idx: usize,
+    rearm: bool,
+    gate_len: u64,
+) -> Result<(), &'static str> {
     let page = va & !(PAGE_SIZE - 1);
     let old_pte = vmm::read_pte(cr3, page);
     if old_pte & vmm::PAGE_PRESENT == 0 {
@@ -392,6 +476,8 @@ fn arm_at_cr3_idx(cr3: u64, va: u64, auto_idx: usize) -> Result<(), &'static str
             slot.private_phys.store(new_phys, Ordering::Release);
             slot.hits.store(0, Ordering::Release);
             slot.auto_idx.store(auto_idx, Ordering::Release);
+            slot.rearm.store(rearm, Ordering::Release);
+            slot.gate_len.store(gate_len, Ordering::Release);
             return Ok(());
         }
     }
@@ -404,6 +490,38 @@ fn cr3_for_pid(pid: u64) -> Option<u64> {
     let pt = crate::proc::PROCESS_TABLE.try_lock()?;
     let c = pt.iter().find(|p| p.pid == pid).map(|p| p.cr3);
     c
+}
+
+/// Best-effort resolution of the file-backing (inode, file_offset) for a VA in
+/// `cr3`.  Returns `(0, 0)` if the VA is anonymous, has no VMA, or the
+/// PROCESS_TABLE lock is contended (ISR-safe: never blocks).  For a memfd
+/// MAP_SHARED segment this gives the (inode, file_offset) the producer wrote to
+/// / the consumer reads from, so a same-inode/same-offset pair with DIFFERENT
+/// physical frames is an aliasing bug (one memfd offset mapped to two frames),
+/// while a different inode/offset means the two sites reference distinct memfd
+/// segments (a gecko-level segment-ref mismatch).
+fn memfd_backing_of(cr3: u64, va: u64) -> (u64, u64) {
+    let pt = match crate::proc::PROCESS_TABLE.try_lock() {
+        Some(g) => g,
+        None => return (0, 0),
+    };
+    for p in pt.iter() {
+        if p.cr3 != cr3 {
+            continue;
+        }
+        let vms = match &p.vm_space {
+            Some(v) => v,
+            None => return (0, 0),
+        };
+        if let Some(vma) = vms.find_vma(va) {
+            if let crate::mm::vma::VmBacking::File { inode, offset, .. } = vma.backing {
+                let foff = offset.wrapping_add(va.wrapping_sub(vma.base));
+                return (inode, foff);
+            }
+        }
+        return (0, 0);
+    }
+    (0, 0)
 }
 
 /// Arm a one-shot userspace breakpoint at `va` in process `pid`.
@@ -469,6 +587,9 @@ pub fn arm(pid: u64, va: u64) -> Result<(u64, u64, u8), &'static str> {
             slot.orig_byte.store(orig as u64, Ordering::Release);
             slot.private_phys.store(new_phys, Ordering::Release);
             slot.hits.store(0, Ordering::Release);
+            slot.auto_idx.store(usize::MAX, Ordering::Release);
+            slot.rearm.store(false, Ordering::Release);
+            slot.gate_len.store(0, Ordering::Release);
             return Ok((cr3, new_phys, orig));
         }
     }
@@ -529,24 +650,36 @@ fn restore_byte(slot: &UBreak) {
     vmm::invlpg(page);
 }
 
+/// Result of [`on_breakpoint`]: tells the vector-3 caller what to do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BpAction {
+    /// Not one of our breakpoints — fall through to generic handling.
+    NotOurs,
+    /// Ours, one-shot: byte already restored, RIP rewound; just return.
+    Handled,
+    /// Ours, re-armable: byte restored, RIP rewound; the caller MUST set
+    /// `RFLAGS.TF` so the single-step trap re-plants the int3.
+    HandledRearm,
+}
+
 /// #BP handler hook.  Called from the vector-3 path in idt.rs for Ring-3
 /// breakpoints.  `gpr` is the 15-element GPR array as laid out by the ISR stub
-/// (see [`read_gprs_from_frame`]).  Returns true if this #BP belonged to a
-/// registered userspace breakpoint (so the caller skips the generic handling
-/// and returns to the rewound RIP).
+/// (see [`read_gprs_from_frame`]).
 ///
 /// `frame_rip` is the RIP *after* the int3 (points one byte past the 0xCC).
-/// On a match we capture, restore the byte (one-shot), and rewind `*rip_out` by
-/// one so the original instruction re-executes.
+/// On a match we capture (subject to the per-slot gate), restore the byte, and
+/// rewind `*rip_out` by one so the original instruction re-executes.  For a
+/// one-shot slot we disarm; for a re-armable slot we record a pending re-arm and
+/// return [`BpAction::HandledRearm`] so the caller sets TF.
 pub fn on_breakpoint(
     cr3: u64,
     frame_rip: u64,
     frame_rsp: u64,
     gpr: &Gprs,
     rip_out: &mut u64,
-) -> bool {
+) -> BpAction {
     let bp_va = frame_rip.wrapping_sub(1);
-    for slot in BREAKS.iter() {
+    for (slot_idx, slot) in BREAKS.iter().enumerate() {
         if !slot.active.load(Ordering::Acquire) {
             continue;
         }
@@ -558,23 +691,88 @@ pub fn on_breakpoint(
         }
         slot.hits.fetch_add(1, Ordering::AcqRel);
 
-        capture(cr3, bp_va, frame_rsp, gpr);
+        let rearm = slot.rearm.load(Ordering::Acquire);
+        // Capture gate: a re-armable slot with a non-zero gate_len only banks
+        // hits whose copy length (RDX) matches — so a hot copy loop records only
+        // the message size of interest.
+        let gate = slot.gate_len.load(Ordering::Acquire);
+        if gate == 0 || gpr.rdx == gate {
+            capture(cr3, bp_va, frame_rsp, gpr);
+        }
 
-        // One-shot: restore the original byte and rewind so the instruction
-        // re-executes normally.  Disarm the slot (we keep the private page).
-        // Mark this offset CONSUMED so the per-fault scan never re-arms it —
-        // re-arming would re-open the plant-without-active-slot window that
-        // turns a later #BP into an unhandled SIGSEGV.
+        // Restore the original byte and rewind so the instruction re-executes.
+        restore_byte(slot);
+        *rip_out = bp_va;
+
+        if rearm {
+            // Re-armable: keep the slot active and record a pending re-arm so
+            // the single-step (#DB) trap re-plants the int3 after the original
+            // instruction executes.  Do NOT mark the offset consumed.
+            PENDING_REARM_SLOT.store(slot_idx, Ordering::Release);
+            PENDING_REARM_CR3.store(cr3, Ordering::Release);
+            PENDING_REARM_VA.store(bp_va, Ordering::Release);
+            return BpAction::HandledRearm;
+        }
+
+        // One-shot: disarm the slot (we keep the private page) and mark the
+        // offset CONSUMED so the per-fault scan never re-arms it — re-arming
+        // would re-open the plant-without-active-slot window that turns a later
+        // #BP into an unhandled SIGSEGV.
         let idx = slot.auto_idx.load(Ordering::Acquire);
         if idx < MAX_AUTO_ARM {
             AUTO_ARM_CONSUMED[idx].store(true, Ordering::Release);
         }
-        restore_byte(slot);
         slot.active.store(false, Ordering::Release);
-        *rip_out = bp_va;
-        return true;
+        return BpAction::Handled;
     }
-    false
+    BpAction::NotOurs
+}
+
+/// #DB (vector 1) single-step hook for re-arm.  Called from the vector-1 path in
+/// idt.rs for a Ring-3 single-step trap.  If a re-arm is pending (the prior #BP
+/// set TF for this CR3), re-plant the int3 at the recorded VA, clear the pending
+/// state, and return true so the caller clears TF and returns.  Returns false if
+/// there is no pending re-arm (some other source of #DB).
+pub fn on_debug_trap(cr3: u64) -> bool {
+    let slot_idx = PENDING_REARM_SLOT.load(Ordering::Acquire);
+    if slot_idx >= MAX_UBREAKS {
+        return false;
+    }
+    if PENDING_REARM_CR3.load(Ordering::Acquire) != cr3 {
+        // The single-step trap belongs to a different address space (should not
+        // happen on SMP=1 single-process, but be conservative).
+        return false;
+    }
+    let va = PENDING_REARM_VA.load(Ordering::Acquire);
+    let slot = &BREAKS[slot_idx];
+    // Re-plant the int3 only if the slot is still the same armed (cr3, va) and
+    // the original byte is currently in place (it was restored by the #BP path).
+    if slot.active.load(Ordering::Acquire)
+        && slot.cr3.load(Ordering::Acquire) == cr3
+        && slot.va.load(Ordering::Acquire) == va
+    {
+        replant_byte(slot);
+    }
+    PENDING_REARM_SLOT.store(usize::MAX, Ordering::Release);
+    true
+}
+
+/// Re-plant the `0xCC` at a slot's VA through the LIVE PTE frame (mirrors
+/// [`restore_byte`]'s live-PTE discipline so a re-faulted page is handled).
+fn replant_byte(slot: &UBreak) {
+    let va = slot.va.load(Ordering::Acquire);
+    let off = (va & (PAGE_SIZE - 1)) as usize;
+    let page = va & !(PAGE_SIZE - 1);
+    let cr3 = slot.cr3.load(Ordering::Acquire);
+    let live_pte = vmm::read_pte(cr3, page);
+    let phys = if live_pte & vmm::PAGE_PRESENT != 0 {
+        live_pte & ADDR_MASK
+    } else {
+        slot.private_phys.load(Ordering::Acquire)
+    };
+    let byte_ptr = (PHYS_OFF + phys + off as u64) as *mut u8;
+    unsafe { core::ptr::write_volatile(byte_ptr, 0xCC); }
+    vmm::invlpg(page);
 }
 
 /// GPR snapshot passed from the ISR stub.
@@ -725,6 +923,62 @@ fn capture(cr3: u64, bp_va: u64, frame_rsp: u64, gpr: &Gprs) {
         crate::serial_println!(
             "[UBREAK] capture blob: rip={:#x} data(rdx)={:#x} blob_ptr={:#x} blob_len={}",
             bp_va, gpr.rdx, blob_ptr, blob_len);
+    }
+
+    // Dispositive consumer-read emit.  At the consumer copy-site (off 0x25b005f,
+    // `call <memcpy>` with RSI=shmem source ptr, RDX=copy length) RSI points
+    // INTO the recycled MAP_SHARED memfd segment that the render thread is about
+    // to read.  Resolve RSI's *physical frame* in this thread's address space and
+    // capture the first 16 bytes so a CORRUPT hit (font-path '/usr/share/fonts',
+    // first u32 = 0x2f757372) is distinguishable from a CLEAN one (kMagicInt,
+    // first u32 = 0xc001feed), and the source PHYS can be compared against the
+    // producer's write-dest phys.  Emitted to serial directly so it survives KDB
+    // starvation under heavy Firefox load.  RSI here is also valid at the moz2d
+    // add site, where the line is harmless extra context.
+    {
+        let src_va = gpr.rsi;
+        let src_page = src_va & !(PAGE_SIZE - 1);
+        let src_phys = vmm::virt_to_phys_in(cr3, src_page)
+            .map(|p| p | (src_va & (PAGE_SIZE - 1)))
+            .unwrap_or(0);
+        let mut srcbuf = [0u8; MEM_WINDOW_LEN];
+        let sn = read_user(cr3, src_va, &mut srcbuf);
+        let magic = if sn >= 4 {
+            u32::from_le_bytes([srcbuf[0], srcbuf[1], srcbuf[2], srcbuf[3]])
+        } else { 0 };
+        // Classify: kMagicInt = CLEAN; the font-path ASCII '/usr' = CORRUPT.
+        let verdict = match magic {
+            0xc001feed => "CLEAN(kMagicInt)",
+            0x2f757372 => "CORRUPT(font-path)",
+            _ => "OTHER",
+        };
+        // Resolve the memfd file-offset for the consumer source VA (best-effort,
+        // try-locked).  same (inode,offset) as the producer DEST but a different
+        // phys ⇒ our kernel aliasing (one memfd offset, two frames); a different
+        // (inode,offset) ⇒ gecko shipped a different segment ref.
+        let (src_inode, src_foff) = memfd_backing_of(cr3, src_va);
+        crate::serial_println!(
+            "[UBREAK] capture read: rip={:#x} pid={} tid={} cr3={:#x} src_va={:#x} src_phys={:#x} inode={} foff={:#x} len(rdx)={} first_u32={:#010x} verdict={}",
+            bp_va, snap.pid, snap.tid, cr3, src_va, src_phys, src_inode, src_foff, gpr.rdx, magic, verdict);
+    }
+
+    // Producer write-dest emit.  At the producer memcpy-into-shmem (off
+    // 0x25af556: `mov r13,rsi`=blob source, `mov r12,rdx`=len, RDI=shmem DEST)
+    // RDI points INTO the recycled MAP_SHARED memfd segment the writer is about
+    // to fill.  Resolve RDI's physical frame so the producer DEST phys can be
+    // compared against the consumer SOURCE phys captured above: same phys +
+    // consumer-stale ⇒ store-visibility-under-recycle (our kernel); different
+    // phys ⇒ aliasing/remap (our W215) or gecko shipped a different segment.
+    {
+        let dst_va = gpr.rdi;
+        let dst_page = dst_va & !(PAGE_SIZE - 1);
+        let dst_phys = vmm::virt_to_phys_in(cr3, dst_page)
+            .map(|p| p | (dst_va & (PAGE_SIZE - 1)))
+            .unwrap_or(0);
+        let (dst_inode, dst_foff) = memfd_backing_of(cr3, dst_va);
+        crate::serial_println!(
+            "[UBREAK] capture write-dest: rip={:#x} pid={} tid={} cr3={:#x} dst_va={:#x} dst_phys={:#x} inode={} foff={:#x} len(rdx)={}",
+            bp_va, snap.pid, snap.tid, cr3, dst_va, dst_phys, dst_inode, dst_foff, gpr.rdx);
     }
 
     // Publish into the ring.

@@ -270,6 +270,25 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         }
     }
 
+    // CoW-private userspace breakpoint re-arm (debug-only).  A #DB (vector 1)
+    // from Ring 3 may be the TF single-step trap that a re-armable ubreak set
+    // after restoring the original byte; re-plant the int3 and clear TF.  Per
+    // Intel SDM Vol. 3B §17.3.1.1 (single-step), the #DB fires AFTER the stepped
+    // instruction with the saved RFLAGS.TF still set.  Runs after the (optional)
+    // w215-diag DR-watch #DB handler above — they never both claim the same
+    // trap (a re-arm is only ever pending from our own #BP path).
+    #[cfg(feature = "kdb")]
+    if vector == 1 && frame.cs & 3 == 3 {
+        let cr3_raw: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_raw, options(nomem, nostack)); }
+        let cr3 = cr3_raw & 0x000F_FFFF_FFFF_F000;
+        if crate::arch::x86_64::ubreak::on_debug_trap(cr3) {
+            // Clear TF so single-stepping stops (we only wanted one step).
+            frame.rflags &= !(1u64 << 8);
+            return;
+        }
+    }
+
     // CoW-private userspace breakpoint (debug-only).  A #BP (vector 3) from
     // Ring 3 may be a planted `int3` belonging to a registered userspace
     // breakpoint (see `arch::x86_64::ubreak`).  Match the faulting
@@ -290,12 +309,24 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             crate::arch::x86_64::ubreak::read_gprs_from_frame(base)
         };
         let mut new_rip = frame.rip;
-        let matched = crate::arch::x86_64::ubreak::on_breakpoint(
+        let action = crate::arch::x86_64::ubreak::on_breakpoint(
             cr3, frame.rip, frame.rsp, &gpr, &mut new_rip,
         );
-        if matched {
-            frame.rip = new_rip;
-            return;
+        match action {
+            crate::arch::x86_64::ubreak::BpAction::Handled => {
+                frame.rip = new_rip;
+                return;
+            }
+            crate::arch::x86_64::ubreak::BpAction::HandledRearm => {
+                // Re-armable: the original byte is restored and RIP rewound; set
+                // RFLAGS.TF (Intel SDM Vol. 3B §17.3.1.1) so the CPU raises #DB
+                // after the original instruction re-executes, where the vector-1
+                // hook re-plants the int3.  TF bit = 1<<8.
+                frame.rip = new_rip;
+                frame.rflags |= 1 << 8;
+                return;
+            }
+            crate::arch::x86_64::ubreak::BpAction::NotOurs => {}
         }
         // Unmatched #BP from Ring 3 with auto-arm enabled: emit one bounded
         // diagnostic so a mismatch (cr3/va) can be diagnosed, then fall through.

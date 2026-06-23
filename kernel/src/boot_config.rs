@@ -163,13 +163,21 @@ fn parse_ff_gui(buf: &[u8]) -> bool {
 /// Max comma-separated `astryx.ubreak=` offsets we accept.
 pub const MAX_UBREAK_OFFSETS: usize = 4;
 
-/// One parsed auto-arm entry: a libxul-relative ELF offset and an optional
-/// 4-byte instruction signature (the first 4 code bytes expected at that
-/// offset, little-endian; 0 = no check).
+/// One parsed auto-arm entry: a libxul-relative ELF offset, an optional 4-byte
+/// instruction signature (the first 4 code bytes expected at that offset,
+/// little-endian; 0 = no check), an optional re-arm flag, and an optional
+/// capture-gate length.
+///
+/// The grammar token `:<dec>` after an offset (and optional `/sig`) marks the
+/// breakpoint RE-ARMABLE with a capture gate of `<dec>` (the copy length, in
+/// bytes, at the consumer copy-site; only hits with `RDX == gate_len` are
+/// captured).  A `:0` marks it re-armable with no gate (capture every hit).
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub struct UbreakEntry {
     pub offset: u64,
     pub sig: u32,
+    pub rearm: bool,
+    pub gate_len: u64,
 }
 
 /// Read the debug-only `astryx.ubreak=<hex>[/<sig8>][,<hex>[/<sig8>]...]` token
@@ -216,6 +224,23 @@ fn parse_hex_at(buf: &[u8], p: &mut usize) -> (u64, bool) {
     (val, any)
 }
 
+/// Parse a decimal integer starting at `*p`; advances `*p` past it.  Returns the
+/// value and whether any digit was consumed.
+fn parse_dec_at(buf: &[u8], p: &mut usize) -> (u64, bool) {
+    let mut val: u64 = 0;
+    let mut any = false;
+    while *p < buf.len() {
+        let d = match buf[*p] {
+            c @ b'0'..=b'9' => (c - b'0') as u64,
+            _ => break,
+        };
+        val = val.wrapping_mul(10).wrapping_add(d);
+        any = true;
+        *p += 1;
+    }
+    (val, any)
+}
+
 /// Parse the `astryx.ubreak=` value into (offset, sig) entries.  Grammar:
 /// `<hex>[ / <sig8hex> ] ( , <hex>[ / <sig8hex> ] )*`.  The value runs to the
 /// first whitespace / control byte / NUL.  Exposed for unit tests.
@@ -238,8 +263,18 @@ fn parse_ubreak_offsets(buf: &[u8]) -> Option<([UbreakEntry; MAX_UBREAK_OFFSETS]
                 sig = s as u32;
             }
         }
+        // optional :<gate_dec> → re-armable with capture gate.  Parsed as a
+        // decimal length (the copy length at the consumer copy-site).
+        let mut rearm = false;
+        let mut gate_len: u64 = 0;
+        if p < buf.len() && buf[p] == b':' {
+            p += 1;
+            rearm = true;
+            let (g, _gany) = parse_dec_at(buf, &mut p);
+            gate_len = g;
+        }
         if count < MAX_UBREAK_OFFSETS {
-            out[count] = UbreakEntry { offset: off, sig };
+            out[count] = UbreakEntry { offset: off, sig, rearm, gate_len };
             count += 1;
         }
         if p < buf.len() && buf[p] == b',' && count < MAX_UBREAK_OFFSETS {
@@ -484,6 +519,37 @@ pub fn self_tests() -> usize {
         parse_ubreak_offsets(b"astryx.ubreak=0x1,0x2,0x3,0x4,0x5")
             .map(|(_, c)| c) == Some(MAX_UBREAK_OFFSETS),
         "ubreak offset count clamped to MAX_UBREAK_OFFSETS"
+    );
+    // Re-arm + capture-gate grammar: `:<dec>` after the offset (and optional
+    // /sig) marks the breakpoint re-armable with a capture gate.
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x25b005f:689")
+            .map(|(o, c)| (o[0].offset, o[0].rearm, o[0].gate_len, c))
+            == Some((0x25b005f, true, 689, 1)),
+        "ubreak rearm with gate length"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x25b005f/488d3c01:689")
+            .map(|(o, c)| (o[0].offset, o[0].sig, o[0].rearm, o[0].gate_len, c))
+            == Some((0x25b005f, 0x488d3c01, true, 689, 1)),
+        "ubreak rearm with /sig and gate length"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x25b005f:0")
+            .map(|(o, _)| (o[0].rearm, o[0].gate_len)) == Some((true, 0)),
+        "ubreak rearm with zero gate = capture every hit"
+    );
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x6e36c70")
+            .map(|(o, _)| (o[0].rearm, o[0].gate_len)) == Some((false, 0)),
+        "ubreak no-gate offset stays one-shot"
+    );
+    // Mixed: a one-shot producer offset and a re-armable gated consumer offset.
+    check!(
+        parse_ubreak_offsets(b"astryx.ubreak=0x25af4e0,0x25b005f:689")
+            .map(|(o, c)| (o[0].rearm, o[1].rearm, o[1].gate_len, c))
+            == Some((false, true, 689, 2)),
+        "ubreak mixed one-shot + re-armable gated"
     );
 
     crate::serial_println!("[BOOTCFG/SELFTEST] PASS ({} asserts)", n);
