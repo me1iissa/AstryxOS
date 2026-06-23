@@ -1446,6 +1446,8 @@ pub fn run() -> ! {
     {
         total += 1;
         if test_640_frame_recycle_zeroing_invariant() { passed += 1; }
+        total += 1;
+        if test_643_bucket_a_classifier_content_aware() { passed += 1; }
     }
 
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
@@ -53977,6 +53979,77 @@ fn test_640_frame_recycle_zeroing_invariant() -> bool {
 
     crate::mm::pmm::free_page(phys);
     crate::mm::pmm::free_page(clean);
+    test_pass!(NAME);
+    true
+}
+
+/// Test 643 — [FAULT/CACHE-KEY] bucket-A classifier is content/CR2-aware.
+///
+/// The W215 bucket classifier decides "bucket=A (same-key in-place corruption)"
+/// when the faulting RIP frame's page-cache key matches its installed phys.
+/// A key match alone proves only that the *code page* is the page the cache
+/// believes it should be — it says nothing about the address that actually
+/// faulted (CR2, Intel SDM Vol. 3A §4.7).  This regression test pins the
+/// `classify_key_match` decision so an ordinary userspace NULL-deref executing
+/// valid code (e.g. `mov [0x0], esi` at a real libxul RIP, CR2=0x0) is NOT
+/// mislabelled bucket-A, while a genuine same-page fault on a corrupt frame
+/// still is.
+///
+/// Cite: Intel SDM Vol. 3A §4.7 (#PF — CR2 holds the faulting linear address;
+/// the error code describes the access).
+#[cfg(feature = "firefox-test-core")]
+fn test_643_bucket_a_classifier_content_aware() -> bool {
+    use crate::signal::{classify_key_match, KeyMatchVerdict};
+    const NAME: &str = "[FAULT/CACHE-KEY] bucket-A CR2-aware classifier (Test 643)";
+    test_header!(NAME);
+
+    // A real libxul-style code RIP (page-aligned 0x...000 + in-page offset).
+    let rip: u64 = 0x0000_3ffa_d21_000 + 0x670;
+
+    // 1. NULL deref: CR2=0x0. Valid code page, fault at address 0 → NOT bucket-A.
+    if classify_key_match(rip, Some(0x0)) != KeyMatchVerdict::CleanNullDeref {
+        test_fail!(NAME, "CR2=0x0 NULL-deref was NOT classified CleanNullDeref");
+        return false;
+    }
+
+    // 2. Near-NULL deref (the Family-B `mov [rax+off],esi` with rax=0 family):
+    //    CR2 anywhere in the first page is still a NULL-class deref → NOT bucket-A.
+    if classify_key_match(rip, Some(0x7c)) != KeyMatchVerdict::CleanNullDeref {
+        test_fail!(NAME, "CR2 in first page was NOT classified CleanNullDeref");
+        return false;
+    }
+
+    // 3. Fault against an unrelated, well-formed page (CR2 on a different page
+    //    than the executing code frame) → clean, NOT corruption of the code page.
+    let other_page = (rip & !0xFFF) + 0x4000 + 0x10;
+    if classify_key_match(rip, Some(other_page)) != KeyMatchVerdict::CleanOtherPage {
+        test_fail!(NAME, "fault off the code page was NOT classified CleanOtherPage");
+        return false;
+    }
+
+    // 4. Genuine same-page fault on the matched frame: CR2 lands in the SAME
+    //    page the RIP executes from (e.g. FF executing a zeroed code page, the
+    //    real content-corruption variant) → still bucket-A.
+    let same_page = (rip & !0xFFF) + 0x40;
+    if classify_key_match(rip, Some(same_page)) != KeyMatchVerdict::BucketA {
+        test_fail!(NAME, "same-page fault on the matched frame was NOT bucket-A");
+        return false;
+    }
+
+    // 5. CR2 unavailable (some fatal paths pass cr2=None): the matched frame is
+    //    the only thing we can implicate → keep bucket-A (no regression in the
+    //    legacy "key match ⇒ bucket-A" behaviour for that case).
+    if classify_key_match(rip, None) != KeyMatchVerdict::BucketA {
+        test_fail!(NAME, "cr2=None did NOT preserve bucket-A");
+        return false;
+    }
+
+    // 6. Boundary: CR2 == first byte of the second page is NOT a NULL deref.
+    if classify_key_match(rip, Some(0x1000)) == KeyMatchVerdict::CleanNullDeref {
+        test_fail!(NAME, "CR2=0x1000 was wrongly classified as a NULL-deref");
+        return false;
+    }
+
     test_pass!(NAME);
     true
 }

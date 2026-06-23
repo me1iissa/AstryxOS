@@ -1559,14 +1559,87 @@ pub static FAULT_CACHE_KEY_BUCKET_A: AtomicU64 = AtomicU64::new(0);
 pub static FAULT_CACHE_KEY_BUCKET_B: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "firefox-test-core")]
 pub static FAULT_CACHE_KEY_BUCKET_C: AtomicU64 = AtomicU64::new(0);
+//   Clean — "not a cache-content fault": the RIP frame's cache key matches its
+//     installed phys (so the code page is the page the cache says it should be),
+//     but the *faulting access itself* — the linear address in CR2 — does not
+//     implicate that frame.  The classic case is an ordinary userspace
+//     NULL-deref (e.g. `mov [0x0], esi` at a perfectly-valid libxul RIP,
+//     CR2=0x0): the instruction page is fine, the fault is a write to address 0.
+//     Per Intel SDM Vol. 3A §4.7, CR2 holds the linear address that faulted and
+//     the error-code W/I bits describe the access; a key-matching code page is
+//     not evidence of in-place corruption when the fault is against an unrelated
+//     (e.g. NULL) address.  Counting these as bucket-A poisoned W215 triage —
+//     investigators chased a cache-corruption ghost for an ordinary NULL-deref.
+#[cfg(feature = "firefox-test-core")]
+pub static FAULT_CACHE_KEY_CLEAN: AtomicU64 = AtomicU64::new(0);
+
+/// Verdict of the [FAULT/CACHE-KEY] bucket classifier for a key-matching
+/// RIP frame (`is_phys_in_cache(rip_phys) == Some(expected_key)`).
+///
+/// A key match alone is NOT sufficient to declare bucket-A "in-place
+/// corruption": the cache key only proves the *code page* the RIP runs from is
+/// the page the cache believes it should be.  Whether the *fault* implicates
+/// that page is determined by CR2 (the linear address that faulted, Intel SDM
+/// Vol. 3A §4.7):
+///
+///   * CR2 in the first page (`< 0x1000`) → a NULL / near-NULL deref.  The
+///     instruction page is valid; the fault is an access to address ~0.  This
+///     is NOT cache corruption → [`KeyMatchVerdict::CleanNullDeref`].
+///   * CR2 known and NOT on the same page as `user_rip` → the faulting access
+///     is to a different page than the (key-matching) code page; the match says
+///     nothing about the faulting address → [`KeyMatchVerdict::CleanOtherPage`].
+///   * CR2 on the same page as `user_rip` (an execute / same-page access fault
+///     on the very frame we matched), or CR2 unknown → the key-matching frame
+///     genuinely is the page implicated by the fault, so an in-place content
+///     corruption of that frame is the live hypothesis → [`KeyMatchVerdict::BucketA`].
+///
+/// Pure (no I/O, no locks) so it is unit-testable in `test_runner.rs`.
+#[cfg(feature = "firefox-test-core")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMatchVerdict {
+    /// Real same-key in-place corruption candidate (fault implicates this frame).
+    BucketA,
+    /// Ordinary NULL / near-NULL deref — code page is fine, fault is at ~0.
+    CleanNullDeref,
+    /// Fault is against a different page than the key-matching code frame.
+    CleanOtherPage,
+}
+
+/// Decide whether a key-matching RIP frame is a genuine bucket-A corruption
+/// candidate or a clean userspace access fault.  See [`KeyMatchVerdict`].
+#[cfg(feature = "firefox-test-core")]
+pub fn classify_key_match(user_rip: u64, cr2: Option<u64>) -> KeyMatchVerdict {
+    match cr2 {
+        // NULL / near-NULL deref: the fault address is in the first page.  The
+        // executing code page can be perfectly valid; this is never cache
+        // corruption of that page.
+        Some(addr) if addr < 0x1000 => KeyMatchVerdict::CleanNullDeref,
+        // Fault against a page other than the one the RIP executes from.  The
+        // cache-key match on the code frame does not describe this fault.
+        Some(addr) if (addr & !0xFFF) != (user_rip & !0xFFF) => {
+            KeyMatchVerdict::CleanOtherPage
+        }
+        // Same-page (execute or in-page access) fault on the matched frame, or
+        // CR2 unavailable: the matched frame is the one implicated → bucket-A.
+        //
+        // This preserves the genuine W215 symptom — an instruction-fetch fault
+        // on a zeroed/corrupt code page.  Per Intel SDM Vol. 3A §6.15, on an
+        // instruction-fetch #PF (error-code I=1) CR2 holds the fetched linear
+        // address, which is the faulting instruction address itself — so it
+        // lands on the same page as `user_rip` and is correctly kept as
+        // bucket-A rather than demoted to "clean".
+        _ => KeyMatchVerdict::BucketA,
+    }
+}
 
 /// Read-only accessor for the kdb `fault-cache-keys` op.
 #[cfg(feature = "firefox-test-core")]
-pub fn fault_cache_key_bucket_counts() -> (u64, u64, u64) {
+pub fn fault_cache_key_bucket_counts() -> (u64, u64, u64, u64) {
     (
         FAULT_CACHE_KEY_BUCKET_A.load(Ordering::Relaxed),
         FAULT_CACHE_KEY_BUCKET_B.load(Ordering::Relaxed),
         FAULT_CACHE_KEY_BUCKET_C.load(Ordering::Relaxed),
+        FAULT_CACHE_KEY_CLEAN.load(Ordering::Relaxed),
     )
 }
 
@@ -1912,21 +1985,52 @@ pub(crate) fn emit_fault_phys_diagnostic(
             if let Some(expected_key) = vma_file_key(vma, user_rip) {
                 match crate::mm::cache::is_phys_in_cache(rip_phys) {
                     Some(actual_key) if actual_key == expected_key => {
-                        FAULT_CACHE_KEY_BUCKET_A.fetch_add(1, Ordering::Relaxed);
-                        crate::serial_println!(
-                            "[FAULT/CACHE-KEY] bucket=A (same-key in-place corruption) \
-                             rip_phys={:#x} key=(mount={},inode={:#x},off={:#x})",
-                            rip_phys,
-                            actual_key.0, actual_key.1, actual_key.2,
-                        );
-                        // W215 diagnostic Arm-1: dump the per-phys provenance
-                        // ring so the corrupting writer's history is visible
-                        // at the moment of fault.  Per Intel SDM Vol. 3A
-                        // §4.10.5, the page must have been alive in the
-                        // cache continuously from insert to fault — the ring
-                        // reveals which other operations touched it in that
-                        // window.
-                        crate::mm::w215_diag::dump_prov_for_phys(rip_phys);
+                        // A key match proves only that the code page the RIP
+                        // runs from is the page the cache believes it should
+                        // be.  Whether the *fault* implicates that page is
+                        // decided by CR2 (the linear address that faulted,
+                        // Intel SDM Vol. 3A §4.7).  A bare key match was being
+                        // mislabelled bucket-A "in-place corruption" even for
+                        // ordinary userspace NULL-derefs (`mov [0x0], esi` at a
+                        // valid libxul RIP, CR2=0x0) — poisoning W215 triage.
+                        match classify_key_match(user_rip, cr2) {
+                            KeyMatchVerdict::BucketA => {
+                                FAULT_CACHE_KEY_BUCKET_A.fetch_add(1, Ordering::Relaxed);
+                                crate::serial_println!(
+                                    "[FAULT/CACHE-KEY] bucket=A (same-key in-place corruption) \
+                                     rip_phys={:#x} key=(mount={},inode={:#x},off={:#x})",
+                                    rip_phys,
+                                    actual_key.0, actual_key.1, actual_key.2,
+                                );
+                                // W215 diagnostic Arm-1: dump the per-phys
+                                // provenance ring so the corrupting writer's
+                                // history is visible at the moment of fault.
+                                // Per Intel SDM Vol. 3A §4.10.5, the page must
+                                // have been alive in the cache continuously
+                                // from insert to fault — the ring reveals which
+                                // other operations touched it in that window.
+                                crate::mm::w215_diag::dump_prov_for_phys(rip_phys);
+                            }
+                            verdict => {
+                                // Clean userspace access fault on a frame whose
+                                // code page is well-formed.  NOT cache
+                                // corruption — do not poison the bucket-A count.
+                                FAULT_CACHE_KEY_CLEAN.fetch_add(1, Ordering::Relaxed);
+                                let reason = match verdict {
+                                    KeyMatchVerdict::CleanNullDeref => "null-deref",
+                                    KeyMatchVerdict::CleanOtherPage => "fault-off-code-page",
+                                    KeyMatchVerdict::BucketA => "bucket-a", // unreachable
+                                };
+                                crate::serial_println!(
+                                    "[FAULT/CACHE-KEY] bucket=clean ({}) \
+                                     rip_phys={:#x} cr2={:#x} key=(mount={},inode={:#x},off={:#x})",
+                                    reason,
+                                    rip_phys,
+                                    cr2.unwrap_or(0),
+                                    actual_key.0, actual_key.1, actual_key.2,
+                                );
+                            }
+                        }
                     }
                     Some(actual_key) => {
                         FAULT_CACHE_KEY_BUCKET_B.fetch_add(1, Ordering::Relaxed);

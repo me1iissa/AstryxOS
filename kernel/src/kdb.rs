@@ -1421,6 +1421,12 @@ fn op_cache_aliasing(out: &mut String) {
 //   but the PTE was not shot down; PMM may have recycled the frame.  Next
 //   dispatch: VMA-shootdown-on-evict audit.
 //
+// clean_userspace_access_fault — the RIP frame's cache key matched its phys,
+//   but the fault (CR2) does NOT implicate that frame: an ordinary userspace
+//   NULL-deref or a fault against a different page.  NOT cache corruption; the
+//   code page is well-formed.  These were previously mis-counted as bucket-A
+//   (Intel SDM Vol. 3A §4.7 — CR2 names the faulting linear address).
+//
 // Requires: --features firefox-test,kdb.
 // Returns zero for all buckets before any W215-cluster fault fires (idle state).
 
@@ -1428,10 +1434,10 @@ fn op_fault_cache_keys(out: &mut String) {
     #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
-        let (a, b, c) = crate::signal::fault_cache_key_bucket_counts();
+        let (a, b, c, clean) = crate::signal::fault_cache_key_bucket_counts();
         out.push('{');
         let _ = write!(out,
-            r#""bucket_a_same_key_inplace":{a},"bucket_b_cross_key_aliased":{b},"bucket_c_post_evict_stale_pte":{c}"#,
+            r#""bucket_a_same_key_inplace":{a},"bucket_b_cross_key_aliased":{b},"bucket_c_post_evict_stale_pte":{c},"clean_userspace_access_fault":{clean}"#,
         );
         out.push('}');
     }
