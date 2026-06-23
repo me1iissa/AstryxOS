@@ -1432,11 +1432,24 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
 
         // Determine page flags from the VMA if available; fall back to RW|User
         // for pages with no registered VMA (orphaned CoW pages after fork).
+        //
+        // `is_shared_writable` distinguishes a MAP_SHARED writable mapping from
+        // a MAP_PRIVATE one.  Copy-on-write is correct ONLY for private
+        // mappings: per POSIX mmap(2), a store through a MAP_SHARED mapping
+        // "shall be visible in all mappings of the same region" and (for a
+        // file-backed mapping) is carried through to the underlying object.
+        // CoW-copying a shared page to a private frame would strand the store
+        // in a frame no other mapper can see — the exact failure behind two
+        // mappings of one recycled memfd diverging (a writer's blob landing in
+        // a private copy while a reader keeps seeing the shared cache frame).
+        // Default for a VMA-less orphan page (post-fork CoW): copy-on-write.
+        let mut write_action = crate::mm::vma::WriteFaultAction::CopyOnWrite;
         let page_flags = match vm_space.find_vma(faulting_addr) {
             Some(vma) => {
                 if vma.prot & crate::mm::vma::PROT_WRITE == 0 {
                     return false; // Genuine write-protection fault — SIGSEGV
                 }
+                write_action = crate::mm::vma::write_fault_action(vma.flags);
                 vma.to_page_flags()
             }
             None => {
@@ -1444,6 +1457,25 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
             }
         };
+        let is_shared_writable =
+            write_action == crate::mm::vma::WriteFaultAction::WriteThrough;
+
+        // MAP_SHARED + writable: write THROUGH the shared frame.  Never CoW —
+        // the store must be visible to every other mapping of this region
+        // (POSIX mmap(2); the canonical write-fault rule "do not copy-on-write
+        // a shared writable mapping").  Mark the existing PTE writable in
+        // place; the faulting store then lands in the shared (cache-resident)
+        // frame, which every other mapper already aliases.  A cross-CPU
+        // shootdown drops any sibling's stale read-only translation so its
+        // next write also write-throughs instead of faulting forever.
+        if is_shared_writable {
+            let pte = crate::mm::vmm::read_pte(cr3, page_addr);
+            let old_phys = pte & 0x000F_FFFF_FFFF_F000;
+            let new_pte = old_phys | page_flags | PAGE_PRESENT;
+            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::tlb::shootdown_page(cr3, page_addr);
+            return true;
+        }
 
         // W216 H_5j-B (unified concurrency): sample VmSpace generation before
         // the CoW copy + install sequence.  A sibling CPU running

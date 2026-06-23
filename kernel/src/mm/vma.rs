@@ -1397,6 +1397,34 @@ pub enum VmaError {
     PermissionDenied,
 }
 
+/// Disposition of a write-protection fault on a present, writable-VMA page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFaultAction {
+    /// MAP_SHARED writable mapping: mark the existing frame writable in place
+    /// and write through it.  The store MUST be visible to every other mapping
+    /// of the same region (POSIX mmap(2) MAP_SHARED) — copy-on-write would
+    /// strand the store in a private frame no other mapper can see.
+    WriteThrough,
+    /// MAP_PRIVATE (or VMA-less orphan) writable mapping: copy-on-write — give
+    /// the writer a private frame so the store stays private to this mapping.
+    CopyOnWrite,
+}
+
+/// Decide how a write-protection fault on a present page must be resolved,
+/// given the VMA flags (`MAP_SHARED` / `MAP_PRIVATE`) of the faulting mapping.
+///
+/// This is the single source of truth shared by the page-fault handler and
+/// its unit test.  Per POSIX mmap(2): stores through a MAP_SHARED mapping are
+/// visible to all mappings of the region (write-through); stores through a
+/// MAP_PRIVATE mapping are private (copy-on-write).
+pub fn write_fault_action(vma_flags: VmFlags) -> WriteFaultAction {
+    if vma_flags & MAP_SHARED != 0 {
+        WriteFaultAction::WriteThrough
+    } else {
+        WriteFaultAction::CopyOnWrite
+    }
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
