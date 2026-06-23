@@ -231,6 +231,15 @@ pub struct Thread {
     /// runnable task accrues owed service the longer it is passed over and
     /// eventually becomes the highest-priority choice (longest-waiting wins).
     pub ready_since_tick: u64,
+    /// Perf P2 phase 2a: where this thread is currently mirrored in the per-CPU
+    /// runqueues (`sched::percpu`).  `None` ⇒ not in any runqueue; `Some((cpu,
+    /// prio))` ⇒ enqueued on `RQS[cpu]` at priority level `prio`.  Maintained
+    /// exclusively by `percpu::mirror_maintain` (under `THREAD_TABLE`); every
+    /// constructor initialises it to `None` (a freshly-built thread is not yet
+    /// mirrored — the first scheduling pass enqueues it).  This is a pure
+    /// bookkeeping shadow of the mirror's membership and drives no scheduling
+    /// decision in this phase.
+    pub mirror_slot: crate::sched::percpu::MirrorSlot,
     /// True when context.rsp holds a valid saved kernel RSP.
     ///
     /// Set to `false` in schedule() just before marking the thread Ready,
@@ -342,6 +351,7 @@ impl Thread {
             last_cpu: 0,
             first_run: false,
             ready_since_tick: 0,
+            mirror_slot: None,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: 0,
@@ -999,6 +1009,7 @@ pub fn init() {
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1271,6 +1282,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1342,6 +1354,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1417,6 +1430,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         last_cpu: 0,
         first_run: false,
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -2266,6 +2280,14 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     if !orphan_zombie_pids.is_empty() {
         let mut threads = THREAD_TABLE.lock();
         for (_cpid, tids) in &orphan_zombie_pids {
+            // Drop any still-mirrored removed thread from the per-CPU runqueues
+            // first, so its tid does not strand in a runqueue the maintainer can
+            // never revisit (Perf P2 phase 2a — see `percpu::mirror_forget`).
+            for t in threads.iter() {
+                if tids.contains(&t.tid) {
+                    crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
+                }
+            }
             threads.retain(|t| !tids.contains(&t.tid));
         }
         drop(threads);
@@ -3026,6 +3048,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         last_cpu: 0,
         first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent's callee-saved regs (RBP/RBX/R12-R15) into the child.
@@ -3280,6 +3303,7 @@ pub fn fork_process_share_vm(
         last_cpu: 0,
         first_run: true,
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: *parent_regs,
@@ -3973,6 +3997,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         last_cpu: 0,
         first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
         ready_since_tick: 0,
+        mirror_slot: None,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent callee-saved regs into the vfork child for the same
@@ -4064,6 +4089,13 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
     // Step 2: Reap the child's threads (THREAD_TABLE only).
     {
         let mut threads = THREAD_TABLE.lock();
+        // Drop any still-mirrored reaped thread from the per-CPU runqueues
+        // first (Perf P2 phase 2a — see `percpu::mirror_forget`).
+        for t in threads.iter() {
+            if thread_tids.contains(&t.tid) {
+                crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
+            }
+        }
         threads.retain(|t| !thread_tids.contains(&t.tid));
     }
 
@@ -4298,6 +4330,12 @@ pub fn reap_dead_threads() -> usize {
             0
         };
         let tls = t.tls_base;
+
+        // Drop any still-mirrored entry from the per-CPU runqueues before the
+        // record disappears (Perf P2 phase 2a — see `percpu::mirror_forget`).
+        // A reapable thread is Dead, so a `mirror_maintain` pass would already
+        // have drained it; this closes the window where reap beats that pass.
+        crate::sched::percpu::mirror_forget(t.mirror_slot, t.tid);
 
         // Remove from table
         threads.swap_remove(idx);
