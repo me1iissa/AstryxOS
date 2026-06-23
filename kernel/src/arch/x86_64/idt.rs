@@ -270,6 +270,25 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         }
     }
 
+    // CoW-private userspace breakpoint re-arm (debug-only).  A #DB (vector 1)
+    // from Ring 3 may be the TF single-step trap that a re-armable ubreak set
+    // after restoring the original byte; re-plant the int3 and clear TF.  Per
+    // Intel SDM Vol. 3B §17.3.1.1 (single-step), the #DB fires AFTER the stepped
+    // instruction with the saved RFLAGS.TF still set.  Runs after the (optional)
+    // w215-diag DR-watch #DB handler above — they never both claim the same
+    // trap (a re-arm is only ever pending from our own #BP path).
+    #[cfg(feature = "kdb")]
+    if vector == 1 && frame.cs & 3 == 3 {
+        let cr3_raw: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_raw, options(nomem, nostack)); }
+        let cr3 = cr3_raw & 0x000F_FFFF_FFFF_F000;
+        if crate::arch::x86_64::ubreak::on_debug_trap(cr3) {
+            // Clear TF so single-stepping stops (we only wanted one step).
+            frame.rflags &= !(1u64 << 8);
+            return;
+        }
+    }
+
     // CoW-private userspace breakpoint (debug-only).  A #BP (vector 3) from
     // Ring 3 may be a planted `int3` belonging to a registered userspace
     // breakpoint (see `arch::x86_64::ubreak`).  Match the faulting
@@ -290,12 +309,24 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             crate::arch::x86_64::ubreak::read_gprs_from_frame(base)
         };
         let mut new_rip = frame.rip;
-        let matched = crate::arch::x86_64::ubreak::on_breakpoint(
+        let action = crate::arch::x86_64::ubreak::on_breakpoint(
             cr3, frame.rip, frame.rsp, &gpr, &mut new_rip,
         );
-        if matched {
-            frame.rip = new_rip;
-            return;
+        match action {
+            crate::arch::x86_64::ubreak::BpAction::Handled => {
+                frame.rip = new_rip;
+                return;
+            }
+            crate::arch::x86_64::ubreak::BpAction::HandledRearm => {
+                // Re-armable: the original byte is restored and RIP rewound; set
+                // RFLAGS.TF (Intel SDM Vol. 3B §17.3.1.1) so the CPU raises #DB
+                // after the original instruction re-executes, where the vector-1
+                // hook re-plants the int3.  TF bit = 1<<8.
+                frame.rip = new_rip;
+                frame.rflags |= 1 << 8;
+                return;
+            }
+            crate::arch::x86_64::ubreak::BpAction::NotOurs => {}
         }
         // Unmatched #BP from Ring 3 with auto-arm enabled: emit one bounded
         // diagnostic so a mismatch (cr3/va) can be diagnosed, then fall through.
@@ -1401,11 +1432,24 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
 
         // Determine page flags from the VMA if available; fall back to RW|User
         // for pages with no registered VMA (orphaned CoW pages after fork).
+        //
+        // `is_shared_writable` distinguishes a MAP_SHARED writable mapping from
+        // a MAP_PRIVATE one.  Copy-on-write is correct ONLY for private
+        // mappings: per POSIX mmap(2), a store through a MAP_SHARED mapping
+        // "shall be visible in all mappings of the same region" and (for a
+        // file-backed mapping) is carried through to the underlying object.
+        // CoW-copying a shared page to a private frame would strand the store
+        // in a frame no other mapper can see — the exact failure behind two
+        // mappings of one recycled memfd diverging (a writer's blob landing in
+        // a private copy while a reader keeps seeing the shared cache frame).
+        // Default for a VMA-less orphan page (post-fork CoW): copy-on-write.
+        let mut write_action = crate::mm::vma::WriteFaultAction::CopyOnWrite;
         let page_flags = match vm_space.find_vma(faulting_addr) {
             Some(vma) => {
                 if vma.prot & crate::mm::vma::PROT_WRITE == 0 {
                     return false; // Genuine write-protection fault — SIGSEGV
                 }
+                write_action = crate::mm::vma::write_fault_action(vma.flags);
                 vma.to_page_flags()
             }
             None => {
@@ -1413,6 +1457,31 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
             }
         };
+        let is_shared_writable =
+            write_action == crate::mm::vma::WriteFaultAction::WriteThrough;
+
+        // MAP_SHARED + writable: write THROUGH the shared frame.  Never CoW —
+        // the store must be visible to every other mapping of this region
+        // (POSIX mmap(2); the canonical write-fault rule "do not copy-on-write
+        // a shared writable mapping").  Mark the existing PTE writable in
+        // place; the faulting store then lands in the shared (cache-resident)
+        // frame, which every other mapper already aliases.  A cross-CPU
+        // shootdown drops any sibling's stale read-only translation so its
+        // next write also write-throughs instead of faulting forever.
+        if is_shared_writable {
+            let pte = crate::mm::vmm::read_pte(cr3, page_addr);
+            let old_phys = pte & 0x000F_FFFF_FFFF_F000;
+            let new_pte = old_phys | page_flags | PAGE_PRESENT;
+            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::tlb::shootdown_page(cr3, page_addr);
+            // NOTE: this does not set the PTE dirty bit nor mark the backing
+            // page-cache frame dirty.  Inert today (VFS writeback is not yet
+            // implemented; shared/memfd reads come back through the same
+            // frame), but once disk-backed MAP_SHARED writeback (msync/munmap
+            // flush) lands, an mmap-written-but-never-write(2)'d page would be
+            // skipped by a dirty-driven flush — mark the frame dirty here then.
+            return true;
+        }
 
         // W216 H_5j-B (unified concurrency): sample VmSpace generation before
         // the CoW copy + install sequence.  A sibling CPU running

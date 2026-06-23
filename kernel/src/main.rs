@@ -1534,10 +1534,12 @@ user_pref("security.sandbox.content.level", 0);
             #[cfg(feature = "kdb")]
             if let Some((entries, n)) = boot_config::ubreak_offsets() {
                 for e in entries.iter().take(n) {
-                    crate::arch::x86_64::ubreak::set_auto_arm_offset_sig(e.offset, e.sig);
+                    crate::arch::x86_64::ubreak::set_auto_arm_full(
+                        e.offset, e.sig, e.rearm, e.gate_len,
+                    );
                     serial_println!(
-                        "[UBREAK] auto-arm enabled at libxul offset {:#x} sig={:#010x}",
-                        e.offset, e.sig
+                        "[UBREAK] auto-arm enabled at libxul offset {:#x} sig={:#010x} rearm={} gate={}",
+                        e.offset, e.sig, e.rearm, e.gate_len
                     );
                 }
             }

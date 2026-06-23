@@ -2406,6 +2406,8 @@ pub fn run() -> ! {
         if test_234_cache_update_range_boundaries() { passed += 1; }
         total += 1;
         if test_240_vfs_truncate_page_cache_coherency() { passed += 1; }
+        total += 1;
+        if test_642_mapshared_write_fault_writethrough() { passed += 1; }
     }
 
     // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
@@ -46282,6 +46284,83 @@ fn test_240_vfs_truncate_page_cache_coherency() -> bool {
     let _ = crate::mm::cache::evict(mount_idx, inode, 0);
     let _ = crate::vfs::remove(path);
     test_pass!("VFS truncate / page-cache coherency (POSIX ftruncate zero-fill)");
+    true
+}
+
+// ── Test 642: MAP_SHARED write fault must write-through, not copy-on-write ─
+//
+// Regression guard for the recycled-memfd stale-blob bug.  Two MAP_SHARED
+// mappings of one memfd alias a single shared page-cache frame.  When one
+// mapping takes a WRITE fault on that present-but-read-only page, the
+// page-fault handler's write-fault arm saw the frame's refcount > 1 (cache
+// ref + this PTE ref) and copy-on-write'd it to a PRIVATE frame — stranding
+// the store where no other mapper could see it.  Observed end-to-end as a
+// WebRender blob producer writing the valid blob into a private copy while
+// the consumer's mapping kept reading the stale (font-path) shared frame.
+//
+// Copy-on-write is correct ONLY for MAP_PRIVATE.  Per POSIX mmap(2), a store
+// through a MAP_SHARED mapping must be visible to all mappings of the same
+// region — so the handler must mark the existing shared frame writable in
+// place (write-through), never copy it.
+//
+// The handler routes the decision through `mm::vma::write_fault_action`, the
+// single source of truth.  This test asserts that disposition directly:
+// MAP_SHARED ⇒ WriteThrough; MAP_PRIVATE (and a VMA-less orphan) ⇒
+// CopyOnWrite.  Pinning the predicate guards the fix without depending on a
+// full user address space in the kernel-mode test context.
+//
+// References:
+//   - IEEE Std 1003.1-2017 mmap(2): MAP_SHARED — stores are visible to all
+//     mappings of the same region; MAP_PRIVATE — stores are private (CoW).
+//   - Intel SDM Vol. 3A §4.10.5: paging-structure changes propagate to all
+//     processors before a frame is repurposed.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_642_mapshared_write_fault_writethrough() -> bool {
+    test_header!("MAP_SHARED write fault writes through (no CoW)");
+    use crate::mm::vma::{write_fault_action, WriteFaultAction,
+                         MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS};
+
+    // The page-fault handler's write-protection arm consults
+    // `write_fault_action(vma.flags)` to decide between writing through a
+    // shared frame (MAP_SHARED) and copy-on-write (MAP_PRIVATE).  This is the
+    // single source of truth; asserting it here pins the disposition that the
+    // recycled-memfd stale-blob fix depends on.
+
+    // (1) MAP_SHARED ⇒ WriteThrough.  Stores must reach the shared frame so
+    //     every other mapping of the region observes them (POSIX mmap(2)).
+    if write_fault_action(MAP_SHARED) != WriteFaultAction::WriteThrough {
+        test_fail!("test642", "MAP_SHARED must write through (got CoW) — stale-blob bug");
+        return false;
+    }
+    // A writable shared file mapping still maps to a single shared frame.
+    if write_fault_action(MAP_SHARED | MAP_ANONYMOUS) != WriteFaultAction::WriteThrough {
+        test_fail!("test642", "MAP_SHARED|MAP_ANONYMOUS must write through");
+        return false;
+    }
+    test_println!("  MAP_SHARED write fault ⇒ WriteThrough ✓");
+
+    // (2) MAP_PRIVATE ⇒ CopyOnWrite.  Stores stay private to the faulting
+    //     mapping (the .so GOT/relocation case must not corrupt the cache).
+    if write_fault_action(MAP_PRIVATE) != WriteFaultAction::CopyOnWrite {
+        test_fail!("test642", "MAP_PRIVATE must copy-on-write (regression)");
+        return false;
+    }
+    if write_fault_action(MAP_PRIVATE | MAP_ANONYMOUS) != WriteFaultAction::CopyOnWrite {
+        test_fail!("test642", "MAP_PRIVATE|MAP_ANONYMOUS must copy-on-write");
+        return false;
+    }
+    test_println!("  MAP_PRIVATE write fault ⇒ CopyOnWrite ✓");
+
+    // (3) Flags with neither bit set default to CopyOnWrite (a VMA-less
+    //     post-fork orphan page is treated as private — the conservative,
+    //     pre-fix-compatible default).
+    if write_fault_action(0) != WriteFaultAction::CopyOnWrite {
+        test_fail!("test642", "no MAP_* flag must default to CopyOnWrite");
+        return false;
+    }
+    test_println!("  no flag (orphan) ⇒ CopyOnWrite ✓");
+
+    test_pass!("MAP_SHARED write fault writes through (no CoW)");
     true
 }
 
