@@ -1501,6 +1501,30 @@ def _build(features: str) -> bool:
                    "-Zjson-target-spec"]
     kernel_cmd += coverage_extra
 
+    # Opt-in: force frame pointers for ONLY the astryx-kernel crate.  When
+    # `ASTRYX_FORCE_FRAME_POINTERS=1` is set in the environment, inject
+    # `-C force-frame-pointers=yes` via the same per-package rustflags
+    # mechanism the coverage path uses.  This makes the kernel's RBP-walk
+    # back-tracer (`caller_rip()` in mm/pmm.rs and mm/cache.rs) reliable: a
+    # release build normally omits frame pointers, so RBP is a scratch reg
+    # at call sites and `[rbp+8]` does not hold the return address.  Scoped
+    # to the astryx-kernel crate so `core`/`alloc`/`compiler_builtins` keep
+    # their normal codegen.  Additive; default builds are unaffected.
+    if os.environ.get("ASTRYX_FORCE_FRAME_POINTERS") == "1":
+        if coverage_extra:
+            # coverage already added a --config for the same key; cargo would
+            # reject a duplicate.  Not a combination this probe needs, so fail
+            # loudly rather than silently dropping one flag.
+            print("[HARNESS] ERROR: ASTRYX_FORCE_FRAME_POINTERS=1 is not "
+                  "compatible with the `coverage` feature (duplicate per-crate "
+                  "rustflags config). Build one at a time.", file=sys.stderr)
+            return False
+        kernel_cmd += [
+            "--config",
+            'profile.release.package."astryx-kernel".rustflags = '
+            '["-C","force-frame-pointers=yes"]',
+        ]
+
     r2 = subprocess.run(kernel_cmd, cwd=ROOT, env=env)
     if r2.returncode != 0:
         return False
