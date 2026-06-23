@@ -1621,6 +1621,13 @@ pub fn classify_key_match(user_rip: u64, cr2: Option<u64>) -> KeyMatchVerdict {
         }
         // Same-page (execute or in-page access) fault on the matched frame, or
         // CR2 unavailable: the matched frame is the one implicated → bucket-A.
+        //
+        // This preserves the genuine W215 symptom — an instruction-fetch fault
+        // on a zeroed/corrupt code page.  Per Intel SDM Vol. 3A §6.15, on an
+        // instruction-fetch #PF (error-code I=1) CR2 holds the fetched linear
+        // address, which is the faulting instruction address itself — so it
+        // lands on the same page as `user_rip` and is correctly kept as
+        // bucket-A rather than demoted to "clean".
         _ => KeyMatchVerdict::BucketA,
     }
 }
