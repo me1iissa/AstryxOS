@@ -384,6 +384,16 @@ pub fn global_force_deadline_ticks() -> u64 {
     STARVE_FORCE_TICKS
 }
 
+/// The anti-starvation force-deadline (in 100 Hz ticks) for a thread with the
+/// given TID: the tighter `STARVE_FORCE_TICKS_BSP` for the BSP poll reactor
+/// (TID 0), the coarse `STARVE_FORCE_TICKS` for every other thread.  Single
+/// source of truth for the per-TID deadline so the picker's per-candidate force
+/// scan and the per-runqueue `min_deadline` gate (`sched::percpu`) cannot drift.
+#[inline]
+pub(crate) fn force_deadline_for_tid(tid: proc::Tid) -> u64 {
+    if tid == 0 { STARVE_FORCE_TICKS_BSP } else { STARVE_FORCE_TICKS }
+}
+
 /// Pure helper: the anti-starvation score bonus for a Ready thread that has
 /// been waiting `age` ticks (`age = now - ready_since_tick`, saturating).
 ///
@@ -1277,11 +1287,7 @@ fn select_next_core(
         }
         if !is_idle_thread {
             score += wait_age_bonus(wait_age);
-            let deadline: u64 = if t.tid == 0 {
-                STARVE_FORCE_TICKS_BSP
-            } else {
-                STARVE_FORCE_TICKS
-            };
+            let deadline: u64 = force_deadline_for_tid(t.tid);
             let margin = wait_age as i64 - deadline as i64;
             if margin > force_margin {
                 force_margin = margin;
@@ -1336,11 +1342,7 @@ fn select_next(
 
     if let Some((fidx, force_age)) = forced {
         let n = SCHED_STARVE_FORCE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        let deadline: u64 = if threads[fidx].tid == 0 {
-            STARVE_FORCE_TICKS_BSP
-        } else {
-            STARVE_FORCE_TICKS
-        };
+        let deadline: u64 = force_deadline_for_tid(threads[fidx].tid);
         if n == 0 || n % STARVE_FORCE_LOG_EVERY == 0 {
             crate::serial_println!(
                 "[SCHED/STARVE] force-select tid={} (waited {} ticks >= {}) on cpu={} \
@@ -1373,9 +1375,9 @@ fn select_next_no_side_effects(
 ///
 ///   * `legacy` — the full rotated `(current_idx + i) % len` walk, and
 ///   * `percpu` — the candidate set the per-CPU path would derive (built here by
-///     [`test_percpu_candidates`] from the same rules `percpu_candidate_indices`
-///     uses, but over the supplied `runnable_tids` so the test need not touch
-///     the live static `RQS`).
+///     [`test_percpu_candidates`] over the supplied `runnable_tids`, applying
+///     the same rotation-distance ordering the live per-CPU pick re-imposes on
+///     its runqueue membership, so the test need not touch the live `RQS`).
 ///
 /// Returns the selected TID for each ordering so the test can assert they are
 /// identical.  Uses the side-effect-free [`select_next_core`], so it perturbs no
@@ -1401,7 +1403,9 @@ pub fn test_pick_equivalence(
 
 /// Build the per-CPU candidate index ordering for [`test_pick_equivalence`] from
 /// an explicit list of runnable Tids (modelling `RQS[cpu]`'s membership),
-/// applying the SAME rotation-distance ordering `percpu_candidate_indices` uses.
+/// applying the SAME rotation-distance ordering the live authoritative pick
+/// re-imposes on its per-CPU runqueue membership (the rotated `(current_idx +
+/// i) % len` walk filtered to this CPU's `mirror_slot` members, in `schedule`).
 fn test_percpu_candidates(
     threads: &[proc::Thread],
     current_idx: usize,
@@ -1419,44 +1423,6 @@ fn test_percpu_candidates(
             }
         }
     }
-    out.sort_by_key(|&idx| (idx + len - (current_idx % len)) % len);
-    out
-}
-
-/// Build the candidate index sequence for [`select_next`] from this CPU's
-/// per-CPU runqueue (Perf P2 phase 2b), in the picker's rotation order.
-///
-/// The runqueue stores Tids; this maps each queued Tid back to its table index
-/// and orders the result by rotation distance from `current_idx`
-/// (`(idx - current_idx) mod len`), so the candidate order — and therefore
-/// `select_next`'s strict-max tie-break — matches the legacy `(current_idx + i)
-/// % len` walk exactly.  Threads in the runqueue whose Tid is not found in the
-/// table (a transient the next maintain pass will reconcile) are skipped.
-///
-/// On SMP=1 the runqueue's non-idle pool equals the legacy eligible non-idle
-/// Ready set, so the candidate set is identical; this function only re-imposes
-/// the rotation ORDER on it.
-#[cfg(feature = "sched-pick-xcheck")]
-fn percpu_candidate_indices(
-    threads: &[proc::Thread],
-    cpu: usize,
-    current_idx: usize,
-) -> alloc::vec::Vec<usize> {
-    let len = threads.len();
-    // Snapshot the queued Tids for this CPU under the runqueue lock.
-    let tids = percpu::rq_snapshot_tids(cpu);
-    let mut out: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(tids.len());
-    for tid in tids {
-        if let Some(idx) = threads.iter().position(|t| t.tid == tid) {
-            // Exclude the current thread's own index: the legacy rotation walk
-            // is `i in 1..len` and never re-considers `current_idx`.
-            if idx != current_idx % len {
-                out.push(idx);
-            }
-        }
-    }
-    // Order by rotation distance from current_idx so the tie-break matches the
-    // legacy `(current_idx + i) % len` walk.
     out.sort_by_key(|&idx| (idx + len - (current_idx % len)) % len);
     out
 }
@@ -1726,60 +1692,66 @@ was_emergency_4k={}",
         // `mirror_maintain`).  See `sched::percpu`.
         percpu::mirror_maintain(&mut threads);
 
-        // ── Pick the next thread (Perf P2 phase 2b: per-CPU runqueue pick) ────
-        // The selection is computed by `select_next`, the verbatim extraction of
-        // the legacy in-line picker, driven over a candidate-index sequence.
+        // ── Pick the next thread (Perf P2 phase 3a: AUTHORITATIVE per-CPU pick) ─
+        // The selection is computed by `select_next` (the verbatim extraction of
+        // the legacy in-line scoring/force picker) driven over THIS CPU's
+        // runqueue membership instead of the whole table.
         //
-        //   * LEGACY path — candidates are the full rotated `1..len` walk
-        //     (`(current_idx + i) % len`).  This is byte-identical to the old
-        //     inline loop and remains the AUTHORITATIVE result.
-        //   * PER-CPU path — candidates come from this CPU's runqueue
-        //     (`RQS[cpu]`, the Ready-eligible set), re-ordered by rotation
-        //     distance.  On SMP=1 the runqueue's non-idle pool equals the legacy
-        //     eligible set, so this selects the identical thread while iterating
-        //     only Ready threads (not the whole table).
+        // The candidate sequence is the rotated `(current_idx + i) % len` walk —
+        // the SAME rotation order the legacy picker used, so the strict-max
+        // first-in-order tie-break is unchanged — but each index is admitted only
+        // if the thread is enqueued on THIS CPU's runqueue, i.e. its
+        // `mirror_slot` (stamped by `mirror_maintain` just above, in this same
+        // locked pass) is `Some((cpu, _))`.  This restricts scoring to the
+        // per-CPU Ready-eligible set while staying ALLOCATION-FREE on the pick
+        // hot path: the candidate iterator is a lazy `filter` over the rotation
+        // walk (no `Vec`, no runqueue-lock re-entry — the slot is read straight
+        // off the locked thread record), which matters because `schedule()` runs
+        // with interrupts disabled and the kernel heap lock is non-reentrant.
         //
-        // For now the LEGACY result drives the switch; on a debug build the
-        // per-CPU result is cross-checked against it and any divergence is
-        // recorded (`percpu::PICK_DIVERGENCES`) — the live half of the
-        // Test-648 pick-equivalence proof.  Once the cross-check has soaked,
-        // a later step promotes the per-CPU result to authoritative.  The
-        // `select_next` call publishes READY_DEPTH and drives the force
-        // backstop exactly as the inline picker did.
-        // Legacy candidate sequence: the rotated `(current_idx + i) % len` walk,
-        // as a lazy iterator — NO heap allocation on the pick hot path (the
-        // iterator is consumed in place by `select_next`).
-        let (legacy_idx, _ready_peers) =
-            select_next(&threads, cpu, (1..len).map(|i| (current_idx + i) % len), now);
+        // Why this is the SAME decision as the legacy whole-table scan on SMP=1
+        // (Perf P2 phase 2b, Test 648, proven for nine cases incl. score-aging
+        // crossover, the TID-0 reactor and the rotation sweep): the runqueue's
+        // non-idle pool (`mirror_slot == Some((cpu, _))`) is exactly the legacy
+        // eligible non-idle Ready set on this CPU, and the idle pool the legacy
+        // two-pass fallback would consider holds only AP-pinned idle threads
+        // (TID >= 0x1000) that are never affinity-eligible on the BSP — so the
+        // legacy idle fallback selects nothing the per-CPU path misses.  `now`,
+        // `wait_age_bonus` and the per-thread force deadline are applied
+        // identically by the shared `select_next`/`select_next_core`.
+        //
+        // `select_next` publishes READY_DEPTH and drives the force backstop
+        // exactly as the inline picker did.  The candidate `filter` reads
+        // `mirror_slot` (a plain field on the locked `Thread`), so the per-CPU
+        // restriction costs one comparison per rotation step and no allocation.
+        let percpu_cpu = cpu;
+        let (best_idx, _ready_peers) = select_next(
+            &threads,
+            cpu,
+            (1..len)
+                .map(|i| (current_idx + i) % len)
+                .filter(|&idx| matches!(threads[idx].mirror_slot, Some((c, _)) if c == percpu_cpu)),
+            now,
+        );
 
-        // Per-CPU pick + equivalence cross-check.  Kept on debug builds only so
-        // the release hot path pays nothing; the candidate build re-reads the
-        // runqueue (one leaf lock) and a short position map.  Note: `select_next`
-        // has already published READY_DEPTH and bumped the force counter for the
-        // legacy pass, so the cross-check must NOT call it a second time (that
-        // would double-count the force diagnostic) — instead it re-evaluates
-        // with a side-effect-free selector.
-        // The per-CPU pick omits the idle pool (the mirror excludes tid>=0x1000),
-        // which is equivalent to the legacy pick ONLY on SMP=1, where no idle
-        // thread is eligible on the BSP. Gate the cross-check on SMP=1 so it
-        // cannot false-fire on a (not-yet-supported) SMP=2 boot, and SAMPLE it
-        // (every Nth pass) so its per-sample heap allocation never dominates the
-        // pick hot path.  The authoritative legacy pick above consumes a lazy
-        // `(1..len).map(..)` iterator and allocates nothing; this sampled
-        // cross-check is the only allocating path, and only when this feature is
-        // explicitly enabled.
+        // ── Cross-check: legacy whole-table scan agrees (debug feature only) ──
+        // The legacy global scan is no longer the decider; it is retained ONLY
+        // behind `sched-pick-xcheck` as an adversarial cross-check that the
+        // authoritative per-CPU pick still selects the thread the old O(N)
+        // table scan would have.  Gated on SMP=1 (where the two are provably
+        // equivalent) and SAMPLED (every Nth pass) so the legacy O(N) re-scan
+        // and its allocation never dominate the hot path.  A divergence is
+        // recorded (`percpu::PICK_DIVERGENCES`) and logged but, the per-CPU
+        // result being authoritative, never acted on — it is the live evidence
+        // that the promotion is behaviour-preserving.
         #[cfg(feature = "sched-pick-xcheck")]
         if crate::arch::x86_64::apic::cpu_count() == 1
             && percpu::pick_xcheck_sample_due()
         {
-            let cand = percpu_candidate_indices(&threads, cpu as usize, current_idx);
-            let percpu_idx =
-                select_next_no_side_effects(&threads, cpu, cand.iter().copied(), now);
-            // Compare by TID (table indices differ between the two candidate
-            // orderings only when they select different threads; comparing the
-            // selected TID is the equivalence property that matters).
+            let legacy_idx = select_next_no_side_effects(
+                &threads, cpu, (1..len).map(|i| (current_idx + i) % len), now);
             let legacy_tid = legacy_idx.map(|i| threads[i].tid);
-            let percpu_tid = percpu_idx.map(|i| threads[i].tid);
+            let percpu_tid = best_idx.map(|i| threads[i].tid);
             if legacy_tid != percpu_tid {
                 percpu::note_pick_divergence();
                 crate::serial_println!(
@@ -1790,10 +1762,6 @@ was_emergency_4k={}",
                 );
             }
         }
-
-        // The legacy result is authoritative this phase; the `match` below
-        // consumes it to perform the context switch.
-        let best_idx = legacy_idx;
 
         match best_idx {
             Some(idx) => {
