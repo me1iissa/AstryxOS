@@ -367,6 +367,24 @@ static CPU_TIMER_SEEN: [(AtomicU64, AtomicU64); super::apic::MAX_CPUS] =
 static CPU_TIMER_DEAD: [core::sync::atomic::AtomicBool; super::apic::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; super::apic::MAX_CPUS];
 
+/// Per-CPU count of consecutive futile re-arms since this CPU's timer was last
+/// declared dead.  Reset to 0 whenever the ISR advances (recovery).  Once it
+/// reaches [`MAX_FUTILE_REARMS`] the periodic re-arm retry STOPS for this CPU
+/// (the host — typically KVM — is permanently suppressing injection on this
+/// vCPU; no amount of re-programming the guest LAPIC will revive it) and the
+/// CPU relies purely on the TSC-clocked spin + cross-CPU poke to stay scheduled.
+/// This bounds futile LAPIC-MMIO writes on a permanently-dead timer while still
+/// giving a transiently-wedged timer many chances to resume.
+static CPU_TIMER_DEAD_REARMS: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
+/// Cap on consecutive periodic re-arms of a dead timer before giving up on
+/// re-programming it (≈ a few seconds of retries at one re-arm per liveness
+/// window).  A genuinely transient wedge resumes well within this; a
+/// host-suppressed timer never will, so stop churning LAPIC MMIO and let the
+/// spin + cross-CPU poke carry the CPU.
+const MAX_FUTILE_REARMS: u64 = 32;
+
 /// True iff `cpu`'s LAPIC periodic timer has been declared dead and not yet
 /// recovered.  Diagnostic accessor for the kdb `cpu-state` survey.
 pub fn cpu_timer_dead(cpu: usize) -> bool {
@@ -499,33 +517,56 @@ pub fn cpu_timer_live(window_ticks: u64) -> bool {
         CPU_TIMER_SEEN[cpu].0.store(isr_now, Ordering::Relaxed);
         CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
         CPU_TIMER_DEAD[cpu].store(false, Ordering::Relaxed);
+        CPU_TIMER_DEAD_REARMS[cpu].store(0, Ordering::Relaxed);
         return true;
     }
 
-    // ISR count unchanged since the last check.  If this CPU's timer was already
-    // declared dead, it STAYS dead until the ISR actually advances (handled
-    // above) — report unhealthy without re-arming again, so the caller keeps
-    // spinning (self-clocked) rather than oscillating hlt↔wake at ~1/window Hz.
+    // ISR count unchanged since the last check.  How long (wall-clock) has the
+    // local timer been silent since we last re-anchored?
+    let silent_ticks = tsc_now.wrapping_sub(seen_tsc) / tsc_per_tick;
+
+    // Already declared dead: stay dead (the caller keeps spinning, self-clocked)
+    // but RE-ARM PERIODICALLY — once per window of continued silence — rather
+    // than only once at declaration.  A wedged KVM LAPIC may not resume on the
+    // first re-arm if injection is still being suppressed (e.g. an MMIO VM-exit
+    // storm has not yet subsided); retrying every window gives the full
+    // from-scratch re-program (see `apic::rearm_timer`) repeated chances to
+    // re-latch the counter once the host stops suppressing.  Bounded to one
+    // re-arm per window, so it is cheap and never an IPI/MMIO storm.  Recovery
+    // (ISR advancing) is detected by the first branch above, which clears the
+    // sticky flag.
     if CPU_TIMER_DEAD[cpu].load(Ordering::Relaxed) {
+        if silent_ticks >= window_ticks
+            && CPU_TIMER_DEAD_REARMS[cpu].load(Ordering::Relaxed) < MAX_FUTILE_REARMS
+        {
+            super::apic::rearm_timer();
+            PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+            CPU_TIMER_DEAD_REARMS[cpu].fetch_add(1, Ordering::Relaxed);
+            CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+        }
+        // Past the cap (host is permanently suppressing injection) we stop
+        // re-arming and rely on the TSC-clocked spin + cross-CPU poke; still
+        // re-anchor occasionally so `silent_ticks` does not overflow the divide.
+        else if silent_ticks >= window_ticks {
+            CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+        }
         return false;
     }
 
-    // Not yet declared dead: how long has the local timer been silent (in
-    // wall-clock ticks)?
-    let silent_ticks = tsc_now.wrapping_sub(seen_tsc) / tsc_per_tick;
     if silent_ticks < window_ticks {
         return true; // within tolerance — not yet considered wedged
     }
 
     // The local LAPIC periodic timer has been silent for > window_ticks while
-    // this CPU is active: declare it wedged (sticky).  Re-arm it once (rewrites
-    // LVT + initial-count — harmless and revives a merely-masked timer) and
-    // report unhealthy so the caller spins rather than hlt-ing into a sleep the
-    // dead timer cannot end.  The sticky flag keeps it false on every subsequent
-    // call until the ISR genuinely advances.
+    // this CPU is active: declare it wedged (sticky).  Re-arm it (full
+    // from-scratch re-program; see `apic::rearm_timer`) and report unhealthy so
+    // the caller spins rather than hlt-ing into a sleep the dead timer cannot
+    // end.  The sticky flag keeps it false on every subsequent call (with a
+    // periodic re-arm retry, above) until the ISR genuinely advances.
     CPU_TIMER_DEAD[cpu].store(true, Ordering::Relaxed);
     super::apic::rearm_timer();
     PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    CPU_TIMER_DEAD_REARMS[cpu].store(1, Ordering::Relaxed);
     CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
     false
 }
