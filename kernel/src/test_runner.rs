@@ -1312,6 +1312,8 @@ pub fn run() -> ! {
         if test_647_percpu_incremental_equiv() { passed += 1; }
         total += 1;
         if test_648_percpu_pick_equivalence() { passed += 1; }
+        total += 1;
+        if test_649_percpu_min_deadline_gate() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49321,7 +49323,8 @@ fn test_648_percpu_pick_equivalence() -> bool {
         // (`tid < 0x1000`), placed on this CPU. The mirror deliberately EXCLUDES
         // idle-class threads (tid >= 0x1000) and includes ctx_rsp_valid==false
         // rows (the skip is re-applied at pick time, not at mirror time). This is
-        // the candidate set `percpu_candidate_indices` derives at runtime; using
+        // the candidate set the live authoritative pick derives at runtime (the
+        // rotated table walk filtered to this CPU's `mirror_slot` members); using
         // it here proves the per-CPU pick == legacy pick over the ACTUAL runqueue
         // contents, not an idealised superset.
         //
@@ -49523,6 +49526,176 @@ fn test_648_percpu_pick_equivalence() -> bool {
     test_println!("  per-CPU pick == legacy pick across 9 scenarios \
 (priority/affinity/aging-crossover/global-force/BSP-reactor-force/ctx-skip/\
 idle-fallback/rotation-sweep/empty) — equivalence proof GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 649: per-rq min_deadline gate == per-candidate force margin ────────
+//
+// Phase 3a adds an O(1) anti-starvation force gate to each per-CPU runqueue:
+// `PerCpuRq::overdue(now)` returns `min_deadline <= now`, where
+// `min_deadline = min over non-idle Ready threads of (ready_since + deadline)`.
+// This must answer the SAME question the picker's per-candidate force scan does
+// — "is at least one thread at/past its force deadline?", i.e.
+// `max over candidates of (wait_age - deadline) >= 0` — so that promoting the
+// gate to O(1) cannot change a single force decision (and therefore cannot
+// regress the #634 anti-starvation guarantees).  This test drives both halves
+// over a battery of synthetic ready-sets and a `now` sweep that straddles every
+// thread's deadline, asserting they agree at every point.
+fn test_649_percpu_min_deadline_gate() -> bool {
+    use crate::proc::{Thread, Tid, ThreadState};
+    use crate::proc::{PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_HIGH};
+    use crate::sched::percpu::PerCpuRq;
+    const NAME: &str = "[SCHED/P2] min_deadline gate == force margin (Test 649)";
+    test_header!(NAME);
+
+    // Build a Ready thread (placed on cpu 0) waiting since `ready_since`.
+    fn mk(tid: Tid, prio: u8, ready_since: u64) -> Thread {
+        let mut t = Thread::new_for_test(prio);
+        t.tid = tid;
+        t.state = ThreadState::Ready;
+        t.cpu_affinity = Some(0);
+        t.last_cpu = 0;
+        t.ready_since_tick = ready_since;
+        t.ctx_rsp_valid = alloc::boxed::Box::new(
+            core::sync::atomic::AtomicBool::new(true));
+        t
+    }
+
+    // Independent reference: the picker's per-candidate force gate as of `now`,
+    // computed straight from the thread set (NOT via the runqueue).  This is the
+    // `max(wait_age - deadline) >= 0` over non-idle Ready candidates the
+    // `select_next_core` force scan evaluates — replicated here so the test does
+    // not depend on the picker's internals beyond the public per-TID deadline.
+    fn force_gate_ref(threads: &[Thread], now: u64) -> bool {
+        let mut max_margin: i64 = i64::MIN;
+        for t in threads {
+            if t.state != ThreadState::Ready || t.tid >= 0x1000 {
+                continue; // idle-class threads never participate in the force gate
+            }
+            let wait_age = now.saturating_sub(t.ready_since_tick);
+            let deadline = crate::sched::force_deadline_for_tid(t.tid) as i64;
+            let margin = wait_age as i64 - deadline;
+            if margin > max_margin { max_margin = margin; }
+        }
+        max_margin >= 0
+    }
+
+    // Build the runqueue gate: enqueue each non-idle Ready thread and set
+    // `min_deadline` exactly as `mirror_maintain` does
+    // (`min(ready_since + per-TID deadline)`), then read `overdue(now)`.
+    fn rq_gate(threads: &[Thread], now: u64) -> bool {
+        let mut rq = PerCpuRq::new_for_test();
+        let mut min_deadline = u64::MAX;
+        for t in threads {
+            if t.state != ThreadState::Ready || t.tid >= 0x1000 {
+                continue;
+            }
+            rq.enqueue(t.tid, t.priority);
+            let abs = t.ready_since_tick
+                .saturating_add(crate::sched::force_deadline_for_tid(t.tid));
+            if abs < min_deadline { min_deadline = abs; }
+        }
+        rq.set_min_deadline(min_deadline);
+        rq.overdue(now)
+    }
+
+    // Drive a thread set across a `now` sweep and assert the two gates agree.
+    fn sweep(scenario: &str, threads: &[Thread], now_lo: u64, now_hi: u64) -> Result<(), alloc::string::String> {
+        let mut now = now_lo;
+        while now <= now_hi {
+            let want = force_gate_ref(threads, now);
+            let got = rq_gate(threads, now);
+            if want != got {
+                return Err(alloc::format!(
+                    "{}: now={} force_gate_ref={} rq.overdue={}", scenario, now, want, got));
+            }
+            now += 1;
+        }
+        Ok(())
+    }
+
+    let bsp = crate::sched::bsp_force_deadline_ticks();        // 8
+    let glob = crate::sched::global_force_deadline_ticks();    // 100
+
+    // Scenario A: empty / no non-idle Ready thread → never overdue.
+    {
+        let threads: [Thread; 0] = [];
+        if let Err(e) = sweep("A-empty", &threads, 0, glob + 10) {
+            test_fail!(NAME, "{}", e); return false;
+        }
+        // Also: a runqueue with no min set must report not-overdue at u64::MAX-now.
+        let rq = PerCpuRq::new_for_test();
+        if rq.overdue(u64::MAX - 1) {
+            test_fail!(NAME, "A: fresh rq (min_deadline=MAX) reported overdue");
+            return false;
+        }
+    }
+
+    // Scenario B: single global-deadline worker — flips exactly at now == ready+100.
+    {
+        let threads = [mk(200, PRIORITY_NORMAL, 0)];
+        if let Err(e) = sweep("B-single-global", &threads, 0, glob + 20) {
+            test_fail!(NAME, "{}", e); return false;
+        }
+        // Pin the boundary explicitly: overdue at exactly `glob`, not at glob-1.
+        if rq_gate(&threads, glob - 1) {
+            test_fail!(NAME, "B: overdue one tick early (now={})", glob - 1); return false;
+        }
+        if !rq_gate(&threads, glob) {
+            test_fail!(NAME, "B: not overdue at deadline (now={})", glob); return false;
+        }
+    }
+
+    // Scenario C: TID 0 (tight BSP deadline 8) + a fresh global worker. The
+    // minimum deadline is TID 0's, so the gate flips at the BSP boundary even
+    // though the worker is nowhere near its 100-tick deadline.
+    {
+        let threads = [mk(0, PRIORITY_IDLE, 0), mk(201, PRIORITY_HIGH, 0)];
+        if let Err(e) = sweep("C-bsp-tight", &threads, 0, glob + 5) {
+            test_fail!(NAME, "{}", e); return false;
+        }
+        if rq_gate(&threads, bsp - 1) {
+            test_fail!(NAME, "C: overdue before BSP deadline (now={})", bsp - 1); return false;
+        }
+        if !rq_gate(&threads, bsp) {
+            test_fail!(NAME, "C: not overdue at BSP deadline (now={})", bsp); return false;
+        }
+    }
+
+    // Scenario D: mixed wait clocks. Two workers readied at different ticks; the
+    // gate must track the EARLIER absolute deadline (the older waiter).
+    {
+        let threads = [mk(202, PRIORITY_NORMAL, 5), mk(203, PRIORITY_NORMAL, 30)];
+        // Earliest abs deadline = 5 + 100 = 105.
+        if let Err(e) = sweep("D-mixed", &threads, 0, 30 + glob + 10) {
+            test_fail!(NAME, "{}", e); return false;
+        }
+        if !rq_gate(&threads, 105) {
+            test_fail!(NAME, "D: not overdue at earliest abs deadline 105"); return false;
+        }
+        if rq_gate(&threads, 104) {
+            test_fail!(NAME, "D: overdue before earliest abs deadline (now=104)"); return false;
+        }
+    }
+
+    // Scenario E: TID 0 readied LATE vs a worker readied early — proves the gate
+    // is the minimum of ABSOLUTE deadlines, not a per-TID-deadline race. TID 0
+    // readied at 200 has abs deadline 208; worker readied at 0 has abs 100, so
+    // the worker's is earlier and governs the flip.
+    {
+        let threads = [mk(0, PRIORITY_IDLE, 200), mk(204, PRIORITY_NORMAL, 0)];
+        if let Err(e) = sweep("E-late-tid0", &threads, 0, 200 + bsp + 10) {
+            test_fail!(NAME, "{}", e); return false;
+        }
+        if !rq_gate(&threads, 100) {
+            test_fail!(NAME, "E: not overdue at worker abs deadline 100"); return false;
+        }
+    }
+
+    test_println!("  PerCpuRq::overdue(now) == per-candidate force gate \
+(max(wait_age-deadline)>=0) across A-empty/B-single/C-bsp-tight/D-mixed/E-late-tid0 \
+with full now-sweep — min_deadline refinement is force-decision-preserving GREEN");
     test_pass!(NAME);
     true
 }

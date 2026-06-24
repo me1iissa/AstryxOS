@@ -76,6 +76,34 @@ pub struct PerCpuRq {
     /// Cached count of queued thread IDs across all levels — the sum of
     /// `lists[p].len()`.  Maintained incrementally by enqueue/dequeue.
     nr_running: u32,
+    /// The earliest absolute anti-starvation force-deadline among the non-idle
+    /// Ready threads on this runqueue, in 100 Hz ticks, or `u64::MAX` when none.
+    ///
+    /// For each queued non-idle thread the absolute deadline is
+    /// `ready_since_tick + (TID 0 ? STARVE_FORCE_TICKS_BSP : STARVE_FORCE_TICKS)`;
+    /// `min_deadline` is the minimum over the runqueue.  It is the O(1)
+    /// force-gate: `min_deadline <= now` is true **iff at least one thread on
+    /// this runqueue is at or past its force deadline** (i.e. iff the picker's
+    /// per-candidate `max(wait_age - deadline) >= 0`).  See
+    /// [`overdue`](PerCpuRq::overdue).  The picker still scans the candidates to
+    /// NAME the most-overdue thread (that scan is already part of its scoring
+    /// pass); this scalar lets a caller cheaply answer "is anyone overdue?"
+    /// without re-deriving per-candidate margins.  Recomputed each maintenance
+    /// pass by [`set_min_deadline`](PerCpuRq::set_min_deadline) (it depends on
+    /// `now`-relative wait clocks, which advance even when membership does not).
+    ///
+    /// # Staging
+    ///
+    /// As of Phase 3a this scalar is maintained and PROVEN equivalent to the
+    /// picker's per-candidate force gate (Test 649) but has no production
+    /// consumer yet — the live force DECISION still flows through
+    /// `select_next_core`'s per-candidate margin scan (which also NAMES the
+    /// most-overdue thread, something a single scalar cannot do).  `overdue` is
+    /// the O(1) "is anyone on this rq past their deadline?" primitive the
+    /// Phase 3d load balancer will use to decide, without a full scan, whether a
+    /// remote runqueue holds a steal-worthy overdue task; it does not (and in
+    /// 3a must not) change any scheduling decision.
+    min_deadline: u64,
 }
 
 impl PerCpuRq {
@@ -88,6 +116,7 @@ impl PerCpuRq {
             lists: [EMPTY; NPRIO],
             bitmap: 0,
             nr_running: 0,
+            min_deadline: u64::MAX,
         }
     }
 
@@ -111,6 +140,36 @@ impl PerCpuRq {
         self.bitmap
     }
 
+    /// Set the cached earliest force-deadline for this runqueue (the minimum,
+    /// over its non-idle Ready threads, of `ready_since_tick + deadline`), or
+    /// `u64::MAX` when there is no non-idle Ready thread.  Called once per
+    /// maintenance pass by the caller that holds the table (it has the
+    /// per-thread wait clocks and per-TID deadlines needed to compute it).
+    #[inline]
+    pub fn set_min_deadline(&mut self, d: u64) {
+        self.min_deadline = d;
+    }
+
+    /// The cached earliest force-deadline (see [`min_deadline`](Self::min_deadline)).
+    #[inline]
+    pub fn min_deadline(&self) -> u64 {
+        self.min_deadline
+    }
+
+    /// O(1) anti-starvation force-gate: is any non-idle Ready thread on this
+    /// runqueue at or past its force deadline as of tick `now`?
+    ///
+    /// Equivalent to the picker's per-candidate test
+    /// `max over candidates of (wait_age - deadline) >= 0`, because
+    /// `min_deadline = min(ready_since + deadline)` and
+    /// `wait_age - deadline = now - (ready_since + deadline)`, so the maximum
+    /// margin is non-negative exactly when the minimum absolute deadline has
+    /// been reached: `min_deadline <= now`.  Test 649 proves this equivalence.
+    #[inline]
+    pub fn overdue(&self, now: u64) -> bool {
+        self.min_deadline <= now
+    }
+
     /// Reset to empty.  Used by the phase-1 mirror rebuild before it re-derives
     /// the queue from the authoritative table; also the natural "clear" for
     /// tests.
@@ -120,6 +179,7 @@ impl PerCpuRq {
         }
         self.bitmap = 0;
         self.nr_running = 0;
+        self.min_deadline = u64::MAX;
     }
 
     /// Enqueue `tid` at priority level `prio` (FIFO tail — round-robin among
@@ -365,30 +425,6 @@ pub fn rq_nr_running(cpu: usize) -> u32 {
     RQS[cpu].lock().nr_running()
 }
 
-/// Snapshot every Tid queued on CPU `cpu`'s runqueue, in bitmap order (highest
-/// priority level first, FIFO within a level).  Used by the phase-2b per-CPU
-/// pick to build its candidate set; the caller re-imposes the picker's rotation
-/// order on the result, so the per-level order here is not load-bearing for the
-/// selection (only membership is).  Takes the single `RQS[cpu]` leaf lock.
-#[cfg(feature = "sched-pick-xcheck")]
-pub fn rq_snapshot_tids(cpu: usize) -> alloc::vec::Vec<Tid> {
-    if cpu >= MAX_CPUS {
-        return alloc::vec::Vec::new();
-    }
-    let g = RQS[cpu].lock();
-    let mut out = alloc::vec::Vec::with_capacity(g.nr_running() as usize);
-    // Highest priority level first (mirrors `highest()`'s bitmap walk).
-    let mut bm = g.bitmap;
-    while bm != 0 {
-        let p = 31 - bm.leading_zeros() as usize;
-        for &tid in g.lists[p].iter() {
-            out.push(tid);
-        }
-        bm &= !(1u32 << p);
-    }
-    out
-}
-
 /// Decide which CPU's runqueue a Ready thread is mirrored onto.
 ///
 /// Phase-1 placement policy (mirror only): a thread is mirrored onto the CPU it
@@ -581,6 +617,30 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
             }
         }
         t.mirror_slot = want;
+    }
+
+    // ── Per-rq earliest force-deadline (O(1) starvation gate) ────────────────
+    // Recompute each pass: a thread's absolute deadline (`ready_since + per-TID
+    // deadline`) is fixed once it becomes Ready, but membership and wait clocks
+    // change between passes, so the per-rq minimum is re-derived from the live
+    // ready-set here (one extra walk, same lock window).  `min_deadline = MAX`
+    // means "no non-idle Ready thread" → `overdue(now)` is always false.  This
+    // mirrors `desired_slot`'s placement so the scalar and the queued set agree.
+    let mut mins: [u64; MAX_CPUS] = [u64::MAX; MAX_CPUS];
+    for t in threads.iter() {
+        if let Some((cpu, _prio)) = desired_slot(t) {
+            let deadline = super::force_deadline_for_tid(t.tid);
+            let abs = t.ready_since_tick.saturating_add(deadline);
+            let c = cpu as usize;
+            if abs < mins[c] {
+                mins[c] = abs;
+            }
+        }
+    }
+    for cpu in 0..MAX_CPUS {
+        if let Some(g) = guards[cpu].as_mut() {
+            g.set_min_deadline(mins[cpu]);
+        }
     }
 
     // ── Gated audit ──────────────────────────────────────────────────────────
