@@ -425,15 +425,19 @@ pub fn rq_nr_running(cpu: usize) -> u32 {
     RQS[cpu].lock().nr_running()
 }
 
-/// Decide which CPU's runqueue a Ready thread is mirrored onto.
+/// Decide which CPU's runqueue a Ready thread is mirrored onto — the
+/// DETERMINISTIC placement read from the thread's stored fields.
 ///
-/// Phase-1 placement policy (mirror only): a thread is mirrored onto the CPU it
-/// would run on under the *current* picker's affinity preference — its
-/// `cpu_affinity` pin if set, else the CPU it last ran on (`last_cpu`).  This
-/// keeps the mirror's membership aligned with where the authoritative picker
-/// would place the thread, so the membership cross-check is meaningful.  The
-/// real wakeup-target selection (`select_task_rq`-equivalent, with
-/// least-loaded fallback) arrives in phase 3.
+/// A pinned thread (`cpu_affinity = Some(a)`) is always placed on its pinned
+/// CPU; an unpinned thread is placed on the CPU it last ran on (`last_cpu`).
+/// This is a pure function of stored state, so the per-CPU runqueue placement is
+/// stable across maintenance passes (it does NOT recompute a load-aware target
+/// each pass, which would thrash a thread between runqueues as load fluctuates).
+///
+/// The LOAD-AWARE wakeup-target choice (`select_task_rq`-equivalent) is made
+/// once, at the moment a thread enters the runnable set (its wake edge), by
+/// [`select_wake_target`]; the result is baked into `last_cpu` so that this
+/// deterministic placement then follows it.  See [`mirror_maintain`].
 #[inline]
 fn target_cpu_for(affinity: Option<u8>, last_cpu: u8) -> usize {
     let c = match affinity {
@@ -441,6 +445,87 @@ fn target_cpu_for(affinity: Option<u8>, last_cpu: u8) -> usize {
         None => last_cpu as usize,
     };
     if c < MAX_CPUS { c } else { 0 }
+}
+
+/// A runqueue at or above this `nr_running` is considered "overloaded" for the
+/// purpose of the cache-warm wakeup heuristic: a waking thread prefers its
+/// cache-warm `last_cpu`, but only while that CPU is not already this deep, in
+/// which case it falls back to the least-loaded runqueue.  One in-flight task
+/// plus one waking task is fine (depth 1 is not overloaded); the threshold
+/// trips when the cache-warm CPU already has a backlog the waker would queue
+/// behind.
+const RQ_OVERLOAD_THRESHOLD: u32 = 2;
+
+/// Pure wakeup-target decision (`select_task_rq`-equivalent), parameterised by a
+/// runqueue-load reader so it can run either over the live `RQS` locks (external
+/// callers) or over guards already held (the `mirror_maintain` wake edge,
+/// which must not re-lock the leaf spinlock).  `ncpus` is the number of online
+/// CPUs.  Decision order:
+///
+///   1. **Hard affinity pin** — if `affinity = Some(a)` the thread MUST run on
+///      CPU `a` (a pin is a correctness constraint, not a hint); return it.
+///   2. **Cache-warm `last_cpu`** — if that CPU's runqueue is not overloaded
+///      (`load < RQ_OVERLOAD_THRESHOLD`), keep the thread there to reuse its
+///      warm cache footprint.
+///   3. **Least-loaded runqueue** — otherwise spread the load: the CPU with the
+///      smallest load, ties broken toward the warm CPU (then the lowest index)
+///      so a tie never forces a gratuitous migration.
+///
+/// On a uniprocessor (`ncpus <= 1`) every candidate resolves to CPU 0.
+#[inline]
+fn wake_target_with_loads(
+    affinity: Option<u8>,
+    last_cpu: u8,
+    ncpus: usize,
+    load: impl Fn(usize) -> u32,
+) -> u8 {
+    // 1. Hard pin wins unconditionally.
+    if let Some(a) = affinity {
+        return if (a as usize) < MAX_CPUS { a } else { 0 };
+    }
+    if ncpus <= 1 {
+        return 0; // uniprocessor: only CPU 0 exists
+    }
+    let warm = (last_cpu as usize).min(ncpus - 1);
+    // 2. Cache-warm CPU if not overloaded.
+    let warm_load = load(warm);
+    if warm_load < RQ_OVERLOAD_THRESHOLD {
+        return warm as u8;
+    }
+    // 3. Least-loaded runqueue (prefer the warm CPU on a tie → no needless move).
+    let mut best_cpu = warm;
+    let mut best_load = warm_load;
+    for cpu in 0..ncpus {
+        let l = load(cpu);
+        if l < best_load {
+            best_load = l;
+            best_cpu = cpu;
+        }
+    }
+    best_cpu as u8
+}
+
+/// Choose the CPU a waking thread should be enqueued on
+/// (`select_task_rq`-equivalent) by reading the LIVE runqueue loads.
+///
+/// O(MAX_CPUS) and allocation-free; it briefly takes each runqueue's leaf lock
+/// to read `nr_running` (ascending index order, the documented order — and the
+/// caller must therefore NOT already hold any `RQS` lock).  On a uniprocessor
+/// (`cpu_count() == 1`) this returns 0, so the wakeup target is a no-op and
+/// SMP=1 is unchanged.  See [`wake_target_with_loads`] for the decision logic.
+pub fn select_wake_target(affinity: Option<u8>, last_cpu: u8) -> u8 {
+    let ncpus = crate::arch::x86_64::apic::cpu_count().min(MAX_CPUS as u32) as usize;
+    wake_target_with_loads(affinity, last_cpu, ncpus, |cpu| RQS[cpu].lock().nr_running())
+}
+
+/// Test-facing replica of the wakeup-target decision over caller-supplied loads
+/// (Test 650), so the >1-CPU routing can be proven without spinning real
+/// threads or touching the live `RQS`.  Identical logic to the live paths.
+#[doc(hidden)]
+pub fn test_wake_target(affinity: Option<u8>, last_cpu: u8, loads: &[u32]) -> u8 {
+    wake_target_with_loads(affinity, last_cpu, loads.len(), |cpu| {
+        loads.get(cpu).copied().unwrap_or(0)
+    })
 }
 
 /// True iff `t` belongs to the mirrored non-idle runnable pool: a `Ready`
@@ -593,11 +678,45 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
         guards[cpu] = Some(RQS[cpu].lock());
     }
 
-    // ── O(Δ) incremental delta ───────────────────────────────────────────────
+    // Number of online CPUs, computed once for this pass (drives the wakeup
+    // target spread below).  `cpu_count()==1` ⇒ every target is CPU 0.
+    let ncpus = crate::arch::x86_64::apic::cpu_count().min(MAX_CPUS as u32) as usize;
+
+    // ── O(Δ) incremental delta + wakeup-target selection ─────────────────────
     // For each thread, reconcile its recorded slot with its desired slot.  A
     // thread whose membership is unchanged (same cpu+prio, or still absent)
     // performs no queue mutation.
+    //
+    // WAKEUP TARGET (Perf P2 phase 3b): the moment a thread ENTERS the
+    // mirrored-runnable set — its `mirror_slot` was `None` and it is now a Ready
+    // non-idle thread — is the wake edge as the scheduler observes it (covering
+    // every Blocked/New→Ready wake site without instrumenting each one
+    // individually, the same centralisation `ready_since_tick` stamping uses).
+    // At that edge, for an UNPINNED thread, choose the load-aware target CPU
+    // (`select_task_rq`-equivalent) and bake it into `last_cpu` so the
+    // deterministic `desired_slot` placement then follows it.  A pinned thread's
+    // target is its pin, handled by `desired_slot`/`target_cpu_for` directly.
+    // The load read uses the guards already held (re-locking `RQS` here would
+    // deadlock the leaf spinlock), so the spread sees this pass's live counts.
     for t in threads.iter_mut() {
+        // Wake-edge target assignment (before computing `want`, which reads
+        // `last_cpu`).  Only on the None→runnable transition, only for unpinned
+        // threads, and only when there is more than one CPU to spread across.
+        if ncpus > 1
+            && t.mirror_slot.is_none()
+            && t.cpu_affinity.is_none()
+            && is_mirrored_runnable(t)
+        {
+            // Read loads from the guards already held (re-locking RQS here would
+            // deadlock the leaf spinlock); shares the decision with the live and
+            // test paths via `wake_target_with_loads`.
+            let target = wake_target_with_loads(
+                t.cpu_affinity, t.last_cpu, ncpus,
+                |cpu| guards[cpu].as_ref().map_or(0, |g| g.nr_running()),
+            );
+            t.last_cpu = target;
+        }
+
         let have = t.mirror_slot;
         let want = desired_slot(t);
         if have == want {
