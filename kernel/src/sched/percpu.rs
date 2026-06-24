@@ -120,6 +120,15 @@ impl PerCpuRq {
         }
     }
 
+    /// Byte size of a full `[PerCpuRq; MAX_CPUS]` audit image.  Exposed for the
+    /// regression test that guards the kstack-overflow invariant: this image
+    /// must never be placed on the kernel stack, because it dwarfs the smallest
+    /// emergency kstack tiers (`proc::alloc_kernel_stack`'s 4/8/16 KiB
+    /// PMM-fragmented fallbacks).  See `mirror_maintain`'s gated-audit block.
+    pub const fn audit_image_bytes() -> usize {
+        core::mem::size_of::<PerCpuRq>() * MAX_CPUS
+    }
+
     /// Public constructor for the test suite, which exercises the runqueue API
     /// directly (deterministic, no thread spinning).  Identical to the internal
     /// `new()` — exposed only so `test_runner` can build a standalone instance
@@ -768,7 +777,45 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
     // runqueues.  An independent derivation (not folded into the delta above) is
     // what makes this a genuine cross-check rather than a self-confirming tally.
     if audit_due {
-        let mut audit: [PerCpuRq; MAX_CPUS] = core::array::from_fn(|_| PerCpuRq::new());
+        // Heap-allocate the throwaway audit image rather than placing it on the
+        // stack.  `[PerCpuRq; MAX_CPUS]` is ~16 KiB (each `PerCpuRq` carries a
+        // 32-entry FIFO array); a stack allocation of that size overflows the
+        // tier-4 emergency kernel stack (16 KiB, `proc::alloc_kernel_stack`'s
+        // PMM-fragmented fallback) on which `schedule()` — and therefore this
+        // maintainer — runs for threads that could not get a full-size stack.
+        // The overflow scribbles the running thread's saved `switch_context`
+        // frame (the `&RQS[i]` guard pointers and bucket bytes land on it),
+        // tearing the saved RFLAGS slot so the next resume's `popf` loads a
+        // torn value (observed: TF=1 → single-step → `#DB` →
+        // UNEXPECTED_KERNEL_MODE_TRAP).  This audit is a behaviour-preserving
+        // diagnostic (it never changes a scheduling decision), so the rare
+        // (every `AUDIT_EVERY_PASSES`th pass) heap allocation is the correct
+        // trade: keep the large transient OFF the kernel stack entirely.
+        //
+        // Compile-time guard at the allocation site: this image dwarfs the
+        // largest emergency kstack tier, so a stack allocation is never safe.
+        // If a future refactor shrinks `PerCpuRq` enough that the array would
+        // fit an emergency stack, this assert keeps firing the "must stay off
+        // the stack" rationale rather than letting someone silently
+        // re-introduce a `[PerCpuRq; MAX_CPUS]` local (the exact regression).
+        const _: () = assert!(
+            PerCpuRq::audit_image_bytes() > 16 * 1024,
+            "audit image must exceed the largest emergency kstack tier — keep it heap-allocated",
+        );
+        // Allocation note: this `Vec` allocation runs inside the
+        // all-`RQS`-held / `THREAD_TABLE`-held / IF=0 region of `schedule()`.
+        // The heap lock is a strict leaf below those (lock order
+        // THREAD_TABLE → RQS[cpu] → HEAP; see the static `RQS` doc), so there
+        // is no deadlock, and `HeapIrqGuard` keeps interrupts masked across the
+        // allocator critical section so no timer ISR re-enters the
+        // non-reentrant allocator.  The first-fit free-list walk is the only
+        // latency cost; it is bounded in frequency to one pass in
+        // `AUDIT_EVERY_PASSES`.  Should a future phase run this audit hotter,
+        // pre-size or pool this image instead of allocating per pass.
+        let mut audit: alloc::vec::Vec<PerCpuRq> = alloc::vec::Vec::with_capacity(MAX_CPUS);
+        for _ in 0..MAX_CPUS {
+            audit.push(PerCpuRq::new());
+        }
         for t in threads.iter() {
             if let Some((cpu, prio)) = desired_slot(t) {
                 audit[cpu as usize].enqueue(t.tid, prio);

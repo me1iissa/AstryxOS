@@ -1316,6 +1316,8 @@ pub fn run() -> ! {
         if test_649_percpu_min_deadline_gate() { passed += 1; }
         total += 1;
         if test_650_percpu_wake_target() { passed += 1; }
+        total += 1;
+        if test_652_percpu_audit_image_off_stack() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49816,6 +49818,68 @@ fn test_650_percpu_wake_target() -> bool {
     test_println!("  select_task_rq-equiv routing: hard-pin / warm-last_cpu / \
 least-loaded-fallback / warm-tie-keep / strict-min-migrate / uniproc-collapse / \
 last_cpu-clamp — >1-CPU target logic correct (closes the Phase 2b coverage nit) GREEN");
+    test_pass!(NAME);
+    true
+}
+
+/// Test 652: the per-CPU runqueue audit image must never be stack-allocated.
+///
+/// Regression guard for the deterministic SMP=1 windowed-Firefox
+/// `UNEXPECTED_KERNEL_MODE_TRAP` (`#DB` at `switch_context_asm`'s `popf`):
+/// `mirror_maintain`'s gated cross-check built a throwaway
+/// `[PerCpuRq; MAX_CPUS]` ON THE STACK.  A `PerCpuRq` carries a 32-level FIFO
+/// array, so the full image is ~16 KiB — larger than every emergency kstack
+/// tier (`proc::alloc_kernel_stack`'s 4 / 8 / 16 KiB PMM-fragmented
+/// fallbacks).  When `schedule()` ran on such a stack the audit array
+/// overflowed it and overwrote the running thread's saved `switch_context`
+/// frame, tearing the saved RFLAGS slot (observed TF=1 → single-step → `#DB`).
+///
+/// The fix moved the audit image to the heap.  This test pins the invariant
+/// that motivated it: the image is larger than the largest emergency tier, so
+/// any future refactor that re-introduces a stack allocation of it is a
+/// stack-overflow hazard and must be rejected.  Cite Intel SDM Vol. 3B
+/// §17.3.1.1 (single-step `#DB` after a retired instruction with RFLAGS.TF
+/// set) and Vol. 3A §6.14 (interrupt/exception stack switch).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_652_percpu_audit_image_off_stack() -> bool {
+    use crate::sched::percpu::PerCpuRq;
+    const NAME: &str = "[SCHED/P2] per-CPU audit image off-stack (Test 652)";
+    test_header!(NAME);
+
+    // The largest emergency kstack tier is 16 KiB (tier 4 in
+    // `proc::alloc_kernel_stack::SMALL_KSTACK_TIERS`).  The audit image must
+    // exceed it — i.e. it cannot safely coexist with the rest of the
+    // schedule() frame on any emergency stack, which is exactly why it has to
+    // live on the heap.
+    const LARGEST_EMERGENCY_KSTACK: usize = 16 * 1024;
+    let img = PerCpuRq::audit_image_bytes();
+
+    test_println!(
+        "  audit_image_bytes={} sizeof(PerCpuRq)={} largest_emergency_kstack={}",
+        img, core::mem::size_of::<PerCpuRq>(), LARGEST_EMERGENCY_KSTACK
+    );
+
+    if img <= LARGEST_EMERGENCY_KSTACK {
+        // If this ever fails it means PerCpuRq shrank enough that the image fits
+        // an emergency stack.  That would weaken (not invalidate) the rationale;
+        // the audit must STILL be heap-allocated, so flag for a human to
+        // re-justify rather than silently passing.
+        test_fail!(NAME,
+            "audit image {} bytes no longer exceeds the 16 KiB emergency tier — \
+             re-justify the heap allocation in mirror_maintain", img);
+        return false;
+    }
+
+    // Sanity: a single PerCpuRq is itself non-trivial (it carries the 32-FIFO
+    // array), so the MAX_CPUS multiple is genuinely large.
+    if core::mem::size_of::<PerCpuRq>() < 256 {
+        test_fail!(NAME, "sizeof(PerCpuRq)={} unexpectedly small",
+            core::mem::size_of::<PerCpuRq>());
+        return false;
+    }
+
+    test_println!("  [PerCpuRq; MAX_CPUS] audit image dwarfs the emergency kstack \
+tier → must stay heap-allocated (closes the switch_context popf #DB) GREEN");
     test_pass!(NAME);
     true
 }
