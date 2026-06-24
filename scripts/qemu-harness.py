@@ -930,6 +930,29 @@ def _pid_alive(pid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
 
+def _pid_running(pid: int) -> bool:
+    """Like `_pid_alive` but treats a defunct/zombie process as NOT running.
+
+    `os.kill(pid, 0)` succeeds for a zombie (the entry survives in the process
+    table until its parent reaps it), so `_pid_alive` reports a QEMU that exited
+    via isa-debug-exit — e.g. on a mid-suite bugcheck — as still alive. A waiter
+    keyed on `_pid_alive` (the `ci-run` suite loop) would then spin out its full
+    timeout instead of noticing QEMU is gone. Reading `/proc/<pid>/stat` field 3
+    (the state char) and rejecting `Z` closes that hole; on any read error we
+    fall back to `_pid_alive` so non-Linux / restricted hosts behave as before.
+    """
+    if not _pid_alive(pid):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            # Field layout: "<pid> (<comm>) <state> ...". comm may contain
+            # spaces/parens, so split on the LAST ')' to find the state char.
+            data = fh.read()
+        state = data[data.rfind(")") + 1:].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        return True
+
 def _emit_event(sid: str, event: dict):
     event["ts"] = time.time()
     with _events_path(sid).open("a") as f:
@@ -2583,7 +2606,11 @@ def cmd_ci_run(args):
             pass
         if suite_found:
             break
-        if pid and not _pid_alive(pid):
+        # `_pid_running` (not `_pid_alive`) so a QEMU that exited via
+        # isa-debug-exit — e.g. a mid-suite bugcheck — is noticed promptly even
+        # while it lingers as a <defunct> zombie awaiting reap, instead of
+        # spinning out the full --timeout-ms.
+        if pid and not _pid_running(pid):
             # QEMU exited — do a final drain
             try:
                 with Path(serial_log).open("r", errors="replace") as fh:

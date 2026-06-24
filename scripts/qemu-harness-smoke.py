@@ -800,6 +800,57 @@ def run_read_ff_png_check():
     print()
 
 
+def run_pid_running_zombie_check():
+    """
+    Tier 1.5 host-only check: `_pid_running` treats a <defunct> zombie as dead.
+
+    `_pid_alive` (os.kill(pid,0)) reports a zombie as alive — the entry survives
+    in the process table until reaped — which made `ci-run`'s suite-wait loop
+    spin its full timeout after a mid-suite bugcheck exited QEMU. `_pid_running`
+    reads /proc/<pid>/stat field 3 and rejects state 'Z'. Fork a real zombie and
+    assert the two helpers disagree exactly there. No QEMU launched.
+    """
+    print("=== Tier 1.5: _pid_running zombie detection (host-only) ===")
+    print()
+    import importlib.util, os, time
+
+    spec = importlib.util.spec_from_file_location("_h_mod", str(HARNESS))
+    mod = importlib.util.module_from_spec(spec)
+    _argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.argv = _argv
+
+    pr = getattr(mod, "_pid_running", None)
+    al = getattr(mod, "_pid_alive", None)
+    check("_pid_running importable", pr is not None)
+    check("_pid_alive importable", al is not None)
+    if pr is None or al is None:
+        print(); return
+
+    # Live self: both True.
+    check("_pid_running(self)=True", pr(os.getpid()) is True, "")
+    # Bogus pid: both False.
+    check("_pid_running(bogus)=False", pr(2 ** 22) is False, "")
+
+    # Real zombie: fork a child that exits, do NOT reap → <defunct>.
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    try:
+        time.sleep(0.3)  # let it become a zombie
+        check("_pid_alive(zombie)=True (existing semantics)", al(pid) is True, "")
+        check("_pid_running(zombie)=False (the fix)", pr(pid) is False, "")
+    finally:
+        try:
+            os.waitpid(pid, 0)  # reap
+        except ChildProcessError:
+            pass
+    print()
+
+
 def run_read_png_disabled_check():
     """
     Tier 1.5 host-only check: `read-png` fails fast + clean when Test 198's
@@ -1407,6 +1458,7 @@ def main():
     run_snapgate_argv_check()
     run_read_ff_png_check()
     run_read_png_disabled_check()
+    run_pid_running_zombie_check()
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
     run_livelock_reap_check()
