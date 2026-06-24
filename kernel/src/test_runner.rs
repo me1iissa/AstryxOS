@@ -1314,6 +1314,8 @@ pub fn run() -> ! {
         if test_648_percpu_pick_equivalence() { passed += 1; }
         total += 1;
         if test_649_percpu_min_deadline_gate() { passed += 1; }
+        total += 1;
+        if test_650_percpu_wake_target() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49696,6 +49698,124 @@ fn test_649_percpu_min_deadline_gate() -> bool {
     test_println!("  PerCpuRq::overdue(now) == per-candidate force gate \
 (max(wait_age-deadline)>=0) across A-empty/B-single/C-bsp-tight/D-mixed/E-late-tid0 \
 with full now-sweep — min_deadline refinement is force-decision-preserving GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 650: wakeup-target selection (select_task_rq-equivalent) ───────────
+//
+// Phase 3b adds load-aware wakeup-target routing for the >1-CPU case — the gap
+// the Phase 2b reviewer flagged: Test 648 modelled per-CPU membership as
+// affinity-ELIGIBILITY, which only coincided with the real target
+// (`affinity` else `last_cpu`) because `last_cpu ≡ 0` on SMP=1.  This test
+// exercises `percpu::test_wake_target` (the exact replica of the live decision,
+// over caller-supplied runqueue loads) for the multi-CPU routing the live path
+// takes, proving the three-tier order: hard pin → cache-warm last_cpu (unless
+// overloaded) → least-loaded fallback.
+fn test_650_percpu_wake_target() -> bool {
+    use crate::sched::percpu::test_wake_target as wt;
+    const NAME: &str = "[SCHED/P2] wakeup-target select_task_rq-equiv (Test 650)";
+    test_header!(NAME);
+
+    // Tier 1 — hard affinity pin wins regardless of load. A thread pinned to
+    // cpu 3 routes to cpu 3 even though cpu 3 is the busiest runqueue.
+    {
+        let loads = [0u32, 0, 0, 9];
+        let got = wt(Some(3), 0, &loads);
+        if got != 3 {
+            test_fail!(NAME, "tier1 pin: got cpu {} expected 3 (hard pin overrides load)", got);
+            return false;
+        }
+    }
+
+    // Tier 2 — cache-warm last_cpu kept while not overloaded (load < 2). last_cpu
+    // = 2 with load 1 → stays on 2 even though cpu 0 is emptier (warmth wins
+    // below the overload threshold, avoiding a needless migration).
+    {
+        let loads = [0u32, 5, 1, 5];
+        let got = wt(None, 2, &loads);
+        if got != 2 {
+            test_fail!(NAME, "tier2 warm: got cpu {} expected 2 (warm cpu not overloaded)", got);
+            return false;
+        }
+    }
+
+    // Tier 2/3 boundary — the warm cpu sitting at EXACTLY RQ_OVERLOAD_THRESHOLD
+    // (2) is "overloaded" (the test is `load < THRESHOLD`, strict), so it falls
+    // through to tier 3 and migrates to the strictly-emptier cpu 0. The
+    // one-below case (load 1) is the tier-2 keep above; this pins the `<` vs
+    // `<=` choice so the threshold semantics cannot silently drift.
+    {
+        let loads = [0u32, 5, 2, 5]; // warm cpu 2 at exactly the threshold
+        let got = wt(None, 2, &loads);
+        if got != 0 {
+            test_fail!(NAME, "boundary: warm at threshold got cpu {} expected 0 (migrate, not keep)", got);
+            return false;
+        }
+    }
+
+    // Tier 3 — warm cpu overloaded (load >= 2) → fall back to least-loaded. warm
+    // = cpu 1 (load 4) is overloaded; cpu 3 has the smallest load (0) → route there.
+    {
+        let loads = [3u32, 4, 2, 0];
+        let got = wt(None, 1, &loads);
+        if got != 3 {
+            test_fail!(NAME, "tier3 spread: got cpu {} expected 3 (least-loaded)", got);
+            return false;
+        }
+    }
+
+    // Tier 3 tie-break — when the warm cpu is overloaded AND is itself one of the
+    // minima after the scan, prefer it over an equal-load lower-index peer (no
+    // gratuitous migration). warm = cpu 2 (load 2, overloaded); cpus 2 and 3 tie
+    // at the minimum 2, but cpu 0 has load 2 as well — the warm cpu 2 is kept.
+    {
+        let loads = [2u32, 5, 2, 2];
+        let got = wt(None, 2, &loads);
+        if got != 2 {
+            test_fail!(NAME, "tier3 tie: got cpu {} expected 2 (warm kept on tie)", got);
+            return false;
+        }
+    }
+
+    // Tier 3 strict minimum below the warm cpu — warm cpu 3 overloaded (load 4),
+    // a strictly-smaller load exists at cpu 1 (load 1) → migrate to cpu 1.
+    {
+        let loads = [3u32, 1, 5, 4];
+        let got = wt(None, 3, &loads);
+        if got != 1 {
+            test_fail!(NAME, "tier3 strict-min: got cpu {} expected 1", got);
+            return false;
+        }
+    }
+
+    // Uniprocessor — a single CPU collapses every choice to cpu 0 (SMP=1
+    // no-op invariant: the wakeup target never changes placement on one CPU).
+    {
+        let loads = [7u32]; // ncpus == 1, even a "busy" sole CPU
+        if wt(None, 0, &loads) != 0 {
+            test_fail!(NAME, "uniproc: unpinned routed off cpu 0");
+            return false;
+        }
+        if wt(Some(0), 0, &loads) != 0 {
+            test_fail!(NAME, "uniproc: pinned routed off cpu 0");
+            return false;
+        }
+    }
+
+    // last_cpu out of range is clamped to the top CPU, not an OOB index.
+    {
+        let loads = [0u32, 0]; // 2 CPUs
+        let got = wt(None, 9, &loads); // last_cpu 9 → clamp to cpu 1
+        if got != 1 {
+            test_fail!(NAME, "clamp: got cpu {} expected 1 (last_cpu clamped to top)", got);
+            return false;
+        }
+    }
+
+    test_println!("  select_task_rq-equiv routing: hard-pin / warm-last_cpu / \
+least-loaded-fallback / warm-tie-keep / strict-min-migrate / uniproc-collapse / \
+last_cpu-clamp — >1-CPU target logic correct (closes the Phase 2b coverage nit) GREEN");
     test_pass!(NAME);
     true
 }
