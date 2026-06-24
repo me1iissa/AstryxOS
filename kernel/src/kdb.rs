@@ -2288,6 +2288,32 @@ fn op_fd_map(req: &str, out: &mut String) {
                         }
                     }
                 }
+
+                // Live socket readiness — the dispositive fields for the
+                // "poll(2) returns 0 while an fd is data/HUP-pending" check.
+                // `avail` is the raw bytes buffered in the AF_UNIX recv ring;
+                // `revents` is exactly what poll_revents(2) reports to the
+                // poller (POLLIN=0x1 POLLOUT=0x4 POLLHUP=0x10 POLLRDHUP=0x2000).
+                // A nonzero `avail` (or a HUP predicate) with revents==0 is a
+                // dropped readiness edge (kernel bug); a zero `avail` with
+                // revents==0 is a genuinely empty fd (userspace wall).
+                let uid = snap.inode;
+                let has_d  = crate::net::unix::has_data(uid);
+                let has_p  = crate::net::unix::has_pending(uid);
+                let avail  = crate::net::unix::bytes_available(uid);
+                let rdhup  = crate::net::unix::read_shutdown(uid);
+                let hup    = crate::net::unix::fully_hung_up(uid);
+                let wr     = crate::net::unix::writable(uid);
+                j_kv(out, "avail",       &alloc::format!("{}", avail));
+                j_kv_str(out, "has_data",    if has_d { "true" } else { "false" });
+                j_kv_str(out, "has_pending", if has_p { "true" } else { "false" });
+                j_kv_str(out, "rdhup",       if rdhup { "true" } else { "false" });
+                j_kv_str(out, "hup",         if hup   { "true" } else { "false" });
+                j_kv_str(out, "writable",    if wr    { "true" } else { "false" });
+                // The single authoritative figure: what poll(2) actually sees.
+                // Emit as a quoted hex string — bare 0x.. is not valid JSON.
+                let pr = crate::syscall::poll_revents(snap.pid, snap.fd, 0x0001 | 0x0004 | 0x2000);
+                j_kv_str(out, "revents", &alloc::format!("{:#x}", pr));
             }
             crate::vfs::FileType::EventFd => {
                 // GLib GWakeup source.  Report the live readiness so the
