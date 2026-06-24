@@ -7014,6 +7014,9 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
+              # cpu-state: per-CPU scheduler/timer survey + TID-0 reactor
+              # placement.  Diagnoses SMP "de-facto single core" imbalance.
+              "cpu-state",
               "coverage-flush", "proc-metrics",
               "futex-stats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
@@ -12958,6 +12961,11 @@ def main():
         "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
+        # cpu-state: per-CPU scheduler/timer survey (timer_isr, current_tid,
+        # watchdog, nr_running) + the TID-0 poll-reactor placement (last_cpu,
+        # affinity, mirror_slot).  Diagnoses SMP "de-facto single core"
+        # imbalance.  See kdb::op_cpu_state.
+        "cpu-state",
         # blk-trace: drain the virtio-blk LBA ring (JSON) / re-emit `[BLK]`
         # serial lines for the heatmap. Also exposed as the `blk-trace`
         # top-level subcommand below (drain|flush).

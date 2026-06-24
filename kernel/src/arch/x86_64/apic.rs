@@ -409,11 +409,22 @@ pub fn lapic_eoi() {
 /// a single core there is no sibling, so the BSP idle path calls this to keep
 /// the timer — and therefore the scheduler tick and `TICK_COUNT` — alive.
 ///
-/// Writing the initial-count register restarts the down-counter (Intel SDM
-/// Vol. 3A §11.5.4), so a wedged periodic timer begins firing again. The LVT
-/// rewrite is belt-and-suspenders in case the vector/mode bits were lost.
-/// Safe to call from any context: it touches only this CPU's LAPIC MMIO and
-/// the value written is the immutable boot-time calibration. No-op before
+/// Re-programs the timer with the FULL from-scratch sequence rather than just
+/// rewriting the initial count: the divide-configuration register, then a fresh
+/// (masked → unmasked) LVT, then the initial count. This mirrors the boot-time
+/// `init_timer` path exactly. A minimal re-arm that rewrites only the LVT and
+/// initial-count register was observed NOT to resume injection on a wedged KVM
+/// LAPIC (the timer-ISR counter stayed frozen): per Intel SDM Vol. 3A §11.5.1
+/// the down-counter is derived through the divide-configuration register, and a
+/// counter wedged with a stale/indeterminate divisor latch does not re-latch on
+/// a bare initial-count write. The order is mandated by §11.5.4 — the LVT mode
+/// and divide configuration must be established *before* the initial-count write
+/// that (re)starts the count. The mask→unmask of LVT bit 16 forces the hardware
+/// to re-evaluate the timer LVT from a known-masked state so the subsequent
+/// initial-count write re-latches cleanly.
+///
+/// Safe to call from any context: it touches only this CPU's LAPIC MMIO and the
+/// values written are the immutable boot-time calibration. No-op before
 /// calibration (period == 0) or if the APIC is disabled.
 pub fn rearm_timer() {
     if !is_enabled() {
@@ -423,7 +434,18 @@ pub fn rearm_timer() {
     if period == 0 {
         return;
     }
-    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic | vector 32
+    // Stop the counter and mask the timer LVT first, so the re-program starts
+    // from a known-quiescent state (Intel SDM Vol. 3A §11.5.4: an initial-count
+    // write of 0 stops the timer).
+    lapic_write(LAPIC_TIMER_INIT, 0);
+    lapic_write(LAPIC_TIMER_LVT, 0x10000 | 32); // masked (bit 16) | vector 32
+    // Re-establish the divide configuration (divide by 16) — the step a bare
+    // LVT+init re-arm omitted (§11.5.1: the count is clocked through this
+    // register; a stale divisor latch prevents a wedged counter from resuming).
+    lapic_write(LAPIC_TIMER_DIVIDE, 0x03);
+    // Fresh periodic, unmasked LVT, then start the counter with the calibrated
+    // period — order per §11.5.4 (mode/divide before the count that starts it).
+    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic (bit 17) | vector 32
     lapic_write(LAPIC_TIMER_INIT, period);
 }
 
@@ -1202,19 +1224,22 @@ pub extern "C" fn ap_rust_entry() -> ! {
     #[cfg(feature = "w215-diag")]
     crate::arch::x86_64::debug_reg::apply_pending_to_this_cpu();
 
-    // Enable interrupts and enter scheduling loop.
-    // After each timer interrupt wakes this AP from HLT, check if a reschedule
-    // is needed and switch to any ready thread.  check_reschedule() is safe
-    // here because the idle thread holds no locks.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-
+    // Enter the scheduling loop.  Each iteration waits one quantum, then checks
+    // for a pending reschedule and switches to any ready thread.
+    // check_reschedule() is safe here because the idle thread holds no locks.
     loop {
-        // HLT until next timer interrupt.
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        // Wait one quantum.  `sched_wait_quantum` halts (`sti; hlt; cli`) while
+        // this AP's LAPIC timer is delivering, but if this AP's own periodic
+        // timer wedges (KVM injection suppression) it re-arms the local LAPIC
+        // and spins (`sti; pause; cli`) instead — so an idle AP whose timer dies
+        // re-arms ITSELF rather than depending solely on a sibling's cross-CPU
+        // poke to limp it along (Intel SDM Vol. 3A §11.5.4).  This keeps the
+        // dead-timer self-heal symmetric between the BSP reactor and idle APs.
+        crate::arch::x86_64::irq::sched_wait_quantum();
         // Reset watchdog: the AP idle thread is alive and responding to interrupts.
         // Without this, the watchdog fires on idle CPUs with no threads to schedule.
         crate::arch::x86_64::irq::reset_watchdog_counter();
-        // Check for pending reschedule after being woken by the timer ISR.
+        // Check for pending reschedule after waking.
         crate::sched::check_reschedule();
     }
 }
