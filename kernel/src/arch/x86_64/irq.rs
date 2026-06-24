@@ -496,6 +496,67 @@ fn poke_stale_siblings(this_cpu: usize, tsc_now: u64, tsc_per_tick: u64) {
 /// (the SMP "de-facto single core" failure mode).  Cheap: two atomic reads, an
 /// `rdtsc`, and — only when wedged — a re-arm.  `window_ticks` is in 100 Hz
 /// ticks; ~10 (≈100 ms) tolerates normal ISR jitter without false re-arms.
+///
+/// The pure decision logic is factored into [`timer_live_decision`] so it can be
+/// unit-tested without LAPIC hardware; `cpu_timer_live` is the thin per-CPU shell
+/// that gathers the inputs (atomics, `rdtsc`, `cpu_index`) and applies the side
+/// effects (re-arm, counter updates) the decision asks for.
+
+/// Outcome of the per-CPU timer-liveness decision (the hardware-free core of
+/// [`cpu_timer_live`]).  Lets the state machine be exercised in `test_runner`
+/// without a real LAPIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerLiveDecision {
+    /// Timer is delivering (ISR advanced, or still within the tolerance window).
+    /// `clear_dead` is true when a previously-dead timer has genuinely recovered.
+    Live { clear_dead: bool },
+    /// Timer is wedged: report unhealthy (caller must spin, not `hlt`).
+    /// `rearm` is true when the caller should issue a from-scratch LAPIC re-arm
+    /// this call (bounded by the futile-re-arm cap once already dead).
+    Dead { rearm: bool },
+}
+
+/// Pure liveness decision shared by [`cpu_timer_live`] and its unit test.
+///
+/// Inputs (all caller-gathered):
+///   * `isr_advanced` — did `TIMER_ISR_PER_CPU[cpu]` change since the last anchor?
+///   * `first_obs`    — is this the first observation for this CPU (no anchor yet)?
+///   * `silent_ticks` — wall-clock ticks since the anchor TSC (0 if `isr_advanced`).
+///   * `window_ticks` — tolerance window before declaring a silent timer wedged.
+///   * `already_dead` — is the sticky dead flag currently set?
+///   * `rearms_so_far`— consecutive futile re-arms since this CPU went dead.
+///   * `max_rearms`   — the futile-re-arm cap ([`MAX_FUTILE_REARMS`]).
+///
+/// The decision is total and side-effect-free; the caller maps it onto the
+/// atomics + the `rearm_timer()` MMIO.
+pub fn timer_live_decision(
+    isr_advanced: bool,
+    first_obs: bool,
+    silent_ticks: u64,
+    window_ticks: u64,
+    already_dead: bool,
+    rearms_so_far: u64,
+    max_rearms: u64,
+) -> TimerLiveDecision {
+    // ISR advanced (or first observation): alive; clear sticky-dead on recovery.
+    if first_obs || isr_advanced {
+        return TimerLiveDecision::Live { clear_dead: already_dead };
+    }
+    // Already declared dead: stay dead, but re-arm once per window until the
+    // futile-re-arm cap, then stop churning LAPIC MMIO and rely on spin + poke.
+    if already_dead {
+        let rearm = silent_ticks >= window_ticks && rearms_so_far < max_rearms;
+        return TimerLiveDecision::Dead { rearm };
+    }
+    // Not yet dead: within tolerance ⇒ still live; past the window ⇒ declare dead
+    // and re-arm now.
+    if silent_ticks < window_ticks {
+        TimerLiveDecision::Live { clear_dead: false }
+    } else {
+        TimerLiveDecision::Dead { rearm: true }
+    }
+}
+
 pub fn cpu_timer_live(window_ticks: u64) -> bool {
     let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
     if tsc_per_tick == 0 {
@@ -509,66 +570,55 @@ pub fn cpu_timer_live(window_ticks: u64) -> bool {
     let tsc_now = rdtsc();
     let seen_isr = CPU_TIMER_SEEN[cpu].0.load(Ordering::Relaxed);
     let seen_tsc = CPU_TIMER_SEEN[cpu].1.load(Ordering::Relaxed);
+    let already_dead = CPU_TIMER_DEAD[cpu].load(Ordering::Relaxed);
+    let rearms = CPU_TIMER_DEAD_REARMS[cpu].load(Ordering::Relaxed);
 
-    // First observation for this CPU, or the local timer advanced since the
-    // last check: it is alive.  Record the new snapshot, CLEAR any sticky-dead
-    // flag (a real recovery), and report healthy.
-    if seen_tsc == 0 || isr_now != seen_isr {
-        CPU_TIMER_SEEN[cpu].0.store(isr_now, Ordering::Relaxed);
-        CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
-        CPU_TIMER_DEAD[cpu].store(false, Ordering::Relaxed);
-        CPU_TIMER_DEAD_REARMS[cpu].store(0, Ordering::Relaxed);
-        return true;
-    }
-
-    // ISR count unchanged since the last check.  How long (wall-clock) has the
-    // local timer been silent since we last re-anchored?
+    let first_obs = seen_tsc == 0;
+    let isr_advanced = isr_now != seen_isr;
+    // `silent_ticks` is meaningful only when the ISR has NOT advanced; the
+    // decision ignores it on the advanced/first-obs path.
     let silent_ticks = tsc_now.wrapping_sub(seen_tsc) / tsc_per_tick;
 
-    // Already declared dead: stay dead (the caller keeps spinning, self-clocked)
-    // but RE-ARM PERIODICALLY — once per window of continued silence — rather
-    // than only once at declaration.  A wedged KVM LAPIC may not resume on the
-    // first re-arm if injection is still being suppressed (e.g. an MMIO VM-exit
-    // storm has not yet subsided); retrying every window gives the full
-    // from-scratch re-program (see `apic::rearm_timer`) repeated chances to
-    // re-latch the counter once the host stops suppressing.  Bounded to one
-    // re-arm per window, so it is cheap and never an IPI/MMIO storm.  Recovery
-    // (ISR advancing) is detected by the first branch above, which clears the
-    // sticky flag.
-    if CPU_TIMER_DEAD[cpu].load(Ordering::Relaxed) {
-        if silent_ticks >= window_ticks
-            && CPU_TIMER_DEAD_REARMS[cpu].load(Ordering::Relaxed) < MAX_FUTILE_REARMS
-        {
-            super::apic::rearm_timer();
-            PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
-            CPU_TIMER_DEAD_REARMS[cpu].fetch_add(1, Ordering::Relaxed);
+    match timer_live_decision(
+        isr_advanced, first_obs, silent_ticks, window_ticks,
+        already_dead, rearms, MAX_FUTILE_REARMS,
+    ) {
+        TimerLiveDecision::Live { clear_dead } => {
+            // Record the fresh anchor and, on a genuine recovery, clear the
+            // sticky-dead flag + futile-re-arm counter.
+            CPU_TIMER_SEEN[cpu].0.store(isr_now, Ordering::Relaxed);
             CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+            if clear_dead {
+                CPU_TIMER_DEAD[cpu].store(false, Ordering::Relaxed);
+                CPU_TIMER_DEAD_REARMS[cpu].store(0, Ordering::Relaxed);
+            }
+            true
         }
-        // Past the cap (host is permanently suppressing injection) we stop
-        // re-arming and rely on the TSC-clocked spin + cross-CPU poke; still
-        // re-anchor occasionally so `silent_ticks` does not overflow the divide.
-        else if silent_ticks >= window_ticks {
-            CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+        TimerLiveDecision::Dead { rearm } => {
+            // Declare dead (idempotent) and, if the decision asked for it, issue
+            // the full from-scratch re-arm and bump the bounded retry counter.
+            if !already_dead {
+                CPU_TIMER_DEAD[cpu].store(true, Ordering::Relaxed);
+            }
+            if rearm {
+                super::apic::rearm_timer();
+                PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                // First re-arm at declaration seeds the counter at 1; subsequent
+                // periodic retries increment it toward the cap.
+                if already_dead {
+                    CPU_TIMER_DEAD_REARMS[cpu].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    CPU_TIMER_DEAD_REARMS[cpu].store(1, Ordering::Relaxed);
+                }
+                CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+            } else if silent_ticks >= window_ticks {
+                // Past the cap: stop re-arming but re-anchor so a long-dead
+                // timer's `silent_ticks` divide never overflows.
+                CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+            }
+            false
         }
-        return false;
     }
-
-    if silent_ticks < window_ticks {
-        return true; // within tolerance — not yet considered wedged
-    }
-
-    // The local LAPIC periodic timer has been silent for > window_ticks while
-    // this CPU is active: declare it wedged (sticky).  Re-arm it (full
-    // from-scratch re-program; see `apic::rearm_timer`) and report unhealthy so
-    // the caller spins rather than hlt-ing into a sleep the dead timer cannot
-    // end.  The sticky flag keeps it false on every subsequent call (with a
-    // periodic re-arm retry, above) until the ISR genuinely advances.
-    CPU_TIMER_DEAD[cpu].store(true, Ordering::Relaxed);
-    super::apic::rearm_timer();
-    PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
-    CPU_TIMER_DEAD_REARMS[cpu].store(1, Ordering::Relaxed);
-    CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
-    false
 }
 
 /// Idle-wait one quantum from a scheduler wait-path: sleep until the next wake,

@@ -2236,6 +2236,12 @@ pub fn run() -> ! {
     total += 1;
     if test_646_tlb_timeout_force_flush() { passed += 1; }
 
+    // ── Test 651: per-CPU LAPIC-timer liveness decision state machine ──
+    // The hardware-free core of the SMP dead-CPU-timer self-heal: ISR-advance
+    // recovery, tolerance window, sticky-dead, bounded futile re-arm cap.
+    total += 1;
+    if test_651_cpu_timer_live_decision() { passed += 1; }
+
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
     //   1. open(/proc/<target>/maps) from a different caller PID succeeds
@@ -49900,6 +49906,68 @@ fn test_652_percpu_audit_image_off_stack() -> bool {
 
     test_println!("  [PerCpuRq; MAX_CPUS] audit image dwarfs the emergency kstack \
 tier → must stay heap-allocated (closes the switch_context popf #DB) GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 651: per-CPU LAPIC-timer liveness decision state machine ───────────
+//
+// Exercises the hardware-free core of the SMP dead-CPU-timer self-heal
+// (`irq::timer_live_decision`) so the state machine is covered without a real
+// LAPIC: ISR-advance recovery (incl. clearing sticky-dead), the tolerance
+// window, the dead→re-arm declaration, periodic re-arm while dead, and the
+// bounded futile-re-arm cap that stops churning LAPIC MMIO on a permanently
+// host-suppressed (KVM) timer.  The same function drives `cpu_timer_live`, so
+// these cases pin the production behaviour.
+fn test_651_cpu_timer_live_decision() -> bool {
+    use crate::arch::x86_64::irq::{timer_live_decision, TimerLiveDecision as D};
+    const NAME: &str = "[ARCH/SMP] per-CPU timer-liveness decision (Test 651)";
+    test_header!(NAME);
+    const W: u64 = 10;   // window_ticks
+    const CAP: u64 = 32; // MAX_FUTILE_REARMS
+
+    // First observation → live, nothing to clear.
+    if timer_live_decision(false, true, 0, W, false, 0, CAP) != (D::Live { clear_dead: false }) {
+        test_fail!(NAME, "first observation not Live"); return false;
+    }
+    // ISR advanced while healthy → live, nothing to clear.
+    if timer_live_decision(true, false, 0, W, false, 0, CAP) != (D::Live { clear_dead: false }) {
+        test_fail!(NAME, "isr-advanced healthy not Live"); return false;
+    }
+    // ISR advanced while previously dead → live AND clear sticky-dead (recovery).
+    if timer_live_decision(true, false, 0, W, true, 5, CAP) != (D::Live { clear_dead: true }) {
+        test_fail!(NAME, "recovery did not clear sticky-dead"); return false;
+    }
+    // Silent but within the tolerance window → still live, no clear.
+    if timer_live_decision(false, false, W - 1, W, false, 0, CAP) != (D::Live { clear_dead: false }) {
+        test_fail!(NAME, "within-window silence not tolerated as Live"); return false;
+    }
+    // Silent past the window, not yet dead → declare dead AND re-arm now.
+    if timer_live_decision(false, false, W, W, false, 0, CAP) != (D::Dead { rearm: true }) {
+        test_fail!(NAME, "wedge declaration did not re-arm"); return false;
+    }
+    // Already dead, a full window of continued silence, under the cap → re-arm.
+    if timer_live_decision(false, false, W, W, true, 5, CAP) != (D::Dead { rearm: true }) {
+        test_fail!(NAME, "periodic retry under cap did not re-arm"); return false;
+    }
+    // Already dead, silence NOT yet a full window → stay dead, do NOT re-arm
+    // (avoids an MMIO storm faster than once per window).
+    if timer_live_decision(false, false, W - 1, W, true, 5, CAP) != (D::Dead { rearm: false }) {
+        test_fail!(NAME, "sub-window dead re-armed too eagerly"); return false;
+    }
+    // Already dead, AT the futile-re-arm cap → stay dead, STOP re-arming
+    // (permanently host-suppressed timer; rely on spin + cross-CPU poke).
+    if timer_live_decision(false, false, W * 5, W, true, CAP, CAP) != (D::Dead { rearm: false }) {
+        test_fail!(NAME, "re-armed past the futile cap (would churn LAPIC MMIO)"); return false;
+    }
+    // One below the cap still re-arms (boundary is strict `<`).
+    if timer_live_decision(false, false, W, W, true, CAP - 1, CAP) != (D::Dead { rearm: true }) {
+        test_fail!(NAME, "cap boundary off-by-one: one-below-cap should still re-arm"); return false;
+    }
+
+    test_println!("  decision: first-obs / isr-advance-recovery(+clear) / within-window-tolerate / \
+wedge-declare(+rearm) / periodic-retry-under-cap / sub-window-no-rearm / at-cap-stop / \
+cap-boundary-strict — dead-CPU-timer self-heal state machine GREEN");
     test_pass!(NAME);
     true
 }
