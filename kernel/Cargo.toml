@@ -38,6 +38,21 @@ heap-canary = []
 # so on the hot path the spew dominates wall-clock.
 test-mode-trace = []
 test-mode = ["heap-canary", "test-mode-trace"]
+# `screenshot-b64-dump` — opt-in for Test 198 (GDI PNG screenshot) to base64-
+# encode the rendered 1.44 MB boot-splash PNG over COM1 as the chunked
+# `[SCREENSHOT-B64:N/M]` stream (~25k lines) that the harness `read-png`
+# subcommand decodes back to a host PNG.  Off by default and DELIBERATELY NOT
+# pulled into `test-mode`: the dump is host-EXTRACTION only — Test 198's
+# pass/fail is decided by the in-guest PNG-signature check (`signature_ok=true`)
+# BEFORE the dump, so gating the dump off changes NO test outcome, only what is
+# transcribed to COM1.  CI never invokes `read-png`, so for CI the dump is pure
+# UART saturation: at ~25k synchronous PIO THR-write lines (Intel SDM Vol. 3C
+# §25 I/O-instruction VM-exits; NS16550A THR-write model) it dominates the
+# kernel-smoke wall-clock and, racing a faulting process's serial spew under
+# `-smp 2`, can push the suite past the 900 s watchdog.  Enable only when a
+# human/agent actually wants the boot-splash PNG extracted (the harness sets it
+# on the `read-png` build path).
+screenshot-b64-dump = []
 gui-test = []
 # `firefox-test-core` — the FUNCTIONAL behaviour the Firefox bring-up path
 # needs to RUN: heap-canary fencing, the FF workload selection + launch in

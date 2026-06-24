@@ -1316,6 +1316,8 @@ pub fn run() -> ! {
         if test_649_percpu_min_deadline_gate() { passed += 1; }
         total += 1;
         if test_650_percpu_wake_target() { passed += 1; }
+        total += 1;
+        if test_652_percpu_audit_image_off_stack() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -40829,6 +40831,26 @@ fn test_gdi_png_screenshot() -> bool {
     // 76 base64 chars = 57 input bytes per line (MIME line length, RFC 2045 §6.8).
     // The harness `read-png` subcommand collects all M chunks, decodes, and
     // writes the result to a host-side file.
+    //
+    // Gated behind the `screenshot-b64-dump` feature.  This dump is host-
+    // EXTRACTION only — it has NO bearing on this test's pass/fail, which is
+    // already decided by the `signature_ok=true` PNG-signature check in step 6
+    // above (BEFORE this block).  The feature is off by default and is
+    // deliberately NOT pulled into `test-mode`, so the CI kernel-smoke boot
+    // (which never invokes `read-png`) does not pay the ~25 000-line COM1
+    // serialisation cost that otherwise dominates the run and, racing a faulting
+    // process's serial spew under `-smp 2`, can blow the 900 s watchdog.  When
+    // the feature is off we emit a single sentinel line so `read-png` reports a
+    // clean "dump not enabled" instead of waiting out its timeout for chunk 0.
+    #[cfg(not(feature = "screenshot-b64-dump"))]
+    {
+        test_println!(
+            "[SCREENSHOT-B64-DISABLED] {} bytes ready; rebuild with \
+             --features screenshot-b64-dump (or harness `read-png`) to extract",
+            read_back.len()
+        );
+    }
+    #[cfg(feature = "screenshot-b64-dump")]
     {
         const CHUNK_BYTES: usize = 57; // → 76 base64 chars per line
         const B64_ALPHABET: &[u8; 64] =
@@ -49816,6 +49838,68 @@ fn test_650_percpu_wake_target() -> bool {
     test_println!("  select_task_rq-equiv routing: hard-pin / warm-last_cpu / \
 least-loaded-fallback / warm-tie-keep / strict-min-migrate / uniproc-collapse / \
 last_cpu-clamp — >1-CPU target logic correct (closes the Phase 2b coverage nit) GREEN");
+    test_pass!(NAME);
+    true
+}
+
+/// Test 652: the per-CPU runqueue audit image must never be stack-allocated.
+///
+/// Regression guard for the deterministic SMP=1 windowed-Firefox
+/// `UNEXPECTED_KERNEL_MODE_TRAP` (`#DB` at `switch_context_asm`'s `popf`):
+/// `mirror_maintain`'s gated cross-check built a throwaway
+/// `[PerCpuRq; MAX_CPUS]` ON THE STACK.  A `PerCpuRq` carries a 32-level FIFO
+/// array, so the full image is ~16 KiB — larger than every emergency kstack
+/// tier (`proc::alloc_kernel_stack`'s 4 / 8 / 16 KiB PMM-fragmented
+/// fallbacks).  When `schedule()` ran on such a stack the audit array
+/// overflowed it and overwrote the running thread's saved `switch_context`
+/// frame, tearing the saved RFLAGS slot (observed TF=1 → single-step → `#DB`).
+///
+/// The fix moved the audit image to the heap.  This test pins the invariant
+/// that motivated it: the image is larger than the largest emergency tier, so
+/// any future refactor that re-introduces a stack allocation of it is a
+/// stack-overflow hazard and must be rejected.  Cite Intel SDM Vol. 3B
+/// §17.3.1.1 (single-step `#DB` after a retired instruction with RFLAGS.TF
+/// set) and Vol. 3A §6.14 (interrupt/exception stack switch).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_652_percpu_audit_image_off_stack() -> bool {
+    use crate::sched::percpu::PerCpuRq;
+    const NAME: &str = "[SCHED/P2] per-CPU audit image off-stack (Test 652)";
+    test_header!(NAME);
+
+    // The largest emergency kstack tier is 16 KiB (tier 4 in
+    // `proc::alloc_kernel_stack::SMALL_KSTACK_TIERS`).  The audit image must
+    // exceed it — i.e. it cannot safely coexist with the rest of the
+    // schedule() frame on any emergency stack, which is exactly why it has to
+    // live on the heap.
+    const LARGEST_EMERGENCY_KSTACK: usize = 16 * 1024;
+    let img = PerCpuRq::audit_image_bytes();
+
+    test_println!(
+        "  audit_image_bytes={} sizeof(PerCpuRq)={} largest_emergency_kstack={}",
+        img, core::mem::size_of::<PerCpuRq>(), LARGEST_EMERGENCY_KSTACK
+    );
+
+    if img <= LARGEST_EMERGENCY_KSTACK {
+        // If this ever fails it means PerCpuRq shrank enough that the image fits
+        // an emergency stack.  That would weaken (not invalidate) the rationale;
+        // the audit must STILL be heap-allocated, so flag for a human to
+        // re-justify rather than silently passing.
+        test_fail!(NAME,
+            "audit image {} bytes no longer exceeds the 16 KiB emergency tier — \
+             re-justify the heap allocation in mirror_maintain", img);
+        return false;
+    }
+
+    // Sanity: a single PerCpuRq is itself non-trivial (it carries the 32-FIFO
+    // array), so the MAX_CPUS multiple is genuinely large.
+    if core::mem::size_of::<PerCpuRq>() < 256 {
+        test_fail!(NAME, "sizeof(PerCpuRq)={} unexpectedly small",
+            core::mem::size_of::<PerCpuRq>());
+        return false;
+    }
+
+    test_println!("  [PerCpuRq; MAX_CPUS] audit image dwarfs the emergency kstack \
+tier → must stay heap-allocated (closes the switch_context popf #DB) GREEN");
     test_pass!(NAME);
     true
 }
