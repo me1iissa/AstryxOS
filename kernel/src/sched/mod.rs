@@ -655,6 +655,75 @@ pub fn request_reschedule() {
     }
 }
 
+/// The reschedule-IPI vector (Perf P2 phase 3c).  Distinct from the TLB
+/// shootdown (0xF0) and the diagnostic DR-sync IPI (0xF1); wired in
+/// `arch::x86_64::idt`.  Sent by [`resched_cpu`] to make a remote CPU notice a
+/// freshly-runnable thread without waiting out a timer tick.
+pub const RESCHED_VECTOR: u8 = 0xF2;
+
+/// Cumulative count of reschedule IPIs serviced by this kernel (all CPUs).
+/// Diagnostic / test signal that the cross-CPU wakeup path actually fired.
+/// Monotone since boot.
+static RESCHED_IPI_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one serviced reschedule IPI (called from the 0xF2 handler body).
+#[inline]
+pub fn note_resched_ipi() {
+    RESCHED_IPI_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot of [`RESCHED_IPI_TOTAL`].
+pub fn resched_ipi_count() -> u64 {
+    RESCHED_IPI_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Set the calling CPU's `NEED_RESCHEDULE` flag (called from the reschedule-IPI
+/// handler).  Like [`request_reschedule`] but unconditional on `is_active`: the
+/// IPI only fires once scheduling is live, and the handler must always EOI and
+/// arm the flag even if a teardown momentarily cleared `SCHEDULER_ACTIVE`.
+#[inline]
+pub fn set_need_reschedule_local() {
+    let cpu = cpu_index();
+    if cpu < MAX_CPUS {
+        NEED_RESCHEDULE[cpu].store(true, Ordering::Relaxed);
+    }
+}
+
+/// Make CPU `cpu` reschedule "soon" because a thread just became runnable on it
+/// (Perf P2 phase 3c — the AstryxOS analogue of `resched_curr`/
+/// `smp_send_reschedule`).
+///
+/// Always sets the target's `NEED_RESCHEDULE` flag first; then, if `cpu` is a
+/// DIFFERENT online CPU, pokes it with a fire-and-forget reschedule IPI
+/// ([`RESCHED_VECTOR`]) so it reschedules at its next return-to-context check
+/// rather than waiting out its ~10 ms timer tick — closing the remote-wakeup
+/// latency hole.  When `cpu` is the CURRENT CPU (always the case on SMP=1, where
+/// an IPI-to-self would just be the local flag) no IPI is sent: setting the flag
+/// is sufficient and is exactly the prior behaviour, so SMP=1 is unchanged.
+///
+/// Lock-free: it sets one atomic and issues one IPI.  It takes NO lock, so it
+/// cannot participate in the TLB-shootdown ACK-spin deadlock class — and it must
+/// not be called while holding a lock the IPI handler could need, which the
+/// handler guarantees by doing nothing but `set_need_reschedule_local` + EOI.
+#[inline]
+pub fn resched_cpu(cpu: usize) {
+    if !is_active() || cpu >= MAX_CPUS {
+        return;
+    }
+    // Arm the target's flag unconditionally (covers the self / SMP=1 case and
+    // races where the IPI is still in flight when the target next checks).
+    NEED_RESCHEDULE[cpu].store(true, Ordering::Release);
+
+    let here = cpu_index();
+    if cpu == here {
+        return; // self-reschedule degenerates to the local flag (SMP=1 path)
+    }
+    // Only IPI an online CPU other than us.
+    if (cpu as u32) < crate::arch::x86_64::apic::cpu_count() {
+        crate::arch::x86_64::apic::send_ipi_noblock(cpu as u8, RESCHED_VECTOR);
+    }
+}
+
 /// Non-consuming peek at this CPU's pending-preemption flag.
 ///
 /// The timer ISR sets `NEED_RESCHEDULE` at each quantum boundary
@@ -675,6 +744,26 @@ pub fn reschedule_pending() -> bool {
     }
     let cpu = cpu_index();
     cpu < MAX_CPUS && NEED_RESCHEDULE[cpu].load(Ordering::Relaxed)
+}
+
+/// Test-only: read this CPU's raw `NEED_RESCHEDULE` flag (no `is_active`
+/// gating, no side effects).  Used by Test 651 to observe that `resched_cpu`
+/// armed the local flag.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_need_reschedule_raw() -> bool {
+    let cpu = cpu_index();
+    cpu < MAX_CPUS && NEED_RESCHEDULE[cpu].load(Ordering::Relaxed)
+}
+
+/// Test-only: clear this CPU's `NEED_RESCHEDULE` flag so Test 651 can establish
+/// a known starting state before exercising `resched_cpu`.  Restores the flag
+/// to whatever it was after the test via the caller.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_clear_need_reschedule() {
+    let cpu = cpu_index();
+    if cpu < MAX_CPUS {
+        NEED_RESCHEDULE[cpu].store(false, Ordering::Relaxed);
+    }
 }
 
 /// Check if a reschedule is pending (called after returning from interrupt).

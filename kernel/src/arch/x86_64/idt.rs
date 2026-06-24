@@ -189,6 +189,18 @@ pub fn init() {
             #[cfg(feature = "w215-diag")]
             IDT[0xF1].set_handler(fix(super::irq::irq_w215_dr_sync_handler as *const () as u64), kernel_cs, 0, 0);
 
+            // Reschedule IPI (vector 0xF2, Perf P2 phase 3c).  Distinct from the
+            // TLB shootdown (0xF0) and the diagnostic DR-sync IPI (0xF1, which
+            // is only assigned under `w215-diag` but whose vector we avoid
+            // unconditionally so the two can never collide in any build).  Sent
+            // by `sched::resched_cpu` when a wakeup makes a thread runnable on a
+            // REMOTE CPU; the handler only sets that CPU's NEED_RESCHEDULE flag
+            // and EOIs, so the target reschedules at its next return-to-context
+            // check instead of waiting out a ~10 ms timer tick.  Always wired
+            // (no feature gate) — the reschedule IPI is core SMP behaviour.
+            // See `sched::RESCHED_VECTOR` and Intel SDM Vol. 3A §10.6.1.
+            IDT[0xF2].set_handler(fix(super::irq::irq_resched_handler as *const () as u64), kernel_cs, 0, 0);
+
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
 
