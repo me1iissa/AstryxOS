@@ -1597,9 +1597,7 @@ was_emergency_4k={}",
                     // sti; hlt; cli — the STI shadow guarantees the next
                     // instruction (hlt) is executed before any pending
                     // interrupt fires, so this sequence is race-free.
-                    unsafe {
-                        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
-                    }
+                    crate::arch::x86_64::irq::sched_wait_quantum();
                     // Re-check SCHEDULER_ACTIVE after waking from hlt.
                     // If another CPU called sched::disable() while we were
                     // halted, timer_tick_schedule() now short-circuits and
@@ -1635,9 +1633,7 @@ was_emergency_4k={}",
                             current_tid, STARVATION_BURST_THRESHOLD,
                         );
                     }
-                    unsafe {
-                        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
-                    }
+                    crate::arch::x86_64::irq::sched_wait_quantum();
                     // See is_active() recheck rationale above.
                     if !is_active() {
                         crate::hal::enable_interrupts();
@@ -1880,9 +1876,7 @@ was_emergency_4k={}",
                                 current_tid, STARVATION_BURST_THRESHOLD,
                             );
                         }
-                        unsafe {
-                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
-                        }
+                        crate::arch::x86_64::irq::sched_wait_quantum();
                         // Re-check SCHEDULER_ACTIVE after waking from hlt.
                         // sched::disable() on another CPU silently disarms
                         // timer_tick_schedule()'s wake hooks, so without
@@ -1905,9 +1899,7 @@ was_emergency_4k={}",
                                 current_tid, STARVATION_BURST_THRESHOLD,
                             );
                         }
-                        unsafe {
-                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
-                        }
+                        crate::arch::x86_64::irq::sched_wait_quantum();
                         // See is_active() recheck rationale above.
                         if !is_active() {
                             crate::hal::enable_interrupts();

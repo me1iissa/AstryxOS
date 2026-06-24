@@ -1056,6 +1056,28 @@ pub fn set_current_tid(tid: Tid) {
     PER_CPU_CURRENT_TID[cpu_index()].store(tid, Ordering::Relaxed);
 }
 
+/// Read the currently running TID for an arbitrary CPU index (not necessarily
+/// the calling CPU).  Used by diagnostics that survey every CPU's state from a
+/// single thread (e.g. the kdb `cpu-state` op).  Returns 0 for an
+/// out-of-range index.
+pub fn current_tid_on_cpu(cpu: usize) -> Tid {
+    if cpu < crate::arch::x86_64::apic::MAX_CPUS {
+        PER_CPU_CURRENT_TID[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Read the currently running PID for an arbitrary CPU index.  See
+/// [`current_tid_on_cpu`].
+pub fn current_pid_on_cpu(cpu: usize) -> Pid {
+    if cpu < crate::arch::x86_64::apic::MAX_CPUS {
+        PER_CPU_CURRENT_PID[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Set the currently running process's PID (per-CPU).
 ///
 /// Must be called from every `set_current_tid` call site that knows the

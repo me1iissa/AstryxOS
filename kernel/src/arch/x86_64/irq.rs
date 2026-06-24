@@ -37,6 +37,18 @@ pub fn reset_watchdog_counter() {
     WATCHDOG_COUNTER[cpu as usize].store(0, Ordering::Relaxed);
 }
 
+/// Read the watchdog counter of an arbitrary CPU (diagnostic-only).  A high
+/// value means that CPU has gone many ticks without a context switch (its
+/// current thread is CPU-bound or it is wedged); a low value means it is
+/// switching threads regularly.  Out-of-range index returns 0.
+pub fn watchdog_counter(cpu: usize) -> u32 {
+    if cpu < MAX_CPUS {
+        WATCHDOG_COUNTER[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// PIC I/O ports.
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -320,6 +332,241 @@ pub static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// tick. Used to rate-limit the software tick to ~`TICK_HZ`.
 static LAST_SOFT_TICK: AtomicU64 = AtomicU64::new(0);
 
+/// Per-CPU LAPIC-timer liveness snapshot for [`cpu_timer_live`].  Element
+/// `[cpu]` stores `(last_seen_isr_count, tsc_at_observation)`: the value of
+/// `TIMER_ISR_PER_CPU[cpu]` the last time this CPU checked its own liveness,
+/// and the TSC at that check.  A check whose ISR count has not advanced AND
+/// whose TSC has moved more than the liveness window ⇒ this CPU's own periodic
+/// timer has wedged (KVM LAPIC-injection suppression, Intel SDM Vol. 3A
+/// §11.5.4 — a wedged periodic counter does not spontaneously resume).
+///
+/// Why per-CPU and not the global `TICK_COUNT`: `TICK_COUNT` is TSC-derived and
+/// CAS-published by *whichever* online CPU's timer ISR runs (see `timer_tick`),
+/// so on SMP a single healthy sibling keeps the GLOBAL clock fresh and masks a
+/// LOCALLY dead timer.  A CPU whose own LAPIC has stopped delivering would see
+/// `TICK_COUNT` tracking the TSC perfectly (the sibling maintains it) and wrongly
+/// conclude its timer is healthy — then `hlt` into a sleep its own dead timer
+/// never wakes.  This per-CPU ISR-advancement check is immune to that masking.
+static CPU_TIMER_SEEN: [(AtomicU64, AtomicU64); super::apic::MAX_CPUS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; super::apic::MAX_CPUS];
+
+/// Per-CPU sticky "this CPU's LAPIC periodic timer is currently dead" flag.
+///
+/// Set the moment [`cpu_timer_live`] first declares the local timer wedged;
+/// cleared only when the local `TIMER_ISR_PER_CPU` count is observed to advance
+/// (a real recovery — the timer started delivering again).  It is sticky on
+/// purpose: a wedged KVM LAPIC does not reliably resume after a re-arm (Intel
+/// SDM Vol. 3A §11.5.4 restarts the *counter*, but KVM may keep suppressing
+/// *injection*), so without stickiness `cpu_timer_live` would optimistically
+/// report "healthy" again as soon as it re-anchored the TSC inside the liveness
+/// window — and the caller would `hlt` straight back into the dead-timer trap,
+/// only to be woken ~one window later by the sibling poke (a low-duty-cycle
+/// limp at ~1/window Hz instead of a CPU that keeps running).  Sticky-dead makes
+/// a CPU with a wedged timer SPIN continuously (self-clocked off the TSC) until
+/// the hardware timer genuinely recovers.
+static CPU_TIMER_DEAD: [core::sync::atomic::AtomicBool; super::apic::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; super::apic::MAX_CPUS];
+
+/// True iff `cpu`'s LAPIC periodic timer has been declared dead and not yet
+/// recovered.  Diagnostic accessor for the kdb `cpu-state` survey.
+pub fn cpu_timer_dead(cpu: usize) -> bool {
+    if cpu < super::apic::MAX_CPUS {
+        CPU_TIMER_DEAD[cpu].load(Ordering::Relaxed)
+    } else {
+        false
+    }
+}
+
+/// Count of per-CPU LAPIC re-arms triggered by [`cpu_timer_live`] detecting a
+/// locally-wedged timer.  Diagnostic-only; a non-zero value on the BSP under
+/// SMP is the signature of the dead-CPU0-LAPIC self-heal firing.
+pub static PERCPU_TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`PERCPU_TIMER_REARM_COUNT`].
+pub fn percpu_timer_rearm_count() -> u64 {
+    PERCPU_TIMER_REARM_COUNT.load(Ordering::Relaxed)
+}
+
+/// IPI vector for the cross-CPU timer-wake poke (see `timer_wake_interrupt`).
+/// 0xF0 = TLB shootdown, 0xF1 = W215 DR-sync, 0xF2 reserved for the reschedule
+/// IPI (Perf P2 phase 3c), 0xF3 = timer-wake.  A distinct vector per IPI class
+/// keeps each handler body independent (Intel SDM Vol. 3A §10.6.1).
+pub const TIMER_WAKE_VECTOR: u8 = 0xF3;
+
+/// Number of timer-wake IPIs SENT (a live CPU poked a sibling whose timer ISR
+/// went stale) and RECEIVED.  Diagnostic-only; a non-zero `sent` under SMP is
+/// the signature of the dead-sibling-LAPIC self-heal driving the poke.
+pub static TIMER_WAKE_IPI_SENT: AtomicU64 = AtomicU64::new(0);
+pub static TIMER_WAKE_IPI_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU `(last_seen_isr, tsc_at_observation)` used by the timer-ISR sender to
+/// detect a sibling whose own timer ISR has gone stale.  Distinct from
+/// `CPU_TIMER_SEEN` (which the SELF-check in `cpu_timer_live` owns) so the two
+/// liveness observers never clobber each other's anchors.
+static SIBLING_TIMER_SEEN: [(AtomicU64, AtomicU64); super::apic::MAX_CPUS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; super::apic::MAX_CPUS];
+
+/// Snapshots of the timer-wake IPI counters.
+pub fn timer_wake_ipi_sent() -> u64 { TIMER_WAKE_IPI_SENT.load(Ordering::Relaxed) }
+pub fn timer_wake_ipi_received() -> u64 { TIMER_WAKE_IPI_RECEIVED.load(Ordering::Relaxed) }
+
+/// From a LIVE CPU's timer ISR, poke any sibling whose own timer ISR has gone
+/// stale (its LAPIC periodic timer wedged) so it cannot sleep through a dead
+/// timer.  Called once per local tick by `timer_tick`; cheap (a handful of
+/// atomic reads, an IPI only when a sibling is actually found stale).
+///
+/// "Stale" = the sibling's `TIMER_ISR_PER_CPU` count has not advanced across a
+/// `STALE_WINDOW`-tick wall-clock window (TSC-measured against our own publish
+/// rate).  We re-anchor the observation whenever the sibling advances OR we
+/// poke it, so a single sibling is poked at most ~once per window rather than
+/// every tick — enough to keep it awake and re-arming without an IPI storm.
+fn poke_stale_siblings(this_cpu: usize, tsc_now: u64, tsc_per_tick: u64) {
+    /// Wall-clock window (100 Hz ticks) a sibling's timer may be silent before
+    /// we consider it wedged and poke it.  ~20 ticks (≈200 ms) is well clear of
+    /// normal ISR jitter yet keeps the reactor's worst-case stall short.
+    const STALE_WINDOW: u64 = 20;
+    if tsc_per_tick == 0 {
+        return;
+    }
+    let ncpus = (super::apic::cpu_count() as usize).min(super::apic::MAX_CPUS);
+    for cpu in 0..ncpus {
+        if cpu == this_cpu {
+            continue;
+        }
+        let isr_now = TIMER_ISR_PER_CPU[cpu].load(Ordering::Relaxed);
+        let seen_isr = SIBLING_TIMER_SEEN[cpu].0.load(Ordering::Relaxed);
+        let seen_tsc = SIBLING_TIMER_SEEN[cpu].1.load(Ordering::Relaxed);
+
+        // First observation, or the sibling's timer advanced: it is alive.
+        // Re-anchor and move on.
+        if seen_tsc == 0 || isr_now != seen_isr {
+            SIBLING_TIMER_SEEN[cpu].0.store(isr_now, Ordering::Relaxed);
+            SIBLING_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+            continue;
+        }
+
+        // Sibling's timer ISR has not advanced since our last observation.  How
+        // long (wall-clock) has it been silent?
+        let silent = tsc_now.wrapping_sub(seen_tsc) / tsc_per_tick;
+        if silent < STALE_WINDOW {
+            continue;
+        }
+
+        // Wedged sibling: poke it.  Any interrupt resumes it from `hlt`; its own
+        // idle/wait path then re-arms its LAPIC (cpu_timer_live).  Re-anchor the
+        // TSC (keep the stale ISR count) so we re-poke at most once per window.
+        super::apic::send_ipi(cpu as u8, TIMER_WAKE_VECTOR);
+        TIMER_WAKE_IPI_SENT.fetch_add(1, Ordering::Relaxed);
+        SIBLING_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+    }
+}
+
+/// Check whether the CALLING CPU's own LAPIC periodic timer is still
+/// delivering interrupts, and re-arm it if it has wedged.
+///
+/// Returns `true` if this CPU's `TIMER_ISR_PER_CPU` count has advanced since the
+/// previous check (or the liveness window has not yet elapsed) — i.e. the local
+/// timer is delivering.  Returns `false` if the local timer has gone silent for
+/// more than `window_ticks` of wall-clock (TSC-measured) while this CPU was
+/// active; in that case it has already issued a `rearm_timer()` for the local
+/// LAPIC (Intel SDM Vol. 3A §11.5.4 — rewriting the LVT + initial-count restarts
+/// a wedged periodic counter) so the caller MUST NOT `hlt` (a dead timer offers
+/// no wakeup) but should spin and re-drive cooperative work.
+///
+/// Unlike the global `TICK_COUNT`-vs-TSC check this is per-CPU and so detects a
+/// locally-dead timer even when a healthy sibling keeps the global clock fresh
+/// (the SMP "de-facto single core" failure mode).  Cheap: two atomic reads, an
+/// `rdtsc`, and — only when wedged — a re-arm.  `window_ticks` is in 100 Hz
+/// ticks; ~10 (≈100 ms) tolerates normal ISR jitter without false re-arms.
+pub fn cpu_timer_live(window_ticks: u64) -> bool {
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        return true; // pre-calibration — the timer is not expected yet
+    }
+    let cpu = super::apic::cpu_index();
+    if cpu >= super::apic::MAX_CPUS {
+        return true;
+    }
+    let isr_now = TIMER_ISR_PER_CPU[cpu].load(Ordering::Relaxed);
+    let tsc_now = rdtsc();
+    let seen_isr = CPU_TIMER_SEEN[cpu].0.load(Ordering::Relaxed);
+    let seen_tsc = CPU_TIMER_SEEN[cpu].1.load(Ordering::Relaxed);
+
+    // First observation for this CPU, or the local timer advanced since the
+    // last check: it is alive.  Record the new snapshot, CLEAR any sticky-dead
+    // flag (a real recovery), and report healthy.
+    if seen_tsc == 0 || isr_now != seen_isr {
+        CPU_TIMER_SEEN[cpu].0.store(isr_now, Ordering::Relaxed);
+        CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+        CPU_TIMER_DEAD[cpu].store(false, Ordering::Relaxed);
+        return true;
+    }
+
+    // ISR count unchanged since the last check.  If this CPU's timer was already
+    // declared dead, it STAYS dead until the ISR actually advances (handled
+    // above) — report unhealthy without re-arming again, so the caller keeps
+    // spinning (self-clocked) rather than oscillating hlt↔wake at ~1/window Hz.
+    if CPU_TIMER_DEAD[cpu].load(Ordering::Relaxed) {
+        return false;
+    }
+
+    // Not yet declared dead: how long has the local timer been silent (in
+    // wall-clock ticks)?
+    let silent_ticks = tsc_now.wrapping_sub(seen_tsc) / tsc_per_tick;
+    if silent_ticks < window_ticks {
+        return true; // within tolerance — not yet considered wedged
+    }
+
+    // The local LAPIC periodic timer has been silent for > window_ticks while
+    // this CPU is active: declare it wedged (sticky).  Re-arm it once (rewrites
+    // LVT + initial-count — harmless and revives a merely-masked timer) and
+    // report unhealthy so the caller spins rather than hlt-ing into a sleep the
+    // dead timer cannot end.  The sticky flag keeps it false on every subsequent
+    // call until the ISR genuinely advances.
+    CPU_TIMER_DEAD[cpu].store(true, Ordering::Relaxed);
+    super::apic::rearm_timer();
+    PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    CPU_TIMER_SEEN[cpu].1.store(tsc_now, Ordering::Relaxed);
+    false
+}
+
+/// Idle-wait one quantum from a scheduler wait-path: sleep until the next wake,
+/// but never sleep into a dead-timer trap.
+///
+/// The scheduler's "no Ready peer" wait paths classically execute
+/// `sti; hlt; cli`, relying on this CPU's periodic LAPIC timer to wake it ~10 ms
+/// later so it can re-run the picker.  On SMP a CPU whose LAPIC periodic timer
+/// has wedged (KVM injection suppression — see [`cpu_timer_live`]) has no such
+/// wakeup: a blind `hlt` there sleeps until an unrelated asynchronous IRQ
+/// happens to land on the CPU, which under a single-vCPU-affine IRQ routing is
+/// effectively never — the CPU drops out of scheduling entirely (the
+/// "de-facto single core" failure mode).
+///
+/// This helper makes the wait timer-fault-tolerant:
+///   * **Timer live** → `sti; hlt; cli` as before (cheap; the timer wakes us).
+///   * **Timer wedged** → [`cpu_timer_live`] has already re-armed the local
+///     LAPIC; drive a software scheduler tick from the TSC and spin briefly
+///     (`sti; pause; cli`) WITHOUT halting, so the CPU re-enters the picker on
+///     its own clock and any peer that becomes Ready is picked up promptly.
+///
+/// The `sti` window in both arms lets a pending IRQ/IPI (including a TLB
+/// shootdown IPI, #643, or a future reschedule IPI, #648) land before the CPU
+/// blocks/spins, so this composes with the cross-CPU IPI paths unchanged.
+#[inline]
+pub fn sched_wait_quantum() {
+    if cpu_timer_live(10) {
+        // Healthy local timer: halt until the next tick (or any wake).  The
+        // STI shadow guarantees `hlt` executes before any pending interrupt,
+        // so this is race-free.
+        unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
+    } else {
+        // Local timer wedged (already re-armed by cpu_timer_live).  Keep the
+        // run queue moving on the TSC clock and spin instead of halting.
+        crate::sched::timer_tick_schedule();
+        unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
+    }
+}
+
 /// Cooperative idle step for the BSP polling/soak loop.
 ///
 /// Returns `true` if the LAPIC timer is healthy (the caller may safely `hlt`
@@ -365,8 +612,25 @@ pub fn idle_tick(slack: u64) -> bool {
     let tsc_floor = elapsed / tsc_per_tick;
 
     // Timer healthy: the ISR is keeping TICK_COUNT within `slack` of the TSC.
+    //
+    // On SMP this GLOBAL check is necessary but not sufficient: `TICK_COUNT` is
+    // maintained by whichever online CPU's timer ISR runs, so a healthy sibling
+    // keeps it fresh and masks a LOCALLY-dead timer on the calling CPU (the
+    // "de-facto single core" failure mode where one CPU's LAPIC periodic timer
+    // wedges under KVM and the other carries the whole clock).  So even when the
+    // global clock looks healthy, gate the `hlt` on this CPU's OWN timer being
+    // live — `cpu_timer_live` re-arms a locally-wedged LAPIC and returns false,
+    // and a CPU whose own timer is dead must spin (not `hlt` into a sleep its
+    // timer can never end).  Window ~10 ticks (≈100 ms) tolerates ISR jitter.
     if tsc_floor <= published.wrapping_add(slack) {
-        return true;
+        if cpu_timer_live(10) {
+            return true;
+        }
+        // Global clock fine but the local timer just wedged: keep the run queue
+        // moving with a software tick before reporting unhealthy so the caller
+        // spins instead of hlt-ing.
+        crate::sched::timer_tick_schedule();
+        return false;
     }
 
     // Timer starved. Try to revive it (harmless if it's just masked), then
@@ -570,6 +834,23 @@ extern "C" fn timer_tick() {
     let is_bsp = cpu == 0;
     if cpu < super::apic::MAX_CPUS {
         TIMER_ISR_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Cross-CPU dead-timer wake (SMP self-heal) ───────────────────────────
+    // Our own LAPIC timer is clearly delivering (we are inside its ISR).  Poke
+    // any SIBLING whose own timer ISR has gone stale — a CPU whose LAPIC
+    // periodic timer wedged (KVM injection suppression) and that may have
+    // halted on the assumption its timer would wake it.  Without this a healthy
+    // CPU keeps the global clock alive while a wedged sibling sleeps forever,
+    // carrying the whole machine alone (the SMP "de-facto single core" failure
+    // mode).  Cheap and self-rate-limited (one poke per sibling per ~200 ms);
+    // a uniprocessor finds no siblings and does nothing.  See
+    // `poke_stale_siblings` + `timer_wake_interrupt`.
+    {
+        let tpt = TSC_PER_TICK.load(Ordering::Acquire);
+        if tpt != 0 && cpu < super::apic::MAX_CPUS {
+            poke_stale_siblings(cpu, rdtsc(), tpt);
+        }
     }
 
     // Compute the wall-clock-correct TICK_COUNT from the TSC delta.  Any
@@ -778,8 +1059,32 @@ irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
+irq_stub!(irq_timer_wake_handler, timer_wake_interrupt);
 #[cfg(feature = "w215-diag")]
 irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
+
+/// Cross-CPU timer-wake IPI body (vector 0xF3).
+///
+/// Sent by a CPU whose own LAPIC timer is delivering to a SIBLING whose
+/// per-CPU timer-ISR count has gone stale — i.e. a CPU whose LAPIC periodic
+/// timer has wedged (KVM injection suppression; Intel SDM Vol. 3A §11.5.4 — a
+/// wedged periodic counter does not spontaneously resume).  A CPU that has
+/// halted (`hlt`) on the assumption its timer will wake it would otherwise
+/// sleep until an unrelated asynchronous IRQ happens to land on it; under
+/// single-vCPU-affine IRQ routing that is effectively never, so the CPU drops
+/// out of scheduling entirely (the SMP "de-facto single core" failure mode).
+///
+/// The IPI itself is the cure: delivering ANY interrupt resumes the target
+/// from `hlt`, after which its idle/wait path re-runs `cpu_timer_live`, detects
+/// the locally-dead timer, re-arms its own LAPIC and drives a software tick.
+/// This handler therefore only needs to record the poke and EOI; it also drives
+/// a scheduler tick so a freshly-Ready peer is picked up immediately on the
+/// woken CPU rather than waiting for the next loop iteration.
+extern "C" fn timer_wake_interrupt() {
+    TIMER_WAKE_IPI_RECEIVED.fetch_add(1, Ordering::Relaxed);
+    crate::sched::timer_tick_schedule();
+    if super::apic::is_enabled() { super::apic::lapic_eoi(); }
+}
 
 /// W215 Arm-1 DR0/DR7 sync IPI body.  Programs this CPU's DR0/DR7 from
 /// the values published by `arch::x86_64::debug_reg::arm_write_watchpoint`.

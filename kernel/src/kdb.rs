@@ -402,6 +402,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fault-cache-keys" => op_fault_cache_keys(out),
         "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
+        "cpu-state"        => op_cpu_state(out),
         "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
         "arm-phys"         => op_arm_phys(req, out),
@@ -1610,6 +1611,89 @@ fn op_arm_phys(req: &str, out: &mut String) {
         let _ = req;
         out.push_str(r#"{"armed":false,"error":"requires_w215_diag"}"#);
     }
+}
+
+// ── cpu-state ───────────────────────────────────────────────────────────────
+//
+// Per-CPU scheduler/timer survey for diagnosing SMP imbalance — specifically
+// "de-facto single core" symptoms where one CPU carries all scheduled load and
+// the other idles.  For each online CPU it reports:
+//
+//   * `timer_isr`       — cumulative LAPIC timer-ISR entries on that CPU.  A
+//                         frozen/near-zero count vs a peer means that CPU's
+//                         periodic timer is not delivering (timer-dead).
+//   * `current_tid`/`current_pid` — what is running on that CPU right now.
+//   * `watchdog`        — ticks since that CPU last context-switched (high ⇒
+//                         CPU-bound or wedged; low ⇒ switching regularly).
+//   * `nr_running`      — depth of that CPU's per-CPU runqueue mirror.
+//
+// Plus a `tid0` block describing the BSP poll reactor (the latency-critical
+// net/x11/compositor thread): its `last_cpu`, `affinity`, `mirror_slot` (which
+// runqueue it is enqueued on) and `state`.  Together these distinguish
+// "cpu0 timer dead" (timer_isr frozen on cpu0) from "reactor steered to cpu1"
+// (cpu0 timer alive but tid0.mirror_slot pinned to cpu1).
+fn op_cpu_state(out: &mut String) {
+    use core::fmt::Write;
+    use crate::arch::x86_64::apic::MAX_CPUS;
+
+    let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize).min(MAX_CPUS);
+    let tick = crate::arch::x86_64::irq::get_ticks();
+
+    out.push('{');
+    let _ = write!(out, r#""tick":{},"ncpus":{},"cpus":["#, tick, ncpus);
+    for cpu in 0..ncpus {
+        if cpu > 0 { out.push(','); }
+        let timer = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[cpu]
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let cur_tid = crate::proc::current_tid_on_cpu(cpu);
+        let cur_pid = crate::proc::current_pid_on_cpu(cpu);
+        let wd = crate::arch::x86_64::irq::watchdog_counter(cpu);
+        let nr = crate::sched::percpu::rq_nr_running(cpu);
+        let dead = crate::arch::x86_64::irq::cpu_timer_dead(cpu);
+        let _ = write!(
+            out,
+            r#"{{"cpu":{},"timer_isr":{},"timer_dead":{},"current_tid":{},"current_pid":{},"watchdog":{},"nr_running":{}}}"#,
+            cpu, timer, dead, cur_tid, cur_pid, wd, nr);
+    }
+    out.push(']');
+
+    // Self-heal telemetry: sibling timer-wake IPIs sent/received + per-CPU LAPIC
+    // re-arms.  Non-zero `wake_ipi_sent` under SMP = the dead-sibling-LAPIC
+    // self-heal is driving the cross-CPU poke.
+    let _ = write!(
+        out,
+        r#","wake_ipi_sent":{},"wake_ipi_received":{},"percpu_timer_rearm":{}"#,
+        crate::arch::x86_64::irq::timer_wake_ipi_sent(),
+        crate::arch::x86_64::irq::timer_wake_ipi_received(),
+        crate::arch::x86_64::irq::percpu_timer_rearm_count());
+
+    // TID-0 (BSP poll reactor) placement.  Best-effort under a brief try_lock;
+    // emit a `busy` marker rather than block the kdb listener if THREAD_TABLE
+    // is held by an in-flight syscall.
+    match try_lock_brief(&THREAD_TABLE) {
+        Some(tt) => {
+            if let Some(t) = tt.iter().find(|t| t.tid == 0) {
+                let aff = match t.cpu_affinity {
+                    Some(a) => a as i32,
+                    None => -1,
+                };
+                let (ms_cpu, ms_prio): (i32, i32) = match t.mirror_slot {
+                    Some((c, p)) => (c as i32, p as i32),
+                    None => (-1, -1),
+                };
+                let _ = write!(
+                    out,
+                    r#","tid0":{{"last_cpu":{},"affinity":{},"mirror_cpu":{},"mirror_prio":{},"state":"{:?}","priority":{}}}"#,
+                    t.last_cpu, aff, ms_cpu, ms_prio, t.state, t.priority);
+            } else {
+                out.push_str(r#","tid0":null"#);
+            }
+        }
+        None => {
+            out.push_str(r#","tid0":"THREAD_TABLE held""#);
+        }
+    }
+    out.push('}');
 }
 
 fn op_tlb_stats(out: &mut String) {

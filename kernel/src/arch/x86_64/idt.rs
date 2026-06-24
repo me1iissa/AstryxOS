@@ -189,6 +189,17 @@ pub fn init() {
             #[cfg(feature = "w215-diag")]
             IDT[0xF1].set_handler(fix(super::irq::irq_w215_dr_sync_handler as *const () as u64), kernel_cs, 0, 0);
 
+            // Cross-CPU timer-wake IPI (vector 0xF3).  A CPU whose LAPIC timer
+            // is delivering sends this to a sibling whose timer ISR went stale
+            // (its LAPIC periodic timer wedged — Intel SDM Vol. 3A §11.5.4) so
+            // the sibling cannot sleep through a dead timer.  Production SMP
+            // self-heal (not diagnostic), so it is always wired.  Vector 0xF2 is
+            // reserved for the reschedule IPI (Perf P2 phase 3c); this poke uses
+            // 0xF3 so the two cross-CPU paths stay independent.  The handler
+            // records the poke, drives a scheduler tick and EOIs; the wake is
+            // effected by the interrupt itself resuming the target from `hlt`.
+            IDT[0xF3].set_handler(fix(super::irq::irq_timer_wake_handler as *const () as u64), kernel_cs, 0, 0);
+
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
 
