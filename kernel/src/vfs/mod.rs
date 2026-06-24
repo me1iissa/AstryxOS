@@ -462,6 +462,28 @@ pub trait FileSystemOps: Send + Sync {
     /// Flush any dirty in-memory state to the backing store.
     fn sync(&self) -> VfsResult<()> { Ok(()) }
 
+    /// Whether this filesystem stores file content purely in RAM with NO
+    /// distinct backing store (ramfs / tmpfs).
+    ///
+    /// In-memory filesystems keep two copies of a file's bytes once a page is
+    /// demand-faulted: the inode's own buffer (authoritative for `read` /
+    /// `write` / `stat.size`) and the page-cache frame the demand-fault path
+    /// installs (what an `mmap` PTE aliases).  A `MAP_SHARED` + `PROT_WRITE`
+    /// store lands ONLY in the page-cache frame — the hardware writes the
+    /// frame directly through the aliasing PTE, never the inode buffer.
+    ///
+    /// For a block-backed filesystem (ext2 / fat32) the on-disk image is the
+    /// single source of truth and a `read` re-reads it, so this hazard does
+    /// not arise; those filesystems return the default `false`.
+    ///
+    /// The page cache uses this to keep the two copies coherent for in-memory
+    /// filesystems: it writes a cache frame back to the inode buffer before
+    /// the frame is evicted, and `fd_read` reads through a resident cache
+    /// frame in preference to the inode buffer.  This satisfies POSIX
+    /// mmap(2) `MAP_SHARED` visibility — "writes ... shall be visible in all
+    /// processes mapping the same region" and to a subsequent `read(2)`.
+    fn is_in_memory(&self) -> bool { false }
+
     /// Rename / move an entry from one directory to another.
     fn rename(&self, _old_parent: u64, _old_name: &str, _new_parent: u64, _new_name: &str) -> VfsResult<()> {
         Err(VfsError::Unsupported)
@@ -2547,14 +2569,23 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 ///
 /// Forward-direction coherency (write(2) visible to a subsequent read or
 /// mmap reader) is maintained by `fd_write` / `write_file` via
-/// `mm::cache::update_range`.  The reverse direction — a write through a
-/// MAP_SHARED+PROT_WRITE PTE visible to a subsequent `read(2)` — is not
-/// currently served from the page cache; this path goes straight to
-/// `fs.read`, which on tmpfs/ramfs returns the in-memory file content
-/// (consistent with mmap'd writes IF those writes have also been flushed
-/// back to FS storage).  Adding a read-through cache lookup here is a
-/// follow-up — see W215 docs/W215_CRC_MISMATCH_INVESTIGATION_*.md for the
-/// scope discussion.
+/// `mm::cache::update_range`.
+///
+/// The reverse direction — a write through a MAP_SHARED+PROT_WRITE PTE
+/// visible to a subsequent `read(2)` — is handled for in-memory filesystems
+/// (ramfs / tmpfs), where it is the dual-storage hazard: the inode buffer
+/// (`fs.read`) and the mmap-aliased page-cache frame are two distinct copies,
+/// and an mmap store lands only in the frame.  This path keeps the two
+/// coherent in both directions:
+///   * resident frames — after the `fs.read` below, any cache-resident page
+///     for the read range is overlaid onto the result (cache-authoritative
+///     read), so an mmap write held in a still-resident frame is observed;
+///   * evicted frames — `mm::cache` writes a frame's bytes back into the
+///     inode buffer before the frame leaves the cache, so a cache-miss
+///     `fs.read` after an eviction observes the mmap write too.
+/// Together these satisfy POSIX mmap(2) MAP_SHARED visibility for ramfs/tmpfs.
+/// Block-backed filesystems (ext2 / fat32) are not in-memory and re-read the
+/// on-disk image, so they are unaffected and skip the overlay.
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
     // SMAP bracket — fd_read writes data into `buf` which is typically
     // a user-VA from the syscall path.  The function does not call
@@ -2831,6 +2862,58 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 }
                 done
             };
+
+            // ── In-memory MAP_SHARED coherence: cache-authoritative read ──────
+            //
+            // For an in-memory filesystem (ramfs / tmpfs) the bounce read above
+            // pulled bytes from the inode buffer.  A `mmap(MAP_SHARED |
+            // PROT_WRITE)` store, however, lands ONLY in the page-cache frame
+            // the demand-fault path aliases — the inode buffer is not on that
+            // write path.  So while a written frame is still cache-resident,
+            // the inode buffer can be stale.  Overlay any cache-resident page's
+            // current bytes onto the just-read buffer so a `read(2)` observes
+            // the mmap write per POSIX mmap(2) MAP_SHARED visibility.  (Evicted
+            // frames are already reconciled into the inode buffer by the
+            // writeback-on-eviction path in `mm::cache`, so this only needs to
+            // cover the resident-frame case.)  Block-backed filesystems
+            // (ext2 / fat32) are not in-memory and never reach this — their
+            // on-disk image is the single source of truth.
+            if n > 0 {
+                let is_in_mem = fs_at(mount_idx)
+                    .map(|(fs, _)| fs.is_in_memory())
+                    .unwrap_or(false);
+                if is_in_mem {
+                    const PAGE: u64 = 4096;
+                    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                    let read_end = offset + n as u64;
+                    let mut pg = offset & !(PAGE - 1);
+                    while pg < read_end {
+                        if let Some(phys) = crate::mm::cache::lookup(mount_idx, inode, pg) {
+                            // Intersect [pg, pg+PAGE) with [offset, read_end).
+                            let seg_start = core::cmp::max(pg, offset);
+                            let seg_end = core::cmp::min(pg + PAGE, read_end);
+                            let in_page_off = (seg_start - pg) as usize;
+                            let buf_off = (seg_start - offset) as usize;
+                            let len = (seg_end - seg_start) as usize;
+                            // SAFETY: `phys` is a live cache frame (cache holds
+                            // a reference); the higher-half map covers it
+                            // (Intel SDM Vol. 3A §4.10.5).  `in_page_off + len
+                            // <= PAGE` and `buf_off + len <= n <= count` by the
+                            // intersection bounds above, so the copy stays in
+                            // bounds of both the frame and `buffer`.
+                            let src = (PHYS_OFF + phys + in_page_off as u64) as *const u8;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    src,
+                                    buffer.as_mut_ptr().add(buf_off),
+                                    len,
+                                );
+                            }
+                        }
+                        pg += PAGE;
+                    }
+                }
+            }
 
             // Update offset.
             {
