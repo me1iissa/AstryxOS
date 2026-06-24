@@ -778,8 +778,26 @@ irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
+irq_stub!(irq_resched_handler, resched_interrupt);
 #[cfg(feature = "w215-diag")]
 irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
+
+/// Reschedule IPI body (vector 0xF2, Perf P2 phase 3c).
+///
+/// A remote CPU made a thread runnable on THIS CPU and poked it via
+/// `sched::resched_cpu` → `apic::send_ipi_noblock`.  The handler does the
+/// minimum possible work: set this CPU's `NEED_RESCHEDULE` flag and EOI.  It
+/// takes NO lock and runs NO scheduler logic in interrupt context — the actual
+/// context switch happens at the next `sched::check_reschedule()` (syscall/IRQ
+/// return), exactly as a timer-tick preemption does.  Because it is
+/// lock-free it cannot interact with the TLB-shootdown IPI's ACK spin
+/// (the `ab84aaa` cross-CPU deadlock class): there is no shared lock to
+/// contend and the EOI is unconditional.
+extern "C" fn resched_interrupt() {
+    crate::sched::note_resched_ipi();
+    crate::sched::set_need_reschedule_local();
+    crate::arch::x86_64::apic::lapic_eoi();
+}
 
 /// W215 Arm-1 DR0/DR7 sync IPI body.  Programs this CPU's DR0/DR7 from
 /// the values published by `arch::x86_64::debug_reg::arm_write_watchpoint`.
