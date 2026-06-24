@@ -547,6 +547,54 @@ pub fn send_ipi(dest_apic_id: u8, vector: u8) {
     while lapic_read(LAPIC_ICR_LO) & (1 << 12) != 0 {}
 }
 
+/// Send an IPI without waiting for the delivery-status bit to clear
+/// (fire-and-forget).
+///
+/// Used by the reschedule IPI (Perf P2 phase 3c): the sender only needs to
+/// kick the target CPU into noticing a freshly-runnable thread, and the target
+/// has already had its `NEED_RESCHEDULE` flag set before this call — so even if
+/// the ICR's previous send is still draining, no correctness depends on this
+/// particular write landing synchronously, and spinning on the delivery bit
+/// from inside a wake path (sometimes with interrupts disabled) would only add
+/// latency.  Per Intel SDM Vol. 3A §10.6.1 the write to ICR_LOW issues the IPI;
+/// we set ICR_HIGH (destination) first, then ICR_LOW, and return immediately.
+///
+/// A short bounded wait for any *prior* in-flight IPI to drain precedes the
+/// write so this send is not silently dropped by overwriting an ICR that has
+/// not yet latched; the bound keeps it from becoming an unbounded spin if the
+/// LAPIC is wedged.
+pub fn send_ipi_noblock(dest_apic_id: u8, vector: u8) {
+    if !is_enabled() {
+        return;
+    }
+    // Bounded drain of any prior in-flight IPI (delivery-status bit 12).  Do
+    // NOT spin unboundedly here — this runs on wake paths that may hold a lock
+    // or have interrupts disabled.
+    //
+    // Cap-out behaviour: if the bound is reached while a *prior* IPI has not yet
+    // latched (only possible when a timer preempts a blocking `send_ipi` mid-send
+    // into a `schedule()`→reschedule-IPI on the same CPU), the unconditional ICR
+    // write below would overwrite that pending IPI.  That degrades to: the
+    // overwritten IPI is dropped → if it was a TLB shootdown, the sender's
+    // ack-spin times out and falls onto the conservative deferred-flush
+    // quarantine path (no UAF, no stale-translation correctness loss).  The
+    // blocking `send_ipi` carries the identical cap-class on its own pre-write
+    // drain, so this introduces no new correctness hazard — the cap exists
+    // precisely so a wedged LAPIC cannot turn a wake into an unbounded ring-0
+    // spin with interrupts disabled.
+    let mut spins = 0u32;
+    while lapic_read(LAPIC_ICR_LO) & (1 << 12) != 0 {
+        spins += 1;
+        if spins > 10_000 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    lapic_write(LAPIC_ICR_HI, (dest_apic_id as u32) << 24);
+    lapic_write(LAPIC_ICR_LO, vector as u32 | ICR_ASSERT);
+    // Return immediately — no post-send delivery wait.
+}
+
 /// Bootstrap application processors (APs).
 ///
 /// Writes a 16-bit real-mode trampoline at physical 0x8000, then sends the
