@@ -40829,6 +40829,26 @@ fn test_gdi_png_screenshot() -> bool {
     // 76 base64 chars = 57 input bytes per line (MIME line length, RFC 2045 §6.8).
     // The harness `read-png` subcommand collects all M chunks, decodes, and
     // writes the result to a host-side file.
+    //
+    // Gated behind the `screenshot-b64-dump` feature.  This dump is host-
+    // EXTRACTION only — it has NO bearing on this test's pass/fail, which is
+    // already decided by the `signature_ok=true` PNG-signature check in step 6
+    // above (BEFORE this block).  The feature is off by default and is
+    // deliberately NOT pulled into `test-mode`, so the CI kernel-smoke boot
+    // (which never invokes `read-png`) does not pay the ~25 000-line COM1
+    // serialisation cost that otherwise dominates the run and, racing a faulting
+    // process's serial spew under `-smp 2`, can blow the 900 s watchdog.  When
+    // the feature is off we emit a single sentinel line so `read-png` reports a
+    // clean "dump not enabled" instead of waiting out its timeout for chunk 0.
+    #[cfg(not(feature = "screenshot-b64-dump"))]
+    {
+        test_println!(
+            "[SCREENSHOT-B64-DISABLED] {} bytes ready; rebuild with \
+             --features screenshot-b64-dump (or harness `read-png`) to extract",
+            read_back.len()
+        );
+    }
+    #[cfg(feature = "screenshot-b64-dump")]
     {
         const CHUNK_BYTES: usize = 57; // → 76 base64 chars per line
         const B64_ALPHABET: &[u8; 64] =

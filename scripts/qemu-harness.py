@@ -3334,6 +3334,24 @@ def cmd_start(args):
                 "'firefox-test-core' nor 'firefox-test'\n"
             )
 
+    # --screenshot-dump appends the `screenshot-b64-dump` feature so Test 198
+    # (GDI PNG screenshot) base64-encodes the rendered boot-splash PNG over COM1
+    # as the chunked [SCREENSHOT-B64:N/M] stream that `read-png` decodes.  The
+    # dump is OFF by default (and NOT in `test-mode`) because it is ~25k serial
+    # lines of pure host-extraction with no bearing on any test's pass/fail; a
+    # plain `test-mode` CI boot must not pay that cost.  Enable it ONLY when you
+    # intend to `read-png` the boot-splash.  Expansion printed to stderr, never
+    # silent (the harness's standing rule).
+    if getattr(args, "screenshot_dump", False):
+        if "screenshot-b64-dump" not in feats:
+            feats.append("screenshot-b64-dump")
+            features_str = ",".join(f for f in feats if f)
+            args.features = features_str
+            sys.stderr.write(
+                "[harness] --screenshot-dump: appended 'screenshot-b64-dump' → "
+                f"features={features_str}\n"
+            )
+
     kdb_host_port = 0
     if "kdb" in feats:
         # Derive deterministically from sid so reruns are stable and two
@@ -11772,6 +11790,11 @@ _B64_CHUNK_RE = re.compile(
     r"\[SCREENSHOT-B64:(\d+)/(\d+)\]\s+([A-Za-z0-9+/=]+)"
 )
 _B64_END_RE = re.compile(r"\[SCREENSHOT-B64-END\]")
+# Emitted by Test 198 when the `screenshot-b64-dump` feature is OFF (the default,
+# incl. plain `test-mode`): the PNG was rendered + signature-verified in-guest
+# but not serialised over COM1.  Lets `read-png` fail fast with a clear pointer
+# instead of waiting out its timeout for a chunk-0 that will never come.
+_B64_DISABLED_RE = re.compile(r"\[SCREENSHOT-B64-DISABLED\]")
 
 _PNG_SIGNATURE = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
@@ -11807,6 +11830,17 @@ def cmd_read_png(args):
 
         if chunk:
             for ln in chunk.splitlines():
+                if _B64_DISABLED_RE.search(ln):
+                    print(json.dumps({
+                        "ok": False,
+                        "error": "screenshot_dump_disabled",
+                        "detail": "Test 198 rendered + signature-verified the PNG "
+                                  "in-guest but the base64 dump is OFF (the default, "
+                                  "incl. plain test-mode). Start the session with "
+                                  "`--screenshot-dump` (or build --features "
+                                  "screenshot-b64-dump) to extract it.",
+                    }, indent=2))
+                    return 1
                 m = _B64_FIRST_RE.search(ln)
                 if m:
                     total_chunks = int(m.group(1))
@@ -12451,6 +12485,17 @@ def main():
                                "'firefox-test-core' boot is the FAST perf/render "
                                "profile (<2 MB serial vs ~45 MB).  The expansion "
                                "is printed to stderr, never silent.")
+    p_start.add_argument("--screenshot-dump", action="store_true",
+                          dest="screenshot_dump",
+                          help="Append the 'screenshot-b64-dump' feature so "
+                               "Test 198 (GDI PNG screenshot) base64-encodes the "
+                               "rendered boot-splash PNG over COM1 for `read-png` "
+                               "extraction. OFF by default (and not in test-mode): "
+                               "the ~25k-line dump is host-extraction only and "
+                               "does NOT affect any test's pass/fail, so a plain "
+                               "CI boot skips it. Set this only when you intend to "
+                               "`read-png` the boot-splash. Expansion printed to "
+                               "stderr, never silent.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
     p_start.add_argument("--build-only", action="store_true", dest="build_only",

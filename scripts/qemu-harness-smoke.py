@@ -800,6 +800,59 @@ def run_read_ff_png_check():
     print()
 
 
+def run_read_png_disabled_check():
+    """
+    Tier 1.5 host-only check: `read-png` fails fast + clean when Test 198's
+    base64 dump is gated off (the default, incl. plain `test-mode`).
+
+    The screenshot-b64-dump gate (CI Test-198 UART-saturation fix) makes Test
+    198 emit a single `[SCREENSHOT-B64-DISABLED]` sentinel instead of the ~25k
+    chunk stream unless built with `--features screenshot-b64-dump`.  This check
+    feeds a synthetic serial log carrying that sentinel and asserts `read-png`
+    returns the structured `screenshot_dump_disabled` error with a non-zero rc
+    (rather than waiting out its timeout for a chunk-0 that never comes).
+
+    No QEMU launched.  Protects the gate's host-side contract against drift.
+    """
+    print("=== Tier 1.5: read-png disabled-sentinel fast-fail (host-only) ===")
+    print()
+    import tempfile
+
+    harness_dir = Path.home() / ".astryx-harness"
+    harness_dir.mkdir(parents=True, exist_ok=True)
+    sid = "smoke-pngdisabled"
+    sess_path = harness_dir / f"{sid}.json"
+    serial_path = harness_dir / f"{sid}.serial.log"
+    out_path = None
+    try:
+        # The exact line Test 198 emits when screenshot-b64-dump is off.
+        serial_path.write_text(
+            "  PNG signature [89, 50, 4E, 47] \xe2\x9c\x93\n"
+            "[SCREENSHOT] path=/tmp/screenshot.png size=1440623 signature_ok=true\n"
+            "[SCREENSHOT-B64-DISABLED] 1440623 bytes ready; rebuild with "
+            "--features screenshot-b64-dump (or harness `read-png`) to extract\n"
+        )
+        # pid=0 → liveness guard skipped, decoder reads the static log.
+        sess_path.write_text(json.dumps({
+            "sid": sid, "pid": 0, "serial_log": str(serial_path),
+        }))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+            out_path = fh.name
+
+        obj, raw, rc = _h("read-png", sid, out_path, "--timeout-ms", "3000")
+        check("read-png(disabled) returns JSON",  obj is not None,             raw[:160])
+        check("read-png(disabled) ok=false",      bool(obj and obj.get("ok") is False), str(obj))
+        check("read-png(disabled) rc!=0",         rc != 0,                     f"rc={rc}")
+        check("read-png(disabled) error tag",
+              bool(obj and obj.get("error") == "screenshot_dump_disabled"), str(obj))
+    finally:
+        sess_path.unlink(missing_ok=True)
+        serial_path.unlink(missing_ok=True)
+        if out_path:
+            Path(out_path).unlink(missing_ok=True)
+    print()
+
+
 def run_kdb_read_png_check():
     """
     Tier 1.5 host-only check: kdb-read-png chunked-assembly round-trip.
@@ -1353,6 +1406,7 @@ def main():
     run_allowlist_check()
     run_snapgate_argv_check()
     run_read_ff_png_check()
+    run_read_png_disabled_check()
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
     run_livelock_reap_check()
