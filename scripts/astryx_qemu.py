@@ -164,7 +164,11 @@ def _machine_args() -> list[str]:
     # `pc` is the legacy i440FX-based machine that AstryxOS targets.
     # `q35` would give us PCIe natively but we haven't validated all
     # drivers against it — keep `pc` pending a separate port.
-    return ["-machine", "pc"]
+    mach = "pc"
+    extra = os.environ.get("ASTRYX_MACHINE_EXTRA", "")  # e.g. "kernel_irqchip=split"
+    if extra:
+        mach = f"pc,{extra}"
+    return ["-machine", mach]
 
 
 def _serial_args(serial_path: str) -> list[str]:

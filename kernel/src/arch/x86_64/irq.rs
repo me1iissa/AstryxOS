@@ -101,7 +101,7 @@ pub static TICK_COUNT_BUMPS: AtomicU64 = AtomicU64::new(0);
 /// Read the TSC.  Standard `rdtsc` — no fences (we only need ordering
 /// against ourselves on the same CPU).
 #[inline(always)]
-fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     let lo: u32; let hi: u32;
     unsafe {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
@@ -925,6 +925,19 @@ extern "C" fn timer_tick() {
     let is_bsp = cpu == 0;
     if cpu < super::apic::MAX_CPUS {
         TIMER_ISR_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Re-arm the TSC-deadline timer (one-shot per write) ──────────────────
+    // In TSC-deadline mode (Intel SDM Vol. 3A §11.5.4.1) each write to
+    // IA32_TSC_DEADLINE arms a single interrupt, so the ISR must program the
+    // next deadline every tick.  Done here, near the top, so the cadence is
+    // measured interrupt-to-interrupt (the next deadline is `rdtsc() + period`
+    // from now, independent of how long the rest of this ISR takes).  No-op in
+    // periodic mode.  This is what keeps every vCPU's timer alive under KVM:
+    // TSC-deadline injection is reliable for the BSP vCPU, unlike the emulated
+    // periodic counter that wedged (the "de-facto single core" failure mode).
+    if super::apic::tsc_deadline_mode() {
+        super::apic::arm_tsc_deadline_next();
     }
 
     // ── Cross-CPU dead-timer wake (SMP self-heal) ───────────────────────────
