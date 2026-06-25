@@ -709,17 +709,33 @@ fn reap_dead_threads_sched() {
     // Collect (stack_base, stack_pages, last_cpu) for each reapable thread,
     // removing them from THREAD_TABLE in the same pass.  `last_cpu` feeds the
     // per-CPU switch-generation quiescence gate (see `CPU_SWITCH_GEN`).
-    let stacks: alloc::vec::Vec<(u64, usize, usize)> = {
+    let stacks = {
         let mut threads = THREAD_TABLE.lock();
         // A Dead thread is safe to reap only when ctx_rsp_valid == true, which
         // switch_context_asm sets AFTER saving the thread's RSP (meaning the CPU
         // has left or is about to leave the thread's kernel stack).  Exit paths
         // (exit_thread/exit_group) set ctx_rsp_valid=false before calling schedule(),
         // preventing the AP from freeing the stack while the BSP is still on it.
+        //
+        // CROSS-CPU GUARD (SMP=2 exit_group race): `current_tid` only names the
+        // thread running on THIS CPU.  `exit_group_inner` marks every sibling of
+        // the dying group Dead out-of-band (proc/mod.rs) while a sibling may be
+        // mid-syscall and physically executing on ANOTHER CPU.  Such a sibling
+        // still has ctx_rsp_valid == true (it was set true when the sibling was
+        // switched IN, not when it switched out), so the ctx_rsp_valid gate alone
+        // does NOT exclude it.  Reaping it would push its kernel stack to the
+        // dead-stack cache (which zero-fills the stack) or free it to the PMM
+        // while that stack is live on the other CPU — the sibling's next
+        // `ret`/`iretq` then loads a zeroed/recycled return slot and transfers
+        // control to RIP=0 (#PF IFETCH) or a torn low address (#GP).  Gate on
+        // `is_tid_current_on_any_cpu` — the kernel analogue of `task_on_cpu()` —
+        // so a Dead-but-still-executing thread is skipped until it actually
+        // leaves its CPU (and publishes ctx_rsp_valid via switch_context_asm).
         let dead_indices: alloc::vec::Vec<usize> = threads.iter().enumerate()
             .filter(|(_, t)| {
                 t.is_reapable()
                     && t.tid != current_tid
+                    && !crate::proc::is_tid_current_on_any_cpu(t.tid)
                     && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
             })
             .map(|(i, _)| i)
@@ -1770,6 +1786,17 @@ was_emergency_4k={}",
                     if cur.state == ThreadState::Running {
                         cur.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                         cur.state = ThreadState::Ready;
+                    } else {
+                        // Outgoing thread is NOT Running — it Blocked/Slept, or was
+                        // marked Dead out-of-band by a sibling's `exit_group` while
+                        // executing here.  We are still on its kernel stack until
+                        // `switch_context_asm` below saves RSP, but `set_current_tid`
+                        // (a few lines down) will stop publishing this tid as current.
+                        // Clear ctx_rsp_valid so the cross-CPU reaper's gate
+                        // (`Dead && !current_on_any_cpu && ctx_rsp_valid`) cannot free
+                        // this still-in-use stack during the publish→switch window.
+                        // `switch_context_asm` re-sets it true after saving RSP.
+                        cur.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                     }
                     // Decay priority boost here (outgoing thread, lock already held)
                     // rather than in the timer ISR to avoid 100 Hz try_lock overhead.
