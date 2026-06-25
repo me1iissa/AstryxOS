@@ -2200,6 +2200,38 @@ was_emergency_4k={}",
                 break 'pick (tid, rsp, pid, kstack_top, first_run);
             }
             None => {
+                // ── Leg 1: idle-path work-steal (Perf P2 phase 3d) ───────────
+                // Nothing is Ready on THIS CPU's own mirror set.  Before halting
+                // this CPU, try to PULL one runnable thread from a peer CPU's
+                // runqueue and re-home it here, so a thread the wake path
+                // enqueued on a stalled/dead-timer peer (whose own picker cannot
+                // drain it) does not strand.  `try_steal_to` re-homes the
+                // thread's `mirror_slot`/`last_cpu` to this CPU under the
+                // THREAD_TABLE lock we already hold; on success we drop the lock
+                // and retry the pick — the stolen thread is now on our mirror set
+                // and the normal `select_next` path selects it.  Gated on
+                // `cpu_count() > 1` so SMP=1 is bit-for-bit unchanged (no peer to
+                // steal from).  Cheap to gate: only attempt the (worst-case O(N))
+                // scan when more than one CPU exists and there is peer work — the
+                // scan stops at the first eligible thread.
+                if crate::arch::x86_64::apic::cpu_count() > 1 {
+                    let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+                        .min(crate::arch::x86_64::apic::MAX_CPUS);
+                    // Only scan if SOME peer runqueue is non-empty (cheap O(ncpus)
+                    // probe of the already-maintained nr_running counters), so the
+                    // steal scan never runs on a genuinely-idle system.
+                    let peer_work = (0..ncpus).any(|c| {
+                        c != cpu as usize && percpu::rq_nr_running(c) > 0
+                    });
+                    if peer_work {
+                        if percpu::try_steal_to(&mut threads, cpu, ncpus).is_some() {
+                            drop(threads);
+                            // A peer thread is now mirrored on this CPU; retry the
+                            // pick so the normal path selects and switches to it.
+                            continue 'pick;
+                        }
+                    }
+                }
                 // No Ready peer on this CPU right now.  Three cases for the
                 // current thread:
                 //

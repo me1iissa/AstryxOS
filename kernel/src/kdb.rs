@@ -1650,10 +1650,20 @@ fn op_cpu_state(out: &mut String) {
         let wd = crate::arch::x86_64::irq::watchdog_counter(cpu);
         let nr = crate::sched::percpu::rq_nr_running(cpu);
         let dead = crate::arch::x86_64::irq::cpu_timer_dead(cpu);
+        // Per-CPU runqueue contents (the task#13 work-steal regression lens):
+        // the actual TIDs enqueued on this CPU's runqueue, priority-ordered.
+        // Makes a thread stranded on a stalled/dead-timer CPU's rq directly
+        // visible, and lets a verifier watch a peer CPU drain those TIDs.
+        let (rq_tids, rq_bitmap) = crate::sched::percpu::rq_snapshot(cpu, 64);
         let _ = write!(
             out,
-            r#"{{"cpu":{},"timer_isr":{},"timer_dead":{},"current_tid":{},"current_pid":{},"watchdog":{},"nr_running":{}}}"#,
-            cpu, timer, dead, cur_tid, cur_pid, wd, nr);
+            r#"{{"cpu":{},"timer_isr":{},"timer_dead":{},"current_tid":{},"current_pid":{},"watchdog":{},"nr_running":{},"rq_bitmap":{},"rq_tids":["#,
+            cpu, timer, dead, cur_tid, cur_pid, wd, nr, rq_bitmap);
+        for (i, t) in rq_tids.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            let _ = write!(out, "{}", t);
+        }
+        out.push_str("]}");
     }
     out.push(']');
 
@@ -1662,10 +1672,11 @@ fn op_cpu_state(out: &mut String) {
     // self-heal is driving the cross-CPU poke.
     let _ = write!(
         out,
-        r#","wake_ipi_sent":{},"wake_ipi_received":{},"percpu_timer_rearm":{}"#,
+        r#","wake_ipi_sent":{},"wake_ipi_received":{},"percpu_timer_rearm":{},"steal_count":{}"#,
         crate::arch::x86_64::irq::timer_wake_ipi_sent(),
         crate::arch::x86_64::irq::timer_wake_ipi_received(),
-        crate::arch::x86_64::irq::percpu_timer_rearm_count());
+        crate::arch::x86_64::irq::percpu_timer_rearm_count(),
+        crate::sched::percpu::steal_count());
 
     // TID-0 (BSP poll reactor) placement.  Best-effort under a brief try_lock;
     // emit a `busy` marker rather than block the kdb listener if THREAD_TABLE
@@ -1691,6 +1702,38 @@ fn op_cpu_state(out: &mut String) {
         }
         None => {
             out.push_str(r#","tid0":"THREAD_TABLE held""#);
+        }
+    }
+
+    // ── Full per-thread state dump (task#13 work-steal regression lens) ──
+    // For every thread: tid, pid, state, last_cpu, cpu_affinity, mirror_slot
+    // (which per-CPU runqueue it is enqueued on, or -1), priority, wake_tick,
+    // ctx_rsp_valid.  The decisive datum for the stranding hazard: a thread
+    // that is Ready with `mcpu` pointing at a stalled/dead-timer CPU is
+    // stranded-Ready-on-wrong-rq; after the work-steal fix a verifier sees a
+    // peer CPU re-home (`mcpu` flips) and run it.  Bounded by MAX_RESP_BYTES
+    // truncation; best-effort under a brief try_lock.
+    match try_lock_brief(&THREAD_TABLE) {
+        Some(tt) => {
+            out.push_str(r#","threads":["#);
+            for (i, t) in tt.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                let aff = match t.cpu_affinity { Some(a) => a as i32, None => -1 };
+                let (ms_cpu, ms_prio): (i32, i32) = match t.mirror_slot {
+                    Some((c, p)) => (c as i32, p as i32),
+                    None => (-1, -1),
+                };
+                let crv = t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Relaxed);
+                let _ = write!(
+                    out,
+                    r#"{{"tid":{},"pid":{},"st":"{:?}","lcpu":{},"aff":{},"mcpu":{},"mprio":{},"prio":{},"wt":{},"crv":{}}}"#,
+                    t.tid, t.pid, t.state, t.last_cpu, aff, ms_cpu, ms_prio,
+                    t.priority, t.wake_tick, crv as u8);
+            }
+            out.push(']');
+        }
+        None => {
+            out.push_str(r#","threads":"THREAD_TABLE held""#);
         }
     }
     out.push('}');

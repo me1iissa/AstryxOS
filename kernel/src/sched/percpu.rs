@@ -326,6 +326,188 @@ pub fn mirror_forget(slot: MirrorSlot, tid: Tid) {
     }
 }
 
+/// Cumulative count of idle-path work-steals (Perf P2 phase 3d): one bump per
+/// thread re-homed from a peer CPU's runqueue onto a CPU that found nothing on
+/// its own mirror set.  Diagnostic only; non-zero under SMP is the signature of
+/// the work-steal un-stranding a runnable thread off a stalled/dead-timer peer.
+/// Monotone since boot; surfaced via [`steal_count`].
+pub static STEAL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of [`STEAL_COUNT`].
+pub fn steal_count() -> u32 {
+    STEAL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Diagnostic snapshot of the TIDs enqueued on a CPU's per-CPU runqueue, in
+/// priority order (highest priority first, FIFO within a level).  Read-only;
+/// takes only the single relevant `RQS[cpu]` leaf lock.  Bounded to `max` tids
+/// so a kdb caller cannot allocate without limit.  Returns `(tids, bitmap)`.
+/// This is the regression lens for the task#13 work-steal: it makes a thread
+/// stranded on a stalled peer's runqueue directly visible.
+pub fn rq_snapshot(cpu: usize, max: usize) -> (alloc::vec::Vec<Tid>, u32) {
+    if cpu >= MAX_CPUS {
+        return (alloc::vec::Vec::new(), 0);
+    }
+    let g = RQS[cpu].lock();
+    let mut out = alloc::vec::Vec::new();
+    // Walk priority levels high → low so the head of the highest non-empty
+    // level (the next pick) appears first.
+    for p in (0..NPRIO).rev() {
+        for &tid in g.lists[p].iter() {
+            if out.len() >= max {
+                return (out, g.bitmap);
+            }
+            out.push(tid);
+        }
+    }
+    (out, g.bitmap)
+}
+
+/// Idle-path work-steal (Perf P2 phase 3d): when `dst_cpu`'s authoritative pick
+/// finds NOTHING on its own mirror set, try to pull one runnable thread from a
+/// PEER CPU's runqueue and re-home it onto `dst_cpu` so the normal picker can
+/// run it on the next retry.  Returns the stolen TID, or `None` if nothing was
+/// steal-eligible.
+///
+/// This is what un-strands a runnable thread that the wake path enqueued on a
+/// CPU whose own picker is stalled — most acutely a CPU whose LAPIC timer has
+/// gone dead (it cannot re-run its own picker to drain its runqueue), but also a
+/// CPU merely running a long Ring-0 section.  Without it, the authoritative
+/// per-CPU pick (which only considers `mirror_slot == Some((self, _))`) leaves
+/// those threads stuck until the stalled CPU eventually drains them, if ever.
+///
+/// # Eligibility (matches the authoritative picker's admission, plus migration safety)
+///   * `state == Ready` and `tid < 0x1000` — the non-idle Ready pool the picker
+///     scores (idle/AP-pinned threads `tid >= 0x1000` are never stolen).
+///   * `ctx_rsp_valid` — the same SMP context-switch guard the picker enforces;
+///     a thread mid-publish (RSP not yet saved) is NOT migratable.
+///   * affinity-compatible with `dst_cpu` — a hard pin is a correctness
+///     constraint; a pinned thread is never stolen to a different CPU.
+///   * `mirror_slot == Some((src, _))` with `src != dst_cpu` — it is enqueued on
+///     a PEER's runqueue.  (A Running thread is not `Ready`, so the
+///     currently-running victim on the peer is never stolen — the analogue of
+///     "don't migrate the running task".)
+///
+/// # Lock discipline
+/// The caller MUST hold `THREAD_TABLE` (so the `mirror_slot`/state it reads are
+/// current and the re-home is serialised against the maintainer).  This takes
+/// the two relevant `RQS` leaf locks to migrate the bucket — but only ONE at a
+/// time (dequeue from src, then enqueue on dst), never both held together, so no
+/// two-lock ordering question arises.  Lock order `THREAD_TABLE → RQS[cpu]` is
+/// respected; no `RQS` lock is held across a `THREAD_TABLE` acquisition and the
+/// heap/PMM are never touched here.  O(N) over the table in the worst case but
+/// gated by the caller to the rare "my mirror set is empty AND a peer rq is
+/// non-empty" path, and it stops at the FIRST eligible thread.
+///
+/// `ncpus` is the online CPU count; on a uniprocessor (`ncpus <= 1`) there is no
+/// peer to steal from and this returns `None` immediately — SMP=1 stays inert.
+pub fn try_steal_to(threads: &mut [proc::Thread], dst_cpu: u8, ncpus: usize) -> Option<Tid> {
+    if ncpus <= 1 || (dst_cpu as usize) >= MAX_CPUS {
+        return None;
+    }
+    for i in 0..threads.len() {
+        let t = &threads[i];
+        // Non-idle Ready pool only (matches the picker's admission).
+        if t.state != ThreadState::Ready || t.tid >= 0x1000 {
+            continue;
+        }
+        // Mid-publish threads are not migratable (SMP switch-context guard).
+        if !t.ctx_rsp_valid.load(Ordering::Acquire) {
+            continue;
+        }
+        // Respect hard affinity: never steal a thread pinned elsewhere.
+        if let Some(a) = t.cpu_affinity {
+            if a != dst_cpu {
+                continue;
+            }
+        }
+        // Must be enqueued on a PEER's runqueue.
+        let (src_cpu, src_prio) = match t.mirror_slot {
+            Some((c, p)) if c != dst_cpu => (c, p),
+            _ => continue,
+        };
+        if (src_cpu as usize) >= MAX_CPUS {
+            continue;
+        }
+        // ── Re-home: migrate the rq bucket, then stamp the new slot. ──────────
+        // Dequeue from the source rq (single leaf lock), then enqueue on the
+        // destination rq (single leaf lock) — never both held at once.
+        let tid = t.tid;
+        let removed = RQS[src_cpu as usize].lock().dequeue(tid, src_prio);
+        if !removed {
+            // The thread's recorded slot disagreed with the source rq (a
+            // maintainer pass migrated it between our table read and the lock).
+            // Re-derive its real slot from the table next pass rather than
+            // double-insert; skip this candidate.
+            continue;
+        }
+        let t = &mut threads[i];
+        let dst_prio = t.priority;
+        RQS[dst_cpu as usize].lock().enqueue(tid, dst_prio);
+        t.mirror_slot = Some((dst_cpu, dst_prio));
+        t.last_cpu = dst_cpu;
+        STEAL_COUNT.fetch_add(1, Ordering::Relaxed);
+        return Some(tid);
+    }
+    None
+}
+
+/// Test-facing replica of [`try_steal_to`]'s eligibility + re-home logic over
+/// CALLER-OWNED runqueues (Test 657), so the steal can be proven deterministic
+/// without spinning real threads or disturbing the live static `RQS`.  Identical
+/// admission rules; operates on `rqs` (the per-CPU runqueues) and `threads` (the
+/// synthetic table) the caller supplies.  Returns the stolen TID, or `None`.
+///
+/// Parameters mirror the live path: `state`, `tid`, `ctx_rsp_valid`,
+/// `cpu_affinity`, `mirror_slot`, `priority` are read off each synthetic thread.
+/// `ncpus <= 1` returns `None` (the SMP=1 inertness the live `cpu_count() > 1`
+/// gate enforces).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn test_steal_to(
+    rqs: &mut [PerCpuRq],
+    states: &[ThreadState],
+    tids: &[Tid],
+    ctx_valid: &[bool],
+    affinity: &[Option<u8>],
+    slots: &mut [MirrorSlot],
+    prios: &[u8],
+    dst_cpu: u8,
+    ncpus: usize,
+) -> Option<Tid> {
+    if ncpus <= 1 || (dst_cpu as usize) >= rqs.len() {
+        return None;
+    }
+    for i in 0..tids.len() {
+        if states[i] != ThreadState::Ready || tids[i] >= 0x1000 {
+            continue;
+        }
+        if !ctx_valid[i] {
+            continue;
+        }
+        if let Some(a) = affinity[i] {
+            if a != dst_cpu {
+                continue;
+            }
+        }
+        let (src_cpu, src_prio) = match slots[i] {
+            Some((c, p)) if c != dst_cpu => (c, p),
+            _ => continue,
+        };
+        if (src_cpu as usize) >= rqs.len() {
+            continue;
+        }
+        if !rqs[src_cpu as usize].dequeue(tids[i], src_prio) {
+            continue;
+        }
+        let dst_prio = prios[i];
+        rqs[dst_cpu as usize].enqueue(tids[i], dst_prio);
+        slots[i] = Some((dst_cpu, dst_prio));
+        return Some(tids[i]);
+    }
+    None
+}
+
 /// Test-facing exact replica of the maintainer's two reconciliation algorithms,
 /// operating on caller-owned structures so the live static `RQS` (shared with
 /// the running scheduler) is never disturbed.
@@ -514,6 +696,21 @@ fn wake_target_with_loads(
     best_cpu as u8
 }
 
+/// Effective wakeup-target load for a CPU: its real runqueue depth, EXCEPT a
+/// CPU whose LAPIC periodic timer is dead is reported as `u32::MAX` (maximally
+/// loaded) so the load-aware spread never routes a fresh wakeup onto a CPU that
+/// cannot drain it.  See the Leg-3 note in [`mirror_maintain`].  `raw_nr` is the
+/// CPU's already-read `nr_running` (so callers holding the rq guard need not
+/// re-lock).  Inert on SMP=1 (a single live CPU is never dead-vs-itself).
+#[inline]
+fn cpu_wake_load(cpu: usize, raw_nr: u32) -> u32 {
+    if crate::arch::x86_64::irq::cpu_timer_dead(cpu) {
+        u32::MAX
+    } else {
+        raw_nr
+    }
+}
+
 /// Choose the CPU a waking thread should be enqueued on
 /// (`select_task_rq`-equivalent) by reading the LIVE runqueue loads.
 ///
@@ -522,9 +719,11 @@ fn wake_target_with_loads(
 /// caller must therefore NOT already hold any `RQS` lock).  On a uniprocessor
 /// (`cpu_count() == 1`) this returns 0, so the wakeup target is a no-op and
 /// SMP=1 is unchanged.  See [`wake_target_with_loads`] for the decision logic.
+/// A dead-timer CPU is biased out via [`cpu_wake_load`] (Leg 3).
 pub fn select_wake_target(affinity: Option<u8>, last_cpu: u8) -> u8 {
     let ncpus = crate::arch::x86_64::apic::cpu_count().min(MAX_CPUS as u32) as usize;
-    wake_target_with_loads(affinity, last_cpu, ncpus, |cpu| RQS[cpu].lock().nr_running())
+    wake_target_with_loads(affinity, last_cpu, ncpus,
+        |cpu| cpu_wake_load(cpu, RQS[cpu].lock().nr_running()))
 }
 
 /// Test-facing replica of the wakeup-target decision over caller-supplied loads
@@ -719,9 +918,20 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
             // Read loads from the guards already held (re-locking RQS here would
             // deadlock the leaf spinlock); shares the decision with the live and
             // test paths via `wake_target_with_loads`.
+            //
+            // Leg 3 (dead-timer load exclusion): a CPU whose LAPIC periodic
+            // timer has gone dead (e.g. KVM BSP-vCPU injection suppression — the
+            // separate de-facto-single-core failure mode) does not drain its
+            // runqueue, so its `nr_running` stays low and the load-aware spread
+            // would WRONGLY rank it least-loaded and steer fresh wakeups onto it
+            // — a positive-feedback strand: more runnable threads pile onto a CPU
+            // that cannot run them.  Report a dead-timer CPU as maximally loaded
+            // so wakeups route to a CPU that can actually make progress.  When
+            // EVERY CPU is dead this degrades to the plain min-load choice (the
+            // saturation is uniform), preserving the old behaviour.
             let target = wake_target_with_loads(
                 t.cpu_affinity, t.last_cpu, ncpus,
-                |cpu| guards[cpu].as_ref().map_or(0, |g| g.nr_running()),
+                |cpu| cpu_wake_load(cpu, guards[cpu].as_ref().map_or(0, |g| g.nr_running())),
             );
             t.last_cpu = target;
         }
