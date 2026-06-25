@@ -91,6 +91,15 @@ const BITMAP_SIZE: usize = MAX_PAGES / 8;
 /// 0 = free, 1 = used/reserved.
 static mut BITMAP: [u8; BITMAP_SIZE] = [0xFF; BITMAP_SIZE]; // Start all as used
 
+/// Physical span (inclusive page bounds, byte addresses) reserved for the
+/// UEFI bootstrap stack at `init`.  Zero until `init` runs (or when the live
+/// stack is already higher-half, e.g. under the test harness).  Exposed via
+/// [`bootstrap_stack_phys_span`] for the regression test and diagnostics.
+static BOOTSTRAP_STACK_PHYS_FIRST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static BOOTSTRAP_STACK_PHYS_LAST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Lock for bitmap operations.
 static PMM_LOCK: Mutex<()> = Mutex::new(());
 
@@ -203,6 +212,60 @@ pub fn boot_info_phys_page_span() -> (usize, usize, u64) {
     let last = ((astryx_shared::BOOT_INFO_PHYS_BASE + bytes.saturating_sub(1))
         / PAGE_SIZE as u64) as usize;
     (first, last, bytes)
+}
+
+/// Inclusive `(first_phys, last_phys)` byte-address span reserved for the UEFI
+/// bootstrap stack at `init`, or `(0, 0)` if no firmware stack was reserved
+/// (the live stack was already higher-half — e.g. under the test harness).
+///
+/// The BSP idle thread (TID 0) executes on this stack for the lifetime of the
+/// system (the bootloader never installs a fresh stack and `proc::init` never
+/// migrates TID 0 off it), so every page in this span MUST stay reserved
+/// against the page allocator — handing one out lets its new owner overwrite
+/// TID 0's saved `switch_context` frame and tear the next resume.
+pub fn bootstrap_stack_phys_span() -> (u64, u64) {
+    (
+        BOOTSTRAP_STACK_PHYS_FIRST.load(Ordering::Relaxed),
+        BOOTSTRAP_STACK_PHYS_LAST.load(Ordering::Relaxed),
+    )
+}
+
+/// Runtime backstop for the bootstrap-stack reservation: verify the live RSP
+/// still lies within the reserved span.
+///
+/// The reservation in [`init`] picks a fixed downward window below the RSP it
+/// observed at PMM-init time.  Every later boot phase grows the BSP stack
+/// *below* that point; if any descends past the reserved floor, that frame is a
+/// FREE bootstrap-stack page the allocator could recycle — silently
+/// re-introducing the torn-`switch_context`-frame fault.  Call this at the
+/// deepest init point (the bottom of `kernel_main`-phase bring-up) so any
+/// shortfall is a loud bugcheck rather than an intermittent recycle months
+/// later.  No-op when no firmware-stack span was recorded (higher-half live
+/// stack, e.g. the test harness) or when the live stack is already higher-half.
+#[inline(never)]
+pub fn bootstrap_stack_assert_rsp_reserved() {
+    let (first, last) = bootstrap_stack_phys_span();
+    if first == 0 && last == 0 {
+        return; // no firmware stack reserved — nothing to police
+    }
+    let rsp: u64;
+    // SAFETY: reading the stack pointer has no side effects.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+    if rsp == 0 || rsp >= astryx_shared::KERNEL_VIRT_BASE {
+        return; // live stack is higher-half (already PMM-reserved by construction)
+    }
+    // `last` is the first byte of the last reserved page; admit the whole page.
+    let lo = first;
+    let hi = last + (PAGE_SIZE as u64 - 1);
+    if rsp < lo || rsp > hi {
+        crate::ke::bugcheck::ke_bugcheck(
+            crate::ke::bugcheck::BUGCHECK_BAD_KERNEL_RSP,
+            rsp,
+            lo,
+            hi,
+            0,
+        );
+    }
 }
 
 /// True if the page index is currently marked used in the PMM bitmap.
@@ -381,6 +444,87 @@ pub fn init(boot_info: &BootInfo) {
         // SAFETY: We hold the PMM lock and page is in bounds.
         unsafe {
             mark_page_used(page);
+        }
+    }
+
+    // Reserve the UEFI bootstrap stack against the PMM (torn-switch-frame fix).
+    //
+    // The bootloader `jmp`s to the kernel WITHOUT installing a fresh stack, so
+    // the kernel — and forever after the BSP idle thread (TID 0) — executes on
+    // the firmware-provided stack (UEFI §2.3.4: the boot-time stack lives in
+    // EfiBootServicesData / EfiConventionalMemory).  Our memory-map converter
+    // reports that region as `Available`, so the loop above just marked the
+    // bootstrap-stack pages FREE.  Under heavy allocation pressure the PMM then
+    // hands one of those physical frames to a user/heap allocation whose owner
+    // overwrites it — while TID 0's saved `switch_context` frame still lives on
+    // that very stack.  The next resume of TID 0 restores a torn frame
+    // (garbage RSP/RIP) and faults.  By design TID 0 never migrates off this
+    // stack (see `proc::init` / `main`), so the frames must be reserved.
+    //
+    // We are executing on the bootstrap stack right now, so the live RSP names
+    // a page inside it.  Reserve a generous window: a few pages above the
+    // current frame (the firmware's own callers, already unwound but still part
+    // of the allocation) and the full kernel-stack span below it — every later
+    // boot phase (`syscall::init`, `vfs::init`, the scheduler bring-up, …) grows
+    // the stack *below* this point, and all of those frames belong to TID 0's
+    // permanent stack and must stay reserved.  The window is bounded and one-
+    // shot; over-reserving a handful of conventional pages is harmless.
+    //
+    // Only meaningful when the live stack is identity-mapped (RSP < the
+    // higher-half base): in `test-mode` the harness may already be on a
+    // higher-half kernel stack, in which case there is no firmware stack to
+    // reserve and we skip — the reservation is purely additive and SMP-count
+    // independent, so it is a behaviour-preserving no-op there and on SMP=1.
+    {
+        let rsp: u64;
+        // SAFETY: reading the stack pointer has no side effects.
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+        if rsp != 0 && rsp < astryx_shared::KERNEL_VIRT_BASE {
+            // Pages above the current frame (firmware callers) + a generous
+            // span below it.  The BSP never leaves this stack, and every later
+            // boot phase (`syscall::init`, `vfs::init`, the GUI/X11 bring-up
+            // with on-stack page buffers, …) descends *below* this frame, so
+            // the downward reservation must comfortably exceed the deepest
+            // `kernel_main` frame.  128 pages (512 KiB) is twice the kernel's
+            // own per-thread kernel-stack budget (`proc::KERNEL_STACK_PAGES`
+            // = 64 pages / 256 KiB), which already bounds the deepest call
+            // chain any single thread is allowed to reach — so a frame below
+            // this floor would be a stack-overflow bug in its own right.
+            // `bootstrap_stack_contains_rsp` provides a loud runtime backstop
+            // at the deepest init point so any shortfall is a bugcheck, never
+            // a silent recycle.  4 pages above covers the firmware's residual
+            // (already-unwound) frames.
+            const ABOVE_PAGES: u64 = 4;
+            const BELOW_PAGES: u64 = 128;
+            let cur_page = rsp / PAGE_SIZE as u64;
+            let first = cur_page.saturating_sub(BELOW_PAGES);
+            let last = cur_page.saturating_add(ABOVE_PAGES);
+            let mut reserved = 0u64;
+            for page in first..=last {
+                let p = page as usize;
+                if p == 0 || p >= MAX_PAGES {
+                    continue;
+                }
+                // SAFETY: lock held, index bounds-checked above.
+                unsafe {
+                    if !is_page_used_locked(p) {
+                        mark_page_used(p);
+                        reserved += 1;
+                        if total_available > 0 {
+                            total_available -= 1;
+                        }
+                    }
+                }
+            }
+            BOOTSTRAP_STACK_PHYS_FIRST.store(first * PAGE_SIZE as u64, Ordering::Relaxed);
+            BOOTSTRAP_STACK_PHYS_LAST.store(last * PAGE_SIZE as u64, Ordering::Relaxed);
+            crate::serial_println!(
+                "[PMM] Bootstrap stack reserved: rsp={:#x} phys=[{:#x}..={:#x}] newly_reserved={} (torn-frame fix)",
+                rsp,
+                first * PAGE_SIZE as u64,
+                last * PAGE_SIZE as u64,
+                reserved,
+            );
         }
     }
 

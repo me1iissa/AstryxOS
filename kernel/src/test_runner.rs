@@ -1320,6 +1320,8 @@ pub fn run() -> ! {
         if test_652_percpu_audit_image_off_stack() { passed += 1; }
         total += 1;
         if test_653_reaper_skips_thread_on_other_cpu() { passed += 1; }
+        total += 1;
+        if test_654_bootstrap_stack_reserved() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49969,6 +49971,61 @@ fn test_653_reaper_skips_thread_on_other_cpu() -> bool {
     test_println!(
         "  current_tid={} on_any_cpu={} phantom_absent=true sentinel0_absent=true",
         my_tid, crate::proc::is_tid_current_on_any_cpu(my_tid)
+    );
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 654: UEFI bootstrap stack reserved against the PMM ──────────────────
+//
+// Regression for the SMP=2 torn-`switch_context`-frame bugcheck (TID 0 idle
+// resumed with a bare-physical RSP in the recurring 0x3fe7b__ range, RIP in the
+// 0x70xx cluster).  Root cause: the bootloader `jmp`s to the kernel without
+// installing a fresh stack, so the BSP idle thread (TID 0) runs forever on the
+// firmware-provided stack, whose physical pages the UEFI memory map reports as
+// `Available` — the page allocator was free to hand one out under load, letting
+// the new owner overwrite TID 0's live saved frame.  `pmm::init` now reserves
+// that span.  This test asserts every page in the reserved span is marked used,
+// so the allocator can never re-issue it.
+fn test_654_bootstrap_stack_reserved() -> bool {
+    const NAME: &str = "[MM/PMM] bootstrap stack reserved (Test 654)";
+    test_header!(NAME);
+
+    let (first, last) = crate::mm::pmm::bootstrap_stack_phys_span();
+
+    // Under the test harness the live stack may already be higher-half (the
+    // firmware stack was replaced before this test runs), in which case
+    // `init` recorded no span.  That is a valid no-op outcome — there is no
+    // firmware stack to protect — so the test passes vacuously.
+    if first == 0 && last == 0 {
+        test_println!("  no firmware-stack span recorded (higher-half live stack) — vacuous pass");
+        test_pass!(NAME);
+        return true;
+    }
+
+    if last < first {
+        test_fail!(NAME, "inverted span first={:#x} last={:#x}", first, last);
+        return false;
+    }
+
+    // Every page in [first, last] (inclusive byte addresses) must be reserved.
+    let first_page = (first / 4096) as usize;
+    let last_page = (last / 4096) as usize;
+    let mut checked = 0usize;
+    for page in first_page..=last_page {
+        if !crate::mm::pmm::is_page_used_for_test(page) {
+            test_fail!(NAME,
+                "bootstrap-stack page {:#x} (phys {:#x}) is FREE — allocator could \
+                 hand it out and tear TID 0's switch frame",
+                page, page * 4096);
+            return false;
+        }
+        checked += 1;
+    }
+
+    test_println!(
+        "  span=[{:#x}..={:#x}] pages={} all_reserved=true",
+        first, last, checked
     );
     test_pass!(NAME);
     true

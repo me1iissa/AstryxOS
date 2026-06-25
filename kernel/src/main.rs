@@ -1644,6 +1644,19 @@ user_pref("security.sandbox.content.level", 0);
             // once; emit_out_png() re-reads and streams the bytes (see below).
             let mut out_png_emitted = false;
             let mut last_png_probe_tick: u64 = 0;
+
+            // Backstop for the bootstrap-stack reservation (mm/pmm.rs): we are
+            // at the deepest point of `kernel_main`-phase bring-up on the BSP
+            // (TID 0) bootstrap stack, just before settling into the steady-
+            // state poll loop.  Assert the live RSP still lies inside the span
+            // `pmm::init` reserved against the page allocator; if a late init
+            // phase descended below the reserved floor, that frame is a free
+            // bootstrap-stack page the allocator could recycle out from under
+            // TID 0's saved switch_context frame — turn that silent residual
+            // into a loud bugcheck here rather than an intermittent torn-frame
+            // fault later.
+            crate::mm::pmm::bootstrap_stack_assert_rsp_reserved();
+
             loop {
                 gui::input::pump_input();
                 crate::net::poll();
