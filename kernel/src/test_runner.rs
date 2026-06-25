@@ -1326,6 +1326,8 @@ pub fn run() -> ! {
         if test_655_kstack_saved_rsp_survey_gate() { passed += 1; }
         total += 1;
         if test_656_alloc_side_alias_guard() { passed += 1; }
+        total += 1;
+        if test_657_percpu_idle_work_steal() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -50243,6 +50245,158 @@ fn test_656_alloc_side_alias_guard() -> bool {
         }
     }
 
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 657: idle-path work-steal un-strands a thread off a stalled peer ────
+//
+// Regression for the task#13 SMP=2 SCHED/STARVE livelock: the authoritative
+// per-CPU picker only considers threads whose `mirror_slot` names ITS OWN CPU,
+// so a runnable thread the wake path enqueued on a peer CPU whose own picker is
+// stalled (most acutely a dead-LAPIC-timer CPU that cannot re-run its picker to
+// drain its runqueue) is STRANDED — Ready, runnable, but unpicked, while the
+// other CPU idles.  The fix lets an idle CPU PULL one such thread from a peer's
+// runqueue and re-home it (`try_steal_to` / its caller-owned replica
+// `test_steal_to`).  This test constructs the stranding hazard deterministically
+// over caller-owned runqueues and asserts the steal migrates the thread, plus
+// the SMP=1 inertness invariant.  No real threads spun; the live `RQS` is never
+// touched.  Cite POSIX 1003.1 (scheduling is implementation-defined; this is the
+// run-queue migration-on-idle a multiprocessor scheduler performs) and Intel SDM
+// Vol. 3A §8.4 (MP initialization — independent per-CPU execution contexts).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_657_percpu_idle_work_steal() -> bool {
+    use crate::sched::percpu::{PerCpuRq, test_steal_to, MirrorSlot};
+    use crate::proc::ThreadState;
+    const NAME: &str = "[SCHED/P2] idle-path work-steal un-strands peer rq (Test 657)";
+    test_header!(NAME);
+
+    let ready = ThreadState::Ready;
+    let running = ThreadState::Running;
+    let blocked = ThreadState::Blocked;
+
+    // ── Scenario 1: the core stranding hazard ────────────────────────────────
+    // CPU0 is the stalled/dead-timer CPU; 3 Ready FF-style threads (tids 54,55,57)
+    // are enqueued on CPU0's runqueue at prio 8.  CPU1 is idle.  CPU1 steals.
+    {
+        let mut rqs = [PerCpuRq::new_for_test(), PerCpuRq::new_for_test()];
+        // Enqueue the three on cpu0 (the stalled CPU's rq).
+        rqs[0].enqueue(54, 8);
+        rqs[0].enqueue(55, 8);
+        rqs[0].enqueue(57, 8);
+        let states = [ready, ready, ready];
+        let tids: [crate::proc::Tid; 3] = [54, 55, 57];
+        let ctx_valid = [true, true, true];
+        let affinity: [Option<u8>; 3] = [None, None, None]; // unpinned (FF threads)
+        let mut slots: [MirrorSlot; 3] = [Some((0, 8)), Some((0, 8)), Some((0, 8))];
+        let prios = [8u8, 8, 8];
+
+        // CPU1 (the idle CPU) steals from CPU0.
+        let stolen = test_steal_to(&mut rqs, &states, &tids, &ctx_valid,
+            &affinity, &mut slots, &prios, /*dst*/1, /*ncpus*/2);
+        match stolen {
+            Some(t) if t == 54 => {} // FIFO: head of the highest level (first enqueued)
+            other => {
+                test_fail!(NAME, "scenario1: expected steal of tid 54, got {:?}", other);
+                return false;
+            }
+        }
+        // The stolen thread must now be mirrored on CPU1, dequeued from CPU0.
+        if slots[0] != Some((1, 8)) {
+            test_fail!(NAME, "scenario1: tid54 slot not re-homed to cpu1: {:?}", slots[0]);
+            return false;
+        }
+        if rqs[0].nr_running() != 2 || rqs[1].nr_running() != 1 {
+            test_fail!(NAME, "scenario1: rq depths wrong cpu0={} cpu1={} (want 2/1)",
+                rqs[0].nr_running(), rqs[1].nr_running());
+            return false;
+        }
+        if !rqs[1].invariants_hold() || !rqs[0].invariants_hold() {
+            test_fail!(NAME, "scenario1: rq invariants broken after steal");
+            return false;
+        }
+        // A second steal pulls the next one, draining CPU0 toward balance.
+        let stolen2 = test_steal_to(&mut rqs, &states, &tids, &ctx_valid,
+            &affinity, &mut slots, &prios, 1, 2);
+        if stolen2 != Some(55) || rqs[0].nr_running() != 1 || rqs[1].nr_running() != 2 {
+            test_fail!(NAME, "scenario1: second steal wrong (got {:?}, depths {}/{})",
+                stolen2, rqs[0].nr_running(), rqs[1].nr_running());
+            return false;
+        }
+    }
+
+    // ── Scenario 2: SMP=1 inertness (ncpus <= 1 ⇒ never steal) ────────────────
+    {
+        let mut rqs = [PerCpuRq::new_for_test()];
+        rqs[0].enqueue(54, 8);
+        let states = [ready];
+        let tids: [crate::proc::Tid; 1] = [54];
+        let ctx_valid = [true];
+        let affinity: [Option<u8>; 1] = [None];
+        let mut slots: [MirrorSlot; 1] = [Some((0, 8))];
+        let prios = [8u8];
+        if test_steal_to(&mut rqs, &states, &tids, &ctx_valid,
+            &affinity, &mut slots, &prios, 0, /*ncpus*/1).is_some() {
+            test_fail!(NAME, "scenario2: SMP=1 must never steal");
+            return false;
+        }
+        if slots[0] != Some((0, 8)) || rqs[0].nr_running() != 1 {
+            test_fail!(NAME, "scenario2: SMP=1 perturbed the runqueue");
+            return false;
+        }
+    }
+
+    // ── Scenario 3: ineligible candidates are NOT stolen ─────────────────────
+    // tid60 Running (not Ready), tid61 Blocked, tid62 ctx_rsp_valid=false
+    // (mid-publish), tid63 pinned to cpu0 (hard affinity), tid0x1001 idle-class.
+    // All on cpu0's rq-equivalent slots; CPU1 must steal NONE of them.
+    {
+        let mut rqs = [PerCpuRq::new_for_test(), PerCpuRq::new_for_test()];
+        rqs[0].enqueue(60, 8); // will be Running
+        rqs[0].enqueue(61, 8); // will be Blocked
+        rqs[0].enqueue(62, 8); // ctx_rsp_valid=false
+        rqs[0].enqueue(63, 8); // pinned to cpu0
+        rqs[0].enqueue(0x1001, 8); // idle-class tid (>= 0x1000)
+        let states = [running, blocked, ready, ready, ready];
+        let tids: [crate::proc::Tid; 5] = [60, 61, 62, 63, 0x1001];
+        let ctx_valid = [true, true, false, true, true];
+        let affinity: [Option<u8>; 5] = [None, None, None, Some(0), None];
+        let mut slots: [MirrorSlot; 5] =
+            [Some((0, 8)), Some((0, 8)), Some((0, 8)), Some((0, 8)), Some((0, 8))];
+        let prios = [8u8, 8, 8, 8, 8];
+        let stolen = test_steal_to(&mut rqs, &states, &tids, &ctx_valid,
+            &affinity, &mut slots, &prios, 1, 2);
+        if stolen.is_some() {
+            test_fail!(NAME, "scenario3: stole an ineligible thread {:?} \
+                (Running/Blocked/mid-publish/pinned/idle-class must all be skipped)", stolen);
+            return false;
+        }
+        if rqs[1].nr_running() != 0 {
+            test_fail!(NAME, "scenario3: cpu1 rq grew despite no eligible steal");
+            return false;
+        }
+    }
+
+    // ── Scenario 4: a thread already on the destination CPU is not "stolen" ───
+    // (src == dst ⇒ not a peer; nothing to migrate.)
+    {
+        let mut rqs = [PerCpuRq::new_for_test(), PerCpuRq::new_for_test()];
+        rqs[1].enqueue(70, 8);
+        let states = [ready];
+        let tids: [crate::proc::Tid; 1] = [70];
+        let ctx_valid = [true];
+        let affinity: [Option<u8>; 1] = [None];
+        let mut slots: [MirrorSlot; 1] = [Some((1, 8))]; // already on cpu1
+        let prios = [8u8];
+        if test_steal_to(&mut rqs, &states, &tids, &ctx_valid,
+            &affinity, &mut slots, &prios, 1, 2).is_some() {
+            test_fail!(NAME, "scenario4: stole a thread already on the dst CPU");
+            return false;
+        }
+    }
+
+    test_println!("  work-steal: peer-rq pull + re-home (slot/depth/invariants) / SMP=1 inert / \
+ineligible (Running/Blocked/mid-publish/pinned/idle-class) skipped / same-CPU no-op — GREEN");
     test_pass!(NAME);
     true
 }
