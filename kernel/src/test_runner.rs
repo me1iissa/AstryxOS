@@ -1318,6 +1318,8 @@ pub fn run() -> ! {
         if test_650_percpu_wake_target() { passed += 1; }
         total += 1;
         if test_652_percpu_audit_image_off_stack() { passed += 1; }
+        total += 1;
+        if test_653_reaper_skips_thread_on_other_cpu() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -49906,6 +49908,68 @@ fn test_652_percpu_audit_image_off_stack() -> bool {
 
     test_println!("  [PerCpuRq; MAX_CPUS] audit image dwarfs the emergency kstack \
 tier → must stay heap-allocated (closes the switch_context popf #DB) GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 653: reaper cross-CPU guard — never reap a thread on another CPU ────
+//
+// Regression for the SMP=2 content-init crash race: `exit_group_inner` marks
+// every sibling of a dying thread group Dead out-of-band while a sibling may be
+// physically executing on another CPU.  Such a sibling keeps `ctx_rsp_valid ==
+// true` (set true when it was switched IN), so the reaper's `ctx_rsp_valid`
+// gate alone does NOT exclude it.  Reaping it would push its kernel stack to
+// the dead-stack cache (which zero-fills it) or free it to the PMM while the
+// stack is live on the other CPU — the sibling's next `ret`/`iretq` then loads
+// a zeroed/recycled return slot and jumps to RIP=0 (#PF IFETCH) or a torn low
+// address such as 0x700a (#GP).
+//
+// The fix gates the reaper on `proc::is_tid_current_on_any_cpu(tid)` — the
+// kernel analogue of `task_on_cpu()`.  This test pins that predicate's core
+// invariants (it is the load-bearing primitive of the reaper gate):
+//   1. The calling thread's own TID IS current on this CPU → predicate true.
+//      (A reaper running on any CPU must therefore never select the thread
+//      executing on that CPU, even if it has been marked Dead out-of-band.)
+//   2. A TID that no CPU has ever adopted as current → predicate false.
+//   3. The idle/bootstrap sentinel TID 0 → predicate false (never a reapable
+//      user thread).
+fn test_653_reaper_skips_thread_on_other_cpu() -> bool {
+    const NAME: &str = "[SCHED/SMP] reaper cross-CPU guard (Test 653)";
+    test_header!(NAME);
+
+    let my_tid = crate::proc::current_tid();
+
+    // (1) The thread currently executing on this CPU must report as current on
+    //     "some" CPU — this is exactly what stops a concurrent reaper on the
+    //     other core from freeing this stack out from under us.
+    if my_tid != 0 && !crate::proc::is_tid_current_on_any_cpu(my_tid) {
+        test_fail!(NAME,
+            "current tid {} not reported running on any CPU — reaper would be \
+             free to recycle a live kernel stack", my_tid);
+        return false;
+    }
+
+    // (2) A TID no CPU runs must be reported absent.  u64::MAX is never a real
+    //     allocated TID (allocation is monotonic from a small base), so it can
+    //     never be published in a PER_CPU_CURRENT_TID slot.
+    let phantom_tid: u64 = u64::MAX;
+    if crate::proc::is_tid_current_on_any_cpu(phantom_tid) {
+        test_fail!(NAME,
+            "phantom tid {:#x} falsely reported running — reaper would defer \
+             forever / mis-gate", phantom_tid);
+        return false;
+    }
+
+    // (3) TID 0 short-circuits to false (per-CPU idle/bootstrap sentinel).
+    if crate::proc::is_tid_current_on_any_cpu(0) {
+        test_fail!(NAME, "sentinel tid 0 reported running — must be false");
+        return false;
+    }
+
+    test_println!(
+        "  current_tid={} on_any_cpu={} phantom_absent=true sentinel0_absent=true",
+        my_tid, crate::proc::is_tid_current_on_any_cpu(my_tid)
+    );
     test_pass!(NAME);
     true
 }

@@ -1052,8 +1052,15 @@ pub fn current_tid() -> Tid {
 }
 
 /// Set the currently running thread's TID (per-CPU).
+///
+/// Published with `Release` so a cross-CPU `Acquire` reader
+/// ([`is_tid_current_on_any_cpu`]) observes this CPU's current TID coherently:
+/// the reaper relies on this to never free the kernel stack of a thread that
+/// is still executing on another core.  The companion `current_tid()` /
+/// `current_tid_on_cpu()` fast readers stay `Relaxed`/`Acquire` as before — a
+/// CPU reading *its own* slot needs no barrier.
 pub fn set_current_tid(tid: Tid) {
-    PER_CPU_CURRENT_TID[cpu_index()].store(tid, Ordering::Relaxed);
+    PER_CPU_CURRENT_TID[cpu_index()].store(tid, Ordering::Release);
 }
 
 /// Read the currently running TID for an arbitrary CPU index (not necessarily
@@ -1066,6 +1073,41 @@ pub fn current_tid_on_cpu(cpu: usize) -> Tid {
     } else {
         0
     }
+}
+
+/// Returns `true` if `tid` is the thread currently executing on **any** logical
+/// processor — including a CPU other than the caller's.
+///
+/// This is the cross-CPU analogue of comparing against [`current_tid`]: where
+/// `current_tid()` only answers "is `tid` running on *my* CPU", this surveys
+/// every CPU's per-CPU current-TID slot.  It is the kernel equivalent of the
+/// `task_on_cpu()` predicate other SMP kernels gate teardown on: a thread's
+/// kernel stack (or any other execution-state resource) must never be freed,
+/// recycled, or zero-filled while the thread is still on a CPU, even if a
+/// different CPU marked it Dead out-of-band (e.g. `exit_group` marking a
+/// sibling Dead while that sibling is mid-syscall on another core).
+///
+/// `tid == 0` is the per-CPU idle/bootstrap sentinel and is never a reapable
+/// user thread, so a zero query short-circuits to `false`.
+///
+/// Ordering: each slot is read with `Acquire` so the result synchronises-with
+/// the `Release` publish performed by `set_current_tid`/the context-switch
+/// path when a CPU adopts a thread as current.  A `false` result therefore
+/// means no CPU had `tid` published as current at a point no earlier than this
+/// call observed each slot — sufficient for the reaper, which re-checks under
+/// the THREAD_TABLE lock that the thread is still Dead.
+pub fn is_tid_current_on_any_cpu(tid: Tid) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+        .min(crate::arch::x86_64::apic::MAX_CPUS);
+    for cpu in 0..ncpus {
+        if PER_CPU_CURRENT_TID[cpu].load(Ordering::Acquire) == tid {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read the currently running PID for an arbitrary CPU index.  See
@@ -2361,15 +2403,31 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // grow large enough that the linear scan becomes a latency concern,
     // consider an atomic per-process Running-thread counter as a fast
     // pre-check before taking the lock.
-    let any_sibling_running = {
-        let threads = THREAD_TABLE.lock();
-        threads.iter().any(|t| {
-            t.pid == pid
-            && (calling_tid == 0 || t.tid != calling_tid)
-            && t.state == ThreadState::Running
+    //
+    // CROSS-CPU detection: the `state == Running` test that used to live here
+    // was defeated by this function's own earlier pass, which forced every
+    // sibling to `Dead` (so none read as Running and the guard always fell
+    // through to an immediate free).  A sibling marked Dead can still be
+    // physically executing on another CPU mid-syscall; freeing the user page
+    // tables out from under it lets its SYSRETQ land on a now-unmapped user VA
+    // (Intel SDM Vol. 3A §4.10).  Detect "still on a CPU" via the per-CPU
+    // current-PID slots — the address-space analogue of the reaper's
+    // `is_tid_current_on_any_cpu` kstack guard.
+    let any_sibling_on_cpu = {
+        let calling_cpu_tid = current_tid();
+        let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+            .min(crate::arch::x86_64::apic::MAX_CPUS);
+        (0..ncpus).any(|c| {
+            let ctid = current_tid_on_cpu(c);
+            current_pid_on_cpu(c) == pid
+                && ctid != 0
+                // Exclude the exit_group caller itself (it is mid-teardown on
+                // its own stack; it frees the rest after it yields).
+                && !(calling_tid != 0 && ctid == calling_tid)
+                && ctid != calling_cpu_tid
         })
     };
-    if !any_sibling_running {
+    if !any_sibling_on_cpu {
         free_process_memory(pid);
     }
 
