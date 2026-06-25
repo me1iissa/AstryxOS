@@ -50245,6 +50245,10 @@ fn test_656_alloc_side_alias_guard() -> bool {
         }
     }
 
+    test_pass!(NAME);
+    true
+}
+
 // ── Test 657: idle-path work-steal un-strands a thread off a stalled peer ────
 //
 // Regression for the task#13 SMP=2 SCHED/STARVE livelock: the authoritative
