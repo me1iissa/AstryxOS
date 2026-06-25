@@ -79,7 +79,7 @@
 //!
 //! No fix-it logic lives here; the module is diagnostic-only.
 
-#![cfg(feature = "w215-diag")]
+#![cfg(any(feature = "w215-diag", feature = "582-diag"))]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 
@@ -187,6 +187,22 @@ pub const WATCH_KIND_D22_USER_CANARY_PHYS: u32 = 8;
 ///       kind), matching legacy slots — a single fire produces the
 ///       full dump and the slot releases for any later diagnostic.
 pub const WATCH_KIND_F3_CODE_DR:     u32 = 9;
+///  10 — #582 torn-saved-RFLAGS-slot watch.  Arms an 8-byte *data-write*
+///       watch on a context-switch victim's saved-RFLAGS slot
+///       (`Thread::context.rsp + 0`, the qword the `pushfq` in
+///       `switch_context_asm` last stored before the save site).  The
+///       goal is to name the out-of-band store that tears that slot to a
+///       TF-set value while the victim sits Ready/Blocked (the kernel-mode
+///       `#DB`/`UNEXPECTED_KERNEL_MODE_TRAP 0x7f` root).  Per Intel SDM
+///       Vol. 3B §17.3.1.1 a data-write breakpoint is a *trap* (taken
+///       after the writer's store retires), so the watched qword read at
+///       fire time reflects exactly what the writer just stored.  The
+///       fire path (`arch::x86_64::db582::record_fire`) classifies the
+///       writer RIP as the legitimate `switch_context_asm` re-save (benign
+///       churn — re-arm and continue) versus an out-of-band RIP (the
+///       catch).  Persistent across fires (its own cap) so the watch can
+///       sit through many benign re-saves until the foreign writer hits.
+pub const WATCH_KIND_D582_RFLAGS:    u32 = 10;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
@@ -228,6 +244,17 @@ const F3_FIRE_CAP: u32 = 32;
 const D16_FIRE_CAP: u32 = 256;
 #[cfg(not(feature = "d18-extended-d16"))]
 const D16_FIRE_CAP: u32 = F3_FIRE_CAP;
+
+/// Per-slot fire CAP for `WATCH_KIND_D582_RFLAGS` arms.  The watch sits on
+/// a switch-victim's saved-RFLAGS slot and is *expected* to fire on every
+/// legitimate `switch_context_asm` re-save of that same victim (benign
+/// churn — the `db582` fire path classifies those and does not emit a
+/// catch line for them).  The cap must therefore be high enough that the
+/// slot survives many benign re-saves before the out-of-band writer hits;
+/// the fire path self-limits the *logged* output to a small budget so the
+/// raised cap does not flood serial.  Per Intel SDM Vol. 3B §17.3.1.1 each
+/// fire still names exactly one retired writer.
+const D582_FIRE_CAP: u32 = 1_000_000;
 
 /// Number of arm broadcasts issued since boot (sum across slots).
 static ARM_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -677,7 +704,11 @@ pub fn handle_db_exception(
         // Intel SDM Vol. 3B §17.3.1.1 each fire still names one
         // retired writer; the cap controls how many writers we log,
         // not the timing of the trap.
-        let cap = if kind_tag == WATCH_KIND_D16_CANARY { D16_FIRE_CAP } else { F3_FIRE_CAP };
+        let cap = match kind_tag {
+            WATCH_KIND_D16_CANARY => D16_FIRE_CAP,
+            WATCH_KIND_D582_RFLAGS => D582_FIRE_CAP,
+            _ => F3_FIRE_CAP,
+        };
         let one_shot = match kind_tag {
             WATCH_KIND_LEGACY => true,
             _ => fire_idx + 1 >= cap,
@@ -687,6 +718,24 @@ pub fn handle_db_exception(
             ARMED_ADDR[slot].store(0, Ordering::Relaxed);
             ARMED_CTRL[slot].store(0, Ordering::Relaxed);
             ARMED_KIND[slot].store(WATCH_KIND_LEGACY, Ordering::Relaxed);
+        }
+
+        // #582 RFLAGS-slot watch — route to the dedicated classifier and
+        // SKIP the generic `[W215/DR-WATCH-FIRE]` + stack dump below.  The
+        // D582 watch fires on every benign `switch_context_asm` re-save of
+        // the watched victim; emitting the verbose generic dump per fire
+        // would flood serial.  `record_fire` self-limits its output and
+        // only emits loudly on an out-of-band writer (the catch).  Gated
+        // on `582-diag`.  Marking the trap consumed and continuing keeps
+        // the slot armed for the next fire (re-armable) unless `one_shot`
+        // already disarmed it at the cap.
+        #[cfg(feature = "582-diag")]
+        if kind_tag == WATCH_KIND_D582_RFLAGS {
+            crate::arch::x86_64::db582::record_fire(
+                slot as u8, fire_idx, rip, rsp, rflags, cs, cr3, addr, gprs,
+            );
+            consumed = true;
+            continue;
         }
 
         crate::serial_println!(
@@ -1108,6 +1157,154 @@ pub fn arm_linear_watchpoint(
         );
     }
     ArmPhysResult::Armed(slot)
+}
+
+/// #582 — arm an 8-byte data-write watch on a switch victim's saved-RFLAGS
+/// slot (`Thread::context.rsp + 0`).  Always uses DR0 (the post-hoc slot,
+/// kept clear of the W215 cache pre-insert pool on DR1/DR2/DR3) so the
+/// scheduler arm site never contends with a render-path arm.
+///
+/// Re-armable / rotating: if DR0 already carries a D582 watch, it is
+/// disarmed and re-pointed at `linear_addr`, letting the scheduler move
+/// the watch from one victim to the next over time without leaking the
+/// slot.  If DR0 carries some *other* kind (a legacy/F3 arm), this is a
+/// no-op (returns `false`) so the diagnostic never steals a slot another
+/// investigation owns.
+///
+/// `linear_addr` must be 8-byte aligned and higher-half (a kernel-stack
+/// VA); callers gate on the slot reading the healthy `0x202` first.
+/// Cross-CPU propagation uses the same lazy-gen protocol as every other
+/// arm path (peers re-program at their next timer-ISR
+/// `apply_pending_if_stale`).  Per Intel SDM Vol. 3B §17.2.4 the watch is
+/// a per-CPU data-write breakpoint; §17.3.1.1 makes the fire a trap, so
+/// the fire handler reads the just-stored value through the direct map.
+/// #582 — the TID whose saved-RFLAGS slot DR0's D582 watch belongs to.
+/// `u64::MAX` = no D582 watch.  The scheduler disarms the watch when it
+/// switches INTO this TID (the slot becomes live stack on resume, so any
+/// further store to it is ordinary stack reuse, not the tear we hunt).
+#[cfg(feature = "582-diag")]
+static D582_WATCHED_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(feature = "582-diag")]
+pub fn arm_d582_rflags_watchpoint(linear_addr: u64) -> bool {
+    arm_d582_rflags_watchpoint_for(linear_addr, u64::MAX)
+}
+
+/// #582 — arm the RFLAGS-slot watch and record the owning TID so the
+/// scheduler can disarm it on that TID's resume (see [`d582_disarm_if_tid`]).
+#[cfg(feature = "582-diag")]
+pub fn arm_d582_rflags_watchpoint_for(linear_addr: u64, owner_tid: u64) -> bool {
+    const SLOT: usize = 0;
+    if linear_addr < 0xFFFF_8000_0000_0000 || (linear_addr & 0x7) != 0 {
+        return false;
+    }
+    // If DR0 is armed for a *non*-D582 kind, do not disturb it.
+    if ARMED[SLOT].load(Ordering::Acquire)
+        && ARMED_KIND[SLOT].load(Ordering::Relaxed) != WATCH_KIND_D582_RFLAGS
+    {
+        return false;
+    }
+    // Claim / re-point DR0.  Reset the per-slot fire count so the cap
+    // applies per-victim rather than accumulating across rotations.
+    ARMED[SLOT].store(true, Ordering::Release);
+    ARMED_ADDR[SLOT].store(linear_addr, Ordering::Relaxed);
+    ARMED_CTRL[SLOT].store(dr7_bits_for_slot(SLOT, 8), Ordering::Relaxed);
+    ARMED_PHYS[SLOT].store(0, Ordering::Relaxed);
+    ARMED_KEY_INODE[SLOT].store(0, Ordering::Relaxed);
+    ARMED_KEY_OFFSET[SLOT].store(0, Ordering::Relaxed);
+    ARMED_KIND[SLOT].store(WATCH_KIND_D582_RFLAGS, Ordering::Relaxed);
+    DR_FIRE_COUNT[SLOT].store(0, Ordering::Relaxed);
+    D582_WATCHED_TID.store(owner_tid, Ordering::Release);
+    let n = ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Bounded arm-confirmation heartbeat: emit the first few arms so an
+    // investigator can confirm the scheduler arm site is live and on which
+    // CPU it programmed DR0.  Diagnostic-only.
+    {
+        static D582_ARM_LOGGED: AtomicU32 = AtomicU32::new(0);
+        if D582_ARM_LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+            let cpu = super::apic::cpu_index();
+            crate::serial_println!(
+                "[582/ARM] slot=0 cpu={} linear={:#x} arm_count={} kind_tag={}",
+                cpu, linear_addr, n, WATCH_KIND_D582_RFLAGS,
+            );
+        }
+    }
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    true
+}
+
+/// #582 — true if DR0 currently carries a D582 RFLAGS-slot watch (used by
+/// the scheduler arm site to decide whether to rotate the watch).
+#[cfg(feature = "582-diag")]
+pub fn d582_is_armed() -> bool {
+    ARMED[0].load(Ordering::Acquire)
+        && ARMED_KIND[0].load(Ordering::Relaxed) == WATCH_KIND_D582_RFLAGS
+}
+
+/// #582 — the linear address DR0's D582 watch currently points at (0 if
+/// none).  Lets the scheduler avoid re-arming on the same victim slot.
+#[cfg(feature = "582-diag")]
+pub fn d582_armed_addr() -> u64 {
+    if d582_is_armed() {
+        ARMED_ADDR[0].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// #582 — the TID that owns DR0's current D582 watch (`u64::MAX` if none).
+/// Read by the fire path to compare against the writing TID: writer ==
+/// owner ⇒ the owner's own-stack activity; writer != owner ⇒ a foreign
+/// thread stored to a parked victim's saved frame (the #582 tear).
+#[cfg(feature = "582-diag")]
+pub fn d582_watched_tid() -> u64 {
+    D582_WATCHED_TID.load(Ordering::Acquire)
+}
+
+/// #582 — disarm DR0's D582 watch if it belongs to `tid`.  Called by the
+/// scheduler just before switching INTO `tid`: on resume the watched
+/// saved-RFLAGS slot becomes live stack within the resuming thread's frame,
+/// so any later store to it is ordinary stack reuse (a `String::clone`
+/// memcpy, a local-variable write, …), NOT the #582 tear.  Leaving the
+/// watch armed across resume produced a flood of false-positive catches
+/// with `tf_tear=0` at non-`switch_context_asm` RIPs.  Returns `true` if a
+/// watch was disarmed.  Cheap fast-path: one atomic load + compare when no
+/// D582 watch is live or the TID does not match.
+#[cfg(feature = "582-diag")]
+pub fn d582_disarm_if_tid(tid: u64) -> bool {
+    const SLOT: usize = 0;
+    if D582_WATCHED_TID.load(Ordering::Acquire) != tid {
+        return false;
+    }
+    if !d582_is_armed() {
+        D582_WATCHED_TID.store(u64::MAX, Ordering::Release);
+        return false;
+    }
+    ARMED[SLOT].store(false, Ordering::Release);
+    ARMED_ADDR[SLOT].store(0, Ordering::Relaxed);
+    ARMED_CTRL[SLOT].store(0, Ordering::Relaxed);
+    ARMED_KIND[SLOT].store(WATCH_KIND_LEGACY, Ordering::Relaxed);
+    D582_WATCHED_TID.store(u64::MAX, Ordering::Release);
+    // Publish the disarm so peer CPUs clear DR7 enable bits at their next
+    // `apply_pending_if_stale` (timer-ISR top).
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    true
 }
 
 /// Build DR7 control bits for an instruction-execute breakpoint on `slot`.

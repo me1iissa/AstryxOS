@@ -1099,7 +1099,10 @@ extern "C" fn timer_tick() {
     // atomic loads + compare; slow path is bounded by `program_local_drs`
     // (≤ 4 DR writes + 1 DR7 write).  Must run BEFORE the CRC walker so
     // a peer-CPU arm propagates before this CPU re-evaluates the cache.
-    #[cfg(feature = "w215-diag")]
+    // Also required by `582-diag`: the #582 RFLAGS-slot watch is armed on
+    // one CPU but must catch a cross-CPU writer, so peers must pick up the
+    // DR0 arm here (the lazy-gen propagation point).
+    #[cfg(any(feature = "w215-diag", feature = "582-diag"))]
     crate::arch::x86_64::debug_reg::apply_pending_if_stale();
 
     // Per-process activity-metrics dump.  Wait-free fast path: one

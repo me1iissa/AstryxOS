@@ -33,6 +33,15 @@ static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// #582 diagnostic: per-CPU resumed-switch counter used to SAMPLE the
+/// RFLAGS-slot write-watch arm site 1-in-N (see the arm block in
+/// `schedule()`).  Diagnostic-only; carried unconditionally (a single
+/// AtomicU64 array) so the arm block stays simple, but only read under
+/// `#[cfg(feature = "582-diag")]`.
+#[cfg(feature = "582-diag")]
+static D582_SAMPLE_CTR: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// Per-CPU context-switch generation counter.
 ///
 /// Incremented by `note_switch_completed()` every time a CPU finishes a
@@ -692,6 +701,39 @@ pub fn check_reschedule() {
     }
 }
 
+/// True if some thread in `threads` (other than `excluding_tid`) has a saved
+/// kernel RSP (`context.rsp`) that falls within `[base, base + size)`.
+///
+/// This is the saved-RSP analogue of `proc::is_tid_current_on_any_cpu` (the
+/// #653 per-CPU running-TID survey): it answers "does a live thread's *saved*
+/// switch-context frame still live in this kstack span?", which is the
+/// invariant a kstack frame must satisfy as FALSE before the frame may be
+/// freed or recycled.  A parked thread's `context.rsp` points at its saved
+/// `switch_context_asm` frame (the `pushfq` slot at `context.rsp + 0`); if a
+/// freed/recycled frame aliases that span, a zero-fill or a re-issue tears the
+/// parked thread's saved RFLAGS slot, and its later `popfq` faults
+/// (kernel-mode `#DB`, `UNEXPECTED_KERNEL_MODE_TRAP` 0x7f).  Folded into the
+/// reaper's existing THREAD_TABLE scan, so it adds no asymptotic cost.
+///
+/// `excluding_tid` is the owner being reaped — its own saved RSP necessarily
+/// lies in its own kstack and must not self-defer the free.
+fn saved_rsp_aliases_live_frame(
+    threads: &[crate::proc::Thread],
+    base: u64,
+    size: u64,
+    excluding_tid: crate::proc::Tid,
+) -> bool {
+    let end = base.wrapping_add(size);
+    threads.iter().any(|t| {
+        t.tid != excluding_tid
+            && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+            && {
+                let rsp = t.context.rsp;
+                rsp >= base && rsp < end
+            }
+    })
+}
+
 /// Reap dead threads and free their kernel stacks.
 ///
 /// MUST be called with interrupts already disabled so that pmm::free_page()
@@ -700,15 +742,26 @@ pub fn check_reschedule() {
 fn reap_dead_threads_sched() {
     use crate::proc::KERNEL_VIRT_OFFSET;
 
+    // First, drain any previously-quarantined emergency-tier frees whose
+    // quiescence + saved-RSP gates have since cleared.  Doing this at the top
+    // of every reaper pass bounds the quarantine and reclaims memory promptly
+    // once a frame is provably no longer referenced.  Safe under the reaper's
+    // IF=0 contract (takes its own short THREAD_TABLE + quarantine locks,
+    // releases before PMM ops).
+    drain_pending_kstack_free();
+
     // IMPORTANT: Never reap the CURRENT thread. The caller is still running on
     // its kernel stack — freeing the stack while executing on it is a UAF.
     // The current thread will be reaped the next time a DIFFERENT thread calls
     // schedule() and runs this function (with a different current_tid).
     let current_tid = crate::proc::current_tid();
 
-    // Collect (stack_base, stack_pages, last_cpu) for each reapable thread,
-    // removing them from THREAD_TABLE in the same pass.  `last_cpu` feeds the
-    // per-CPU switch-generation quiescence gate (see `CPU_SWITCH_GEN`).
+    // Collect (stack_base, stack_pages, last_cpu, aliased) for each reapable
+    // thread, removing them from THREAD_TABLE in the same pass.  `last_cpu`
+    // feeds the per-CPU switch-generation quiescence gate (see
+    // `CPU_SWITCH_GEN`); `aliased` is the saved-RSP survey result (computed
+    // after all removals, against the survivors) — see
+    // `saved_rsp_aliases_live_frame`.
     let stacks = {
         let mut threads = THREAD_TABLE.lock();
         // A Dead thread is safe to reap only when ctx_rsp_valid == true, which
@@ -743,14 +796,29 @@ fn reap_dead_threads_sched() {
         if dead_indices.is_empty() {
             return;
         }
-        let mut out = alloc::vec::Vec::with_capacity(dead_indices.len());
+        // Pass 1: remove the reapable threads, capturing each frame's
+        // (base, size, last_cpu, tid).  We must remove ALL of them BEFORE the
+        // saved-RSP survey so a sibling reaped in the same batch does not count
+        // itself (or another batch member) as a "live aliaser".
+        let mut removed: alloc::vec::Vec<(u64, u64, usize, crate::proc::Tid)> =
+            alloc::vec::Vec::with_capacity(dead_indices.len());
         for &idx in dead_indices.iter().rev() {
             let t = &threads[idx];
             let base = t.kernel_stack_base;
-            let pages = if t.kernel_stack_size > 0 {
-                (t.kernel_stack_size as usize + 4095) / 4096
-            } else { 0 };
+            let size = if t.kernel_stack_size > 0 { t.kernel_stack_size } else { 0 };
             let last_cpu = t.last_cpu as usize;
+            let reaped_tid = t.tid;
+            // #582 diagnostic: disarm the RFLAGS-slot write-watch if it
+            // currently belongs to the thread being reaped.  The watch was
+            // previously disarmed only on RESUME (the owner becoming
+            // `next_tid`); a thread that dies while parked never resumes, so
+            // its watch would persist with a now-dead owner_tid — turning a
+            // recycle of that frame into a misleading "foreign" catch.  After
+            // this, a [582/CATCH] can only fire on a still-resumable owner =
+            // a real tear.  `d582_disarm_if_tid` is lock-free (no IPI; lazy
+            // cross-CPU gen-sync) and safe under THREAD_TABLE with IF=0.
+            #[cfg(feature = "582-diag")]
+            crate::arch::x86_64::debug_reg::d582_disarm_if_tid(reaped_tid as u64);
             // Drop any still-mirrored entry from the per-CPU runqueues before
             // the record disappears (Perf P2 phase 2a — see
             // `percpu::mirror_forget`).  This reaper runs at the top of
@@ -758,9 +826,22 @@ fn reap_dead_threads_sched() {
             // this a thread mirrored on a prior pass would strand its tid.
             percpu::mirror_forget(t.mirror_slot, t.tid);
             threads.swap_remove(idx);
-            if base > 0 && pages > 0 {
-                out.push((base, pages, last_cpu));
+            if base > 0 && size > 0 {
+                removed.push((base, size, last_cpu, reaped_tid));
             }
+        }
+        // Pass 2: survey the survivors for each removed frame.  `aliased=true`
+        // means some still-live thread's saved RSP points into this frame's
+        // span — it MUST NOT be cached/freed yet (the #582 tear root); route it
+        // to the gated quarantine instead.  `excluding_tid` is the frame's own
+        // (now-removed) owner, which is harmless to pass (it is gone from the
+        // table) but keeps intent explicit.
+        let mut out: alloc::vec::Vec<(u64, usize, usize, bool)> =
+            alloc::vec::Vec::with_capacity(removed.len());
+        for (base, size, last_cpu, reaped_tid) in removed {
+            let aliased = saved_rsp_aliases_live_frame(&threads, base, size, reaped_tid);
+            let pages = ((size + 4095) / 4096) as usize;
+            out.push((base, pages, last_cpu, aliased));
         }
         out
     }; // THREAD_TABLE released before any PMM operations
@@ -780,9 +861,15 @@ fn reap_dead_threads_sched() {
     // STACK_CANARY_CORRUPT closure rationale.  Overflow (cache full,
     // or push rejected by the defensive size check) falls through to
     // per-page PMM free as before.
-    for (stack_base, stack_pages, last_cpu) in stacks {
-        if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
-            let stack_size_bytes = (stack_pages as u64) * 0x1000;
+    for (stack_base, stack_pages, last_cpu, aliased) in stacks {
+        let stack_size_bytes = (stack_pages as u64) * 0x1000;
+        // Standard-size frame with no live saved-RSP aliasing it → dead-stack
+        // cache (its own quiescence gate governs re-issue).  An ALIASED frame
+        // — even a standard-size one — must NOT enter the cache: a live
+        // thread's saved switch_context frame still lives in this span, and
+        // `push_dead_stack` would zero-fill it (the #582 tear).  Route any
+        // aliased frame to the gated quarantine instead.
+        if !aliased && stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
             if push_dead_stack(stack_base, stack_size_bytes, last_cpu) {
                 #[cfg(feature = "test-mode")]
                 {
@@ -794,11 +881,27 @@ fn reap_dead_threads_sched() {
                 continue; // cached for reuse
             }
         }
-        // Cache full or non-standard size — free to PMM.
+        // Emergency-tier (sub-256 KiB), cache-overflow, OR aliased frame:
+        // quarantine for a GATED PMM free instead of freeing immediately.
+        // This closes the #582 root — an emergency-tier frame freed straight
+        // to the PMM while a parked thread's saved switch_context frame still
+        // lives in its span (its own in-flight switch epilogue, or a PMM
+        // double-alloc aliasing a live frame) gets re-allocated + zero-filled,
+        // tearing the parked owner's saved RFLAGS slot → its `popfq` faults.
+        if quarantine_kstack_free(stack_base, stack_size_bytes, last_cpu) {
+            #[cfg(feature = "test-mode")]
+            crate::serial_println!(
+                "[KSTACK/REAP] quarantined base={:#x} size={} aliased={} (gated PMM free)",
+                stack_base, stack_size_bytes, aliased as u8);
+            continue;
+        }
+        // Quarantine full (pathological) — fall back to an immediate PMM free.
+        // This is the pre-fix behaviour and re-opens the residual race only in
+        // the rare full-quarantine case; preferred over leaking the frame.
         #[cfg(feature = "test-mode")]
         crate::serial_println!(
-            "[KSTACK/REAP] cache full or non-std size={} — freed to PMM base={:#x}",
-            stack_pages, stack_base);
+            "[KSTACK/REAP] quarantine FULL — immediate PMM free base={:#x} size={}",
+            stack_base, stack_size_bytes);
         let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
             stack_base - KERNEL_VIRT_OFFSET
         } else {
@@ -833,6 +936,78 @@ const MAX_DEAD_STACKS: usize = 64;
 /// LAPIC timer stopped delivering interrupts — causing its per-CPU counter
 /// to freeze and all cache entries to remain permanently unquiesced.
 const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
+
+// ── #582 cache-push provenance shadow ────────────────────────────────────────
+//
+// Records, per dead-stack-cache push, the (push_tick, pusher_tid) for the
+// pushed frame, keyed by physical frame number.  Lets the alloc-side alias
+// guard answer "who put this frame into the cache?" when a cache-pop returns a
+// base that aliases a LIVE thread — distinguishing a cache-admitted-live-frame
+// disease from a PMM-returned-live-frame disease.  Diagnostic-only; gated on
+// `582-diag`.  Direct pfn-addressed (mod size) so a collision overwrites the
+// oldest record rather than evicting a hash bucket.
+#[cfg(feature = "582-diag")]
+mod d582_push_prov {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    const SIZE: usize = 4096; // covers a wide span of kstack pfns; pow2 for mask
+    struct Slot {
+        pfn: AtomicU64,
+        tick: AtomicU64,
+        pusher_tid: AtomicU64,
+    }
+    impl Slot {
+        const fn new() -> Self {
+            Self {
+                pfn: AtomicU64::new(u64::MAX),
+                tick: AtomicU64::new(0),
+                pusher_tid: AtomicU64::new(u64::MAX),
+            }
+        }
+    }
+    struct Shadow {
+        slots: [Slot; SIZE],
+    }
+    impl Shadow {
+        const fn new() -> Self {
+            const S: Slot = Slot::new();
+            Self { slots: [S; SIZE] }
+        }
+    }
+    static SHADOW: Shadow = Shadow::new();
+
+    #[inline]
+    fn slot(phys: u64) -> &'static Slot {
+        let pfn = (phys >> 12) as usize;
+        &SHADOW.slots[pfn & (SIZE - 1)]
+    }
+
+    /// Record a dead-stack-cache push for the page-aligned `base` (higher-half
+    /// VA).  `pusher_tid` is the reaper's current thread (the pusher).
+    pub fn record(base_virt: u64, pusher_tid: u64) {
+        let phys = base_virt.wrapping_sub(crate::proc::KERNEL_VIRT_OFFSET);
+        let pfn = (phys >> 12) as u64;
+        let s = slot(phys);
+        s.pfn.store(pfn, Ordering::Relaxed);
+        s.tick
+            .store(crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+        s.pusher_tid.store(pusher_tid, Ordering::Relaxed);
+    }
+
+    /// Look up the last cache-push for the page containing `base_virt`.
+    /// Returns `(push_tick, pusher_tid)` if the slot's pfn matches.
+    pub fn lookup(base_virt: u64) -> Option<(u64, u64)> {
+        let phys = base_virt.wrapping_sub(crate::proc::KERNEL_VIRT_OFFSET);
+        let pfn = (phys >> 12) as u64;
+        let s = slot(phys);
+        if s.pfn.load(Ordering::Relaxed) != pfn {
+            return None;
+        }
+        Some((
+            s.tick.load(Ordering::Relaxed),
+            s.pusher_tid.load(Ordering::Relaxed),
+        ))
+    }
+}
 
 /// One cached dead stack: the higher-half kernel-stack base, the honest
 /// byte-extent of the underlying kernel-stack allocation, plus the per-CPU
@@ -1096,6 +1271,10 @@ fn push_dead_stack(
         last_cpu: last_cpu_norm,
         last_cpu_gen,
     });
+    // #582 provenance: record who pushed this frame to the cache, so the
+    // alloc-side alias guard can name a cache-admitted-live-frame disease.
+    #[cfg(feature = "582-diag")]
+    d582_push_prov::record(stack_base_virt, crate::proc::current_tid() as u64);
     true
 }
 
@@ -1155,6 +1334,176 @@ pub fn pop_dead_stack() -> Option<(u64, u64)> {
     // amortised against PMM allocation cost.
     let entry = cache.remove(i);
     Some((entry.base, entry.size))
+}
+
+// ── Emergency-tier kstack free quarantine ────────────────────────────────────
+//
+// Standard 256 KiB kstacks go to the dead-stack cache, which already withholds
+// re-issue until the frame is quiesced (CPU_SWITCH_GEN + tick — see
+// `entry_is_quiesced`).  Sub-256 KiB *emergency-tier* frames (16K/8K/4K, taken
+// when the PMM is fragmented) historically went STRAIGHT to `pmm::free_page` in
+// the reaper, with NO quiescence gate.  The DR0 write-watch named the resulting
+// bug: a reaper frees an emergency-tier frame to the PMM while a *parked*
+// thread's saved `switch_context_asm` frame still lives in that span (its own
+// in-flight switch epilogue, or — case B — a PMM double-allocation aliasing a
+// live frame); the next `alloc_kernel_stack` zero-fills it (proc/mod.rs:725) or
+// the new owner's `pushfq`/a stale-TSS.RSP0 interrupt frame tears the parked
+// owner's saved RFLAGS slot → its `popfq` faults (`#DB`,
+// `UNEXPECTED_KERNEL_MODE_TRAP` 0x7f).
+//
+// Fix: route emergency-tier frees through this quarantine, which applies BOTH
+// gates the standard cache gets:
+//   (a) quiescence — `entry_is_quiesced` (CPU_SWITCH_GEN + tick), so the frame
+//       cannot reach the PMM free list until its last user's switch epilogue
+//       has retired;
+//   (b) saved-RSP survey — `saved_rsp_aliases_live_frame`, so the frame is also
+//       withheld while ANY live thread's `context.rsp` still falls in its span
+//       (covers the aliasing / case-B variants the gen gate alone cannot see).
+// A quarantined frame is re-checked on every later reaper pass and freed to the
+// PMM only once BOTH gates clear — no leak (the entry is retried, not dropped),
+// no UAF (the frame never reaches the PMM while still referenced).  Cite Intel
+// SDM Vol. 3A §6.14 (TSS-RSP interrupt stack switch) + Vol. 3B §17.3.1.1 (TF).
+#[derive(Clone, Copy)]
+struct PendingKstackFree {
+    /// Higher-half kernel-stack base virtual address.
+    base: u64,
+    /// Honest byte-extent of the underlying allocation (emergency tier:
+    /// 16K/8K/4K; or any non-standard size that overflowed the cache).
+    size: u64,
+    /// Global `TICK_COUNT` at quarantine time (drives `entry_is_quiesced`).
+    push_tick: u64,
+    /// CPU that last ran the dead thread + its `CPU_SWITCH_GEN` snapshot —
+    /// same gen-quiescence signal the dead-stack cache uses.
+    last_cpu: usize,
+    last_cpu_gen: u64,
+}
+
+/// Quarantine of emergency-tier (and cache-overflow) kstack frames awaiting a
+/// PMM free, gated on quiescence + saved-RSP survey.  Bounded by the live
+/// thread count (each reaped thread contributes at most one entry, and entries
+/// drain as soon as their gates clear); a generous cap prevents unbounded
+/// growth if a frame's gate somehow never clears (it would surface as a
+/// diagnostic, never a silent leak of all of RAM).
+const MAX_PENDING_KSTACK_FREES: usize = 256;
+static PENDING_KSTACK_FREE: spin::Mutex<alloc::vec::Vec<PendingKstackFree>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Quarantine an emergency-tier / cache-overflow kstack frame for a gated PMM
+/// free.  Stamps the quiescence snapshot exactly like `push_dead_stack`.
+/// Returns `true` if quarantined; `false` if the quarantine is full (caller
+/// then falls back to an immediate PMM free, accepting the residual race — far
+/// rarer than the steady-state emergency-tier path this closes).
+fn quarantine_kstack_free(base: u64, size: u64, last_cpu: usize) -> bool {
+    let (last_cpu_norm, last_cpu_gen) = if last_cpu < MAX_CPUS {
+        (last_cpu, cpu_switch_gen(last_cpu))
+    } else {
+        (0usize, u64::MAX)
+    };
+    let push_tick = current_tick_for_quiesce();
+    let mut q = PENDING_KSTACK_FREE.lock();
+    if q.len() >= MAX_PENDING_KSTACK_FREES {
+        return false;
+    }
+    q.push(PendingKstackFree {
+        base,
+        size,
+        push_tick,
+        last_cpu: last_cpu_norm,
+        last_cpu_gen,
+    });
+    true
+}
+
+/// Public entry for the alloc-side alias guard to deposit a REJECTED candidate
+/// frame (one whose span aliased a live thread's kstack) into the gated
+/// quarantine instead of returning it or re-freeing it to the PMM.  The
+/// quarantine's quiescence + saved-RSP gates ensure the frame is freed to the
+/// PMM only once it is genuinely no longer referenced — never re-issued as a
+/// kstack while still live, never double-freed, never leaked.  `last_cpu` is
+/// unknown at the alloc site, so the `u64::MAX` gen sentinel is recorded and
+/// the wall-clock tick + survey gates govern.  Returns `false` if the
+/// quarantine is full (caller must then leak-with-diagnostic rather than risk
+/// returning the aliasing frame).
+pub fn quarantine_rejected_alloc_frame(base: u64, size: u64) -> bool {
+    quarantine_kstack_free(base, size, usize::MAX)
+}
+
+/// #582 provenance lookup: who pushed the page at `base_virt` to the dead-stack
+/// cache?  Returns `(push_tick, pusher_tid)`.  Diagnostic-only.
+#[cfg(feature = "582-diag")]
+pub fn d582_cache_push_prov(base_virt: u64) -> Option<(u64, u64)> {
+    d582_push_prov::lookup(base_virt)
+}
+
+/// Drain the emergency-tier free quarantine: free to the PMM every entry that
+/// has BOTH quiesced (`entry_is_quiesced`) AND cleared the saved-RSP survey
+/// (no live thread's `context.rsp` aliases its span).  Entries failing either
+/// gate are retried on the next reaper pass.
+///
+/// MUST be called with interrupts disabled (reaper contract — `pmm::free_page`
+/// shares `PMM_LOCK` with the timer ISR).  Takes a fresh `THREAD_TABLE` lock to
+/// run the survey, then releases it before any PMM op (the established pattern
+/// in `reap_dead_threads_sched`).
+fn drain_pending_kstack_free() {
+    use crate::proc::KERNEL_VIRT_OFFSET;
+    // Phase 1: under THREAD_TABLE, partition the quarantine into "free now"
+    // (both gates clear) vs "retain" (still gated).  We build the free-list
+    // while holding both locks briefly, then release before PMM ops.
+    let to_free: alloc::vec::Vec<(u64, u64)> = {
+        let threads = THREAD_TABLE.lock();
+        let mut q = PENDING_KSTACK_FREE.lock();
+        if q.is_empty() {
+            return;
+        }
+        let mut freeable = alloc::vec::Vec::new();
+        q.retain(|e| {
+            // Reuse the dead-stack cache's quiescence decision verbatim (it
+            // reads `entry_is_quiesced`'s gen + tick + escape-valve logic).
+            let quiesced = {
+                let probe = CachedDeadStack {
+                    base: e.base,
+                    size: e.size,
+                    push_tick: e.push_tick,
+                    last_cpu: e.last_cpu,
+                    last_cpu_gen: e.last_cpu_gen,
+                };
+                entry_is_quiesced(&probe)
+            };
+            // Survey: the owner has already been removed from THREAD_TABLE by
+            // the reaper, so any saved-RSP hit here is a DIFFERENT live thread
+            // aliasing this span — withhold.  `excluding_tid = 0` is safe: tid
+            // 0 (BSP idle) runs on the identity-mapped bootstrap stack, never
+            // an emergency-tier higher-half kstack, so it can never legitimately
+            // alias a quarantined frame.
+            let aliased = saved_rsp_aliases_live_frame(&threads, e.base, e.size, 0);
+            if quiesced && !aliased {
+                freeable.push((e.base, e.size));
+                false // remove from quarantine
+            } else {
+                true // retain, retry next pass
+            }
+        });
+        freeable
+    }; // both locks released
+
+    // Phase 2: free the cleared frames to the PMM (no lock held except PMM's).
+    for (base, size) in to_free {
+        let phys_base = if base >= KERNEL_VIRT_OFFSET {
+            base - KERNEL_VIRT_OFFSET
+        } else {
+            base
+        };
+        let pages = ((size + 4095) / 4096) as u64;
+        for p in 0..pages {
+            crate::mm::pmm::free_page(phys_base + p * 0x1000);
+        }
+    }
+}
+
+/// Test-only: current quarantine depth.
+#[cfg(any(feature = "test-mode", feature = "582-diag"))]
+pub fn pending_kstack_free_len() -> usize {
+    PENDING_KSTACK_FREE.lock().len()
 }
 
 /// Public interface to pre-populate the dead stack cache (called from main.rs).
@@ -1247,6 +1596,23 @@ pub fn test_entry_quiesced(push_tick: u64, last_cpu: usize, last_cpu_gen: u64) -
 #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub fn test_cpu_switch_gen(cpu: usize) -> u64 {
     cpu_switch_gen(cpu)
+}
+
+/// Test-only: run the saved-RSP survey against a caller-supplied thread slice.
+///
+/// Lets the kernel test suite verify the #582 saved-RSP-survey gate
+/// (`saved_rsp_aliases_live_frame`) in isolation: a kstack frame must report
+/// `aliased=true` while a live thread's saved `context.rsp` falls in its span,
+/// `false` once it does not — and the frame's own (excluded) owner must never
+/// self-alias.  Mirrors `test_entry_quiesced`'s isolation shape.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_saved_rsp_aliases(
+    threads: &[crate::proc::Thread],
+    base: u64,
+    size: u64,
+    excluding_tid: crate::proc::Tid,
+) -> bool {
+    saved_rsp_aliases_live_frame(threads, base, size, excluding_tid)
 }
 
 /// Pure selection core: the scoring loop + two-pass split + force-backstop
@@ -2070,6 +2436,18 @@ was_emergency_4k={}",
         }
     }
 
+    // ── #582 diagnostic: disarm the RFLAGS-slot watch if it belongs to the
+    //    thread we are about to resume ────────────────────────────────────
+    // On resume, `next_tid`'s saved-RFLAGS slot becomes live stack within
+    // its running frame; leaving the watch armed across the resume turns
+    // every ordinary store to that reclaimed slot into a false-positive
+    // `#DB`.  Disarm here (we know `next_tid`), so the watch only ever fires
+    // while the watched victim is genuinely parked.  See `db582`.
+    #[cfg(feature = "582-diag")]
+    {
+        crate::arch::x86_64::debug_reg::d582_disarm_if_tid(next_tid as u64);
+    }
+
     unsafe {
         proc::thread::switch_context(old_rsp_ptr, next_rsp, ctx_valid_ptr);
     }
@@ -2085,6 +2463,93 @@ was_emergency_4k={}",
     // `CPU_SWITCH_GEN` / `note_switch_completed`.  (First-run threads jump
     // to `user_mode_bootstrap` and never reach this line; they bump there.)
     note_switch_completed();
+
+    // ── #582 diagnostic: arm a DR0 write-watch on the DEPARTED victim's
+    //    saved-RFLAGS slot ────────────────────────────────────────────────
+    //
+    // We have just switched AWAY from `current_tid` and are now running as
+    // `next_tid`.  `current_tid`'s `switch_context_asm` frame is therefore
+    // fully saved: `Thread::context.rsp` points at the qword the `pushfq`
+    // last stored (the saved-RFLAGS slot, `context.rsp + 0`).  If that slot
+    // currently reads the healthy `0x202`, arm an 8-byte data-write watch on
+    // it (DR0).  Any subsequent 8-byte store to that slot — while the victim
+    // sits Ready/Blocked — raises `#DB` on the writing CPU; the fire path
+    // (`db582::record_fire`) classifies the writer as the legitimate
+    // `switch_context_asm` re-save (benign) versus an out-of-band RIP (the
+    // #582 catch).  Re-armable: the watch rotates onto a fresh victim each
+    // time it is not currently watching one of equal address.  Gated on
+    // `582-diag`; zero cost in production builds.  See `arch::x86_64::db582`.
+    #[cfg(feature = "582-diag")]
+    {
+        // SAMPLED rotation: re-arm only once every `D582_SAMPLE_PERIOD`
+        // resumed switches on this CPU.  Each armed slot fires a `#DB` per
+        // store to it, so arming on EVERY switch traps at the switch rate
+        // and slows the system into the `[SCHED/STARVE]` wedge before the
+        // (timing-sensitive) #582 race can fire — and risks perturbing the
+        // race away.  Sampling 1-in-N keeps the trap overhead ~N× lower
+        // while still rotating across the diverse thread population over a
+        // run.  The counter is per-CPU and Relaxed (diagnostic only).
+        const D582_SAMPLE_PERIOD: u64 = 32;
+        let do_sample = {
+            let c = D582_SAMPLE_CTR[cpu as usize]
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            c % D582_SAMPLE_PERIOD == 0
+        };
+        // Read the slot value AND gate on healthy WHILE STILL HOLDING the
+        // table lock, so the saved-RSP VA cannot be reaped/recycled between
+        // the lookup and the read (no TOCTOU on a dereference of a possibly-
+        // freed kstack).  The slot is a higher-half kernel-stack VA mapped
+        // in every CR3 (PML4[256-511]); the read is well-defined under the
+        // kernel CR3 active at this resume point.
+        let victim_rflags_slot = {
+            let threads = THREAD_TABLE.lock();
+            threads
+                .iter()
+                .find(|t| t.tid == current_tid)
+                .filter(|t| {
+                    // Only watch a victim that actually saved a frame (its
+                    // ctx_rsp_valid is set by switch_context_asm) and whose
+                    // saved RSP is a higher-half kernel-stack VA.
+                    t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+                        && t.context.rsp >= 0xFFFF_8000_0000_0000
+                })
+                .and_then(|t| {
+                    let slot_va = t.context.rsp;
+                    // Gate on the slot reading *structurally healthy* before
+                    // arming so we never start a watch on an already-torn slot
+                    // (which would mis-attribute the tear to the next benign
+                    // writer).  A live thread's saved `pushfq` carries
+                    // condition-code flags (ZF/SF/PF/CF/OF) in addition to
+                    // IF, so an exact `0x202` match would reject almost every
+                    // real frame; the #582 signature is specifically TF (bit
+                    // 8) SET, so "healthy" = reserved-bit-1 set, IF set, TF
+                    // clear (Intel SDM Vol. 1 §3.4.3).
+                    let val = unsafe { core::ptr::read_volatile(slot_va as *const u64) };
+                    if crate::arch::x86_64::db582::rflags_is_healthy(val) {
+                        Some(slot_va)
+                    } else {
+                        None
+                    }
+                })
+        };
+        if let (true, Some(slot_va)) = (do_sample, victim_rflags_slot) {
+            // Rotation policy: on a sampled switch, re-arm on the
+            // JUST-DEPARTED victim (replacing any prior watch).  The freshest
+            // departed victim is the one whose CPU may still be in the
+            // `switch_context_asm` restore epilogue / whose TSS.RSP0 may be
+            // stale, i.e. the one most exposed to the #582 tear.  False
+            // positives from the owner's own-stack reuse are filtered
+            // downstream (`db582::record_fire` writer-vs-owner check) and on
+            // resume (`d582_disarm_if_tid`).  Avoid a redundant re-arm when
+            // DR0 already watches this exact slot.  Record `current_tid` as
+            // owner so the resume-disarm + foreign-writer test can match.
+            if crate::arch::x86_64::debug_reg::d582_armed_addr() != slot_va {
+                crate::arch::x86_64::debug_reg::arm_d582_rflags_watchpoint_for(
+                    slot_va, current_tid as u64,
+                );
+            }
+        }
+    }
 
     // ── FPU/SSE state restore for incoming thread ───────────────────
     {

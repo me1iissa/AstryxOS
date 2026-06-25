@@ -599,6 +599,109 @@ pub fn thread_table_try_lock_or_panic(
     );
 }
 
+/// #582 diagnostic: `#DB`-safe snapshot of a thread's reaper-relevant state.
+///
+/// Returns `(state_byte, ctx_rsp_valid, last_cpu, kstack_base, kstack_size)`
+/// for `tid`, or `None` if the table lock is contended (we never block — the
+/// caller runs in `#DB` interrupt context with `IF=0`, where blocking on
+/// `THREAD_TABLE` could deadlock against an interrupted holder) or `tid` is
+/// absent (already reaped).  `state_byte`: 0=Ready 1=Running 2=Blocked
+/// 3=Sleeping 4=Dead 0xff=unknown.  Diagnostic-only.
+#[cfg(feature = "582-diag")]
+pub fn d582_owner_state(tid: u64) -> Option<(u8, bool, u8, u64, u64)> {
+    let guard = THREAD_TABLE.try_lock()?;
+    let t = guard.iter().find(|t| t.tid as u64 == tid)?;
+    let state_byte = match t.state {
+        ThreadState::Ready => 0u8,
+        ThreadState::Running => 1,
+        ThreadState::Blocked => 2,
+        ThreadState::Sleeping => 3,
+        ThreadState::Dead => 4,
+    };
+    let ctx_valid = t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire);
+    Some((
+        state_byte,
+        ctx_valid,
+        t.last_cpu,
+        t.kernel_stack_base,
+        t.kernel_stack_size,
+    ))
+}
+
+/// Live-kstack survey for the kernel-stack allocator's alias guard (#582).
+///
+/// Returns `Some((tid, kbase, ksize))` of a live thread whose kernel-stack
+/// allocation `[kbase, kbase+ksize)` OVERLAPS the candidate span
+/// `[cand_base, cand_base+cand_size)`, or `None` if the candidate aliases no
+/// live thread's stack.  This is the allocator-side complement to the reaper's
+/// `sched::saved_rsp_aliases_live_frame`: `alloc_kernel_stack` must never hand
+/// out a base whose span overlaps a live thread's kernel stack — doing so lets
+/// `init_thread_stack` / the new thread's `pushfq` tear the live owner's saved
+/// `switch_context` frame (the #582 torn-RFLAGS-slot bugcheck).
+///
+/// Range-overlap (not saved-RSP point) is used here because the WHOLE candidate
+/// span will be written (zero-fill + init frame + the new thread's stack
+/// usage); any overlap with a live stack is a hazard regardless of where the
+/// owner's saved RSP currently sits.
+///
+/// MUST be called with NO `THREAD_TABLE` lock held (it acquires the lock).
+/// `alloc_kernel_stack`'s call sites all allocate the stack BEFORE taking the
+/// table lock, so a blocking acquire here is deadlock-free.  Production code
+/// (the guard ships), not diagnostic-gated.
+pub fn kstack_candidate_aliases_live(
+    cand_base: u64,
+    cand_size: u64,
+) -> Option<(Tid, u64, u64)> {
+    let cand_end = cand_base.wrapping_add(cand_size);
+    let threads = THREAD_TABLE.lock();
+    for t in threads.iter() {
+        if t.kernel_stack_base == 0 || t.kernel_stack_size == 0 {
+            continue;
+        }
+        // Dead threads are excluded: their stack is no longer live (the reaper
+        // will reclaim it).  Any non-Dead thread's stack is live and must not
+        // be aliased.
+        if t.state == ThreadState::Dead {
+            continue;
+        }
+        let kbase = t.kernel_stack_base;
+        let kend = kbase.wrapping_add(t.kernel_stack_size);
+        // Half-open overlap test: [cand_base, cand_end) ∩ [kbase, kend) ≠ ∅.
+        if cand_base < kend && kbase < cand_end {
+            return Some((t.tid, kbase, t.kernel_stack_size));
+        }
+    }
+    None
+}
+
+/// Test-only: the pure overlap core of [`kstack_candidate_aliases_live`], run
+/// against a caller-supplied thread slice (so the suite can verify the alloc
+/// alias guard without mutating the global `THREAD_TABLE`).  Mirrors the live
+/// function's predicate exactly: skip Dead / zero-stack rows, half-open range
+/// overlap test against each live thread's `[kstack_base, +size)`.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_kstack_candidate_aliases(
+    threads: &[Thread],
+    cand_base: u64,
+    cand_size: u64,
+) -> Option<(Tid, u64, u64)> {
+    let cand_end = cand_base.wrapping_add(cand_size);
+    for t in threads.iter() {
+        if t.kernel_stack_base == 0 || t.kernel_stack_size == 0 {
+            continue;
+        }
+        if t.state == ThreadState::Dead {
+            continue;
+        }
+        let kbase = t.kernel_stack_base;
+        let kend = kbase.wrapping_add(t.kernel_stack_size);
+        if cand_base < kend && kbase < cand_end {
+            return Some((t.tid, kbase, t.kernel_stack_size));
+        }
+    }
+    None
+}
+
 /// Currently running thread ID — per-CPU, indexed by APIC ID.
 /// With SMP, each CPU tracks its own running thread.
 static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
@@ -646,33 +749,106 @@ pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
 /// for every tier.  Stamping the constant unconditionally produced
 /// STACK_CANARY_CORRUPT on emergency threads — see PR #391 diagnostic and
 /// the kstack-honesty fix in PR #392.
+/// #582 alloc-side alias guard.  Returns `true` if `base`/`size` is SAFE to
+/// hand out (does not alias any live thread's kernel stack); `false` if it
+/// aliases a live stack, in which case the candidate has been routed to the
+/// gated quarantine (`sched::quarantine_rejected_alloc_frame`) and the caller
+/// MUST retry with a fresh candidate.  Emits a `[582/ALLOC-ALIAS]` provenance
+/// line (source + the aliased live owner + last-PMM-freer + cache-pusher) so a
+/// persistent alias is fully attributed.  `source` is "cache" or "pmm".
+///
+/// This enforces the invariant "alloc_kernel_stack never returns a base
+/// overlapping a live thread's kernel stack", closing the #582 case-B hazard
+/// (the allocator returning a frame still mapped as a live thread's stack)
+/// regardless of HOW the frame reached the free list / cache.  Production code
+/// (ships); the `[582/ALLOC-ALIAS]` provenance dump is gated on `582-diag`.
+fn kstack_candidate_ok(base: u64, size: u64, source: &str) -> bool {
+    match crate::proc::kstack_candidate_aliases_live(base, size) {
+        None => true,
+        Some((live_tid, kbase, ksize)) => {
+            // Provenance: name the source + the live owner + last-freer.
+            #[cfg(feature = "582-diag")]
+            {
+                let phys = base.wrapping_sub(KERNEL_VIRT_OFFSET);
+                let freer = crate::mm::w215_diag::free_shadow_lookup(phys);
+                let pusher = crate::sched::d582_cache_push_prov(base);
+                crate::serial_println!(
+                    "[582/ALLOC-ALIAS] source={} cand=[{:#x},{:#x}) live_tid={} \
+                     live_kstack=[{:#x},{:#x}) phys={:#x} last_pmm_free={:?} \
+                     cache_push={:?} — REJECT+quarantine+retry",
+                    source, base, base.wrapping_add(size), live_tid,
+                    kbase, kbase.wrapping_add(ksize), phys, freer, pusher,
+                );
+            }
+            let _ = source;
+            // Route the rejected (live-aliasing) frame to the gated quarantine.
+            // It is freed to the PMM only once the quiescence + saved-RSP gates
+            // clear — never re-issued while live, never double-freed, never
+            // leaked (unless the quarantine is full, handled by the caller).
+            if !crate::sched::quarantine_rejected_alloc_frame(base, size) {
+                // Quarantine full: leak-with-diagnostic is strictly safer than
+                // returning an aliasing frame (which crashes) or re-freeing a
+                // live frame to the PMM (double-free).
+                crate::serial_println!(
+                    "[582/ALLOC-ALIAS] WARN quarantine full — leaking rejected \
+                     frame base={:#x} size={} (safer than returning a live alias)",
+                    base, size,
+                );
+            }
+            false
+        }
+    }
+}
+
 fn alloc_kernel_stack() -> Option<(u64, u64)> {
-    // Try the dead-stack cache first — avoids PMM allocator overhead.
-    // The cache returns the honest byte-extent stamped at push time
-    // (see `sched::pop_dead_stack`).  The call-site gate in
-    // `reap_dead_threads_sched` refuses any non-`KERNEL_STACK_SIZE`
-    // entry, so `cached_size` is `KERNEL_STACK_SIZE` in production —
-    // but using the returned size (rather than the constant) keeps the
-    // pair `(base, top)` exactly bracketing the cached allocation, so
-    // future loosening of the cache gate cannot silently extend
-    // `stack_top` past the real allocation boundary.
-    if let Some((cached_base, cached_size)) = crate::sched::pop_dead_stack() {
+    // Bound the alias-rejection retry loop.  Each rejected candidate is
+    // quarantined (removed from circulation), so a bounded number of fresh
+    // candidates is drawn before giving up.  In the healthy case the first
+    // candidate passes; the loop only spins when consecutive candidates alias
+    // live stacks (the #582 case-B hazard), which the rejection drains.
+    const MAX_ALIAS_RETRIES: usize = 16;
+    for _attempt in 0..MAX_ALIAS_RETRIES {
+        // Try the dead-stack cache first — avoids PMM allocator overhead.
+        // The cache returns the honest byte-extent stamped at push time
+        // (see `sched::pop_dead_stack`).  The call-site gate in
+        // `reap_dead_threads_sched` refuses any non-`KERNEL_STACK_SIZE`
+        // entry, so `cached_size` is `KERNEL_STACK_SIZE` in production —
+        // but using the returned size (rather than the constant) keeps the
+        // pair `(base, top)` exactly bracketing the cached allocation, so
+        // future loosening of the cache gate cannot silently extend
+        // `stack_top` past the real allocation boundary.
+        if let Some((cached_base, cached_size)) = crate::sched::pop_dead_stack() {
+            // #582 alloc-side alias guard: never hand out a base that overlaps
+            // a live thread's kernel stack.  A cache entry that aliases a live
+            // stack is the case-B hazard — reject (quarantine) and retry.
+            if !kstack_candidate_ok(cached_base, cached_size, "cache") {
+                continue;
+            }
+            #[cfg(feature = "test-mode")]
+            crate::serial_println!("[KSTACK/ALLOC] cache hit base={:#x}", cached_base);
+            write_stack_canary(cached_base);
+            return Some((cached_base, cached_base + cached_size));
+        }
         #[cfg(feature = "test-mode")]
-        crate::serial_println!("[KSTACK/ALLOC] cache hit base={:#x}", cached_base);
-        write_stack_canary(cached_base);
-        return Some((cached_base, cached_base + cached_size));
-    }
-    #[cfg(feature = "test-mode")]
-    {
-        let cache_len = crate::sched::dead_stack_cache_len();
-        crate::serial_println!("[KSTACK/ALLOC] cache miss (len={}) — PMM fallback", cache_len);
-    }
-    // Try contiguous allocation first (fast path).
-    if let Some(phys_stack) = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES) {
-        let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-        let stack_top = stack_base + KERNEL_STACK_SIZE;
-        write_stack_canary(stack_base);
-        return Some((stack_base, stack_top));
+        {
+            let cache_len = crate::sched::dead_stack_cache_len();
+            crate::serial_println!("[KSTACK/ALLOC] cache miss (len={}) — PMM fallback", cache_len);
+        }
+        // Try contiguous allocation first (fast path).
+        if let Some(phys_stack) = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES) {
+            let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
+            let stack_top = stack_base + KERNEL_STACK_SIZE;
+            // #582 alloc-side alias guard (PMM 256 KiB path).
+            if !kstack_candidate_ok(stack_base, KERNEL_STACK_SIZE, "pmm") {
+                continue;
+            }
+            write_stack_canary(stack_base);
+            return Some((stack_base, stack_top));
+        }
+        // Both the cache and the contiguous-256K PMM path produced nothing
+        // safe this attempt; fall through to the emergency tiers (which have
+        // their own guard below) and, if those also fail, end the attempt.
+        break;
     }
     // Contiguous 256 KiB allocation failed (PMM fragmented by page cache).
     // Walk down progressively smaller contiguous tiers before giving up:
@@ -708,6 +884,15 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         let Some(phys) = phys_opt else { continue };
         let stack_base = KERNEL_VIRT_OFFSET + phys;
         let stack_top = stack_base + span_bytes;
+        // #582 alloc-side alias guard — run BEFORE the zero-fill below.  If this
+        // emergency-tier frame aliases a live thread's kernel stack, the
+        // zero-fill `write_bytes(0)` would tear that live owner's saved
+        // switch_context frame (the original case-A signature, `memset+0x39`).
+        // Reject (quarantine) and try the next tier instead of zeroing a live
+        // frame.
+        if !kstack_candidate_ok(stack_base, span_bytes, "pmm-emergency") {
+            continue;
+        }
         // Defence-in-depth: `pmm::alloc_page`/`alloc_pages` do not zero the
         // returned frame, so a frame previously occupied by the page cache
         // (e.g. an evicted libxul `.text` page) can land here with residual

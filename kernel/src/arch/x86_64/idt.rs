@@ -254,8 +254,9 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     // interrupted RIP without printing any further diagnostics.  Per
     // Intel SDM Vol. 3B §17.2.5 (Debug Status Register DR6), B0..B3
     // identify which DRn triggered.  Diagnostic-only; gated on
-    // `w215-diag` so non-diagnostic builds carry no DR0 dispatch.
-    #[cfg(feature = "w215-diag")]
+    // `w215-diag` (the CRC walker) or `582-diag` (the RFLAGS-slot probe)
+    // so non-diagnostic builds carry no DR0 dispatch.
+    #[cfg(any(feature = "w215-diag", feature = "582-diag"))]
     if vector == 1 {
         // Reconstruct the saved-GPR slice from the ISR-stub stack frame.
         // Per the layout documented above `isr_no_error!`:

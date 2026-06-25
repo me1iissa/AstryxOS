@@ -1220,8 +1220,10 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // W215 Arm-1 diagnostic: if a CRC-walker mismatch already armed the
     // DR0 write-watchpoint before this AP came online, apply it now.
     // Per Intel SDM Vol. 3B §17.2.4, DR0–DR3 are per-CPU and must be
-    // programmed on every CPU that should participate in the trap.
-    #[cfg(feature = "w215-diag")]
+    // programmed on every CPU that should participate in the trap.  Also
+    // required by `582-diag` so an AP that comes online after the #582
+    // RFLAGS-slot watch is armed picks up DR0.
+    #[cfg(any(feature = "w215-diag", feature = "582-diag"))]
     crate::arch::x86_64::debug_reg::apply_pending_to_this_cpu();
 
     // Enter the scheduling loop.  Each iteration waits one quantum, then checks

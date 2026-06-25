@@ -1,10 +1,16 @@
 //! x86_64 architecture-specific code.
 
 pub mod apic;
-// DR0 W-watchpoint plumbing for the W215 Arm-1 CRC walker.
-// Gated behind `w215-diag` together with the walker itself.
-#[cfg(feature = "w215-diag")]
+// DR0 W-watchpoint plumbing for the W215 Arm-1 CRC walker (and the #582
+// RFLAGS-slot probe).  Gated behind `w215-diag` (the walker) or `582-diag`
+// (the #582 probe) since both consume the shared DR0–DR3 facility.
+#[cfg(any(feature = "w215-diag", feature = "582-diag"))]
 pub mod debug_reg;
+// #582 torn-saved-RFLAGS-slot writer classifier.  Fire path for the DR0
+// data-write watch the scheduler arms on switch victims.  Gated behind
+// `582-diag` (which pulls in the `w215-diag` DR plumbing).
+#[cfg(feature = "582-diag")]
+pub mod db582;
 pub mod gdt;
 pub mod idt;
 pub mod irq;
