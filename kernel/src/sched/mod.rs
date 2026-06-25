@@ -937,6 +937,78 @@ const MAX_DEAD_STACKS: usize = 64;
 /// to freeze and all cache entries to remain permanently unquiesced.
 const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
 
+// ── #582 cache-push provenance shadow ────────────────────────────────────────
+//
+// Records, per dead-stack-cache push, the (push_tick, pusher_tid) for the
+// pushed frame, keyed by physical frame number.  Lets the alloc-side alias
+// guard answer "who put this frame into the cache?" when a cache-pop returns a
+// base that aliases a LIVE thread — distinguishing a cache-admitted-live-frame
+// disease from a PMM-returned-live-frame disease.  Diagnostic-only; gated on
+// `582-diag`.  Direct pfn-addressed (mod size) so a collision overwrites the
+// oldest record rather than evicting a hash bucket.
+#[cfg(feature = "582-diag")]
+mod d582_push_prov {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    const SIZE: usize = 4096; // covers a wide span of kstack pfns; pow2 for mask
+    struct Slot {
+        pfn: AtomicU64,
+        tick: AtomicU64,
+        pusher_tid: AtomicU64,
+    }
+    impl Slot {
+        const fn new() -> Self {
+            Self {
+                pfn: AtomicU64::new(u64::MAX),
+                tick: AtomicU64::new(0),
+                pusher_tid: AtomicU64::new(u64::MAX),
+            }
+        }
+    }
+    struct Shadow {
+        slots: [Slot; SIZE],
+    }
+    impl Shadow {
+        const fn new() -> Self {
+            const S: Slot = Slot::new();
+            Self { slots: [S; SIZE] }
+        }
+    }
+    static SHADOW: Shadow = Shadow::new();
+
+    #[inline]
+    fn slot(phys: u64) -> &'static Slot {
+        let pfn = (phys >> 12) as usize;
+        &SHADOW.slots[pfn & (SIZE - 1)]
+    }
+
+    /// Record a dead-stack-cache push for the page-aligned `base` (higher-half
+    /// VA).  `pusher_tid` is the reaper's current thread (the pusher).
+    pub fn record(base_virt: u64, pusher_tid: u64) {
+        let phys = base_virt.wrapping_sub(crate::proc::KERNEL_VIRT_OFFSET);
+        let pfn = (phys >> 12) as u64;
+        let s = slot(phys);
+        s.pfn.store(pfn, Ordering::Relaxed);
+        s.tick
+            .store(crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+        s.pusher_tid.store(pusher_tid, Ordering::Relaxed);
+    }
+
+    /// Look up the last cache-push for the page containing `base_virt`.
+    /// Returns `(push_tick, pusher_tid)` if the slot's pfn matches.
+    pub fn lookup(base_virt: u64) -> Option<(u64, u64)> {
+        let phys = base_virt.wrapping_sub(crate::proc::KERNEL_VIRT_OFFSET);
+        let pfn = (phys >> 12) as u64;
+        let s = slot(phys);
+        if s.pfn.load(Ordering::Relaxed) != pfn {
+            return None;
+        }
+        Some((
+            s.tick.load(Ordering::Relaxed),
+            s.pusher_tid.load(Ordering::Relaxed),
+        ))
+    }
+}
+
 /// One cached dead stack: the higher-half kernel-stack base, the honest
 /// byte-extent of the underlying kernel-stack allocation, plus the per-CPU
 /// timer-ISR tick counter snapshot taken at push time.
@@ -1199,6 +1271,10 @@ fn push_dead_stack(
         last_cpu: last_cpu_norm,
         last_cpu_gen,
     });
+    // #582 provenance: record who pushed this frame to the cache, so the
+    // alloc-side alias guard can name a cache-admitted-live-frame disease.
+    #[cfg(feature = "582-diag")]
+    d582_push_prov::record(stack_base_virt, crate::proc::current_tid() as u64);
     true
 }
 
@@ -1336,6 +1412,27 @@ fn quarantine_kstack_free(base: u64, size: u64, last_cpu: usize) -> bool {
         last_cpu_gen,
     });
     true
+}
+
+/// Public entry for the alloc-side alias guard to deposit a REJECTED candidate
+/// frame (one whose span aliased a live thread's kstack) into the gated
+/// quarantine instead of returning it or re-freeing it to the PMM.  The
+/// quarantine's quiescence + saved-RSP gates ensure the frame is freed to the
+/// PMM only once it is genuinely no longer referenced — never re-issued as a
+/// kstack while still live, never double-freed, never leaked.  `last_cpu` is
+/// unknown at the alloc site, so the `u64::MAX` gen sentinel is recorded and
+/// the wall-clock tick + survey gates govern.  Returns `false` if the
+/// quarantine is full (caller must then leak-with-diagnostic rather than risk
+/// returning the aliasing frame).
+pub fn quarantine_rejected_alloc_frame(base: u64, size: u64) -> bool {
+    quarantine_kstack_free(base, size, usize::MAX)
+}
+
+/// #582 provenance lookup: who pushed the page at `base_virt` to the dead-stack
+/// cache?  Returns `(push_tick, pusher_tid)`.  Diagnostic-only.
+#[cfg(feature = "582-diag")]
+pub fn d582_cache_push_prov(base_virt: u64) -> Option<(u64, u64)> {
+    d582_push_prov::lookup(base_virt)
 }
 
 /// Drain the emergency-tier free quarantine: free to the PMM every entry that

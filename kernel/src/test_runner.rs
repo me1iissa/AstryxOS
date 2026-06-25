@@ -1324,6 +1324,8 @@ pub fn run() -> ! {
         if test_654_bootstrap_stack_reserved() { passed += 1; }
         total += 1;
         if test_655_kstack_saved_rsp_survey_gate() { passed += 1; }
+        total += 1;
+        if test_656_alloc_side_alias_guard() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -50136,6 +50138,109 @@ fn test_655_kstack_saved_rsp_survey_gate() -> bool {
             return false;
         }
         test_println!("  E: boundary base=inclusive, end=exclusive (ok)");
+    }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 656: alloc-side kstack alias guard (#582 case-B) ────────────────────
+//
+// Regression for the case-B residual that the free-side gate (Test 655) could
+// not cover: `alloc_kernel_stack` returning a base whose span OVERLAPS a LIVE
+// thread's kernel stack (the allocator handing out a frame still mapped as a
+// live thread's stack — DR0 write-watch named create_user_thread ->
+// init_thread_stack tearing PID1's live Sleeping kstack).  The guard
+// `proc::kstack_candidate_aliases_live` must reject any candidate overlapping a
+// live (non-Dead) thread's [kstack_base, +size).  This test exercises its pure
+// overlap core (`test_kstack_candidate_aliases`) as a deterministic predicate:
+//   A. candidate fully inside a live thread's stack          → aliased (reject)
+//   B. candidate disjoint from all live stacks               → ok (allocate)
+//   C. partial overlap (candidate straddles a stack edge)    → aliased
+//   D. a DEAD thread's stack is NOT a live alias             → ok
+//   E. zero-base / zero-size rows are ignored                → ok
+//   F. exact-equal span (alias of the whole live stack)      → aliased
+// Intel SDM Vol. 3A §6.14; Vol. 3B §17.3.1.1.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_656_alloc_side_alias_guard() -> bool {
+    use crate::proc::{Thread, Tid, ThreadState};
+    const NAME: &str = "[PROC] alloc-side kstack alias guard (#582 case-B, Test 656)";
+    test_header!(NAME);
+
+    // Live thread tid 1 with a standard 256 KiB kstack (the V2-catch shape).
+    let live_base: u64 = 0xFFFF_8000_18F0_A000;
+    let live_size: u64 = 0x40000; // 256 KiB
+    let live_end = live_base + live_size;
+
+    fn mk(tid: Tid, kbase: u64, ksize: u64, state: ThreadState) -> Thread {
+        let mut t = Thread::new_for_test(10);
+        t.tid = tid;
+        t.kernel_stack_base = kbase;
+        t.kernel_stack_size = ksize;
+        t.state = state;
+        t
+    }
+
+    // Case A: candidate fully inside the live stack → must alias.
+    {
+        let threads = alloc::vec![mk(1, live_base, live_size, ThreadState::Sleeping)];
+        match crate::proc::test_kstack_candidate_aliases(&threads, live_base + 0x1000, 0x4000) {
+            Some((tid, _, _)) if tid == 1 => {
+                test_println!("  A: candidate inside live stack → aliased tid=1 (ok)");
+            }
+            other => { test_fail!(NAME, "A: in-stack candidate not flagged: {:?}", other); return false; }
+        }
+    }
+
+    // Case B: candidate disjoint (well above the live stack) → ok.
+    {
+        let threads = alloc::vec![mk(1, live_base, live_size, ThreadState::Sleeping)];
+        if crate::proc::test_kstack_candidate_aliases(&threads, live_end + 0x10000, 0x40000).is_some() {
+            test_fail!(NAME, "B: disjoint candidate wrongly flagged as aliasing"); return false;
+        }
+        test_println!("  B: disjoint candidate → not aliased (ok)");
+    }
+
+    // Case C: partial overlap (candidate starts below live_end, ends above) → alias.
+    {
+        let threads = alloc::vec![mk(1, live_base, live_size, ThreadState::Sleeping)];
+        // candidate [live_end-0x1000, live_end-0x1000+0x40000) straddles live_end.
+        if crate::proc::test_kstack_candidate_aliases(&threads, live_end - 0x1000, 0x40000).is_none() {
+            test_fail!(NAME, "C: partial-overlap candidate not flagged"); return false;
+        }
+        test_println!("  C: partial overlap → aliased (ok)");
+    }
+
+    // Case D: a DEAD thread's stack is reclaimable → not a live alias.
+    {
+        let threads = alloc::vec![mk(1, live_base, live_size, ThreadState::Dead)];
+        if crate::proc::test_kstack_candidate_aliases(&threads, live_base + 0x1000, 0x4000).is_some() {
+            test_fail!(NAME, "D: DEAD thread's stack wrongly treated as live alias"); return false;
+        }
+        test_println!("  D: DEAD owner's stack → not a live alias (ok)");
+    }
+
+    // Case E: zero-base / zero-size rows ignored.
+    {
+        let threads = alloc::vec![
+            mk(2, 0, 0x40000, ThreadState::Running),       // zero base
+            mk(3, live_base, 0, ThreadState::Running),     // zero size
+        ];
+        if crate::proc::test_kstack_candidate_aliases(&threads, live_base, 0x40000).is_some() {
+            test_fail!(NAME, "E: zero-base/size row wrongly flagged"); return false;
+        }
+        test_println!("  E: zero-base/zero-size rows ignored (ok)");
+    }
+
+    // Case F: candidate == the whole live stack span (the V2-catch exact shape).
+    {
+        let threads = alloc::vec![mk(1, live_base, live_size, ThreadState::Sleeping)];
+        match crate::proc::test_kstack_candidate_aliases(&threads, live_base, live_size) {
+            Some((tid, kb, ks)) if tid == 1 && kb == live_base && ks == live_size => {
+                test_println!("  F: exact-span alias → flagged tid=1 (ok)");
+            }
+            other => { test_fail!(NAME, "F: exact-span alias not flagged correctly: {:?}", other); return false; }
+        }
     }
 
     test_pass!(NAME);
