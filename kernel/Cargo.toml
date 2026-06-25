@@ -329,6 +329,19 @@ native-core-tests = []
 # preserving on-demand investigative access.  Implies `firefox-test`
 # because the diagnostic shares the firefox-test cache instrumentation.
 w215-diag = ["firefox-test"]
+# #582 torn-saved-RFLAGS-slot writer probe.  Arms a DR0 8-byte data-write
+# watch on context-switch victims' saved-RFLAGS slots
+# (`Thread::context.rsp + 0`) and classifies the writer of any store to
+# that slot as the legitimate `switch_context_asm` re-save versus an
+# out-of-band RIP (the kernel-mode `#DB`/UNEXPECTED_KERNEL_MODE_TRAP root).
+# Diagnostic-only; pulls in `w215-diag` for the shared DR0–DR3 +
+# `handle_db_exception` plumbing.  Refs: Intel SDM Vol. 3B §17.2.4 (DR
+# data-write breakpoints), §17.3.1.1 (trap-after-retire).
+# Depends only on `firefox-test-core` (NOT the full trace bundle) so the
+# timing-sensitive SMP race is not perturbed by the per-syscall serial
+# firehose; the shared DR0-DR3 + handle_db_exception plumbing is compiled
+# in via the widened module gate any(w215-diag, 582-diag).
+582-diag = ["firefox-test-core"]
 # W133: opt-out for cross-CPU TLB shootdown.  Default builds run the full
 # shootdown protocol (IPI vector 0xF0, per-CPU active-CR3 mask).  Enable
 # this feature only for bisect/baseline runs where you want to compare

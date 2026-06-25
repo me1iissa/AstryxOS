@@ -599,6 +599,35 @@ pub fn thread_table_try_lock_or_panic(
     );
 }
 
+/// #582 diagnostic: `#DB`-safe snapshot of a thread's reaper-relevant state.
+///
+/// Returns `(state_byte, ctx_rsp_valid, last_cpu, kstack_base, kstack_size)`
+/// for `tid`, or `None` if the table lock is contended (we never block — the
+/// caller runs in `#DB` interrupt context with `IF=0`, where blocking on
+/// `THREAD_TABLE` could deadlock against an interrupted holder) or `tid` is
+/// absent (already reaped).  `state_byte`: 0=Ready 1=Running 2=Blocked
+/// 3=Sleeping 4=Dead 0xff=unknown.  Diagnostic-only.
+#[cfg(feature = "582-diag")]
+pub fn d582_owner_state(tid: u64) -> Option<(u8, bool, u8, u64, u64)> {
+    let guard = THREAD_TABLE.try_lock()?;
+    let t = guard.iter().find(|t| t.tid as u64 == tid)?;
+    let state_byte = match t.state {
+        ThreadState::Ready => 0u8,
+        ThreadState::Running => 1,
+        ThreadState::Blocked => 2,
+        ThreadState::Sleeping => 3,
+        ThreadState::Dead => 4,
+    };
+    let ctx_valid = t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire);
+    Some((
+        state_byte,
+        ctx_valid,
+        t.last_cpu,
+        t.kernel_stack_base,
+        t.kernel_stack_size,
+    ))
+}
+
 /// Currently running thread ID — per-CPU, indexed by APIC ID.
 /// With SMP, each CPU tracks its own running thread.
 static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =

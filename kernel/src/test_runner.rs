@@ -1322,6 +1322,8 @@ pub fn run() -> ! {
         if test_653_reaper_skips_thread_on_other_cpu() { passed += 1; }
         total += 1;
         if test_654_bootstrap_stack_reserved() { passed += 1; }
+        total += 1;
+        if test_655_kstack_saved_rsp_survey_gate() { passed += 1; }
     }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
@@ -50027,6 +50029,115 @@ fn test_654_bootstrap_stack_reserved() -> bool {
         "  span=[{:#x}..={:#x}] pages={} all_reserved=true",
         first, last, checked
     );
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 655: kstack saved-RSP survey gate (#582 torn-RFLAGS-slot) ───────────
+//
+// Regression for the SMP=2 torn-saved-RFLAGS-slot bugcheck (kernel-mode `#DB`,
+// `UNEXPECTED_KERNEL_MODE_TRAP` 0x7f).  The DR0 write-watch named the root: a
+// reaper freed/recycled a kernel-stack frame while a STILL-PARKED thread's saved
+// `switch_context_asm` frame (its `context.rsp`) lived in that span; the next
+// `alloc_kernel_stack` zero-fill (proc/mod.rs:725) or the new owner's `pushfq`
+// then tore the parked owner's saved RFLAGS slot → its `popfq` faulted.
+//
+// The fix is the robust two-gate withholding on the reaper's emergency-tier
+// free path.  This test exercises the SAVED-RSP SURVEY gate
+// (`sched::saved_rsp_aliases_live_frame`, via `test_saved_rsp_aliases`) as a
+// pure predicate — the kstack analogue of #653's per-CPU running-TID survey,
+// keyed on saved-RSP instead of current-TID:
+//   A. a live thread whose saved RSP falls inside the frame    → aliased (hold)
+//   B. the frame's OWN owner is excluded                       → not aliased
+//   C. a live thread whose saved RSP is outside the frame      → not aliased
+//   D. an aliasing thread with ctx_rsp_valid=false             → not aliased
+//      (its saved RSP is not yet a committed switch frame)
+//   E. boundary: rsp == base (inclusive) aliases; rsp == end (exclusive) not
+// Intel SDM Vol. 3A §6.14 (TSS-RSP interrupt stack switch); Vol. 3B §17.3.1.1.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_655_kstack_saved_rsp_survey_gate() -> bool {
+    use crate::proc::{Thread, Tid};
+    const NAME: &str = "[SCHED] kstack saved-RSP survey gate (#582, Test 655)";
+    test_header!(NAME);
+
+    // Model an emergency-tier 16 KiB frame.
+    let base: u64 = 0xFFFF_8000_1900_0000;
+    let size: u64 = 16 * 1024;
+    let end = base + size;
+
+    // Helper: a parked thread with a given tid + saved RSP + ctx_rsp_valid.
+    fn mk(tid: Tid, rsp: u64, ctx_valid: bool) -> Thread {
+        let mut t = Thread::new_for_test(10);
+        t.tid = tid;
+        t.context.rsp = rsp;
+        t.ctx_rsp_valid
+            .store(ctx_valid, core::sync::atomic::Ordering::Release);
+        t
+    }
+
+    // The frame's owner being reaped (excluded from every survey below).
+    let owner_tid: Tid = 5;
+
+    // Case A: a live thread (tid 7) parked WITH its saved RSP inside the frame
+    // → the survey must report aliased (the frame must be withheld).
+    {
+        let threads = alloc::vec![mk(7, base + 0x510, true)];
+        if !crate::sched::test_saved_rsp_aliases(&threads, base, size, owner_tid) {
+            test_fail!(NAME, "A: in-span saved RSP {:#x} NOT detected as aliasing", base + 0x510);
+            return false;
+        }
+        test_println!("  A: live thread saved-RSP in frame → aliased (withheld) (ok)");
+    }
+
+    // Case B: only the frame's OWN owner has a saved RSP in the span → excluded
+    // → not aliased (must not self-defer the free forever).
+    {
+        let threads = alloc::vec![mk(owner_tid, base + 0x100, true)];
+        if crate::sched::test_saved_rsp_aliases(&threads, base, size, owner_tid) {
+            test_fail!(NAME, "B: owner's own saved RSP self-aliased (would never free)");
+            return false;
+        }
+        test_println!("  B: only owner in span (excluded) → not aliased (ok)");
+    }
+
+    // Case C: a live thread parked with saved RSP OUTSIDE the frame → not aliased.
+    {
+        let threads = alloc::vec![mk(7, end + 0x1000, true), mk(8, base - 0x1000, true)];
+        if crate::sched::test_saved_rsp_aliases(&threads, base, size, owner_tid) {
+            test_fail!(NAME, "C: out-of-span saved RSP wrongly reported as aliasing");
+            return false;
+        }
+        test_println!("  C: live threads saved-RSP outside frame → not aliased (ok)");
+    }
+
+    // Case D: a thread whose saved RSP is in-span but ctx_rsp_valid=false → not
+    // a committed switch frame → not aliased (matches the reaper's own
+    // ctx_rsp_valid gate; a half-saved frame is not yet load-bearing).
+    {
+        let threads = alloc::vec![mk(7, base + 0x510, false)];
+        if crate::sched::test_saved_rsp_aliases(&threads, base, size, owner_tid) {
+            test_fail!(NAME, "D: ctx_rsp_valid=false in-span thread wrongly aliased");
+            return false;
+        }
+        test_println!("  D: in-span but ctx_rsp_valid=false → not aliased (ok)");
+    }
+
+    // Case E: half-open boundary — rsp == base aliases (inclusive low end);
+    // rsp == end does NOT (exclusive high end).
+    {
+        let at_base = alloc::vec![mk(7, base, true)];
+        if !crate::sched::test_saved_rsp_aliases(&at_base, base, size, owner_tid) {
+            test_fail!(NAME, "E: rsp == base (inclusive) not detected as aliasing");
+            return false;
+        }
+        let at_end = alloc::vec![mk(7, end, true)];
+        if crate::sched::test_saved_rsp_aliases(&at_end, base, size, owner_tid) {
+            test_fail!(NAME, "E: rsp == end (exclusive) wrongly reported as aliasing");
+            return false;
+        }
+        test_println!("  E: boundary base=inclusive, end=exclusive (ok)");
+    }
+
     test_pass!(NAME);
     true
 }
