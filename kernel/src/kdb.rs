@@ -1639,8 +1639,16 @@ fn op_cpu_state(out: &mut String) {
     let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize).min(MAX_CPUS);
     let tick = crate::arch::x86_64::irq::get_ticks();
 
+    let timer_mode = if crate::arch::x86_64::apic::tsc_deadline_mode() {
+        "tsc-deadline"
+    } else {
+        "periodic"
+    };
     out.push('{');
-    let _ = write!(out, r#""tick":{},"ncpus":{},"cpus":["#, tick, ncpus);
+    let _ = write!(
+        out,
+        r#""tick":{},"ncpus":{},"timer_mode":"{}","cpus":["#,
+        tick, ncpus, timer_mode);
     for cpu in 0..ncpus {
         if cpu > 0 { out.push(','); }
         let timer = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[cpu]

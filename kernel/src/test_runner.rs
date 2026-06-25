@@ -2252,6 +2252,12 @@ pub fn run() -> ! {
     total += 1;
     if test_651_cpu_timer_live_decision() { passed += 1; }
 
+    // ── Test 658: TSC-deadline timer next-deadline cadence ──
+    // Hardware-free core of the TSC-deadline re-arm (the SMP dead-CPU0-timer
+    // #650 fix): strictly-future deadline + modulo-2^64 wrap.
+    total += 1;
+    if test_658_tsc_deadline_cadence() { passed += 1; }
+
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
     //   1. open(/proc/<target>/maps) from a different caller PID succeeds
@@ -50459,6 +50465,51 @@ fn test_651_cpu_timer_live_decision() -> bool {
     test_println!("  decision: first-obs / isr-advance-recovery(+clear) / within-window-tolerate / \
 wedge-declare(+rearm) / periodic-retry-under-cap / sub-window-no-rearm / at-cap-stop / \
 cap-boundary-strict — dead-CPU-timer self-heal state machine GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 658: TSC-deadline timer next-deadline cadence ──────────────────────
+//
+// Pins the hardware-free core of the TSC-deadline re-arm path
+// (`apic::next_tsc_deadline`).  TSC-deadline mode is one-shot per write (Intel
+// SDM Vol. 3A §11.5.4.1), so the timer ISR re-arms `now + period` every tick;
+// this verifies the deadline is strictly in the future (so the LAPIC arms a
+// real interval rather than firing immediately every tick) and that the
+// computation wraps correctly near the 64-bit TSC boundary (the hardware
+// comparison is modulo-2^64).  TSC-deadline is what keeps every vCPU's timer
+// alive under KVM — the fix for the SMP dead-CPU0-timer "de-facto single core"
+// wedge (#650).
+fn test_658_tsc_deadline_cadence() -> bool {
+    use crate::arch::x86_64::apic::next_tsc_deadline;
+    const NAME: &str = "[ARCH/SMP] TSC-deadline next-deadline cadence (Test 658)";
+    test_header!(NAME);
+
+    // A mid-range TSC plus a typical ~10 ms period: deadline is now + period,
+    // strictly in the future.
+    let now: u64 = 0x0000_1234_5678_9abc;
+    let period: u64 = 24_000_000; // ~10 ms @ 2.4 GHz
+    let d = next_tsc_deadline(now, period);
+    if d != now + period {
+        test_fail!(NAME, "deadline != now + period"); return false;
+    }
+    if d <= now {
+        test_fail!(NAME, "deadline not strictly in the future"); return false;
+    }
+
+    // Wrap case: a TSC near u64::MAX + period must wrap modulo-2^64 (the LAPIC
+    // comparison is modulo-2^64), not saturate or panic.
+    let near_wrap: u64 = u64::MAX - 5;
+    let dw = next_tsc_deadline(near_wrap, 100);
+    if dw != near_wrap.wrapping_add(100) {
+        test_fail!(NAME, "wrap deadline not modulo-2^64"); return false;
+    }
+    if dw != 94 {
+        test_fail!(NAME, "wrap arithmetic incorrect"); return false;
+    }
+
+    test_println!("  next-deadline: now+period strictly-future / modulo-2^64 wrap — \
+TSC-deadline one-shot re-arm cadence GREEN (KVM dead-CPU0-timer fix)");
     test_pass!(NAME);
     true
 }

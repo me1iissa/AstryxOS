@@ -21,6 +21,20 @@ const LAPIC_TIMER_INIT: u32    = 0x380;
 const LAPIC_TIMER_CURRENT: u32 = 0x390;
 const LAPIC_TIMER_DIVIDE: u32  = 0x3E0;
 
+/// LVT Timer register mode field (bits 18:17), Intel SDM Vol. 3A §11.5.1 /
+/// §11.5.4.1.  `00b` one-shot, `01b` periodic (bit 17), `10b` TSC-deadline
+/// (bit 18).  We use periodic by default and TSC-deadline when the CPU
+/// advertises it (CPUID.01H:ECX[24]) — KVM injects TSC-deadline reliably even
+/// for the BSP vCPU, whereas its emulated *periodic* counter can wedge and not
+/// resume (the SMP "de-facto single core" failure mode).
+const LAPIC_LVT_TIMER_PERIODIC: u32     = 0x2_0000; // bit 17
+const LAPIC_LVT_TIMER_TSC_DEADLINE: u32 = 0x4_0000; // bit 18
+
+/// `IA32_TSC_DEADLINE` MSR (index 6E0H).  In TSC-deadline mode a write arms a
+/// single interrupt at the absolute target TSC value; writing 0 disarms.
+/// Intel SDM Vol. 3A §11.5.4.1.
+const IA32_TSC_DEADLINE_MSR: u32 = 0x6E0;
+
 // I/O APIC registers
 const IOAPIC_REGSEL: u32 = 0x00;
 const IOAPIC_WIN: u32    = 0x10;
@@ -85,6 +99,49 @@ static APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// BSP has stored a non-zero value.  The BSP brings up APs only after
 /// completing its own LAPIC init, so this ordering is naturally established.
 static LAPIC_TIMER_PERIOD: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the LAPIC timer runs in TSC-deadline mode (vs periodic).
+///
+/// Set once at BSP boot from CPUID.01H:ECX[bit 24] (Intel SDM Vol. 3A
+/// §11.5.4.1).  When true, every CPU programs its LVT timer in TSC-deadline
+/// mode and re-arms the absolute deadline from its own timer ISR each tick
+/// (the mode is one-shot per write).  When false (e.g. the TCG baseline CPU
+/// model, which does not advertise the feature) every CPU falls back to the
+/// classic periodic count.  A single machine-wide decision keeps the BSP and
+/// every AP in the same mode.
+static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// LAPIC timer period expressed in TSC cycles, for TSC-deadline re-arming.
+///
+/// Derived at BSP calibration from the same PIT window that produces the
+/// periodic initial-count (`tsc_per_10ms` ≈ one ~10 ms tick at TICK_HZ=100).
+/// Read by the timer ISR (`rdtsc() + period` is the next deadline) and by APs
+/// when arming their first deadline.  0 before calibration.
+static LAPIC_TSC_DEADLINE_PERIOD: AtomicU64 = AtomicU64::new(0);
+
+/// True iff the CPU advertises TSC-deadline timer support
+/// (CPUID.01H:ECX[bit 24]).  Intel SDM Vol. 3A §11.5.4.1.
+fn cpuid_has_tsc_deadline() -> bool {
+    let ecx: u32;
+    // RBX is reserved by the compiler (PIC base); save/restore around CPUID.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+    (ecx & (1 << 24)) != 0
+}
+
+/// Whether the LAPIC timer is in TSC-deadline mode for this boot.
+pub fn tsc_deadline_mode() -> bool {
+    TSC_DEADLINE_MODE.load(Ordering::Acquire)
+}
 
 /// Per-CPU online flag — the authoritative SMP online state.
 ///
@@ -222,20 +279,33 @@ pub fn init() {
     let (calibration_ticks, tsc_per_10ms) = calibrate_lapic_timer();
     crate::arch::x86_64::irq::set_tsc_calibration(tsc_per_10ms);
 
-    // Configure periodic timer at ~100 Hz
-    // We measured ticks in 10ms, so this gives us ~100 Hz
-    let timer_count = calibration_ticks;
-    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // Periodic | vector 32
-    lapic_write(LAPIC_TIMER_INIT, timer_count);
+    // Decide the timer mode once for the whole machine.  TSC-deadline
+    // (CPUID.01H:ECX[24]) is preferred: KVM injects it reliably for every
+    // vCPU including the BSP, whereas its emulated periodic counter can wedge
+    // post-bringup and never resume (Intel SDM Vol. 3A §11.5.4 — a wedged
+    // periodic counter does not spontaneously restart), the SMP "de-facto
+    // single core" failure mode that the irq.rs self-heal otherwise has to
+    // limp around.  A CPU model that does not advertise the feature (e.g. the
+    // TCG baseline) falls back to periodic.
+    let use_deadline = cpuid_has_tsc_deadline();
+    TSC_DEADLINE_MODE.store(use_deadline, Ordering::Release);
 
     // Publish the calibrated period for APs to copy (see `ap_rust_entry`).
+    // Both representations are published: the periodic initial-count and the
+    // per-tick TSC-cycle delta used to compute TSC-deadline targets.
+    let timer_count = calibration_ticks;
     LAPIC_TIMER_PERIOD.store(timer_count, Ordering::Release);
+    LAPIC_TSC_DEADLINE_PERIOD.store(tsc_per_10ms, Ordering::Release);
+
+    // Program this CPU's LAPIC timer in the chosen mode and arm it.
+    arm_lapic_timer();
 
     crate::serial_println!(
-        "[APIC] Local APIC initialized: BSP ID={}, base={:#x}, timer count={}",
+        "[APIC] Local APIC initialized: BSP ID={}, base={:#x}, timer count={}, mode={}",
         bsp_id,
         base_phys,
-        timer_count
+        timer_count,
+        if use_deadline { "tsc-deadline" } else { "periodic" }
     );
 
     // Try to initialize I/O APIC
@@ -430,6 +500,22 @@ pub fn rearm_timer() {
     if !is_enabled() {
         return;
     }
+    rearm_timer_inner();
+}
+
+/// Mode-aware LAPIC-timer re-arm body, callable before `APIC_ENABLED` is
+/// published (the boot `init` path arms the timer before flipping the flag).
+fn rearm_timer_inner() {
+    if tsc_deadline_mode() {
+        // TSC-deadline: re-establish the LVT mode (10b) and arm a fresh
+        // absolute deadline.  The mode is one-shot per write, so a wedged
+        // counter (the periodic failure mode this whole path exists for)
+        // cannot occur — but re-asserting the LVT is cheap and keeps the
+        // recovery semantics identical for both modes.
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | 32);
+        arm_tsc_deadline_next();
+        return;
+    }
     let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
     if period == 0 {
         return;
@@ -445,8 +531,65 @@ pub fn rearm_timer() {
     lapic_write(LAPIC_TIMER_DIVIDE, 0x03);
     // Fresh periodic, unmasked LVT, then start the counter with the calibrated
     // period — order per §11.5.4 (mode/divide before the count that starts it).
-    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic (bit 17) | vector 32
+    lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32); // periodic | vec 32
     lapic_write(LAPIC_TIMER_INIT, period);
+}
+
+/// Program the calling CPU's LAPIC timer in the machine-wide chosen mode and
+/// arm the first interrupt.  Used by the BSP `init` path and by each AP at
+/// bringup so all CPUs run the same mode.
+///
+/// Periodic: divide-by-16, LVT periodic | vector 32, calibrated initial-count.
+/// TSC-deadline: LVT TSC-deadline (bits 18:17 = 10b) | vector 32, then a first
+/// deadline of `rdtsc() + period` cycles (Intel SDM Vol. 3A §11.5.4.1).  The
+/// divide-configuration register is irrelevant in TSC-deadline mode (the timer
+/// is clocked off the TSC, not the LAPIC bus divisor).
+pub fn arm_lapic_timer() {
+    if tsc_deadline_mode() {
+        // Establish TSC-deadline mode before the first deadline write — the
+        // LVT mode field must be 10b for the IA32_TSC_DEADLINE write to take
+        // effect (§11.5.4.1: in other modes a write to the MSR is ignored).
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | 32);
+        arm_tsc_deadline_next();
+    } else {
+        let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
+        lapic_write(LAPIC_TIMER_DIVIDE, 0x03); // divide by 16
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32);
+        lapic_write(LAPIC_TIMER_INIT, period);
+    }
+}
+
+/// Arm the next TSC-deadline (`rdtsc() + period` cycles) by writing the
+/// IA32_TSC_DEADLINE MSR.  Called from the timer ISR every tick — TSC-deadline
+/// is one-shot per write (Intel SDM Vol. 3A §11.5.4.1).
+///
+/// An `mfence` precedes the WRMSR because a write to IA32_TSC_DEADLINE is NOT
+/// serializing (Intel SDM Vol. 3A §11.5.4.1 / the architectural-MSR note): the
+/// fence orders the `rdtsc` that produced the deadline ahead of the MSR write
+/// so the hardware never sees a stale/out-of-order base.  A target already in
+/// the past simply fires immediately on the next vmentry (KVM) / instruction
+/// boundary (HW), which self-corrects a missed tick rather than wedging.
+#[inline]
+pub fn arm_tsc_deadline_next() {
+    let period = LAPIC_TSC_DEADLINE_PERIOD.load(Ordering::Acquire);
+    if period == 0 {
+        return; // pre-calibration
+    }
+    let deadline = next_tsc_deadline(crate::arch::x86_64::irq::rdtsc(), period);
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+        wrmsr(IA32_TSC_DEADLINE_MSR, deadline);
+    }
+}
+
+/// Pure next-deadline computation, factored out of [`arm_tsc_deadline_next`] so
+/// the cadence arithmetic can be unit-tested without writing the MSR.  The next
+/// absolute TSC target is `now + period`, using wrapping addition so a TSC near
+/// the 64-bit wrap still produces a deadline the LAPIC compares correctly (the
+/// hardware comparison is modulo-2^64; Intel SDM Vol. 3A §11.5.4.1).
+#[inline]
+pub fn next_tsc_deadline(now: u64, period: u64) -> u64 {
+    now.wrapping_add(period)
 }
 
 /// Check if APIC is enabled and active.
@@ -1113,20 +1256,20 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // Accept all interrupts
     lapic_write(LAPIC_TPR, 0);
 
-    // Configure LAPIC timer (same settings as BSP — periodic, vector 32).
-    //
-    // Use the period the BSP measured against the PIT, not a hard-coded
-    // guess.  A wrong AP period was previously masked because APs do not
-    // advance the global TICK_COUNT (BSP-only), but it still affects
-    // preemption granularity and any future per-CPU time accounting.
-    lapic_write(LAPIC_TIMER_DIVIDE, 0x03);   // divide by 16
-    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic | vector 32
-    let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
-    // Fallback to a conservative count if we ever reach this before the BSP
-    // published its calibration; this keeps timer interrupts firing rather
-    // than leaving the AP without any periodic preemption.
-    let ap_count = if period == 0 { 100_000 } else { period };
-    lapic_write(LAPIC_TIMER_INIT, ap_count);
+    // Configure LAPIC timer in the same machine-wide mode the BSP chose
+    // (TSC-deadline when available, else periodic) and arm the first
+    // interrupt.  Using the BSP-published calibration keeps every CPU's
+    // preemption granularity identical; `arm_lapic_timer` falls back to a
+    // conservative periodic count if the BSP calibration has not yet been
+    // published (it always has by the time an AP runs, but the guard keeps a
+    // timer firing rather than leaving the AP without any preemption).
+    if LAPIC_TIMER_PERIOD.load(Ordering::Acquire) == 0 && !tsc_deadline_mode() {
+        lapic_write(LAPIC_TIMER_DIVIDE, 0x03);
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32);
+        lapic_write(LAPIC_TIMER_INIT, 100_000);
+    } else {
+        arm_lapic_timer();
+    }
 
     // Create an idle thread for this AP so the scheduler can track it.
     // We use a special TID = 0x1000 + apic_id to avoid conflicts.
