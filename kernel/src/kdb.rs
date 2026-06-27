@@ -399,6 +399,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "compose-stats"    => op_compose_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
+        "cache-lookup"     => op_cache_lookup(req, out),
         "fault-cache-keys" => op_fault_cache_keys(out),
         "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
@@ -1409,6 +1410,77 @@ fn op_cache_aliasing(out: &mut String) {
     {
         out.push_str(r#"{"error":"cache-aliasing requires firefox-test feature"}"#);
     }
+}
+
+// ── cache-lookup ──────────────────────────────────────────────────────────────
+//
+// W215 in-place-writer localization helper.  Given a page-cache key
+// (mount, inode, page-aligned file offset) resolve the CURRENT backing
+// physical frame, derive the kernel direct-map (physmap) virtual address
+// (PHYS_OFF + phys, where PHYS_OFF = 0xFFFF_8000_0000_0000 — the same
+// higher-half identity map the cache/pmm zeroing paths write through), and
+// return a 16-byte content sample read from that physmap VA.
+//
+// Purpose: a GDB Z2 hardware write-watchpoint is a *linear-address* watch.
+// To catch the in-place corruptor of a live file-backed cache frame, the
+// caller must arm the watch on the kernel physmap VA of the CURRENT frame
+// (the frame's phys is per-boot and not known statically).  This op turns
+// the static, byte-proven cache key into the live (phys, kernel-VA, sample)
+// triple, so the caller can (a) confirm the frame holds REAL content (not
+// yet corrupted), then (b) arm `watch-set` on the returned kernel-VA and
+// resume — the next write through that VA is the corruptor.
+//
+// Request fields: "mount" (usize), "inode" (u64), "off" (u64, page-aligned
+// file offset).  All accept 0x-hex or decimal.  Read-only; no feature gate
+// (cache::lookup is always present).  Per Intel SDM Vol. 3A §4.10.5 the
+// direct map and the user PTE alias the same physical frame, so a write
+// through either VA mutates this content — but only a write through the
+// watched linear address fires the DR.
+fn op_cache_lookup(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let mount = match extract_field(req, "mount").and_then(|s| parse_u64(&s)) {
+        Some(m) => m as usize,
+        None => { out.push_str(r#"{"error":"missing 'mount'"}"#); return; }
+    };
+    let inode = match extract_field(req, "inode").and_then(|s| parse_u64(&s)) {
+        Some(i) => i,
+        None => { out.push_str(r#"{"error":"missing 'inode'"}"#); return; }
+    };
+    let off = match extract_field(req, "off").and_then(|s| parse_u64(&s)) {
+        Some(o) => o & !0xFFF,
+        None => { out.push_str(r#"{"error":"missing 'off'"}"#); return; }
+    };
+    let phys = match crate::mm::cache::lookup(mount, inode, off) {
+        Some(p) => p,
+        None => {
+            out.push('{');
+            j_kv(out, "mount", &alloc::format!("{}", mount));
+            j_str(out, "inode"); out.push(':'); j_hex(out, inode); out.push(',');
+            j_str(out, "off"); out.push(':'); j_hex(out, off); out.push(',');
+            j_kv_str(out, "resident", "false");
+            j_trim_comma(out);
+            out.push('}');
+            return;
+        }
+    };
+    let kva = PHYS_OFF + phys;
+    // Sample 16 bytes from the physmap VA (the frame is RAM, always mapped).
+    let mut hex = String::with_capacity(32);
+    for i in 0..16u64 {
+        let b = unsafe { core::ptr::read_volatile((kva + i) as *const u8) };
+        let _ = write!(hex, "{:02x}", b);
+    }
+    out.push('{');
+    j_kv(out, "mount", &alloc::format!("{}", mount));
+    j_str(out, "inode"); out.push(':'); j_hex(out, inode); out.push(',');
+    j_str(out, "off"); out.push(':'); j_hex(out, off); out.push(',');
+    j_kv_str(out, "resident", "true");
+    j_str(out, "phys"); out.push(':'); j_hex(out, phys); out.push(',');
+    j_str(out, "kernel_va"); out.push(':'); j_hex(out, kva); out.push(',');
+    j_kv_str(out, "sample16", &hex);
+    j_trim_comma(out);
+    out.push('}');
 }
 
 // ── fault-cache-keys ──────────────────────────────────────────────────────────

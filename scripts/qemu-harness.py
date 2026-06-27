@@ -6456,13 +6456,54 @@ def cmd_watch_set(args):
                 if 0 < val < 0x10000:
                     corrupt_hit = True
                     break
+            # Enrich the catch with CR3 (names the active address space — which
+            # process's page tables were loaded when the kernel writer ran) via
+            # the QMP human monitor `info registers`, and a raw stack backtrace
+            # (best-effort): the return-address chain via the rbp frame links
+            # plus a flat dump of words at rsp.  Raw addresses only — the
+            # coordinator symbolizes against the kernel map.
+            cr3 = None
+            try:
+                hmp = _qmp_command(sess.get("qmp_sock", ""), "human-monitor-command",
+                                   {"command-line": "info registers"})
+                txt = hmp.get("return", "") if isinstance(hmp, dict) else ""
+                m = re.search(r"CR3=([0-9a-fA-F]+)", txt)
+                if m:
+                    cr3 = "0x" + m.group(1)
+            except Exception:
+                cr3 = None
+            bt_rbp = []
+            try:
+                fp = int(regs.get("rbp", "0x0"), 0)
+                for _ in range(16):
+                    if fp == 0 or fp < 0x1000:
+                        break
+                    saved_rbp = int.from_bytes(gdb.read_mem(fp, 8), "little")
+                    ret = int.from_bytes(gdb.read_mem(fp + 8, 8), "little")
+                    bt_rbp.append(hex(ret))
+                    if saved_rbp <= fp:
+                        break
+                    fp = saved_rbp
+            except Exception:
+                pass
+            stack_words = []
+            try:
+                rsp = int(regs.get("rsp", "0x0"), 0)
+                raw = gdb.read_mem(rsp, 8 * 32)
+                stack_words = [hex(int.from_bytes(raw[i*8:i*8+8], "little"))
+                               for i in range(32)]
+            except Exception:
+                pass
             fire = {
                 "fire_index": len(fires) + 1,
                 "rip": hex(rip),
                 "mode": "kernel" if is_kernel else "user",
+                "cr3": cr3,
                 "code_at_rip": code,
                 "slot_vals": slot_vals,
                 "corrupt_hit": corrupt_hit,
+                "bt_rbp_chain": bt_rbp,
+                "stack_words_at_rsp": stack_words,
                 "regs": regs,
             }
             if getattr(args, "corrupt_only", False) and not corrupt_hit:
@@ -7211,6 +7252,17 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
+    if op == "cache-lookup":
+        # Resolve a page-cache key (mount, inode, page-aligned file offset) to
+        # its CURRENT backing phys + kernel physmap VA + 16-byte content sample.
+        #   kdb <sid> cache-lookup <mount> <inode> <off>
+        # All accept 0x-hex or decimal.
+        if len(rest) < 3:
+            raise ValueError("cache-lookup requires <mount> <inode> <off>")
+        return {"op": "cache-lookup",
+                "mount": str(int(rest[0], 0)),
+                "inode": str(int(rest[1], 0)),
+                "off":   str(int(rest[2], 0))}
     if op == "procmaps":
         # Terse file-backed VMA map for ASLR-base / addr2line symbolication.
         # Emits one JSON object per VMA with first_page_phys via PML4 walk.
@@ -13096,6 +13148,7 @@ def main():
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
         "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
+        "cache-lookup",
         "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
