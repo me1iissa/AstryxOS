@@ -1330,6 +1330,23 @@ pub fn run() -> ! {
         if test_657_percpu_idle_work_steal() { passed += 1; }
     }
 
+    // ── Test 659: kstack-free quarantine survey per-tick throttle ────────
+    // Regression guard for the SMP=1 FF render-path starvation: the reaper's
+    // O(entries × live-threads) quarantine survey was run on every schedule()
+    // and was throttled to at most once per TICK_COUNT advance.  Verifies the
+    // drain-frequency invariant (survey runs at most once per tick, exactly
+    // once per CPU-set per tick, and resumes each new tick so reclamation is
+    // not starved) plus that the 16-tick escape valve still judges a stale
+    // entry eligible (the throttle did not break reclamation).  Placed with
+    // the kstack-recycle regression cluster (650-657) so it runs early —
+    // ahead of the heavy Firefox launch oracle — and is reachable on every
+    // boot.  Pure logic (atomic swap gate + entry_is_quiesced); test-mode only.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_659_kstack_drain_per_tick_throttle() { passed += 1; }
+    }
+
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
     // Non-destructive: verifies that guard PTEs are not-present and that the
     // first heap page is present.  Does NOT trigger the guard fault (which would
@@ -47332,6 +47349,104 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_println!("  E: too-recent push → tick gate withholds (ok)");
 
     test_pass!("switch-generation gate: withhold-until-advanced + escape valve correct");
+    true
+}
+
+// ── Test 659: kstack-free quarantine survey per-tick throttle ────────────────
+//
+// The emergency-tier / aliased kstack-free quarantine is surveyed by
+// `drain_pending_kstack_free`, which is O(pending-entries × live-threads): for
+// each quarantined frame it walks the whole THREAD_TABLE
+// (`saved_rsp_aliases_live_frame`).  The reaper runs at the top of every
+// `schedule()`, and a frame whose recycled base VA aliases a live thread is
+// *correctly and permanently* withheld — so under heavy thread churn the
+// quarantine climbs to its cap and the full survey was re-run on every schedule,
+// burning ~half the single CPU and starving the cooperative in-kernel service
+// threads (net poll / display / compositor).
+//
+// The fix throttles the survey to at most once per `TICK_COUNT` advance via an
+// atomic swap-gate (`kstack_drain_due` / `LAST_KSTACK_DRAIN_TICK`).  This is
+// correctness-neutral: the survey's eligibility gates are wall-clock / switch-
+// generation based (earliest `DEAD_STACK_QUIESCE_TICKS` = 2 ticks, latest the
+// 8× escape valve = 16 ticks), so re-running the survey more than once within a
+// single tick reclaims nothing.  This test guards the throttle's two invariants
+// without driving the live scheduler (deterministic, non-interactive):
+//
+//   (1) drain-frequency invariant: for a given tick value the gate admits a
+//       drain exactly once; every later call in the same tick is suppressed;
+//       a new tick re-admits exactly one drain.  This is the regression: pre-
+//       fix the survey ran on every schedule (the gate would always admit).
+//   (2) reclamation invariant: a stale quarantine entry (push ≥ 16 ticks ago)
+//       is still judged eligible by `entry_is_quiesced` via the escape valve,
+//       so per-tick draining reclaims exactly what per-schedule draining did.
+//
+// The gate is exercised against a test-owned `AtomicU64` (initialised to the
+// same `u64::MAX` sentinel as the production `LAST_KSTACK_DRAIN_TICK`) so the
+// assertions stay deterministic even while a sibling CPU's reaper is touching
+// the production slot.  Intel SDM Vol. 3A §8.1.2.2 (atomic locked RMW).
+#[cfg(feature = "test-mode")]
+fn test_659_kstack_drain_per_tick_throttle() -> bool {
+    use core::sync::atomic::AtomicU64;
+    test_header!("sched: kstack-free quarantine survey per-tick throttle (drain-frequency)");
+
+    // Production initial value: u64::MAX guarantees the first-ever call drains.
+    let slot = AtomicU64::new(u64::MAX);
+
+    // First survey in tick T must run (gate admits).
+    if !crate::sched::test_kstack_drain_due(&slot, 1_000) {
+        test_fail!("test659", "first call for a fresh tick did not admit a drain");
+        return false;
+    }
+    test_println!("  A: first call in tick 1000 → drain admitted (ok)");
+
+    // The regression guard: every later call WITHIN the same tick must be
+    // suppressed.  Pre-fix (drain-every-schedule) this would admit each time.
+    for i in 0..256 {
+        if crate::sched::test_kstack_drain_due(&slot, 1_000) {
+            test_fail!("test659",
+                "survey ran more than once in tick 1000 (admitted on repeat #{}) \
+                 — per-tick throttle regressed to per-schedule", i + 1);
+            return false;
+        }
+    }
+    test_println!("  B: 256 repeat calls in tick 1000 → all suppressed (ok)");
+
+    // A new tick must re-admit exactly one drain, then suppress repeats — so
+    // reclamation resumes every tick and is never permanently starved.
+    if !crate::sched::test_kstack_drain_due(&slot, 1_001) {
+        test_fail!("test659", "new tick 1001 did not re-admit a drain — reclamation starved");
+        return false;
+    }
+    if crate::sched::test_kstack_drain_due(&slot, 1_001) {
+        test_fail!("test659", "tick 1001 admitted a second drain — once-per-tick broken");
+        return false;
+    }
+    test_println!("  C: tick advance 1000→1001 → exactly one drain re-admitted (ok)");
+
+    // A backwards/equal tick (e.g. TICK_COUNT frozen) must still admit the
+    // first observation of a *different* value and then suppress — never loop
+    // freely.  Re-presenting 1001 after 1001 is a no-op (already the slot).
+    if crate::sched::test_kstack_drain_due(&slot, 1_001) {
+        test_fail!("test659", "re-presenting the current tick admitted a drain");
+        return false;
+    }
+    test_println!("  D: re-present current tick → suppressed (frozen-tick safe) (ok)");
+
+    // Reclamation invariant: a quarantine entry pushed ≥ 16 ticks ago is judged
+    // eligible by the escape valve regardless of switch generation, so the
+    // once-per-tick drain still reclaims everything the per-schedule drain did.
+    let now = crate::arch::x86_64::irq::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let cpu0_gen = crate::sched::test_cpu_switch_gen(0);
+    let stale_push = now.saturating_sub(100); // ≥ 16-tick escape margin
+    if !crate::sched::test_entry_quiesced(stale_push, 0, cpu0_gen) {
+        test_fail!("test659",
+            "stale quarantine entry (push={} now={}) not eligible — escape valve \
+             broken, per-tick drain would leak", stale_push, now);
+        return false;
+    }
+    test_println!("  E: stale entry (≥16t) eligible via escape valve → per-tick drain reclaims (ok)");
+
+    test_pass!("per-tick drain throttle: once-per-tick + resumes each tick + reclamation intact");
     true
 }
 

@@ -759,7 +759,7 @@ fn reap_dead_threads_sched() {
     // `LAST_KSTACK_DRAIN_TICK`.
     {
         let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
-        if LAST_KSTACK_DRAIN_TICK.swap(now, Ordering::Relaxed) != now {
+        if kstack_drain_due(&LAST_KSTACK_DRAIN_TICK, now) {
             drain_pending_kstack_free();
         }
     }
@@ -1425,6 +1425,34 @@ static PENDING_KSTACK_FREE: spin::Mutex<alloc::vec::Vec<PendingKstackFree>> =
 /// per schedule, with zero change to *which* entries are freed or *when* they
 /// become eligible (the quiescence + alias correctness gates are untouched).
 static LAST_KSTACK_DRAIN_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Per-tick throttle gate for the quarantine survey.  Returns `true` at most
+/// once per distinct `now` value across all callers: the atomic swap publishes
+/// `now` and the prior occupant of `slot` decides.  The first caller to observe
+/// a new tick swaps in `now`, reads back the *previous* tick (`!= now`) and
+/// drains; every later caller in the same tick reads back `now` (`== now`) and
+/// skips.  Under SMP this admits exactly one drain per tick — the swap is a
+/// single atomic RMW, so concurrent callers cannot both read back a value other
+/// than `now` (Intel SDM Vol. 3A §8.1.2.2: locked read-modify-write operations
+/// are atomic).  `Relaxed` ordering suffices: the gate carries no data, and the
+/// drain it guards takes its own `THREAD_TABLE` / quarantine / PMM locks which
+/// provide the ordering for the actual reclamation.  Initialising `slot` to
+/// `u64::MAX` guarantees the first-ever call drains (no real `TICK_COUNT` value
+/// equals `u64::MAX`).
+#[inline]
+fn kstack_drain_due(slot: &AtomicU64, now: u64) -> bool {
+    slot.swap(now, Ordering::Relaxed) != now
+}
+
+/// Test-only: exercise the per-tick drain-throttle gate against a caller-owned
+/// `slot`, so the suite can assert the once-per-tick invariant without
+/// perturbing the production `LAST_KSTACK_DRAIN_TICK` (which a sibling CPU's
+/// reaper may be reading concurrently).  Identical code path to the production
+/// call site in `reap_dead_threads_sched`.
+#[cfg(feature = "test-mode")]
+pub fn test_kstack_drain_due(slot: &AtomicU64, now: u64) -> bool {
+    kstack_drain_due(slot, now)
+}
 
 /// Quarantine an emergency-tier / cache-overflow kstack frame for a gated PMM
 /// free.  Stamps the quiescence snapshot exactly like `push_dead_stack`.
