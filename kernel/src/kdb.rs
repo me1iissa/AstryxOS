@@ -397,6 +397,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
         "compose-stats"    => op_compose_stats(out),
+        "x11-windows"      => op_x11_windows(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
         "cache-lookup"     => op_cache_lookup(req, out),
@@ -1378,6 +1379,34 @@ fn op_compose_stats(out: &mut String) {
         blitted, skipped, total, gate_ratio_permille
     );
 }
+// ── x11-windows ───────────────────────────────────────────────────────────────
+//
+// Live X11 window/compositor-surface introspection.  Reports, per window:
+// geometry, mapped state, the allocated pixel-buffer length, and the count of
+// non-zero (painted) pixels in the server-side source-of-truth buffer.  The
+// dispositive (b) paint-never-produced vs (c) present-dropped probe for the
+// large content surface (a mapped content window with nonzero==0 means the
+// client never wrote into the server buffer; nonzero>0 with a blank screen
+// means the compositor blit dropped it).
+fn op_x11_windows(out: &mut String) {
+    use core::fmt::Write;
+    let wins = crate::x11::window_debug_summary();
+    out.push_str(r#"{"windows":["#);
+    for (i, w) in wins.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        // win/parent are emitted as quoted hex strings so the object is valid
+        // JSON (a bare 0x… literal is not JSON-parseable).
+        let _ = write!(
+            out,
+            r#"{{"fd":{},"win":"{:#x}","parent":"{:#x}","mapped":{},"w":{},"h":{},"abs_x":{},"abs_y":{},"pixels_len":{},"nonzero":{},"chrome_colored":{},"content_colored":{},"content_white":{}}}"#,
+            w.fd, w.win_id, w.parent, w.mapped, w.width, w.height,
+            w.abs_x, w.abs_y, w.pixels_len, w.nonzero,
+            w.chrome_colored, w.content_colored, w.content_white
+        );
+    }
+    let _ = write!(out, r#"],"count":{}}}"#, wins.len());
+}
+
 // ── cache-aliasing ────────────────────────────────────────────────────────────
 //
 // W215 H3a diagnostic: dump the two new counters that instrument the
