@@ -610,6 +610,20 @@ class GdbClient:
         finally:
             self._s.settimeout(old_to)
 
+    def interrupt(self, timeout_s: float = 2.0) -> Optional[str]:
+        """
+        Halt a running target by sending a raw Ctrl-C (0x03) byte — the GDB
+        remote-protocol interrupt request — then drain the resulting stop
+        reply.  Used to re-stop the guest between `cont_no_wait`/`wait_for_stop`
+        windows so memory can be re-read and watchpoints re-armed.  Returns the
+        stop payload, or None on timeout.
+        """
+        try:
+            self._s.sendall(b"\x03")
+        except (OSError, ConnectionError):
+            return None
+        return self.wait_for_stop(timeout_s)
+
 
 # ── Tier 2: ELF symbol resolver ──────────────────────────────────────────────
 #
@@ -6374,6 +6388,150 @@ def cmd_watch(args):
     })
 
 
+def cmd_watch_deep(args):
+    """
+    #655 deep-frame foreign-writer catcher (low-perturbation variant).
+
+    boot3 showed the re-arming watch-park perturbs tid2 to a near-halt (the
+    benign-fire storm on tid2's own stack + periodic interrupts) so it never
+    samples the DEEP transient frame where the #655 corruption actually lands
+    (`context.rsp ~0x18f8a2xx`, ~0x800+ below the stack top) and the crash is
+    suppressed.  This variant: (1) briefly polls PARK_RSP_TID2 until tid2 is
+    parked DEEP (>= --min-depth below the stack top) and Blocked/Sleeping/Ready;
+    (2) arms 4 Z2 write-watches on `context.rsp + {0,24,48,56}`; (3) FREE-RUNS
+    with NO periodic interrupts — only fires stop it.  When tid2 resumes it goes
+    shallower, leaving the deep region untouched, so the watch stays silent
+    until either tid2 re-parks deep or the FOREIGN corruptor writes it.  Each
+    fire is classified OWNER (writer RSP in tid2 kstack) vs FOREIGN.  Reports the
+    first FOREIGN fire — dispositive (a parked thread has no benign owner write).
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    elf  = _get_kernel_elf()
+
+    def _symaddr(name):
+        r = _resolve_symbol(elf, name)
+        return int(r["addr"], 0) if r and r.get("addr") else None
+
+    rsp_sym   = _symaddr("PARK_RSP_TID2")
+    kbase_sym = _symaddr("PARK_KBASE_TID2")
+    ksize_sym = _symaddr("PARK_KSIZE_TID2")
+    state_sym = _symaddr("PARK_STATE_TID2")
+    if rsp_sym is None or kbase_sym is None:
+        _err("PARK_RSP_TID2/KBASE not in ELF — build with `park-rsp-diag`.")
+
+    min_depth   = args.min_depth
+    timeout_s   = args.timeout_ms / 1000.0
+    poll_ms     = args.poll_ms
+    K = 0xFFFF_8000_0000_0000
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port}")
+
+    def _rd(a):
+        try:
+            return struct.unpack("<Q", gdb.read_mem(a, 8))[0]
+        except Exception:
+            return 0
+
+    samples = []
+    armed = []
+    fires = []
+    deep_found = None
+    deadline = time.monotonic() + timeout_s
+    try:
+        # ── Phase 1: poll for a DEEP parked frame (brief stops) ──────────
+        # The guest runs between polls (cont then short wait then interrupt).
+        while time.monotonic() < deadline and deep_found is None:
+            rsp   = _rd(rsp_sym)
+            kbase = _rd(kbase_sym)
+            ksize = _rd(ksize_sym)
+            state = _rd(state_sym) if state_sym else 0
+            st = state & 0xFF
+            depth = (kbase + ksize - rsp) if (kbase and kbase <= rsp < kbase + ksize) else -1
+            samples.append({"rsp": hex(rsp), "depth": hex(depth) if depth >= 0 else "oob",
+                            "state": st})
+            # Deep + parked (not Running=1)
+            if depth >= min_depth and st != 1:
+                deep_found = {"rsp": rsp, "kbase": kbase, "ksize": ksize, "depth": depth,
+                              "state": st}
+                break
+            # let the guest run a slice, then re-stop to re-sample
+            gdb.cont_no_wait()
+            time.sleep(poll_ms / 1000.0)
+            if gdb.interrupt(2.0) is None:
+                break
+
+        if deep_found is None:
+            _out({"ok": True, "verdict": "NO-DEEP-PARK-SAMPLED",
+                  "samples": samples[-40:], "note": "tid2 never observed parked "
+                  f">= {hex(min_depth)} below stack top within budget"})
+            return
+
+        # ── Phase 2: arm 4 watches on the deep frame, FREE-RUN ───────────
+        rsp   = deep_found["rsp"]
+        kbase = deep_found["kbase"]
+        ksize = deep_found["ksize"]
+        for off in (0, 24, 48, 56):
+            a = rsp + off
+            if gdb.set_watch(a, 8, "write"):
+                armed.append(a)
+        catch = None
+        while time.monotonic() < deadline:
+            gdb.cont_no_wait()
+            stop = gdb.wait_for_stop(max(1.0, deadline - time.monotonic()))
+            if stop is None:
+                break  # timed out free-running, no fire
+            regs = gdb.read_regs()
+            rip  = int(regs.get("rip", "0x0"), 0)
+            wrsp = int(regs.get("rsp", "0x0"), 0)
+            foreign = not (kbase <= wrsp < kbase + ksize)
+            slot_now = {}
+            for a in armed:
+                try:
+                    slot_now[hex(a)] = gdb.read_mem(a, 8).hex()
+                except Exception:
+                    slot_now[hex(a)] = None
+            try:
+                code = gdb.read_mem(rip, 16).hex()
+            except Exception:
+                code = None
+            try:
+                wstack = gdb.read_mem(wrsp, 160).hex()
+            except Exception:
+                wstack = None
+            fire = {"rip": hex(rip), "writer_rsp": hex(wrsp),
+                    "mode": "kernel" if rip >= K else "user", "foreign": foreign,
+                    "regs": regs, "slot_now": slot_now, "code_at_rip": code,
+                    "writer_stack_160": wstack}
+            fires.append(fire)
+            if foreign:
+                catch = fire
+                break  # THE CATCH
+            # benign owner write (tid2 resumed onto this region) — keep watching
+        for a in armed:
+            try:
+                gdb.del_watch(a, 8, "write")
+            except Exception:
+                pass
+        _out({"ok": True,
+              "verdict": "FOREIGN-WRITE-CAUGHT" if catch else
+                         ("NO-FIRE" if not fires else "ONLY-OWNER-FIRES"),
+              "deep_frame": {"context_rsp": hex(rsp),
+                             "depth_below_top": hex(deep_found["depth"]),
+                             "saved_rip_slot": hex(rsp + 56),
+                             "kstack": [hex(kbase), hex(kbase + ksize)],
+                             "state": deep_found["state"]},
+              "armed": [hex(a) for a in armed],
+              "catch": catch, "owner_fire_count": sum(1 for f in fires if not f["foreign"]),
+              "total_fires": len(fires), "poll_samples": len(samples)})
+    except Exception as e:
+        _err(f"watch-deep error: {e}")
+    finally:
+        gdb.close()
+
+
 def cmd_watch_set(args):
     """
     Arm MULTIPLE hardware write watchpoints (up to 4 x86 DRs) spanning a
@@ -6529,6 +6687,216 @@ def cmd_watch_set(args):
         "writer": fires[0] if fires else None,
         "all_fires": fires,
     })
+
+
+def cmd_watch_park(args):
+    """
+    #655 parked-frame foreign-writer catcher.
+
+    Reads PID1 tid2's live parked `context.rsp` (+ kstack range + state) from
+    the `park-rsp-diag` statics over the GDB stub, arms up to 4 hardware Z2
+    write-watchpoints on the saved switch-context frame slots
+    (`context.rsp + <offsets>`), resumes, and classifies every store to those
+    slots as OWNER (writer RSP inside tid2's kstack = tid2 itself, benign) or
+    FOREIGN (writer RSP outside tid2's kstack = the #655 corruptor).
+
+    Because tid2 parks/resumes at varying frame depths, the watch is re-armed
+    from the live `PARK_RSP_TID2` value on every quiet window and after every
+    benign owner fire, so it tracks the current parked frame.  A FOREIGN fire
+    while tid2 is parked is dispositive: it names the corruptor RIP + writer
+    RSP + the writer's stack (return addresses → call path).
+
+    Also performs the POINTER-CORRUPTION check: if `context.rsp` itself falls
+    OUTSIDE tid2's `[kstack_base, +size)` it is reported (the saved-frame
+    pointer is corrupt, not the contents) and no slot watch is armed for that
+    window.
+
+    With --corrupt-only, only a FOREIGN fire stops the run and is reported;
+    benign owner fires auto re-arm.  Contract: session started with --gdb-port
+    and the kernel built with the `park-rsp-diag` feature.  One-shot JSON.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    elf  = _get_kernel_elf()
+
+    def _symaddr(name):
+        r = _resolve_symbol(elf, name)
+        return int(r["addr"], 0) if r and r.get("addr") else None
+
+    rsp_sym   = _symaddr("PARK_RSP_TID2")
+    kbase_sym = _symaddr("PARK_KBASE_TID2")
+    ksize_sym = _symaddr("PARK_KSIZE_TID2")
+    state_sym = _symaddr("PARK_STATE_TID2")
+    seq_sym   = _symaddr("PARK_SEQ_TID2")
+    if rsp_sym is None or kbase_sym is None or ksize_sym is None:
+        _err("PARK_RSP_TID2/KBASE/KSIZE not found in ELF — build the kernel "
+             "with the `park-rsp-diag` feature.")
+
+    try:
+        offsets = [int(x, 0) for x in str(args.offsets).split(",") if x != ""]
+    except ValueError:
+        _err(f"Invalid --offsets: {args.offsets}")
+    offsets = offsets[:4]  # at most 4 HW DRs
+
+    timeout_s = args.timeout_ms / 1000.0
+    rearm_s   = max(0.1, args.rearm_ms / 1000.0)
+    corrupt_only = args.corrupt_only
+    K = 0xFFFF_8000_0000_0000
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+
+    def _rd_u64(a):
+        try:
+            return struct.unpack("<Q", gdb.read_mem(a, 8))[0]
+        except Exception:
+            return 0
+
+    armed = []
+    arm_history = []
+    foreign_fires = []
+    benign_count = 0
+    pointer_corrupt_windows = []
+
+    def _disarm_all():
+        for a in list(armed):
+            try:
+                gdb.del_watch(a, 8, "write")
+            except Exception:
+                pass
+        armed.clear()
+
+    def _arm_from_park():
+        """Re-read tid2's parked context and (re)arm the slot watches.
+        Returns (rsp, kbase, ksize, in_range)."""
+        _disarm_all()
+        rsp   = _rd_u64(rsp_sym)
+        kbase = _rd_u64(kbase_sym)
+        ksize = _rd_u64(ksize_sym)
+        state = _rd_u64(state_sym) if state_sym else 0
+        seq   = _rd_u64(seq_sym)   if seq_sym   else 0
+        in_range = (kbase != 0 and ksize != 0 and kbase <= rsp < kbase + ksize)
+        info = {
+            "park_rsp": hex(rsp), "kstack_base": hex(kbase),
+            "kstack_size": hex(ksize), "rsp_in_kstack": in_range,
+            "state_raw": hex(state),
+            "state": {0: "Ready", 1: "Running", 2: "Blocked",
+                      3: "Sleeping", 4: "Dead"}.get(state & 0xFF, "?"),
+            "ctx_rsp_valid": bool((state >> 8) & 1),
+            "last_cpu": (state >> 16) & 0xFF, "seq": seq, "armed": [],
+        }
+        if in_range:
+            for off in offsets:
+                a = rsp + off
+                if gdb.set_watch(a, 8, "write"):
+                    armed.append(a)
+                    info["armed"].append(hex(a))
+        else:
+            pointer_corrupt_windows.append(info)
+        arm_history.append(info)
+        return rsp, kbase, ksize, in_range
+
+    result = {"ok": True, "offsets": offsets, "corrupt_only": corrupt_only}
+    try:
+        rsp, kbase, ksize, in_range = _arm_from_park()
+        deadline = time.monotonic() + timeout_s
+        iters = 0
+        while time.monotonic() < deadline:
+            iters += 1
+            if not armed:
+                # tid2's rsp is out of its kstack (pointer corruption) or no DR
+                # took.  Let the guest run a bit, re-stop, re-read, re-arm.
+                gdb.cont_no_wait()
+                time.sleep(min(rearm_s, max(0.0, deadline - time.monotonic())))
+                gdb.interrupt(2.0)
+                rsp, kbase, ksize, in_range = _arm_from_park()
+                continue
+
+            gdb.cont_no_wait()
+            stop = gdb.wait_for_stop(min(rearm_s, max(0.2, deadline - time.monotonic())))
+            if stop is None:
+                # quiet window — re-stop and re-arm from the (possibly new) frame
+                if gdb.interrupt(2.0) is None:
+                    break
+                rsp, kbase, ksize, in_range = _arm_from_park()
+                continue
+
+            # a watchpoint fired; guest is stopped
+            regs = gdb.read_regs()
+            rip  = int(regs.get("rip", "0x0"), 0)
+            wrsp = int(regs.get("rsp", "0x0"), 0)
+            foreign = not (kbase != 0 and kbase <= wrsp < kbase + ksize)
+            slot_now = {}
+            for a in armed:
+                try:
+                    slot_now[hex(a)] = gdb.read_mem(a, 8).hex()
+                except Exception:
+                    slot_now[hex(a)] = None
+            try:
+                code = gdb.read_mem(rip, 16).hex()
+            except Exception:
+                code = None
+            try:
+                wstack = gdb.read_mem(wrsp, 128).hex()
+            except Exception:
+                wstack = None
+            fire = {
+                "fire_index": len(foreign_fires) + benign_count + 1,
+                "rip": hex(rip), "writer_rsp": hex(wrsp),
+                "mode": "kernel" if rip >= K else "user",
+                "foreign": foreign,
+                "regs": regs, "slot_now": slot_now,
+                "code_at_rip": code, "writer_stack_128": wstack,
+                "park": dict(arm_history[-1]),
+            }
+            if foreign:
+                foreign_fires.append(fire)
+                if corrupt_only:
+                    break  # THE CATCH
+                break      # report first fire of any kind
+            else:
+                benign_count += 1
+                if not corrupt_only:
+                    foreign_fires.append(fire)  # report this benign fire too
+                    break
+                # benign owner write under --corrupt-only: tid2 resumed; re-arm
+                rsp, kbase, ksize, in_range = _arm_from_park()
+                continue
+    except Exception as e:
+        result["loop_error"] = str(e)
+    finally:
+        try:
+            _disarm_all()
+        except Exception:
+            pass
+        gdb.close()
+
+    catch = foreign_fires[0] if foreign_fires else None
+    seqs = [w.get("seq", 0) for w in arm_history]
+    rsps = sorted({w.get("park_rsp") for w in arm_history if w.get("rsp_in_kstack")})
+    result.update({
+        "catch": catch,
+        "foreign_fire_count": sum(1 for f in foreign_fires if f.get("foreign")),
+        "benign_owner_fires": benign_count,
+        "arm_windows": len(arm_history),
+        # Liveness: if max_seq > min_seq the guest WAS progressing (schedule()
+        # ran tid2's stamp) during the watch — a frozen seq means the guest was
+        # halted (e.g. already bugchecked) and the watch caught nothing because
+        # nothing ran.
+        "seq_min": min(seqs) if seqs else None,
+        "seq_max": max(seqs) if seqs else None,
+        "guest_progressed": bool(seqs and max(seqs) > min(seqs)),
+        "distinct_parked_rsps": rsps,
+        "pointer_corrupt_windows": pointer_corrupt_windows,
+        "last_park": arm_history[-1] if arm_history else None,
+        "verdict": (
+            "FOREIGN-WRITE-CAUGHT" if (catch and catch.get("foreign"))
+            else "POINTER-CORRUPT" if pointer_corrupt_windows
+            else "NO-FOREIGN-FIRE"
+        ),
+    })
+    _out(result)
 
 
 def cmd_pause(args):
@@ -13064,6 +13432,50 @@ def main():
                                   "fire that left a small (<0x10000) value in a "
                                   "watched slot (the saved-RIP corruptor sig).")
 
+    # watch-park (#655 parked-frame foreign-writer catcher; auto-reads
+    # PARK_RSP_TID2 from the park-rsp-diag statics and re-arms as tid2 reparks)
+    p_watch_park = sub.add_parser(
+        "watch-park",
+        help="[Tier2] #655: auto-read PID1 tid2's live parked context.rsp from "
+             "the park-rsp-diag statics, arm Z2 write-watches on the saved "
+             "switch-frame slots, and catch the FOREIGN corruptor (writer RSP "
+             "outside tid2's kstack) while tid2 is parked. Re-arms as tid2 "
+             "reparks; also flags a corrupt context.rsp pointer.")
+    p_watch_park.add_argument("sid")
+    p_watch_park.add_argument("--offsets", default="0,8,48,56",
+                              help="Comma-separated byte offsets from context.rsp "
+                                   "to watch (<=4). Default 0,8,48,56 = saved "
+                                   "RFLAGS, r15, rbp, RIP slots.")
+    p_watch_park.add_argument("--rearm-ms", dest="rearm_ms", type=int, default=1500,
+                              help="Quiet-window length before re-stop/re-read/"
+                                   "re-arm from the (possibly new) parked frame "
+                                   "(default 1500). Larger = less perturbation.")
+    p_watch_park.add_argument("--corrupt-only", dest="corrupt_only",
+                              action="store_true",
+                              help="Only a FOREIGN fire (writer RSP outside "
+                                   "tid2's kstack) stops the run; benign owner "
+                                   "fires auto re-arm.")
+    p_watch_park.add_argument("--timeout-ms", type=int, default=120000,
+                              help="Overall budget for catching the corruptor")
+
+    # watch-deep (#655 low-perturbation deep-frame catcher)
+    p_watch_deep = sub.add_parser(
+        "watch-deep",
+        help="[Tier2] #655 low-perturbation: poll for tid2 parked DEEP "
+             "(>= --min-depth below stack top), arm Z2 on its frame, then "
+             "FREE-RUN (no periodic interrupts) and catch the FOREIGN corruptor "
+             "of the deep transient frame where #655 actually lands.")
+    p_watch_deep.add_argument("sid")
+    p_watch_deep.add_argument("--min-depth", dest="min_depth",
+                              type=lambda x: int(x, 0), default=0x800,
+                              help="Min bytes below stack top for 'deep' "
+                                   "(default 0x800; fatal frames seen 0x848+).")
+    p_watch_deep.add_argument("--poll-ms", dest="poll_ms", type=int, default=120,
+                              help="Guest run-slice between deep-park polls "
+                                   "(default 120; small = faster sampling).")
+    p_watch_deep.add_argument("--timeout-ms", type=int, default=180000,
+                              help="Overall budget")
+
     # pause
     p_pause = sub.add_parser("pause", help="[Tier2] Pause QEMU via QMP stop")
     p_pause.add_argument("sid")
@@ -13973,6 +14385,8 @@ def main():
         "cont":   cmd_cont,
         "watch":  cmd_watch,
         "watch-set": cmd_watch_set,
+        "watch-park": cmd_watch_park,
+        "watch-deep": cmd_watch_deep,
         "pause":  cmd_pause,
         "resume": cmd_resume,
         "autopsy": cmd_autopsy,

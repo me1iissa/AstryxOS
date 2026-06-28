@@ -42,6 +42,47 @@ static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
 static D582_SAMPLE_CTR: [AtomicU64; MAX_CPUS] =
     [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// #655 parked-frame watch instrument (`park-rsp-diag`).
+///
+/// On every `schedule()` we publish PID1 tid2's live `Thread` fields into these
+/// fixed, `#[no_mangle]` statics so a GDB hardware write-watch can be armed on
+/// tid2's EXACT parked saved-RIP slot without parsing `THREAD_TABLE` (a
+/// `Vec<Thread>` of `Box<CpuContext>`) over the stub.  The saved switch frame
+/// layout (see `switch_context_asm`, `proc/thread.rs`) is, from `context.rsp`
+/// upward: `[+0]=RFLAGS [+8]=r15 [+16]=r14 [+24]=r13 [+32]=r12 [+40]=rbx
+/// [+48]=rbp [+56]=saved-RIP`.  So the saved-RIP slot a corrupt `ret` reads is
+/// `PARK_RSP_TID2 + 56`; the saved-RFLAGS slot a torn `popfq` reads is
+/// `PARK_RSP_TID2 + 0`.  While tid2 is parked its `context.rsp` is stable, so
+/// ANY write to that range from a thread whose RSP is OUTSIDE tid2's kstack is
+/// dispositively the #655 foreign corruptor.  These are plain memory stores
+/// (NO debug-register touch), so a GDB Z2 watchpoint coexists with them.
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_RSP_TID2: AtomicU64 = AtomicU64::new(0);
+/// tid2's `Thread::kernel_stack_base` (the foreign-writer discriminator low
+/// bound; a writer whose RSP is in `[base, base+size)` is tid2 itself).
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_KBASE_TID2: AtomicU64 = AtomicU64::new(0);
+/// tid2's `Thread::kernel_stack_size`.
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_KSIZE_TID2: AtomicU64 = AtomicU64::new(0);
+/// tid2's `context.cr3`.
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_CR3_TID2: AtomicU64 = AtomicU64::new(0);
+/// tid2 packed state: `bits[0..8]=state` (0=Ready 1=Running 2=Blocked
+/// 3=Sleeping 4=Dead), `bit8=ctx_rsp_valid`, `bits[16..24]=last_cpu`.
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_STATE_TID2: AtomicU64 = AtomicU64::new(0);
+/// Monotonic publish counter — lets the harness confirm the stamp is live and
+/// detect when tid2's parked `context.rsp` last changed.
+#[cfg(feature = "park-rsp-diag")]
+#[no_mangle]
+pub static PARK_SEQ_TID2: AtomicU64 = AtomicU64::new(0);
+
 /// Per-CPU context-switch generation counter.
 ///
 /// Incremented by `note_switch_completed()` every time a CPU finishes a
@@ -2469,6 +2510,34 @@ was_emergency_4k={}",
     static DEAD_VALID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     let (old_rsp_ptr, ctx_valid_ptr) = {
         let mut threads = THREAD_TABLE.lock();
+        // ── #655 parked-frame watch: publish tid2's live context ──────────
+        // Read immutably BEFORE the `iter_mut` below.  When tid2 is parked
+        // (the pre-crash state), `context.rsp` is its stable saved frame; a
+        // GDB watch on `PARK_RSP_TID2 + 56` then catches the foreign #655
+        // corruptor.  Diagnostic-only; no debug-register touch.
+        #[cfg(feature = "park-rsp-diag")]
+        {
+            if let Some(t2) = threads.iter().find(|t| t.tid == 2) {
+                PARK_RSP_TID2.store(t2.context.rsp, Ordering::Relaxed);
+                PARK_KBASE_TID2.store(t2.kernel_stack_base, Ordering::Relaxed);
+                PARK_KSIZE_TID2.store(t2.kernel_stack_size, Ordering::Relaxed);
+                PARK_CR3_TID2.store(t2.context.cr3, Ordering::Relaxed);
+                let state = match t2.state {
+                    ThreadState::Ready => 0u64,
+                    ThreadState::Running => 1,
+                    ThreadState::Blocked => 2,
+                    ThreadState::Sleeping => 3,
+                    ThreadState::Dead => 4,
+                };
+                let cv = if t2.ctx_rsp_valid.load(Ordering::Acquire) {
+                    1u64 << 8
+                } else {
+                    0
+                };
+                PARK_STATE_TID2.store(state | cv | ((t2.last_cpu as u64) << 16), Ordering::Relaxed);
+                PARK_SEQ_TID2.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if let Some(cur) = threads.iter_mut().find(|t| t.tid == current_tid) {
             // ── FPU/SSE state save for outgoing thread ─────────────────────
             if cur.fpu_state.is_none() {
