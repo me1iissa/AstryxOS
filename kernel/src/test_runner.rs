@@ -1024,6 +1024,10 @@ pub fn run() -> ! {
     total += 1;
     if test_sysv_shm() { passed += 1; }
 
+    // ── SHM higher-half direct-map invariant (>1 GiB zero-fill regression) ──
+    total += 1;
+    if test_shm_phys_map_invariant() { passed += 1; }
+
     // ── Test 79: syscall completeness — fcntl FD_CLOEXEC, fsync, fd table ────
 
     total += 1;
@@ -20247,7 +20251,8 @@ fn test_x11_glx_handshake() -> bool {
 // real SysV shared-memory segment, fills it with a known pixel pattern, attaches
 // it via MIT-SHM ShmAttach, issues ShmPutImage into a mapped window, and verifies
 // the pixel was composited into the window surface — i.e. the server read the
-// pixel data straight from the segment's physical backing (sysv_shm::segment_phys).
+// pixel data straight from the segment's backing via the higher-half direct
+// map (sysv_shm::segment_kvirt).
 fn test_x11_shm_put_image() -> bool {
     test_header!("X11 MIT-SHM ShmPutImage (real shared-memory present)");
 
@@ -20287,16 +20292,16 @@ fn test_x11_shm_put_image() -> bool {
     let shmid = shmid as u32;
     // Write a known BGRA pattern (0x11,0x22,0x33,0xFF) directly into the segment's
     // physical backing — the same memory the X server will read on ShmPutImage.
-    let (phys_base, _size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+    let (virt_base, _size) = match crate::ipc::sysv_shm::segment_kvirt(shmid) {
         Some(v) => v,
         None => {
-            test_fail!("x11_shm", "segment_phys({}) returned None", shmid);
+            test_fail!("x11_shm", "segment_kvirt({}) returned None", shmid);
             crate::net::unix::close(client); return false;
         }
     };
-    // SAFETY: phys_base is the identity-mapped base of the just-allocated segment.
+    // SAFETY: virt_base is the higher-half direct-map base of the just-allocated segment.
     unsafe {
-        let p = phys_base as *mut u8;
+        let p = virt_base as *mut u8;
         for i in 0..(W * H) as usize {
             *p.add(i * 4)     = 0x11;
             *p.add(i * 4 + 1) = 0x22;
@@ -20437,18 +20442,18 @@ fn test_x11_shm_create_pixmap() -> bool {
         crate::net::unix::close(client); return false;
     }
     let shmid = shmid as u32;
-    let (phys_base, _size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+    let (virt_base, _size) = match crate::ipc::sysv_shm::segment_kvirt(shmid) {
         Some(v) => v,
         None => {
-            test_fail!("x11_shmpix", "segment_phys({}) returned None", shmid);
+            test_fail!("x11_shmpix", "segment_kvirt({}) returned None", shmid);
             crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
             crate::net::unix::close(client); return false;
         }
     };
     // Initial pattern (will be OVERWRITTEN after CreatePixmap to prove live read).
-    // SAFETY: phys_base is the identity-mapped base of the just-allocated segment.
+    // SAFETY: virt_base is the higher-half direct-map base of the just-allocated segment.
     unsafe {
-        let p = phys_base as *mut u8;
+        let p = virt_base as *mut u8;
         for i in 0..(W * H) as usize {
             *p.add(i * 4) = 0x00; *p.add(i * 4 + 1) = 0x00;
             *p.add(i * 4 + 2) = 0x00; *p.add(i * 4 + 3) = 0xFF;
@@ -20507,9 +20512,9 @@ fn test_x11_shm_create_pixmap() -> bool {
 
     // Now CHANGE the segment AFTER the pixmap exists — CopyArea must see THIS,
     // proving the pixmap reads live segment contents (not a create-time snapshot).
-    // SAFETY: same identity-mapped segment base, still allocated.
+    // SAFETY: same higher-half direct-map segment base, still allocated.
     unsafe {
-        let p = phys_base as *mut u8;
+        let p = virt_base as *mut u8;
         for i in 0..(W * H) as usize {
             *p.add(i * 4) = 0x44; *p.add(i * 4 + 1) = 0x55;
             *p.add(i * 4 + 2) = 0x66; *p.add(i * 4 + 3) = 0xFF;
@@ -22423,6 +22428,86 @@ fn test_sysv_shm() -> bool {
     }
 
     if ok { test_pass!("SysV SHM — shmget / shmat / shmdt / shmctl"); }
+    ok
+}
+
+/// Regression guard for the >1 GiB SHM-zero bugcheck (KERNEL_PAGE_FAULT at
+/// `memset` from `shmget`).  A SysV segment's physical backing may live above
+/// the 1 GiB low identity map; the kernel must therefore reach the bytes only
+/// through the higher-half direct map (`PHYS_OFF + phys`), never through the
+/// bare physical address.  This test pins that invariant: `segment_kvirt` must
+/// return exactly `PHYS_OFF + phys`, a higher-half address, and a write/read
+/// through it must round-trip.  The old code dereferenced the raw physical base
+/// returned by `segment_phys`, which faults the instant a frame lands >1 GiB.
+fn test_shm_phys_map_invariant() -> bool {
+    test_header!("SHM higher-half direct-map invariant (>1 GiB zero-fill guard)");
+    let mut ok = true;
+
+    let shmid = crate::ipc::sysv_shm::shmget(
+        crate::ipc::sysv_shm::IPC_PRIVATE,
+        16384,
+        crate::ipc::sysv_shm::IPC_CREAT | 0o666,
+    );
+    if shmid < 0 {
+        test_fail!("shm_physmap", "shmget returned {}", shmid);
+        return false;
+    }
+    let shmid = shmid as u32;
+
+    let raw = crate::ipc::sysv_shm::segment_phys(shmid);
+    let kv  = crate::ipc::sysv_shm::segment_kvirt(shmid);
+    match (raw, kv) {
+        (Some((phys, psize)), Some((virt, vsize))) => {
+            // Invariant: kvirt == PHYS_OFF + phys (the direct map), and the
+            // returned address is in the higher half — never a bare phys.
+            let expect = crate::mm::vmm::PHYS_OFF + phys;
+            if virt != expect {
+                test_fail!("shm_physmap",
+                    "segment_kvirt={:#x} != PHYS_OFF+phys={:#x}", virt, expect);
+                ok = false;
+            }
+            if virt < crate::mm::vmm::PHYS_OFF {
+                test_fail!("shm_physmap",
+                    "segment_kvirt={:#x} is not higher-half (bare phys?)", virt);
+                ok = false;
+            }
+            if psize != vsize {
+                test_fail!("shm_physmap", "size mismatch {} != {}", psize, vsize);
+                ok = false;
+            }
+            // shmget already zero-filled through the direct map; a non-faulting
+            // read here proves the mapping is live for the whole segment.
+            unsafe {
+                let p = virt as *const u8;
+                let first = *p;
+                let last  = *p.add((vsize - 1) as usize);
+                if first != 0 || last != 0 {
+                    test_fail!("shm_physmap",
+                        "segment not zero-filled: first={:#x} last={:#x}", first, last);
+                    ok = false;
+                }
+                // Round-trip a byte through the direct map.
+                let pw = virt as *mut u8;
+                *pw.add((vsize - 1) as usize) = 0xA5;
+                if *p.add((vsize - 1) as usize) != 0xA5 {
+                    test_fail!("shm_physmap", "direct-map write did not round-trip");
+                    ok = false;
+                }
+            }
+            if ok {
+                test_println!(
+                    "  segment_kvirt={:#x} = PHYS_OFF+{:#x}, size={} ✓", virt, phys, vsize);
+            }
+        }
+        _ => {
+            test_fail!("shm_physmap", "segment_phys/kvirt returned None");
+            ok = false;
+        }
+    }
+
+    crate::ipc::sysv_shm::shmctl(shmid, crate::ipc::sysv_shm::IPC_RMID, 0);
+
+    if ok { test_pass!("SHM higher-half direct-map invariant (>1 GiB zero-fill guard)"); }
     ok
 }
 

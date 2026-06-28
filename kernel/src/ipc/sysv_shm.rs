@@ -88,9 +88,20 @@ pub fn shmget(key: i32, size: u64, flags: i32) -> i64 {
         None => return -12, // ENOMEM
     };
 
-    // Zero the backing memory
+    // Zero the backing memory through the higher-half physical map.
+    //
+    // `alloc_pages` returns a *physical* base.  The CPU must reach it through
+    // a mapped virtual address: the kernel's higher-half direct map at
+    // `PHYS_OFF + phys` covers every physical frame (0 .. 4 GiB), whereas the
+    // low identity map (virtual == physical) only covers the first 1 GiB of
+    // RAM.  Dereferencing the bare physical address therefore faults the
+    // instant `alloc_pages` hands back a frame above 1 GiB — exactly what a
+    // large MIT-SHM segment triggers on a >1 GiB guest.  See Intel SDM Vol. 3A
+    // §4.5 (4-level paging): a linear address is translated only if every
+    // paging-structure entry on its walk is present; the identity range past
+    // 1 GiB has no such entries, so the access is a not-present #PF.
     unsafe {
-        core::ptr::write_bytes(phys_base as *mut u8, 0, size_aligned as usize);
+        core::ptr::write_bytes(phys_to_kvirt(phys_base), 0, size_aligned as usize);
     }
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -288,19 +299,47 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) -> i64 {
     }
 }
 
-/// Look up a segment by its shmid and return its `(phys_base, size)`.
+/// Look up a segment by its shmid and return its raw `(phys_base, size)`.
 ///
-/// The backing pages are physically contiguous and reside in the kernel's
-/// identity-mapped low memory, so the returned `phys_base` is directly readable
-/// by the kernel (the same property `shmget`'s `write_bytes(phys_base ...)` zero
-/// relies on).  Used by the X server's MIT-SHM ShmPutImage to read client pixel
-/// data straight from the segment without a per-frame copy through the request
-/// body.  Returns `None` if no in-use segment has that id.
+/// The backing pages are physically contiguous.  The returned value is a
+/// *physical* address — suitable for installing a page-table entry, but NOT
+/// for direct CPU dereference (the low identity map only covers the first
+/// 1 GiB of RAM).  Callers that need to read or write the segment bytes from
+/// kernel mode must use [`segment_kvirt`], which returns a higher-half virtual
+/// base valid for any frame.  Returns `None` if no in-use segment has that id.
 pub fn segment_phys(shmid: u32) -> Option<(u64, u64)> {
     let segs = SEGMENTS.lock();
     segs.iter()
         .find(|s| s.in_use && s.id == shmid)
         .map(|s| (s.phys_base, s.size))
+}
+
+/// Look up a segment by its shmid and return its kernel-readable
+/// `(virt_base, size)`.
+///
+/// `virt_base` is the segment's physical base mapped through the kernel's
+/// higher-half direct map (`PHYS_OFF + phys`), so it is dereferenceable from
+/// kernel mode regardless of where the frame lives in physical memory.  Used
+/// by the in-kernel X server's MIT-SHM `ShmPutImage` / `CopyArea` paths to read
+/// client pixel data straight from the segment without a per-frame copy.
+/// Returns `None` if no in-use segment has that id.
+///
+/// Per Intel SDM Vol. 3A §4.5, the higher-half direct map is the only mapping
+/// guaranteed present for physical addresses above the 1 GiB identity range, so
+/// the raw `phys_base` must never be dereferenced directly.
+pub fn segment_kvirt(shmid: u32) -> Option<(u64, u64)> {
+    let segs = SEGMENTS.lock();
+    segs.iter()
+        .find(|s| s.in_use && s.id == shmid)
+        .map(|s| (phys_to_kvirt(s.phys_base) as u64, s.size))
+}
+
+/// Convert a physical frame base into a kernel-dereferenceable pointer via the
+/// higher-half direct map.  The map covers physical 0 .. 4 GiB (`PHYS_OFF`),
+/// unlike the low identity map which stops at 1 GiB.
+#[inline]
+fn phys_to_kvirt(phys: u64) -> *mut u8 {
+    (crate::mm::vmm::PHYS_OFF + phys) as *mut u8
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

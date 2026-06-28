@@ -185,8 +185,9 @@ static SERVER: Mutex<Server> = Mutex::new(Server::new());
 // MIT-SHM ShmAttach binds an X resource id (`shmseg`) to a previously-created
 // SysV shared-memory segment (the integer `shmid` the client got from
 // `shmget`).  ShmPutImage then references the `shmseg`; the server resolves it
-// to the `shmid`, looks up the segment's physical backing via
-// `sysv_shm::segment_phys`, and reads pixel data directly.  Attachments are
+// to the `shmid`, looks up the segment's kernel-readable base via
+// `sysv_shm::segment_kvirt` (higher-half direct map), and reads pixel data
+// directly.  Attachments are
 // few (a compositor uses a handful of back-buffers), so a small fixed table
 // shared across all clients is sufficient.
 const MAX_SHM_ATTACH: usize = 32;
@@ -2725,13 +2726,14 @@ fn op_copy_area(fd: u64, data: &[u8]) {
                         let rh = (y1 - y0).max(0) as usize;
                         let mut buf = alloc::vec![0u8; rw * rh * 4];
                         let ok = if p.is_shm_backed() {
-                            // Resolve the segment's kernel-readable physical base
-                            // and copy the clipped rectangle from it.  Row stride
-                            // is the SHM image stride (scanline-padded), not sw*4.
-                            match crate::ipc::sysv_shm::segment_phys(p.shm_shmid) {
-                                Some((phys_base, seg_size)) => {
+                            // Resolve the segment's kernel-readable virtual base
+                            // (higher-half direct map) and copy the clipped
+                            // rectangle from it.  Row stride is the SHM image
+                            // stride (scanline-padded), not sw*4.
+                            match crate::ipc::sysv_shm::segment_kvirt(p.shm_shmid) {
+                                Some((virt_base, seg_size)) => {
                                     let stride = p.shm_stride as usize;
-                                    let base = phys_base as usize + p.shm_offset as usize;
+                                    let base = virt_base as usize + p.shm_offset as usize;
                                     // Last byte the loop touches must lie inside the
                                     // segment (guards against a truncated/detached
                                     // segment between CreatePixmap and CopyArea).
@@ -2741,11 +2743,11 @@ fn op_copy_area(fd: u64, data: &[u8]) {
                                         || (p.shm_offset as u64 + last as u64) > seg_size {
                                         false
                                     } else {
-                                        // SAFETY: `phys_base` is the identity-mapped,
-                                        // kernel-readable base of a physically
+                                        // SAFETY: `virt_base` is the higher-half
+                                        // direct-map address of a physically
                                         // contiguous SysV segment (see
-                                        // sysv_shm::shmget); the bound check above
-                                        // keeps every read inside the segment.
+                                        // sysv_shm::segment_kvirt); the bound check
+                                        // above keeps every read inside the segment.
                                         for row in 0..rh {
                                             for col in 0..rw {
                                                 let so = base
@@ -3807,7 +3809,7 @@ fn op_shm_put_image(fd: u64, data: &[u8]) {
     if total_w <= 0 || total_h <= 0 || src_w <= 0 || src_h <= 0 { return; }
 
     let shmid = match shm_lookup(fd, shmseg) { Some(id) => id, None => return };
-    let (phys_base, seg_size) = match crate::ipc::sysv_shm::segment_phys(shmid) {
+    let (virt_base, seg_size) = match crate::ipc::sysv_shm::segment_kvirt(shmid) {
         Some(v) => v, None => return,
     };
 
@@ -3821,13 +3823,13 @@ fn op_shm_put_image(fd: u64, data: &[u8]) {
     if src_x < 0 || src_y < 0
         || src_x + src_w > total_w || src_y + src_h > total_h { return; }
 
-    // SAFETY: `phys_base` is the identity-mapped, kernel-readable base of a
-    // physically-contiguous SysV segment (see sysv_shm::shmget).  The bounds
-    // checks above guarantee `[offset, offset+img_len)` is within the segment,
-    // so the slice never reads past the backing pages.
+    // SAFETY: `virt_base` is the higher-half direct-map address of a
+    // physically-contiguous SysV segment (see sysv_shm::segment_kvirt).  The
+    // bounds checks above guarantee `[offset, offset+img_len)` is within the
+    // segment, so the slice never reads past the backing pages.
     let src: &[u8] = unsafe {
         core::slice::from_raw_parts(
-            (phys_base + offset) as *const u8,
+            (virt_base + offset) as *const u8,
             img_len as usize,
         )
     };
