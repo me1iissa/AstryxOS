@@ -49797,7 +49797,7 @@ fn test_648_percpu_pick_equivalence() -> bool {
     const NAME: &str = "[SCHED/P2] per-CPU pick == legacy pick (Test 648, equivalence proof)";
     test_header!(NAME);
 
-    let bsp_deadline = crate::sched::bsp_force_deadline_ticks();      // 8
+    let bsp_deadline = crate::sched::bsp_force_deadline_ticks();      // 2
     let global_deadline = crate::sched::global_force_deadline_ticks(); // 100
 
     // Build a Ready candidate Thread on CPU `cpu_pin`/`last_cpu`, aged
@@ -50127,7 +50127,7 @@ fn test_649_percpu_min_deadline_gate() -> bool {
         Ok(())
     }
 
-    let bsp = crate::sched::bsp_force_deadline_ticks();        // 8
+    let bsp = crate::sched::bsp_force_deadline_ticks();        // 2
     let glob = crate::sched::global_force_deadline_ticks();    // 100
 
     // Scenario A: empty / no non-idle Ready thread → never overdue.
@@ -51520,7 +51520,7 @@ fn test_285_anti_starvation_aging() -> bool {
 //       longer the routine rescue path;
 //   (2) the BSP-specific force-deadline is far tighter than the global ceiling
 //       (STARVE_FORCE_TICKS_BSP < STARVE_FORCE_TICKS), so even in the worst case
-//       the reactor's run-queue latency is bounded at ~80 ms, not ~1 s.
+//       the reactor's run-queue latency is bounded at ~20 ms, not ~1 s.
 //
 // Pure arithmetic / constant comparison — deterministic, no spawning, no
 // scheduler races.  Cite POSIX sched(7) (SCHED_OTHER: every runnable thread

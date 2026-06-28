@@ -353,14 +353,24 @@ const STARVE_FORCE_TICKS: u64 = 100;
 /// latency-critical poll reactor (net::poll / x11::poll / compositor::compose).
 /// Like an interactive task in a virtual-deadline fair scheduler, TID 0 spends
 /// almost no CPU and yields early every iteration, so it is owed a much earlier
-/// deadline than the compute-bound workers it competes with.  8 ticks (≈80 ms,
-/// at TICK_HZ = 100) keeps the reactor running at ~10+ Hz even when a 50+-thread
-/// userspace workload saturates the run-queue, so the network/compositor pump
-/// keeps draining and a page load can actually complete and composite.  The
-/// score-based aging usually selects TID 0 even sooner; this deadline bounds the
-/// reactor's worst-case latency well below the coarse `STARVE_FORCE_TICKS`
-/// global ceiling.
-const STARVE_FORCE_TICKS_BSP: u64 = 8;
+/// deadline than the compute-bound workers it competes with.  At TICK_HZ = 100,
+/// 2 ticks (≈20 ms) bounds the reactor's worst-case run-queue latency at the
+/// compositor's own frame cadence: `gui::compositor` rate-gates presents at
+/// `COMPOSE_MIN_INTERVAL_TICKS = 2` (≈50 Hz), so a reactor force-deadline of 2
+/// is exactly the cadence needed to *saturate* that cap under a 50+-thread
+/// userspace load.  A coarser deadline (the previous 8 ticks ≈ 12.5 Hz) capped
+/// the reactor — and therefore the present rate — at ~4× below the compositor's
+/// own ceiling, so a busy windowed app composited only ~1 frame every few ticks
+/// even though the gate would have allowed 50 Hz.  The reactor early-yields each
+/// iteration and the compositor self-throttles, so a forced run that finds no
+/// owed frame is a cheap skip (see `compose_if_due` / `COMPOSE_SKIPPED`); this
+/// raises present cadence without handing TID 0 a larger share of the vCPU.
+/// The score-based aging usually selects TID 0 even sooner; this deadline bounds
+/// the reactor's worst-case latency well below the coarse `STARVE_FORCE_TICKS`
+/// global ceiling.  (Cite POSIX sched(7): every runnable thread eventually runs;
+/// an early-yielding latency-sensitive task is owed an earlier virtual deadline
+/// than compute-bound peers.)
+const STARVE_FORCE_TICKS_BSP: u64 = 2;
 
 /// Throttle factor for the `[SCHED/STARVE] force-select` diagnostic: the line
 /// is emitted on the first force and then once per this many force-selects.
