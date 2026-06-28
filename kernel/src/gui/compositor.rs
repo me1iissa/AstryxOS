@@ -22,7 +22,7 @@ pub fn is_active() -> bool {
     COMPOSITOR_ACTIVE.load(Ordering::Relaxed)
 }
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 
 /// Monotone damage counter.  Bumped by every accessor that changes on-screen
 /// pixel content (X11 PutImage / fill / text, window move/resize, cursor move,
@@ -65,7 +65,10 @@ const COMPOSE_MAX_IDLE_TICKS: u64 = 100;
 /// content calls this so the next [`compose_if_due`] knows a repaint is owed.
 #[inline]
 pub fn damage() {
+    DAMAGE_NOTED.fetch_add(1, Ordering::Relaxed);
     DAMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Coordinate-free: force a full-surface repaint this frame.
+    DAMAGE.lock().full = true;
 }
 
 /// Rate-gated, damage-driven compositor entry point for the cooperative BSP
@@ -113,6 +116,301 @@ pub fn compose_gate_stats() -> (u64, u64) {
         COMPOSE_BLITTED.load(Ordering::Relaxed),
         COMPOSE_SKIPPED.load(Ordering::Relaxed),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Damage-region tracking
+//
+// The compositor repaints and presents only the screen rectangles that
+// actually changed since the last frame, instead of regenerating + blitting
+// the whole surface.  Producers (the X11 server's draw ops, window geometry
+// changes, native GDI accessors) report changed regions as screen-space
+// rectangles via [`damage_rect`]; a coordinate-free producer (or any path we
+// have not taught fine damage) falls back to [`damage`], which forces a
+// full-surface repaint that frame.  An empty damage set is likewise treated
+// as full-surface so a direct `compose()` call (no recorded damage) still
+// refreshes everything.  See the X11 DAMAGE protocol region model and the DRM
+// dirty-fb convention (NULL/empty clips ⇒ full update).
+// ---------------------------------------------------------------------------
+
+/// Maximum number of distinct damage rectangles tracked per frame before they
+/// are collapsed into a single bounding box.  Bounds per-frame compositing work
+/// so a pathological flood of tiny rects cannot make a frame O(n) in rects.
+const MAX_DAMAGE_RECTS: usize = 16;
+
+struct DamageAccum {
+    /// Pending screen-space damage rectangles (x, y, w, h), already clipped to
+    /// the screen.  Drained by [`compose`].
+    rects: Vec<(u32, u32, u32, u32)>,
+    /// When set, the whole surface is repainted this frame and `rects` is
+    /// ignored (coarse fallback / first frame / resolution change).
+    full: bool,
+}
+
+static DAMAGE: Mutex<DamageAccum> =
+    Mutex::new(DamageAccum { rects: Vec::new(), full: true });
+
+/// Active surface dimensions, published by [`init`] so [`damage_rect`] can clip
+/// without taking the compositor lock.
+static SCREEN_W: AtomicU32 = AtomicU32::new(0);
+static SCREEN_H: AtomicU32 = AtomicU32::new(0);
+
+/// Last software-cursor position painted into the backbuffer, so a partial frame
+/// can repaint (erase) the cursor's old cell and paint its new one without a
+/// full-surface repaint.  `i32::MIN` = "no previous cursor yet".  Only used on
+/// the software-cursor path (the hardware cursor is composited by the device and
+/// leaves no framebuffer damage).
+static PREV_CURSOR_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static PREV_CURSOR_Y: AtomicI32 = AtomicI32::new(i32::MIN);
+
+/// Software-cursor cell size (the arrow bitmap is 12×12).
+const CURSOR_CELL: u32 = 12;
+
+/// Counts every op that reported its own damage (fine OR a deliberate "no
+/// on-screen change", e.g. a draw to an off-screen pixmap).  The X11 dispatch
+/// snapshots this before/after a request: if it did NOT advance for a
+/// screen-changing request, the request had no fine-damage handler and the
+/// dispatch issues the coarse [`damage`] full-surface fallback.  This lets the
+/// fine-damage migration be incremental and always-correct.
+static DAMAGE_NOTED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the damage-accounted counter (see [`DAMAGE_NOTED`]).
+#[inline]
+pub fn damage_noted_seq() -> u64 {
+    DAMAGE_NOTED.load(Ordering::Relaxed)
+}
+
+/// Record that the current op accounted for its own on-screen damage without
+/// necessarily changing the screen (e.g. it drew to an off-screen pixmap).
+/// Suppresses the dispatch-level coarse full-surface fallback for that op.
+#[inline]
+pub fn note_damage() {
+    DAMAGE_NOTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record on-screen damage for a single screen-space rectangle.  Clips to the
+/// surface; coalesces into a bounding box once the rect list exceeds
+/// [`MAX_DAMAGE_RECTS`].  Also marks the op as damage-accounted (see
+/// [`DAMAGE_NOTED`]) and advances the compose gate's [`DAMAGE_SEQ`].
+pub fn damage_rect(x: i32, y: i32, w: i32, h: i32) {
+    DAMAGE_NOTED.fetch_add(1, Ordering::Relaxed);
+    let sw = SCREEN_W.load(Ordering::Relaxed);
+    let sh = SCREEN_H.load(Ordering::Relaxed);
+    if sw == 0 || sh == 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    let x1 = (x.saturating_add(w).max(0) as u32).min(sw);
+    let y1 = (y.saturating_add(h).max(0) as u32).min(sh);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    // A real on-screen change is owed: advance the compose gate.
+    DAMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut acc = DAMAGE.lock();
+    if acc.full {
+        return; // already painting everything this frame
+    }
+    acc.rects.push((x0, y0, x1 - x0, y1 - y0));
+    if acc.rects.len() > MAX_DAMAGE_RECTS {
+        let bbox = damage_bounding_box(&acc.rects);
+        acc.rects.clear();
+        acc.rects.push(bbox);
+    }
+}
+
+/// Bounding box of a non-empty rect list.
+fn damage_bounding_box(rects: &[(u32, u32, u32, u32)]) -> (u32, u32, u32, u32) {
+    let mut x0 = u32::MAX;
+    let mut y0 = u32::MAX;
+    let mut x1 = 0u32;
+    let mut y1 = 0u32;
+    for &(x, y, w, h) in rects {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x + w);
+        y1 = y1.max(y + h);
+    }
+    (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+/// Rectangle intersection in screen space, all `(x, y, w, h)`.  Returns `None`
+/// if the rectangles do not overlap.
+#[inline]
+fn rect_intersect(
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let ax2 = a.0 + a.2;
+    let ay2 = a.1 + a.3;
+    let bx2 = b.0 + b.2;
+    let by2 = b.1 + b.3;
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = ax2.min(bx2);
+    let y1 = ay2.min(by2);
+    if x1 <= x0 || y1 <= y0 {
+        None
+    } else {
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-compose timing/throughput instrumentation (before/after the damage-region
+// overhaul, exposed via the kdb `compose-stats` op).  All in TSC-derived µs and
+// bytes; cumulative + last-frame snapshots so a single boot quantifies the win.
+// ---------------------------------------------------------------------------
+static COMPOSE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_DIRTY_PX_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_LAST_US: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_LAST_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMPOSE_LAST_DIRTY_PX: AtomicU64 = AtomicU64::new(0);
+
+/// Record one composited frame's wall time (TSC cycles), VRAM bytes moved, and
+/// dirty-pixel area, converting cycles → µs via the BSP TSC calibration.
+fn record_compose(cycles: u64, bytes: u64, dirty_px: u64) {
+    let tpt = crate::arch::x86_64::irq::TSC_PER_TICK.load(Ordering::Relaxed);
+    // TSC_PER_TICK = cycles per 10 ms tick ⇒ µs = cycles * 10_000 / TSC_PER_TICK.
+    let us = if tpt == 0 {
+        0
+    } else {
+        (cycles.saturating_mul(10_000)) / tpt
+    };
+    COMPOSE_US_TOTAL.fetch_add(us, Ordering::Relaxed);
+    COMPOSE_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    COMPOSE_DIRTY_PX_TOTAL.fetch_add(dirty_px, Ordering::Relaxed);
+    COMPOSE_FRAMES.fetch_add(1, Ordering::Relaxed);
+    COMPOSE_LAST_US.store(us, Ordering::Relaxed);
+    COMPOSE_LAST_BYTES.store(bytes, Ordering::Relaxed);
+    COMPOSE_LAST_DIRTY_PX.store(dirty_px, Ordering::Relaxed);
+}
+
+/// Snapshot of the compose-timing instrumentation:
+/// `(frames, us_total, bytes_total, dirty_px_total, last_us, last_bytes,
+/// last_dirty_px)`.  Used by the kdb `compose-stats` op to report the
+/// before/after damage-region win.
+pub fn compose_timing_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (
+        COMPOSE_FRAMES.load(Ordering::Relaxed),
+        COMPOSE_US_TOTAL.load(Ordering::Relaxed),
+        COMPOSE_BYTES_TOTAL.load(Ordering::Relaxed),
+        COMPOSE_DIRTY_PX_TOTAL.load(Ordering::Relaxed),
+        COMPOSE_LAST_US.load(Ordering::Relaxed),
+        COMPOSE_LAST_BYTES.load(Ordering::Relaxed),
+        COMPOSE_LAST_DIRTY_PX.load(Ordering::Relaxed),
+    )
+}
+
+/// Self-test for the damage-region machinery (rectangle intersection, bounding-
+/// box coalescing, screen clipping, and the full-surface fallback).  Returns
+/// `true` on success.  Saves and restores the live damage accumulator so it can
+/// run against an initialised compositor without perturbing live compositing.
+/// Invoked from `test_runner::test_damage_region`.
+pub fn damage_region_selftest() -> bool {
+    // 1. rect_intersect: overlap, containment, disjoint, edge-touch.
+    if rect_intersect((0, 0, 10, 10), (5, 5, 10, 10)) != Some((5, 5, 5, 5)) {
+        return false;
+    }
+    if rect_intersect((0, 0, 100, 100), (10, 10, 20, 20)) != Some((10, 10, 20, 20)) {
+        return false;
+    }
+    if rect_intersect((0, 0, 10, 10), (20, 20, 5, 5)).is_some() {
+        return false;
+    }
+    // Edge-touch (shared boundary, zero overlap area) must be None.
+    if rect_intersect((0, 0, 10, 10), (10, 0, 10, 10)).is_some() {
+        return false;
+    }
+
+    // 2. bounding box of a disjoint pair = enclosing rect.
+    let bb = damage_bounding_box(&[(2, 3, 4, 5), (20, 30, 1, 1)]);
+    if bb != (2, 3, 19, 28) {
+        return false;
+    }
+
+    let sw = SCREEN_W.load(Ordering::Relaxed);
+    let sh = SCREEN_H.load(Ordering::Relaxed);
+    if sw == 0 || sh == 0 {
+        // Compositor not initialised — the pure-logic checks above still ran.
+        return true;
+    }
+
+    // Save the live accumulator, then exercise damage_rect in isolation.
+    let saved: (Vec<(u32, u32, u32, u32)>, bool) = {
+        let mut acc = DAMAGE.lock();
+        let r = core::mem::take(&mut acc.rects);
+        let f = acc.full;
+        acc.full = false;
+        (r, f)
+    };
+
+    let mut ok = true;
+
+    // 3. A clipped, in-bounds rect lands as one entry.
+    damage_rect(10, 10, 20, 20);
+    {
+        let acc = DAMAGE.lock();
+        if acc.full || acc.rects.len() != 1 || acc.rects[0] != (10, 10, 20, 20) {
+            ok = false;
+        }
+    }
+
+    // 4. An off-screen rect is clipped to the surface bounds.
+    {
+        let mut acc = DAMAGE.lock();
+        acc.rects.clear();
+        acc.full = false;
+    }
+    damage_rect(-5, -5, 10, 10);
+    {
+        let acc = DAMAGE.lock();
+        // (-5,-5,10,10) clips to (0,0,5,5).
+        if acc.rects.len() != 1 || acc.rects[0] != (0, 0, 5, 5) {
+            ok = false;
+        }
+    }
+
+    // 5. Flooding well past MAX_DAMAGE_RECTS stays bounded by the cap (the rect
+    //    list is collapsed to a bounding box whenever it exceeds the cap, so it
+    //    can never grow without limit).
+    {
+        let mut acc = DAMAGE.lock();
+        acc.rects.clear();
+        acc.full = false;
+    }
+    for i in 0..(MAX_DAMAGE_RECTS as u32 * 4) {
+        let x = (i % sw.max(1)) as i32;
+        damage_rect(x, 0, 1, 1);
+    }
+    {
+        let acc = DAMAGE.lock();
+        if acc.rects.len() > MAX_DAMAGE_RECTS {
+            ok = false;
+        }
+    }
+
+    // 6. Coarse damage() forces full-surface.
+    damage();
+    {
+        let acc = DAMAGE.lock();
+        if !acc.full {
+            ok = false;
+        }
+    }
+
+    // Restore the live accumulator and force a full repaint of the real frame.
+    {
+        let mut acc = DAMAGE.lock();
+        acc.rects = saved.0;
+        acc.full = true; // be conservative: full repaint next live frame
+        let _ = saved.1;
+    }
+
+    ok
 }
 
 /// Pure gating predicate for [`compose_if_due`] (extracted so it is unit
@@ -588,9 +886,6 @@ pub struct CompositorState {
     pub fb_stride: u32,
     pub backbuffer: Vec<u32>,
     pub frame_count: u64,
-    /// Bounding box of dirty region this frame: (x, y, w, h).
-    /// `None` means nothing dirty yet; `Some((0,0,sw,sh))` = full screen.
-    pub dirty_rect: Option<(u32, u32, u32, u32)>,
 }
 
 static COMPOSITOR: Mutex<Option<CompositorState>> = Mutex::new(None);
@@ -941,9 +1236,17 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
         fb_stride: stride,
         backbuffer: vec![0u32; buf_size],
         frame_count: 0,
-        dirty_rect: Some((0, 0, width, height)), // initial frame: full dirty
     };
     *COMPOSITOR.lock() = Some(state);
+    // Publish dimensions for lock-free damage clipping, and force a full
+    // first-frame repaint.
+    SCREEN_W.store(width, Ordering::Relaxed);
+    SCREEN_H.store(height, Ordering::Relaxed);
+    {
+        let mut acc = DAMAGE.lock();
+        acc.rects.clear();
+        acc.full = true;
+    }
     crate::serial_println!(
         "[GUI] Compositor initialized ({}x{}, stride={}, fb=0x{:X})",
         width,
@@ -959,14 +1262,27 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
 
 /// Main compositing entry point — call once per frame.
 ///
-/// 1. Fills the backbuffer with the desktop background colour.
-/// 2. Iterates over windows in z-order (back → front), collecting a snapshot
-///    of each visible, non-minimized window and drawing it.
-/// 3. Draws the mouse cursor.
-/// 4. Blits the backbuffer to the hardware framebuffer.
+/// Damage-region driven: repaints and presents only the screen rectangles that
+/// changed since the last composited frame, rather than regenerating the full
+/// backbuffer and blitting the whole surface every frame.
+///
+/// 1. Latch the pending damage region(s) (or full-surface) under the damage
+///    lock, re-arming for the next frame.
+/// 2. For each damaged region: repaint the desktop background, then the Win32
+///    windows whose bounds intersect it.
+/// 3. Composite the X11 client windows on top, copying only the damaged
+///    sub-rectangles (memcpy per row; no full-window clone).
+/// 4. Start-menu overlay + mouse cursor.
+/// 5. Blit each region to the hardware framebuffer (non-blocking
+///    `SVGA_CMD_UPDATE` per region + one trailing present kick).
+///
+/// A coordinate-free [`damage`] call (or first frame / no recorded damage)
+/// forces a full-surface frame, so direct `compose()` callers always refresh.
 pub fn compose() {
     // Mark compositor as active — disables TTY console framebuffer writes.
     COMPOSITOR_ACTIVE.store(true, Ordering::Relaxed);
+
+    let t0 = crate::arch::x86_64::irq::rdtsc();
 
     let mut guard = COMPOSITOR.lock();
     let comp = match guard.as_mut() {
@@ -978,29 +1294,57 @@ pub fn compose() {
     let sh = comp.screen_height;
     let stride = sw; // backbuffer is tightly packed
 
-    // --- 1. Desktop background (subtle gradient) ---
-    // Top: deep navy (0xFF0A0A20) → Bottom: dark teal (0xFF0D1B2A)
-    let top_r: u32 = 0x0A; let top_g: u32 = 0x0A; let top_b: u32 = 0x20;
-    let bot_r: u32 = 0x0D; let bot_g: u32 = 0x1B; let bot_b: u32 = 0x2A;
-    for y in 0..sh {
-        let r = top_r + (bot_r.wrapping_sub(top_r)) * y / sh.max(1);
-        let g = top_g + (bot_g.wrapping_sub(top_g)) * y / sh.max(1);
-        let b = top_b + (bot_b.wrapping_sub(top_b)) * y / sh.max(1);
-        let color = 0xFF000000 | (r << 16) | (g << 8) | b;
-        let row_start = (y * stride) as usize;
-        let row_end = row_start + sw as usize;
-        if row_end <= comp.backbuffer.len() {
-            comp.backbuffer[row_start..row_end].fill(color);
+    // The hardware cursor (when enabled) is composited by the SVGA device and
+    // generates no framebuffer damage.  The software-cursor fallback paints the
+    // cursor into the backbuffer; instead of forcing a full-surface frame to
+    // avoid cursor trails, it is treated as ordinary damage — the cursor's old
+    // and new cells are added to this frame's regions below (X11 DAMAGE-style
+    // accounting of the cursor's own region).
+    let hw_cursor = HARDWARE_CURSOR_ACTIVE.load(Ordering::Relaxed);
+
+    // --- 1. Latch-and-clear the damage region under the damage lock ---
+    let (mut regions, full): (Vec<(u32, u32, u32, u32)>, bool) = {
+        let mut acc = DAMAGE.lock();
+        let first = comp.frame_count == 0;
+        let full = first || acc.full || acc.rects.is_empty();
+        let regions = if full {
+            vec![(0, 0, sw, sh)]
+        } else {
+            core::mem::take(&mut acc.rects)
+        };
+        // Re-arm: any producer that runs after this point re-dirties for the
+        // next frame (the producer locks DAMAGE after us).
+        acc.rects.clear();
+        acc.full = false;
+        (regions, full)
+    };
+
+    // Software cursor: on a partial frame, repaint (erase) the cursor's previous
+    // cell and paint its new one by adding both to this frame's regions.  On a
+    // full frame the whole surface is already covered, so nothing to add.
+    let (cur_mx, cur_my) = crate::drivers::mouse::position();
+    if !hw_cursor && !full {
+        let px = PREV_CURSOR_X.load(Ordering::Relaxed);
+        let py = PREV_CURSOR_Y.load(Ordering::Relaxed);
+        for (cxp, cyp) in [(px, py), (cur_mx, cur_my)] {
+            if cxp == i32::MIN {
+                continue;
+            }
+            if let Some(r) = rect_intersect(
+                (0, 0, sw, sh),
+                (cxp.max(0) as u32, cyp.max(0) as u32, CURSOR_CELL, CURSOR_CELL),
+            ) {
+                if !regions.contains(&r) {
+                    regions.push(r);
+                }
+            }
         }
     }
-    // Full screen is dirty (background covers entire frame).
-    expand_dirty(comp, 0, 0, sw, sh);
 
-    // --- 2. Windows (back-to-front) ---
+    // --- 2. Gather Win32 window snapshots once (locks released before paint) ---
     let z_order: Vec<WindowHandle> = crate::wm::zorder::get_z_order();
-
+    let mut win32: Vec<WindowSnapshot> = Vec::new();
     for &handle in z_order.iter() {
-        // Snapshot the window data (briefly locks WINDOW_REGISTRY, then releases).
         let snap = crate::wm::window::with_window(handle, |w| WindowSnapshot {
             handle: w.handle,
             x: w.x,
@@ -1017,18 +1361,13 @@ pub fn compose() {
             style: w.style,
             state: w.state,
         });
-
         let snap = match snap {
             Some(s) => s,
             None => continue,
         };
-
-        // Skip invisible or minimized windows.
         if !snap.style.visible || snap.state == WindowState::Minimized {
             continue;
         }
-
-        // Trivial off-screen rejection.
         if snap.x + (snap.width as i32) <= 0
             || snap.y + (snap.height as i32) <= 0
             || snap.x >= sw as i32
@@ -1036,126 +1375,135 @@ pub fn compose() {
         {
             continue;
         }
-
-        draw_window(&mut comp.backbuffer, stride, &snap);
-        // Mark the window's bounding box dirty.
-        let wx = snap.x.max(0) as u32;
-        let wy = snap.y.max(0) as u32;
-        let wx2 = ((snap.x + snap.width as i32).max(0) as u32).min(sw);
-        let wy2 = ((snap.y + snap.height as i32).max(0) as u32).min(sh);
-        if wx2 > wx && wy2 > wy {
-            expand_dirty(comp, wx, wy, wx2 - wx, wy2 - wy);
-        }
+        win32.push(snap);
     }
 
-    // --- 2b. X11 client windows (on top of Win32 windows) ---
-    // Render mapped X11 windows to the backbuffer. These are from Firefox,
-    // xterm, or any other X11 client connected to our Xastryx server.
-    {
-        let x11_windows = crate::x11::get_mapped_windows();
-        for xwin in &x11_windows {
-            let wx = xwin.x as i32;
-            let wy = xwin.y as i32;
-            let ww = xwin.width as u32;
-            let wh = xwin.height as u32;
-            // Clip to screen
-            let x0 = wx.max(0) as u32;
-            let y0 = wy.max(0) as u32;
-            let x1 = ((wx + ww as i32) as u32).min(sw);
-            let y1 = ((wy + wh as i32) as u32).min(sh);
-            if x1 <= x0 || y1 <= y0 { continue; }
-            // Blit BGRA pixels to backbuffer
-            for py in y0..y1 {
-                let src_y = (py as i32 - wy) as u32;
-                let dst_off = (py * stride + x0) as usize;
-                let src_off = (src_y * ww + (x0 as i32 - wx) as u32) as usize;
-                for px in 0..(x1 - x0) as usize {
-                    let si = (src_off + px) * 4;
-                    if si + 3 >= xwin.pixels.len() { break; }
-                    let b = xwin.pixels[si] as u32;
-                    let g = xwin.pixels[si + 1] as u32;
-                    let r = xwin.pixels[si + 2] as u32;
-                    comp.backbuffer[dst_off + px] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                }
+    // --- 3. Per-region repaint: background + intersecting Win32 windows ---
+    for &region in &regions {
+        paint_background_region(comp, region);
+        for snap in &win32 {
+            let wx = snap.x.max(0) as u32;
+            let wy = snap.y.max(0) as u32;
+            let wx2 = ((snap.x + snap.width as i32).max(0) as u32).min(sw);
+            let wy2 = ((snap.y + snap.height as i32).max(0) as u32).min(sh);
+            if wx2 <= wx || wy2 <= wy {
+                continue;
             }
-            expand_dirty(comp, x0, y0, x1 - x0, y1 - y0);
+            // draw_window paints its full extent into the backbuffer; only the
+            // region is presented, so an unclipped redraw of an intersecting
+            // window is correct (and the windows are few/small).
+            if rect_intersect(region, (wx, wy, wx2 - wx, wy2 - wy)).is_some() {
+                draw_window(&mut comp.backbuffer, stride, snap);
+            }
         }
     }
 
-    // --- 3. Start menu overlay (on top of all windows) ---
+    // --- 4. X11 client windows (on top of Win32), damage-bounded memcpy ---
+    // The X11 server owns the window pixel buffers; have it composite only the
+    // damaged sub-rectangles of its mapped windows directly into the backbuffer
+    // (memcpy per row under its own lock — no per-frame full-window clone, no
+    // per-pixel shuffle).  Lock order is COMPOSITOR → SERVER, as before.
+    crate::x11::blit_windows_to_backbuffer(&mut comp.backbuffer, stride, sw, sh, &regions);
+
+    // --- 5. Start-menu overlay (on top of all windows) ---
     if crate::gui::content::is_start_menu_open() {
-        crate::gui::content::render_start_menu_to_backbuffer(
-            &mut comp.backbuffer,
-            sw,
-            sh,
-        );
+        crate::gui::content::render_start_menu_to_backbuffer(&mut comp.backbuffer, sw, sh);
     }
 
-    // --- 4. Mouse cursor ---
-    let (mx, my) = crate::drivers::mouse::position();
-    if HARDWARE_CURSOR_ACTIVE.load(Ordering::Relaxed) {
-        // Hardware cursor: tell the SVGA device where to composite the cursor
-        // overlay.  This writes 3 u32s directly into FIFO bypass registers —
-        // no backbuffer modification, no MMIO blit required.
+    // --- 6. Mouse cursor (painted on top, within the regions above) ---
+    let (mx, my) = (cur_mx, cur_my);
+    if hw_cursor {
+        // Hardware cursor: position via FIFO bypass registers — no backbuffer
+        // modification, no MMIO blit.
         crate::drivers::vmware_svga::move_cursor(mx as u32, my as u32);
     } else {
-        // Software fallback: paint the cursor into the backbuffer.  The
-        // upcoming blit will copy it to VRAM along with everything else.
+        // Software cursor: the new cell is already a damage region (added at the
+        // latch on a partial frame, or covered by the full frame), so painting
+        // here lands inside a region that will be blitted below.  The old cell
+        // was repainted from the scene, erasing the previous cursor.
         draw_cursor(&mut comp.backbuffer, stride, sw, sh, mx, my);
+        PREV_CURSOR_X.store(mx, Ordering::Relaxed);
+        PREV_CURSOR_Y.store(my, Ordering::Relaxed);
     }
 
-    // --- 5. Blit to screen ---
-    blit_to_screen(comp);
+    // --- 7. Blit each region to the framebuffer, then one present kick ---
+    let mut bytes_moved: u64 = 0;
+    let mut dirty_px: u64 = 0;
+    for &region in &regions {
+        let (b, p) = blit_region(comp, region);
+        bytes_moved += b;
+        dirty_px += p;
+    }
+    crate::drivers::vmware_svga::present_kick();
 
-    // --- 6. Frame counter ---
+    // --- 8. Frame counter + timing ---
     comp.frame_count += 1;
+    let cycles = crate::arch::x86_64::irq::rdtsc().wrapping_sub(t0);
+    record_compose(cycles, bytes_moved, dirty_px);
 }
 
-/// Expand the dirty bounding box to include the given rectangle.
-#[inline]
-fn expand_dirty(comp: &mut CompositorState, x: u32, y: u32, w: u32, h: u32) {
-    let x2 = (x + w).min(comp.screen_width);
-    let y2 = (y + h).min(comp.screen_height);
-    let x = x.min(comp.screen_width);
-    let y = y.min(comp.screen_height);
-    if x2 <= x || y2 <= y { return; }
-    comp.dirty_rect = Some(match comp.dirty_rect {
-        None => (x, y, x2 - x, y2 - y),
-        Some((dx, dy, dw, dh)) => {
-            let nx = x.min(dx);
-            let ny = y.min(dy);
-            let nx2 = x2.max(dx + dw);
-            let ny2 = y2.max(dy + dh);
-            (nx, ny, nx2 - nx, ny2 - ny)
+/// Paint the desktop background gradient into one screen-space region.
+/// Top: deep navy (0xFF0A0A20) → bottom: dark teal (0xFF0D1B2A).
+fn paint_background_region(comp: &mut CompositorState, region: (u32, u32, u32, u32)) {
+    let sw = comp.screen_width;
+    let sh = comp.screen_height;
+    let stride = sw;
+    let (rx, ry, rw, rh) = region;
+    let x0 = rx.min(sw);
+    let y0 = ry.min(sh);
+    let x1 = (rx + rw).min(sw);
+    let y1 = (ry + rh).min(sh);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let top_r: u32 = 0x0A; let top_g: u32 = 0x0A; let top_b: u32 = 0x20;
+    let bot_r: u32 = 0x0D; let bot_g: u32 = 0x1B; let bot_b: u32 = 0x2A;
+    for y in y0..y1 {
+        let r = top_r + (bot_r.wrapping_sub(top_r)) * y / sh.max(1);
+        let g = top_g + (bot_g.wrapping_sub(top_g)) * y / sh.max(1);
+        let b = top_b + (bot_b.wrapping_sub(top_b)) * y / sh.max(1);
+        let color = 0xFF000000 | (r << 16) | (g << 8) | b;
+        let row_start = (y * stride + x0) as usize;
+        let row_end = (y * stride + x1) as usize;
+        if row_end <= comp.backbuffer.len() {
+            comp.backbuffer[row_start..row_end].fill(color);
         }
-    });
+    }
 }
 
-/// Copy the backbuffer to the hardware framebuffer.
-/// Only blits the dirty region (or the full screen if dirty_rect covers it),
-/// then issues a targeted SVGA_CMD_UPDATE for that rectangle.
-fn blit_to_screen(comp: &mut CompositorState) {
-    let (dx, dy, dw, dh) = match comp.dirty_rect.take() {
-        Some(r) => r,
-        None => return, // nothing changed
-    };
-
+/// Copy one screen-space region from the backbuffer to the hardware framebuffer
+/// and queue a non-blocking `SVGA_CMD_UPDATE` for it.  Returns
+/// `(bytes_copied, pixels_copied)` for the compose-timing instrumentation.
+fn blit_region(comp: &CompositorState, region: (u32, u32, u32, u32)) -> (u64, u64) {
+    let sw = comp.screen_width;
+    let sh = comp.screen_height;
+    let (rx, ry, rw, rh) = region;
+    let x = rx.min(sw);
+    let y = ry.min(sh);
+    let x2 = (rx + rw).min(sw);
+    let y2 = (ry + rh).min(sh);
+    if x2 <= x || y2 <= y {
+        return (0, 0);
+    }
     let fb = comp.fb_base as *mut u32;
     let hw_stride = comp.fb_stride;
     let w = comp.screen_width;
-
-    // Blit only the dirty rows.
-    for row_idx in dy..(dy + dh) {
-        let src_row_start = (row_idx * w + dx) as usize;
-        let dst_row_start = (row_idx * hw_stride + dx) as usize;
-        let pixels = dw as usize;
+    let pixels = (x2 - x) as usize;
+    for row_idx in y..y2 {
+        let src_row_start = (row_idx * w + x) as usize;
+        let dst_row_start = (row_idx * hw_stride + x) as usize;
+        if src_row_start + pixels > comp.backbuffer.len() {
+            break;
+        }
         let src = &comp.backbuffer[src_row_start..src_row_start + pixels];
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), fb.add(dst_row_start), pixels);
         }
     }
-
-    crate::drivers::vmware_svga::update_rect(dx, dy, dw, dh);
+    crate::drivers::vmware_svga::update_rect_async(x, y, x2 - x, y2 - y);
+    let rows = (y2 - y) as u64;
+    let px = rows * pixels as u64;
+    (px * 4, px)
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,15 +1515,7 @@ fn blit_to_screen(comp: &mut CompositorState) {
 /// Called by external code (e.g. the X11 server) when window pixel data
 /// has changed and the hardware framebuffer needs to be refreshed.
 pub fn mark_dirty(x: u32, y: u32, w: u32, h: u32) {
-    let mut guard = COMPOSITOR.lock();
-    if let Some(comp) = guard.as_mut() {
-        expand_dirty(comp, x, y, w, h);
-    }
-    // `damage()` is a single lock-free atomic; calling it under any lock is
-    // sound (it never reacquires COMPOSITOR).  Drop the guard first anyway so
-    // every damage()-bumping accessor follows the same shape.
-    drop(guard);
-    damage();
+    damage_rect(x as i32, y as i32, w as i32, h as i32);
 }
 
 /// Fill a solid rectangle in the backbuffer. `color` is 0x00RRGGBB.
@@ -1195,9 +1535,8 @@ pub fn screen_fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
             comp.backbuffer[ry as usize * stride + rx as usize] = color;
         }
     }
-    expand_dirty(comp, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
     drop(guard);
-    damage();
+    damage_rect(x0, y0, x1 - x0, y1 - y0);
 }
 
 /// Blit a 32-bpp BGRA/XRGB pixel buffer into the backbuffer.
@@ -1225,11 +1564,10 @@ pub fn screen_blit_pixels(x: i32, y: i32, w: u32, h: u32, pixels: &[u8]) {
                 (r << 16) | (g << 8) | b;
         }
     }
-    let x0 = x.max(0) as u32;
-    let y0 = y.max(0) as u32;
-    expand_dirty(comp, x0, y0, w, h);
+    let x0 = x.max(0);
+    let y0 = y.max(0);
     drop(guard);
-    damage();
+    damage_rect(x0, y0, w as i32, h as i32);
 }
 
 /// Draw ASCII text using the embedded 8×16 VGA bitmap font.
@@ -1259,10 +1597,9 @@ pub fn screen_draw_text(x: i32, y: i32, text: &str, fg: u32, bg: u32) {
         }
         cx += 8;
     }
-    let tw = (text.len() as i32 * 8).max(0) as u32;
-    expand_dirty(comp, x.max(0) as u32, y.max(0) as u32, tw, 16);
+    let tw = (text.len() as i32 * 8).max(0);
     drop(guard);
-    damage();
+    damage_rect(x.max(0), y.max(0), tw, 16);
 }
 
 /// Returns `true` if the compositor has been initialised.

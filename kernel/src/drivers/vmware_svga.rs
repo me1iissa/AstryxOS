@@ -145,8 +145,60 @@ fn init_fifo(svga: &mut VmwareSvga) {
     );
 }
 
+/// Ensure at least `bytes` of free space exist in the FIFO command ring before
+/// the next write, so a producer that no longer spin-drains after every command
+/// (see [`present_kick`]) cannot lap the device-owned `SVGA_FIFO_STOP` consumer
+/// pointer and corrupt in-flight commands.
+///
+/// The VMware SVGA II FIFO is a byte ring of 32-bit words bounded by `MIN`/`MAX`;
+/// the guest advances `NEXT_CMD`, the device advances `STOP`.  Used bytes are
+/// `(NEXT_CMD - STOP) mod ring`; one word is reserved so a full ring is never
+/// indistinguishable from an empty one.  When space is short we kick the device
+/// (`SVGA_REG_SYNC`) and spin on `SVGA_REG_BUSY` to drain — the only place the
+/// present path ever blocks.  When space is available this is a few volatile
+/// reads and returns immediately, so the spin-drained callers (`update_rect`,
+/// `fill_rect`, …) are unaffected.
+fn fifo_reserve(svga: &VmwareSvga, bytes: u32) {
+    let fifo = svga.fifo_virt as *mut u32;
+    unsafe {
+        let min = fifo.add(SVGA_FIFO_MIN).read_volatile();
+        let max = fifo.add(SVGA_FIFO_MAX).read_volatile();
+        if max <= min { return; }
+        let ring = max - min;
+        // Need room for the command plus the one reserved sentinel word.
+        let need = bytes.saturating_add(4);
+        if need >= ring { return; } // command larger than the ring: best-effort
+        loop {
+            let next = fifo.add(SVGA_FIFO_NEXT_CMD).read_volatile();
+            let stop = fifo.add(SVGA_FIFO_STOP).read_volatile();
+            // `next`/`stop` are byte offsets in [min, max); `fifo_write` wraps
+            // NEXT_CMD back to `min` at `max`, so `next < stop` is a normal
+            // wrap state.  The ring size (max - min) is NOT a power of two
+            // (a 64 KiB FIFO gives ring = 0xFFC0), so `(next - stop) % ring`
+            // mis-computes `used` in the wrap case and over-reports free space
+            // — letting the producer lap the device-owned STOP.  Branch on the
+            // wrap instead (both offsets in [min,max) ⇒ stop - next < ring).
+            let used = if next >= stop { next - stop } else { ring - (stop - next) };
+            let free = ring - used;
+            if free >= need { return; }
+            // Producer would lap the consumer: force a drain and re-check.
+            // NB: this drain spins on SVGA_REG_BUSY while SVGA.lock() is held
+            // (we are inside update_rect_async's locked region); it is only
+            // reached on the rare genuine-overrun path and is equivalent in
+            // shape to the old synchronous fifo_sync.
+            write_reg(svga.io_base, SVGA_REG_SYNC, 1);
+            while read_reg(svga.io_base, SVGA_REG_BUSY) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
 /// Write a single `u32` into the FIFO ring, advancing next_cmd with wrapping.
 fn fifo_write(svga: &VmwareSvga, val: u32) {
+    // Overrun guard: never let NEXT_CMD lap the device-owned STOP pointer.
+    fifo_reserve(svga, 4);
+
     let fifo = svga.fifo_virt as *mut u32;
 
     unsafe {
@@ -157,6 +209,12 @@ fn fifo_write(svga: &VmwareSvga, val: u32) {
         // Write the value at the current next_cmd offset (byte offset → u32 index).
         let ptr = (svga.fifo_virt as *mut u8).add(next_cmd as usize) as *mut u32;
         ptr.write_volatile(val);
+
+        // The command word must be globally visible before the device can see
+        // the advanced producer pointer, or it could consume a half-written
+        // command.  On x86 (TSO) program-ordered stores to WB memory suffice;
+        // the compiler fence keeps the value store ahead of the pointer store.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         // Advance next_cmd, wrapping around to min if we hit max.
         next_cmd += 4;
@@ -450,6 +508,45 @@ pub fn update_rect(x: u32, y: u32, w: u32, h: u32) {
     // Explicitly drop guard before sync (sync acquires the lock too).
     drop(guard);
     fifo_sync();
+}
+
+/// Queue a targeted `SVGA_CMD_UPDATE` for a rectangle **without** spin-waiting
+/// for the device to drain.  Multiple rectangles can be queued back-to-back in
+/// one frame; a single trailing [`present_kick`] then asks the device to scan
+/// them all out.  Overrun is prevented by the per-write [`fifo_reserve`] guard
+/// (free-space check against the device `STOP` pointer), not by spinning on
+/// `SVGA_REG_BUSY` — so the common case costs only the FIFO writes, no VM-exit
+/// poll loop.  Coordinates are clamped to the active mode by the device.
+pub fn update_rect_async(x: u32, y: u32, w: u32, h: u32) {
+    if w == 0 || h == 0 { return; }
+    let guard = SVGA.lock();
+    let svga = match guard.as_ref() {
+        Some(s) if s.enabled => s,
+        _ => return,
+    };
+    fifo_write(svga, SVGA_CMD_UPDATE);
+    fifo_write(svga, x);
+    fifo_write(svga, y);
+    fifo_write(svga, w);
+    fifo_write(svga, h);
+}
+
+/// Non-blocking present: kick the device to begin draining any queued FIFO
+/// commands (e.g. the [`update_rect_async`] rectangles of this frame) and return
+/// immediately, **without** spinning on `SVGA_REG_BUSY`.  Writing
+/// `SVGA_REG_SYNC` wakes the host FIFO-processing thread; the back-pressure that
+/// keeps the guest from outrunning the device lives in [`fifo_reserve`] (it
+/// blocks only when the ring would otherwise overrun), so per-frame this is one
+/// MMIO write rather than a drain spin.
+pub fn present_kick() {
+    let guard = SVGA.lock();
+    let svga = match guard.as_ref() {
+        Some(s) if s.enabled => s,
+        _ => return,
+    };
+    // All queued FIFO command words must be visible before the host is kicked.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    write_reg(svga.io_base, SVGA_REG_SYNC, 1);
 }
 
 /// Fill a rectangle with `color` via the FIFO (SVGA_CMD_RECT_FILL).
