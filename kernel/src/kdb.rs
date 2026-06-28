@@ -397,6 +397,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
         "compose-stats"    => op_compose_stats(out),
+        "mouse-state"      => op_mouse_state(out),
         "x11-windows"      => op_x11_windows(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
@@ -1396,6 +1397,42 @@ fn op_compose_stats(out: &mut String) {
         out,
         r#""last_us":{},"last_bytes":{},"last_dirty_px":{},"us_total":{},"bytes_total":{}}}"#,
         last_us, last_bytes, last_dirty_px, us_total, bytes_total
+    );
+}
+// ── mouse-state ─────────────────────────────────────────────────────────────
+//
+// Per-link evidence for the PS/2 mouse → input-pump → X11-pointer chain.
+//   irq12_count    : IRQ12 (vector 44) fires recorded by perf — proves the
+//                    QEMU PS/2 device → IOAPIC → ISR link is live.
+//   initialized    : mouse::init completed (data reporting enabled).
+//   x,y,buttons    : decoded pointer state from mouse.rs — advances iff
+//                    handle_irq successfully assembled+decoded packets.
+//   x11_*          : whether the X11 server would deliver MotionNotify to its
+//                    focused window (focus_selects_motion=false ⇒ events are
+//                    dropped at the server even though the sprite tracks).
+fn op_mouse_state(out: &mut String) {
+    use core::fmt::Write;
+    let irq12 = crate::perf::interrupt_count(44);
+    let irq1 = crate::perf::interrupt_count(33);
+    let (mx, my) = crate::drivers::mouse::position();
+    let buttons = crate::drivers::mouse::buttons();
+    let initialized = crate::drivers::mouse::is_initialized();
+    // CCB is best-effort: None when a device byte is in flight (see read_ccb).
+    let ccb = crate::drivers::mouse::read_ccb();
+    let ccb_val = ccb.map(|c| c as i32).unwrap_or(-1);
+    let mouse_irq_enabled = ccb.map(|c| c & 0x02 != 0).unwrap_or(false); // CCB bit 1
+    let mouse_clock_on = ccb.map(|c| c & 0x20 == 0).unwrap_or(false);    // bit 5 clear = clock on
+    let (x11_init, x11_clients, x11_focus, x11_motion) =
+        crate::x11::debug_pointer_state();
+    let _ = write!(
+        out,
+        r#"{{"irq12_count":{},"irq1_count":{},"initialized":{},"x":{},"y":{},"buttons":{},"ccb":{},"mouse_irq_enabled":{},"mouse_clock_on":{},"#,
+        irq12, irq1, initialized, mx, my, buttons, ccb_val, mouse_irq_enabled, mouse_clock_on
+    );
+    let _ = write!(
+        out,
+        r#""x11_initialized":{},"x11_clients":{},"x11_focus_window":{},"x11_focus_selects_motion":{}}}"#,
+        x11_init, x11_clients, x11_focus, x11_motion
     );
 }
 // ── x11-windows ───────────────────────────────────────────────────────────────

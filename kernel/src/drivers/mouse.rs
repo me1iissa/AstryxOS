@@ -68,15 +68,25 @@ pub fn init(width: u32, height: u32) {
     wait_input();
     unsafe { crate::hal::outb(COMMAND_PORT, 0xA8); } // Enable auxiliary device
 
-    // Enable IRQ12
+    // Configure the controller command byte (CCB) for the mouse:
+    //   * bit 1 (0x02) — enable the mouse/aux IRQ12.
+    //   * bit 5 (0x20) — mouse-clock DISABLE: must be CLEARED or the controller
+    //     gates the aux clock and the device never streams movement packets
+    //     (so no IRQ12 ever fires).  The keyboard's CCB write leaves bit 5 set
+    //     ("keep mouse bits as-is"), and although the `0xA8` enable-aux command
+    //     is specified to clear it, we must not depend on that side effect —
+    //     clear bit 5 explicitly here so the aux clock is unconditionally on.
+    // Reference: IBM PS/2 / 8042 keyboard-controller command-byte definition;
+    // PC/AT keyboard controller specification (command byte bits 1 and 5).
     wait_input();
     unsafe { crate::hal::outb(COMMAND_PORT, 0x20); } // Read controller config byte
     wait_output();
     let config = unsafe { crate::hal::inb(DATA_PORT) };
+    let new_config = (config | 0x02) & !0x20; // enable IRQ12, clear mouse-clock-disable
     wait_input();
     unsafe { crate::hal::outb(COMMAND_PORT, 0x60); } // Write controller config byte
     wait_input();
-    unsafe { crate::hal::outb(DATA_PORT, config | 0x02); } // Enable IRQ12
+    unsafe { crate::hal::outb(DATA_PORT, new_config); }
 
     // Reset mouse
     mouse_write(0xFF);
@@ -182,4 +192,36 @@ pub fn warp(x: i32, y: i32) {
 /// Check if mouse is initialized.
 pub fn is_initialized() -> bool {
     MOUSE_INITIALIZED.load(Ordering::Relaxed)
+}
+
+/// Best-effort read of the live i8042 controller command byte (CCB), for the
+/// `mouse-state` kdb diagnostic.
+///
+/// Issues the `0x20` (read-config) controller command and returns the byte.
+/// Bit 1 (0x02) = mouse IRQ enabled; bit 5 (0x20) = mouse-clock disabled (must
+/// be 0 for the mouse to stream).  Returns `None` if the controller already has
+/// an unread output byte on entry (a device packet in flight): issuing `0x20`
+/// then would read that data byte instead of the config and could desync the
+/// packet assembler, so we decline rather than corrupt the stream.  Interrupts
+/// are masked across the command/read so the IRQ12 handler cannot race the read.
+/// Reference: PC/AT 8042 keyboard-controller command byte; status-register OBF
+/// (bit 0) / AUX (bit 5) flags.
+pub fn read_ccb() -> Option<u8> {
+    let mut flags: u64;
+    // Save RFLAGS then mask interrupts so the IRQ12 handler cannot consume the
+    // output byte between our `0x20` command and the `0x60` read.  Restoring the
+    // saved RFLAGS re-enables interrupts only if they were enabled on entry.
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
+    // Decline if an output byte is already pending (OBF, status bit 0): consuming
+    // it would steal a device packet byte and report garbage.
+    let ccb = if unsafe { crate::hal::inb(STATUS_PORT) } & 0x01 != 0 {
+        None
+    } else {
+        wait_input();
+        unsafe { crate::hal::outb(COMMAND_PORT, 0x20); }
+        wait_output();
+        Some(unsafe { crate::hal::inb(DATA_PORT) })
+    };
+    unsafe { core::arch::asm!("push {}; popfq", in(reg) flags, options(nomem)); }
+    ccb
 }
