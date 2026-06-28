@@ -647,6 +647,10 @@ pub fn run() -> ! {
     total += 1;
     if test_compositor_init() { passed += 1; }
 
+    // ── Test 39b: Damage-region compositing logic ───────────────────────
+    total += 1;
+    if test_damage_region() { passed += 1; }
+
     // ── Test 206: /proc/self/{mountinfo,cgroup,oom_score_adj} — Mozilla sandbox unblock
     //
     // Placed BEFORE Test 40 (Desktop Launch) which has pre-existing flakiness
@@ -13169,6 +13173,21 @@ fn test_compositor_init() -> bool {
     }
 
     if ok { test_pass!("Compositor Init"); }
+    ok
+}
+
+/// Damage-region compositing logic: rectangle intersection, bounding-box
+/// coalescing, screen clipping, the >MAX_DAMAGE_RECTS collapse, and the coarse
+/// full-surface fallback.  Exercises the pure machinery added by the
+/// damage-region overhaul without needing a live framebuffer/timer.
+fn test_damage_region() -> bool {
+    test_header!("Damage-region compositing");
+    let ok = crate::gui::compositor::damage_region_selftest();
+    if ok {
+        test_pass!("Damage-region compositing");
+    } else {
+        test_fail!("Damage-region", "damage_region_selftest() returned false");
+    }
     ok
 }
 

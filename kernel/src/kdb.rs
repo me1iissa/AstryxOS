@@ -1373,10 +1373,29 @@ fn op_compose_stats(out: &mut String) {
     let (blitted, skipped) = crate::gui::compositor::compose_gate_stats();
     let total = blitted.saturating_add(skipped);
     let gate_ratio_permille = if total == 0 { 0u64 } else { blitted.saturating_mul(1000) / total };
+    // Damage-region compositing throughput: per-frame µs, VRAM bytes moved, and
+    // dirty-pixel area — cumulative + last-frame.  avg_* let a single boot
+    // quantify the before/after win (idle/spinner frames drop to a tiny dirty
+    // area + µs once the page settles).
+    let (frames, us_total, bytes_total, dirty_px_total, last_us, last_bytes, last_dirty_px) =
+        crate::gui::compositor::compose_timing_stats();
+    let avg_us = if frames == 0 { 0 } else { us_total / frames };
+    let avg_bytes = if frames == 0 { 0 } else { bytes_total / frames };
+    let avg_dirty_px = if frames == 0 { 0 } else { dirty_px_total / frames };
     let _ = write!(
         out,
-        r#"{{"blitted":{},"skipped":{},"total_calls":{},"gate_ratio_permille":{}}}"#,
+        r#"{{"blitted":{},"skipped":{},"total_calls":{},"gate_ratio_permille":{},"#,
         blitted, skipped, total, gate_ratio_permille
+    );
+    let _ = write!(
+        out,
+        r#""frames":{},"avg_us":{},"avg_bytes":{},"avg_dirty_px":{},"#,
+        frames, avg_us, avg_bytes, avg_dirty_px
+    );
+    let _ = write!(
+        out,
+        r#""last_us":{},"last_bytes":{},"last_dirty_px":{},"us_total":{},"bytes_total":{}}}"#,
+        last_us, last_bytes, last_dirty_px, us_total, bytes_total
     );
 }
 // ── x11-windows ───────────────────────────────────────────────────────────────

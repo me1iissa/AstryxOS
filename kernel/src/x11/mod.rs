@@ -461,15 +461,6 @@ pub fn inject_mouse_event(rx: i16, ry: i16, buttons: u8, prev_buttons: u8) {
     }
 }
 
-/// Snapshot of an X11 window for the compositor to blit.
-pub struct X11WindowSnapshot {
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-    pub pixels: Vec<u8>, // BGRA, width×height×4
-}
-
 /// Resolve a window's absolute (screen-space) origin by summing the
 /// parent-relative offsets up the window tree until the root (id 1) or an
 /// unknown parent is reached.  Window coordinates in the protocol are relative
@@ -496,35 +487,147 @@ fn absolute_origin(client: &Client, mut id: u32) -> (i32, i32) {
     (ax, ay)
 }
 
-/// Collect all mapped X11 client windows for compositor rendering.
-/// Returns a Vec of snapshots (copies pixel data to avoid holding locks).
-/// Coordinates are absolute (screen-space); child widget windows are resolved
-/// relative to their ancestors.  Resources iterate in creation order, so a
-/// parent precedes its children — i.e. children are blitted on top, matching
-/// the X11 stacking model where later-mapped children draw over their parent.
-pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
-    if !X11_INITIALIZED.load(Ordering::Acquire) { return Vec::new(); }
+/// Screen-space rectangle intersection, all `(x, y, w, h)`; `None` if disjoint.
+#[inline]
+fn rect_intersect_u(
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    if x1 <= x0 || y1 <= y0 { None } else { Some((x0, y0, x1 - x0, y1 - y0)) }
+}
+
+/// Composite the mapped X11 client windows on top of the compositor backbuffer,
+/// copying only the parts that fall inside the supplied damage `regions`.
+///
+/// Replaces the previous "deep-clone every mapped window's pixel buffer per
+/// frame, then per-pixel BGRA→XRGB shuffle the whole window" path.  For each
+/// mapped window we compute its screen-space bounds (child widgets resolved via
+/// their ancestors' offsets), intersect with each damage region, and `memcpy`
+/// only the intersected rows directly from the window's persistent `pixels`
+/// buffer into the backbuffer.  The window surface is BGRA and the backbuffer
+/// is little-endian XRGB8888 (memory order B,G,R,X); the colour bytes coincide
+/// and the alpha/X byte is ignored by the SVGA scanout, so a raw row `memcpy`
+/// is correct and avoids both the clone and the per-pixel arithmetic.
+///
+/// Called by the compositor holding the `COMPOSITOR` lock; this takes the X11
+/// `SERVER` lock — the established COMPOSITOR → SERVER order.  Resources iterate
+/// in creation order, so a parent precedes its children (children composite on
+/// top), matching the X11 stacking model.
+pub fn blit_windows_to_backbuffer(
+    backbuffer: &mut [u32],
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    regions: &[(u32, u32, u32, u32)],
+) {
+    if !X11_INITIALIZED.load(Ordering::Acquire) || regions.is_empty() { return; }
     let srv = SERVER.lock();
-    let mut result = Vec::new();
     for slot in srv.clients.iter() {
-        if let Some(client) = slot {
-            for (rid, body) in client.resources.iter_all() {
-                if let resource::ResourceBody::Window(ref w) = body {
-                    if w.mapped && !w.pixels.is_empty() && w.width > 0 && w.height > 0 {
-                        let (ax, ay) = absolute_origin(client, rid);
-                        result.push(X11WindowSnapshot {
-                            x: ax as i16,
-                            y: ay as i16,
-                            width: w.width,
-                            height: w.height,
-                            pixels: w.pixels.clone(),
-                        });
+        let client = match slot { Some(c) => c, None => continue };
+        for (rid, body) in client.resources.iter_all() {
+            let w = match body {
+                resource::ResourceBody::Window(ref w) => w,
+                _ => continue,
+            };
+            if !(w.mapped && !w.pixels.is_empty() && w.width > 0 && w.height > 0) {
+                continue;
+            }
+            let (ax, ay) = absolute_origin(client, rid);
+            let ww = w.width as u32;
+            let wh = w.height as u32;
+            // Window screen bounds clipped to the surface.
+            let wsx0 = ax.max(0) as u32;
+            let wsy0 = ay.max(0) as u32;
+            let wsx1 = ((ax + ww as i32).max(0) as u32).min(screen_w);
+            let wsy1 = ((ay + wh as i32).max(0) as u32).min(screen_h);
+            if wsx1 <= wsx0 || wsy1 <= wsy0 { continue; }
+            let win_rect = (wsx0, wsy0, wsx1 - wsx0, wsy1 - wsy0);
+            for &region in regions {
+                let (ix, iy, iw, ih) = match rect_intersect_u(win_rect, region) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let npix = iw as usize;
+                for sy in iy..(iy + ih) {
+                    let local_x = (ix as i32 - ax) as u32;
+                    let local_y = (sy as i32 - ay) as u32;
+                    let src_byte = ((local_y * ww + local_x) * 4) as usize;
+                    let dst_idx = (sy * stride + ix) as usize;
+                    if src_byte + npix * 4 > w.pixels.len() { continue; }
+                    if dst_idx + npix > backbuffer.len() { continue; }
+                    // SAFETY: bounds checked above; disjoint src (Vec<u8>) and
+                    // dst (backbuffer slice) regions.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            w.pixels.as_ptr().add(src_byte),
+                            backbuffer.as_mut_ptr().add(dst_idx) as *mut u8,
+                            npix * 4,
+                        );
                     }
                 }
             }
         }
     }
-    result
+}
+
+/// Report on-screen damage for a window-local rectangle that was drawn into a
+/// window's persistent surface, converting it to screen space via the window's
+/// absolute origin and forwarding it to the compositor.  Always marks the op as
+/// damage-accounted (suppressing the dispatch's coarse full-surface fallback),
+/// but pushes a damage rectangle only when `win_id` is a *mapped window*: a draw
+/// into an off-screen pixmap (or an unmapped window) changes nothing visible.
+fn mark_window_damage(fd: u64, win_id: u32, lx: i32, ly: i32, lw: i32, lh: i32) {
+    crate::gui::compositor::note_damage();
+    if lw <= 0 || lh <= 0 { return; }
+    let rect = {
+        let srv = SERVER.lock();
+        srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| {
+                let mapped_window = c.resources.entries.iter().filter_map(|s| s.as_ref())
+                    .find(|r| r.id == win_id)
+                    .map(|r| matches!(r.body, resource::ResourceBody::Window(ref w) if w.mapped))
+                    .unwrap_or(false);
+                if !mapped_window { return None; }
+                let (ax, ay) = absolute_origin(c, win_id);
+                Some((ax + lx, ay + ly, lw, lh))
+            })
+    };
+    if let Some((sx, sy, w, h)) = rect {
+        crate::gui::compositor::damage_rect(sx, sy, w, h);
+    }
+}
+
+/// Report whole-window on-screen damage for `win_id` (used by draw paths whose
+/// exact sub-rectangle is not available, e.g. the generic software rasteriser).
+/// Always marks the op damage-accounted; pushes a rectangle only for a mapped
+/// window.
+fn mark_window_damage_full(fd: u64, win_id: u32) {
+    crate::gui::compositor::note_damage();
+    let dims = {
+        let srv = SERVER.lock();
+        srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
+            .and_then(|c| {
+                c.resources.entries.iter().filter_map(|s| s.as_ref())
+                    .find(|r| r.id == win_id)
+                    .and_then(|r| match r.body {
+                        resource::ResourceBody::Window(ref w) if w.mapped => {
+                            Some((w.width as i32, w.height as i32))
+                        }
+                        _ => None,
+                    })
+                    .map(|(ww, wh)| {
+                        let (ax, ay) = absolute_origin(c, win_id);
+                        (ax, ay, ww, wh)
+                    })
+            })
+    };
+    if let Some((sx, sy, w, h)) = dims {
+        crate::gui::compositor::damage_rect(sx, sy, w, h);
+    }
 }
 
 /// Live introspection of every X11 window's compositor-source surface, for the
@@ -1018,6 +1121,12 @@ fn handle_request(fd: u64, data: &[u8]) {
     let seq = { let mut srv = SERVER.lock();
         match srv.clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd) {
             Some(c) => c.next_seq(), None => return } };
+    // Snapshot the compositor's damage-accounted counter: a handler that reports
+    // fine per-rectangle damage (via `mark_window_damage`) advances it, which
+    // suppresses the coarse full-surface fallback below.  Handlers we have not
+    // yet taught fine damage leave it unchanged and so still fall back to a
+    // correct (if conservative) full-surface repaint.
+    let pre_noted = crate::gui::compositor::damage_noted_seq();
     match opcode {
         proto::OP_CREATE_WINDOW         => op_create_window(fd, data, seq),
         proto::OP_CHANGE_WINDOW_ATTRS   => op_change_win_attrs(fd, data),
@@ -1124,15 +1233,18 @@ fn handle_request(fd: u64, data: &[u8]) {
 
     // Signal the rate-gated compositor that on-screen content may have changed.
     // The X11 server's window pixel buffers (`WindowData::pixels`) are the
-    // compositor's source of truth (it re-blits them each frame), but unlike
+    // compositor's source of truth (it composites them each frame), but unlike
     // the native GDI accessors the X11 draw path does not go through
-    // `compositor::screen_*`, so nothing else bumps the damage counter.  Bump
-    // it here for every request that can alter a mapped window's contents or
-    // geometry — including the extension draw paths (RENDER / SHM PutImage /
-    // COMPOSITE) — so `compose_if_due()` repaints promptly.  A non-drawing
-    // request (reply-only, property, atom) leaves the desktop quiescent and
-    // costs zero framebuffer MMIO.
-    if x11_op_changes_screen(opcode) {
+    // `compositor::screen_*`, so nothing else reports damage.  Drawing handlers
+    // that have been taught fine damage call `mark_window_damage` (advancing the
+    // accounted counter), so the compositor repaints only the changed
+    // rectangles.  For any screen-changing request whose handler reported no
+    // fine damage, fall back here to a coarse full-surface repaint so the result
+    // is always correct.  A non-drawing request (reply-only, property, atom)
+    // leaves the desktop quiescent and costs zero framebuffer MMIO.
+    if x11_op_changes_screen(opcode)
+        && crate::gui::compositor::damage_noted_seq() == pre_noted
+    {
         crate::gui::compositor::damage();
     }
 }
@@ -1195,6 +1307,9 @@ fn window_fill_pixels(fd: u64, win_id: u32, x: i32, y: i32, w: i32, h: i32, bgra
             }
         }
     });
+    // Solid-fill path (RenderFillRectangles / ClearArea / viewable background):
+    // report the filled rectangle as on-screen damage.
+    mark_window_damage(fd, win_id, x, y, w, h);
 }
 
 /// Paint a window-local region to the window's background, honouring the X core
@@ -1340,6 +1455,8 @@ fn window_draw_text_pixels(fd: u64, win_id: u32, tx: i32, ty: i32, text: &str, f
             }
         }
     });
+    // Report the text run's bounding box as on-screen damage (8×16 cells).
+    mark_window_damage(fd, win_id, tx, ty, text.len() as i32 * FW, 16);
 }
 
 /// Composite a window-local BGRA source rectangle into `w.pixels`.
@@ -1392,6 +1509,12 @@ fn window_composite_pixels(
             }
         }
     });
+    // The window's persistent surface changed: report the composited rectangle
+    // as on-screen damage (screen-space conversion + the mapped-window gate live
+    // in `mark_window_damage`).  This helper funnels both core PutImage(window)
+    // and MIT-SHM ShmPutImage — the windowed-Firefox content paint path — so a
+    // small present (spinner, caret) damages a small rectangle, not the screen.
+    mark_window_damage(fd, win_id, dx, dy, rw, rh);
 }
 
 // ── CreateWindow (1) ──────────────────────────────────────────────────────────
@@ -1756,6 +1879,9 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
     for &pwid in &to_paint {
         paint_window_background(fd, pwid, 0, 0, 0, 0, true);
     }
+    // A newly-mapped window is a geometry change: damage its whole screen rect
+    // so the compositor paints it (and any newly-viewable area) this frame.
+    mark_window_damage_full(fd, wid);
 }
 
 // ── MapSubwindows (9) ─────────────────────────────────────────────────────────
@@ -1830,14 +1956,32 @@ fn op_map_subwindows(fd: u64, data: &[u8], seq: u16) {
 fn op_unmap_window(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 8 { return; }
     let wid = r32(data, 4);
+    // The region the window vacates is now exposed (background or lower windows)
+    // and must be repainted.  Capture its last screen-space rect *before*
+    // clearing the mapped flag (after which it no longer contributes pixels).
+    let mut vacated: Option<(i32, i32, i32, i32)> = None;
     with_client(fd, |c| {
+        let info = c.resources.get_window_mut(wid)
+            .map(|w| (w.width as i32, w.height as i32, w.mapped));
+        let (ww, wh, was_mapped) = match info { Some(v) => v, None => return };
+        if was_mapped {
+            // dims already copied out, so this immutable walk does not overlap
+            // the mutable window borrow.
+            let (ax, ay) = absolute_origin(c, wid);
+            vacated = Some((ax, ay, ww, wh));
+        }
         if let Some(w) = c.resources.get_window_mut(wid) {
             w.mapped = false;
-            if w.event_mask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
+            let em = w.event_mask;
+            if em & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
                 c.send(&event::encode_unmap_notify(seq, wid));
             }
         }
     });
+    crate::gui::compositor::note_damage();
+    if let Some((x, y, w, h)) = vacated {
+        crate::gui::compositor::damage_rect(x, y, w, h);
+    }
 }
 
 // ── ConfigureWindow (12) ──────────────────────────────────────────────────────
@@ -1846,7 +1990,25 @@ fn op_configure_window(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 12 { return; }
     let wid  = r32(data, 4);
     let mask = r16(data, 8);
+    // A geometry change damages both the old and the new screen rect (the old
+    // rect exposes whatever was beneath; the new rect must be repainted).
+    let mut old_rect: Option<(i32, i32, i32, i32)> = None;
+    let mut new_rect: Option<(i32, i32, i32, i32)> = None;
     with_client(fd, |c| {
+        // Old screen rect (only if currently mapped — else nothing was shown).
+        let old = c.resources.get_window_mut(wid)
+            .map(|w| (w.width as i32, w.height as i32, w.mapped));
+        let mapped = match old {
+            Some((ow, oh, m)) => {
+                if m {
+                    let (ax, ay) = absolute_origin(c, wid);
+                    old_rect = Some((ax, ay, ow, oh));
+                }
+                m
+            }
+            None => return,
+        };
+        // Apply the requested geometry.
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
             if mask & proto::CW_X      != 0 { w.x = r16(data, vi) as i16; vi += 4; }
@@ -1858,7 +2020,19 @@ fn op_configure_window(fd: u64, data: &[u8], seq: u16) {
                 c.send(&event::encode_configure_notify(seq, wid, x, y, width, height, bw));
             }
         }
+        // New screen rect.
+        if mapped {
+            let new = c.resources.get_window_mut(wid)
+                .map(|w| (w.width as i32, w.height as i32));
+            if let Some((nw, nh)) = new {
+                let (ax, ay) = absolute_origin(c, wid);
+                new_rect = Some((ax, ay, nw, nh));
+            }
+        }
     });
+    crate::gui::compositor::note_damage();
+    if let Some((x, y, w, h)) = old_rect { crate::gui::compositor::damage_rect(x, y, w, h); }
+    if let Some((x, y, w, h)) = new_rect { crate::gui::compositor::damage_rect(x, y, w, h); }
 }
 
 // ── GetGeometry (14) ──────────────────────────────────────────────────────────
@@ -2714,6 +2888,11 @@ fn op_copy_area(fd: u64, data: &[u8]) {
     let height  = r16(data, 26) as i32;
     if width <= 0 || height <= 0 { return; }
 
+    // A window destination reports a precise rect via `window_composite_pixels`;
+    // a pixmap destination changes nothing on-screen.  Either way the op is
+    // accounted, so it must not trip the dispatch's coarse full-surface fallback.
+    crate::gui::compositor::note_damage();
+
     // Determine src and dst drawable types
     let (src_is_pixmap, dst_is_pixmap) = {
         let srv = SERVER.lock();
@@ -2911,7 +3090,9 @@ fn op_poly_fill_rect(fd: u64, data: &[u8]) {
     };
 
     if is_pixmap {
-        // Draw rectangles into the pixmap's pixel buffer
+        // Draw rectangles into the pixmap's pixel buffer (off-screen: accounted
+        // but no on-screen damage).
+        crate::gui::compositor::note_damage();
         let color = 0xFF000000 | (fg & 0x00FFFFFF); // set full alpha
         let mut i = 12usize;
         while i + 8 <= data.len() {
@@ -2953,6 +3134,8 @@ fn op_poly_fill_rect(fd: u64, data: &[u8]) {
                     }
                 }
             });
+            // Report the filled rectangle as on-screen damage.
+            mark_window_damage(fd, draw, rx, ry, rw, rh);
         }
     }
 }
@@ -2994,6 +3177,15 @@ fn with_drawable_pixels<F: FnMut(&mut [u8], i32, i32)>(fd: u64, draw: u32, is_pi
             f(&mut w.pixels, ww, wh);
         }
     });
+    // Generic raster path (PolyFill/PolyLine/PolyArc/PolyPoint/ImageText/…): the
+    // exact sub-rectangle is not threaded through here, so report whole-window
+    // damage when the target is a window.  Off-screen pixmap draws change
+    // nothing visible but are still accounted (suppressing the coarse fallback).
+    if is_pix {
+        crate::gui::compositor::note_damage();
+    } else {
+        mark_window_damage_full(fd, draw);
+    }
 }
 
 // PolyFillArc (71): list of ARC {x:i16,y:i16,w:u16,h:u16,a1:i16,a2:i16} (12 B).
@@ -3137,6 +3329,11 @@ fn op_put_image(fd: u64, data: &[u8]) {
     if fmt != proto::IMAGE_FORMAT_ZPIXMAP || depth < 24 { return; }
     let px_len = (width * height * 4) as usize;
     if data.len() < 24 + px_len { return; }
+
+    // Account for this op's damage: the window branch reports a precise rect via
+    // `window_composite_pixels`; the pixmap branch changes nothing on-screen but
+    // must still suppress the dispatch's coarse full-surface fallback.
+    crate::gui::compositor::note_damage();
 
     // Determine if target is a pixmap or a window
     let is_pixmap = {
@@ -3546,6 +3743,11 @@ fn op_render_composite(fd: u64, data: &[u8]) {
     let width  = r16(data, 32) as i32;
     let height = r16(data, 34) as i32;
     if width <= 0 || height <= 0 { return; }
+
+    // A window destination reports a precise rect via `window_composite_pixels`;
+    // a pixmap (off-screen Picture) destination changes nothing on-screen.
+    // Account for the op either way so it does not trip the coarse fallback.
+    crate::gui::compositor::note_damage();
 
     // Resolve picture → drawable IDs
     let (src_draw, dst_draw) = {
@@ -4887,6 +5089,10 @@ fn op_render_free_glyphs(fd: u64, data: &[u8]) {
 // GlyphSetElt: 0xFF(1)  pad(3) new_gsid(4)
 fn op_render_composite_glyphs(fd: u64, data: &[u8], elem_size: u8) {
     if data.len() < 28 { return; }
+    // The final window write funnels through `window_composite_pixels` (precise
+    // per-run damage); account here so an off-screen (pixmap) glyph target does
+    // not trip the dispatch's coarse full-surface fallback.
+    crate::gui::compositor::note_damage();
     let op     = data[4];
     let src_id = r32(data, 8);
     let dst_id = r32(data, 12);
