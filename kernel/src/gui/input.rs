@@ -81,6 +81,14 @@ const SC_LALT: u8     = 0x38;
 // Break-code flag
 const SC_RELEASE: u8  = 0x80;
 
+// ── Cursor cell size ────────────────────────────────────────────────────────
+
+/// Software-cursor cell size in pixels (the arrow bitmap is 12×12).  Matches the
+/// compositor's cursor cell; used to report *fine* cursor damage on a pointer
+/// move so the move costs a ~KB partial frame rather than a full-surface
+/// recomposite.
+const CURSOR_CELL: i32 = 12;
+
 // ── Input state ────────────────────────────────────────────────────────────
 
 /// Tracks previous-frame state so we can detect deltas.
@@ -139,10 +147,22 @@ pub fn pump_input() {
 
     if mouse_moved || buttons_changed {
         // On-screen cursor position changed → owe a recomposite so the
-        // damage-driven compositor repaints the cursor.  `damage()` is a
-        // lock-free atomic (it never takes COMPOSITOR), so bumping it while
-        // INPUT_STATE is held is sound.
-        crate::gui::compositor::damage();
+        // damage-driven compositor repaints the cursor.  Report *fine* damage
+        // for just the cursor's old and new 12×12 cells (the PR #666 per-cell
+        // cursor path) rather than the coarse full-surface `damage()`, which
+        // forced an ~8 MB full-frame recomposite on every pointer move.
+        // Recording fine rects makes the next `compose()` a partial frame; on a
+        // partial frame compose() itself erases the previously-painted cursor
+        // cell and paints the new one within these regions (no trail).  Cursor
+        // damage is owed only on an actual move — a pure button change does not
+        // alter on-screen pixels, and any resulting redraw reports its own
+        // damage.  `damage_rect` takes only the lock-free DAMAGE accumulator
+        // (never COMPOSITOR), so calling it while INPUT_STATE is held is sound.
+        if mouse_moved {
+            crate::gui::compositor::damage_rect(
+                state.prev_mouse_x, state.prev_mouse_y, CURSOR_CELL, CURSOR_CELL);
+            crate::gui::compositor::damage_rect(mx, my, CURSOR_CELL, CURSOR_CELL);
+        }
         process_mouse(&state, mx, my, buttons);
 
         // ── X11 mouse forwarding ───────────────────────────────────────

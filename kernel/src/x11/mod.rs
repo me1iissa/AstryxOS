@@ -413,6 +413,35 @@ pub fn inject_key_event(keycode: u8, pressed: bool) {
     }
 }
 
+/// Debug snapshot of the server pointer-routing state, for the kdb `mouse-state`
+/// op.  Returns `(initialized, client_count, focus_window,
+/// focus_selects_pointer_motion)` — i.e. whether [`inject_mouse_event`] would
+/// actually deliver a MotionNotify to the focused window (it only does so when
+/// that window's event mask includes `PointerMotion`).
+pub fn debug_pointer_state() -> (bool, u32, u32, bool) {
+    let srv = SERVER.lock();
+    if !srv.initialized {
+        return (false, 0, 0, false);
+    }
+    let fw = srv.focus_window;
+    let mut clients = 0u32;
+    let mut motion = false;
+    for slot in srv.clients.iter() {
+        if let Some(c) = slot {
+            clients += 1;
+            let entries = &c.resources.entries;
+            if let Some(r) = entries.iter().filter_map(|s| s.as_ref()).find(|r| r.id == fw) {
+                if let resource::ResourceBody::Window(ref w) = r.body {
+                    if w.event_mask & proto::EVENT_MASK_POINTER_MOTION != 0 {
+                        motion = true;
+                    }
+                }
+            }
+        }
+    }
+    (true, clients, fw, motion)
+}
+
 /// Inject a mouse motion / button event to X11 clients.
 ///
 /// `rx`/`ry` are root-space coordinates.  `buttons` is a button-state bitmask
