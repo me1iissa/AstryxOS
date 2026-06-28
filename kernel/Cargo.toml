@@ -342,6 +342,15 @@ w215-diag = ["firefox-test"]
 # firehose; the shared DR0-DR3 + handle_db_exception plumbing is compiled
 # in via the widened module gate any(w215-diag, 582-diag).
 582-diag = ["firefox-test-core"]
+# #655 parked-frame watch instrument.  Publishes PID1 tid2's live
+# `Thread::context.{rsp,cr3}`, kstack `[base,size)` and packed state into
+# fixed `#[no_mangle]` statics (`PARK_RSP_TID2` et al.) on every `schedule()`
+# so a GDB hardware write-watch can be armed on the EXACT parked saved-RIP
+# slot (`context.rsp + 56`) and any store WHILE tid2 is parked is dispositively
+# a FOREIGN writer.  Touches NO debug registers (a plain memory store only), so
+# a GDB Z2 watchpoint survives — unlike `582-diag`/`w215-diag` which own DR0–3.
+# Diagnostic-only; zero cost in production builds.
+park-rsp-diag = ["firefox-test-core"]
 # W133: opt-out for cross-CPU TLB shootdown.  Default builds run the full
 # shootdown protocol (IPI vector 0xF0, per-CPU active-CR3 mask).  Enable
 # this feature only for bisect/baseline runs where you want to compare
