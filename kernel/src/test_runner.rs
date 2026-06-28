@@ -2041,6 +2041,9 @@ pub fn run() -> ! {
     total += 1;
     if test_recvfrom_truncated_addrlen() { passed += 1; }
 
+    total += 1;
+    if test_recvfrom_closewait_reports_eof() { passed += 1; }
+
     // ── Tests 195–199: shutdown(2) half-close (Phase NDE-4) ──────────────
 
     total += 1;
@@ -36601,6 +36604,99 @@ fn test_recvfrom_truncated_addrlen() -> bool {
 
     test_println!("  cap=8 → 8 bytes copied, *addrlen=16, tail untouched ✓");
     test_pass!("recvfrom — sockaddr truncation honours addrlen in/out");
+    true
+}
+
+/// recvfrom(2) on a peer-FINned (CLOSE-WAIT) TCP connection with an empty
+/// receive buffer must report an orderly end-of-stream — the syscall path
+/// returns `0`, not `-EAGAIN`.
+///
+/// Regression guard for the single-vCPU busy-poll livelock: poll(2) reports
+/// a CLOSE-WAIT fd readable (the next recv "won't block"); if recvfrom then
+/// returns `-EAGAIN` instead of `0`, a level-triggered event loop spins
+/// `poll → recvfrom → EAGAIN` forever and never observes the orderly close
+/// to deregister the fd (RFC 9293 §3.5; `man 2 recv`: 0 = orderly shutdown).
+/// The recvfrom(2) handler maps an empty drain to `0` exactly when
+/// `socket_recv_would_eof` is true, so we assert that predicate (which the
+/// handler consults) plus the empty drain — the two facts that compose the
+/// handler's return.
+#[cfg(feature = "kdb")]
+fn test_recvfrom_closewait_reports_eof() -> bool {
+    test_header!("recvfrom — CLOSE-WAIT empty buffer reports EOF, not EAGAIN");
+
+    use crate::net::socket;
+    use crate::net::tcp;
+
+    const LPORT: u16 = 50071;
+    const RIP:   [u8; 4] = [10, 9, 9, 9];
+    const RPORT: u16 = 8443;
+
+    // Synthetic connected socket + its Established TCB (no SLIRP 3WHS).
+    let id = socket::socket_create_accepted(LPORT, RIP, RPORT);
+    if let Err(e) = tcp::test_inject_established(LPORT, RIP, RPORT, &[]) {
+        socket::socket_close(id);
+        test_fail!("recvfrom_cw", "inject established failed: {}", e);
+        return false;
+    }
+
+    // Control: ESTABLISHED + empty buffer is would-block, NOT EOF.
+    if socket::socket_recv_would_eof(id) {
+        socket::socket_close(id);
+        test_fail!("recvfrom_cw", "ESTABLISHED empty falsely reported EOF");
+        return false;
+    }
+
+    // Deliver the peer's FIN at the in-order sequence → CLOSE-WAIT.
+    let seq = match tcp::test_recv_next(LPORT, RIP, RPORT) {
+        Some(s) => s,
+        None => { socket::socket_close(id); test_fail!("recvfrom_cw", "no recv_next"); return false; }
+    };
+    match tcp::test_feed_segment(LPORT, RIP, RPORT, seq, &[], true) {
+        Some((st, buflen)) => {
+            if st != tcp::TcpState::CloseWait || buflen != 0 {
+                socket::socket_close(id);
+                test_fail!("recvfrom_cw", "expected CLOSE_WAIT empty, got {:?} buflen={}", st, buflen);
+                return false;
+            }
+        }
+        None => { socket::socket_close(id); test_fail!("recvfrom_cw", "feed FIN: no TCB"); return false; }
+    }
+
+    // poll(2) reports the fd readable (the recv won't block) …
+    if !socket::socket_read_ready(id) {
+        socket::socket_close(id);
+        test_fail!("recvfrom_cw", "CLOSE-WAIT not poll-readable");
+        return false;
+    }
+    // … the drain yields no bytes …
+    let drained = match socket::socket_recvfrom(id, 4096) {
+        Ok((d, _, _)) => d,
+        Err(e) => { socket::socket_close(id); test_fail!("recvfrom_cw", "recvfrom err: {}", e); return false; }
+    };
+    if !drained.is_empty() {
+        socket::socket_close(id);
+        test_fail!("recvfrom_cw", "expected empty drain, got {} bytes", drained.len());
+        return false;
+    }
+    // … and the handler-consulted EOF predicate is true → recvfrom returns 0.
+    if !socket::socket_recv_would_eof(id) {
+        socket::socket_close(id);
+        test_fail!("recvfrom_cw",
+            "CLOSE-WAIT empty drain reported would-block (EAGAIN) instead of EOF — \
+             the busy-poll livelock regression");
+        return false;
+    }
+
+    socket::socket_close(id);
+    test_println!("  CLOSE-WAIT empty: read_ready=1, drain=0B, would_eof=1 → recvfrom returns 0 ✓");
+    test_pass!("recvfrom — CLOSE-WAIT empty buffer reports EOF, not EAGAIN");
+    true
+}
+
+#[cfg(not(feature = "kdb"))]
+fn test_recvfrom_closewait_reports_eof() -> bool {
+    test_header!("recvfrom — CLOSE-WAIT EOF (kdb-only)");
+    test_pass!("recvfrom — CLOSE-WAIT EOF (kdb-only stub)");
     true
 }
 

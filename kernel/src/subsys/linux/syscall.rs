@@ -2155,13 +2155,26 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // excess of an oversized datagram).
                 match crate::net::socket::socket_recvfrom(socket_id, len) {
                     Ok((data, src_ip, src_port)) => {
-                        // Empty result on a non-blocking socket = EAGAIN
-                        // per IEEE 1003.1 §recvfrom.  We can only hit
-                        // this branch when blocking==false (the wait
-                        // loop above guarantees data on the blocking
-                        // path) so the userspace contract holds.
+                        // An empty drain is either an orderly end-of-stream
+                        // or a transient would-block, and recvfrom(2) MUST
+                        // distinguish them: a peer-FINned TCP connection
+                        // (CLOSE-WAIT, empty buffer) returns 0 ("the peer
+                        // has performed an orderly shutdown", man 2 recv /
+                        // RFC 9293 §3.5), while an ESTABLISHED socket with
+                        // no data yet returns -EAGAIN (IEEE 1003.1 §recvfrom).
+                        //
+                        // Returning -EAGAIN for the EOF case is the bug that
+                        // wedges a level-triggered event loop: poll() reports
+                        // the CLOSE-WAIT fd readable (the next recv "won't
+                        // block"), the app recvfrom()s, gets -EAGAIN instead
+                        // of the 0 that would let it close the fd, and spins
+                        // poll → recvfrom → EAGAIN forever — monopolising the
+                        // CPU and never observing the orderly close.
                         if data.is_empty() {
-                            return -11; // EAGAIN
+                            if crate::net::socket::socket_recv_would_eof(socket_id) {
+                                return 0; // orderly EOF
+                            }
+                            return -11; // EAGAIN (would-block)
                         }
                         let n = data.len().min(len);
                         if n > 0 {
