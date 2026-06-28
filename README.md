@@ -14,25 +14,37 @@ A UEFI-native x86_64 research operating system written in Rust, with an NT-inspi
 AstryxOS is a from-scratch operating system kernel (codename **Aether**) that takes the NT
 subsystem model as its architectural inspiration: a microkernel-ish executive at the centre,
 with personality subsystems layered above the HAL that give each application binary the illusion
-of running on its native operating system. The practical result is that an unmodified
-glibc-linked ELF binary executes inside AstryxOS today, and the long-horizon target is Firefox
-rendering a page without any source modifications. The project is also an experiment in
-agentic software development: most of the ~83 KLOC was written by Claude agents working in
-parallel worktrees, with human review at merge time.
+of running on its native operating system. The practical result is that **unmodified upstream
+binaries run on AstryxOS** — and the headline result is that **upstream Firefox (musl ESR-115,
+GTK3) now runs as a windowed application on the in-kernel X11 compositor and renders real HTTPS
+web content**, with no source modifications to the browser. The project is also an experiment in
+agentic software development: the bulk of the ~200 KLOC of Rust (kernel, bootloader, and the
+in-tree test suite) was written by Claude agents working in parallel worktrees, with human
+review at merge time.
+
+![Upstream Firefox (musl ESR-115, GTK3) rendering example.com over HTTPS on the AstryxOS in-kernel X11 compositor — an unmodified browser binary, real web content, verified pixels](docs/screenshots/firefox-example-com.png)
+
+*Upstream Firefox rendering [example.com](https://example.com) over HTTPS on AstryxOS — chrome,
+TLS lock, and page content all painted by the in-kernel X11 server and software compositor. The
+browser binary is unmodified.*
 
 ---
 
 ## Current status
 
-- glibc-linked ELF hello world runs end-to-end (dynamic linker + glibc fully wired)
-- 139 of 140 headless tests pass (one Win32 PE test gated behind a feature flag)
+- **Upstream Firefox (musl ESR-115, GTK3) runs windowed on the in-kernel X11 compositor** and
+  renders **real HTTPS web content** — for [example.com](https://example.com) the browser
+  chrome, the TLS-secured navigation, and the page content all paint to verified pixels, with an
+  unmodified browser binary. Heavier sites (e.g. Wikipedia) load over TLS and paint the browser
+  chrome; full content compositing for large pages is the active focus.
+- Unmodified glibc- and musl-linked ELF binaries run end-to-end (dynamic linker fully wired)
+- Full TCP/IP stack (IPv4, IPv6, 3WHS, FIN, retransmit, congestion control, DHCP, DNS) — Firefox
+  fetches real sites over HTTPS
+- In-kernel X11 server with RENDER, MIT-SHM, XKB, XFIXES, SYNC, BIG-REQUESTS extensions, driving
+  a software compositor that blits to the framebuffer
 - 193 Linux syscalls dispatched; 50+ native Aether syscalls
-- Firefox infrastructure installed on data disk; content process reaches 56K+ syscalls before
-  hitting a non-canonical mmap return in `ld-linux.so.2` (next wave's focus)
-- Full TCP/IP stack (IPv4, IPv6, 3WHS, FIN, retransmit, congestion control, DHCP, DNS)
-- In-kernel X11 server with RENDER, MIT-SHM, XKB, XFIXES, SYNC, BIG-REQUESTS extensions
 - FAT32 read-write, ext2 read-only, NTFS read-only, procfs, tmpfs
-- ~83 KLOC across 170+ Rust source files
+- ~130 KLOC across 200+ Rust source files in `kernel/src` (including a 56K-line in-tree test suite); ~200 KLOC of Rust repo-wide
 
 ---
 
@@ -124,7 +136,25 @@ bash scripts/create-data-disk.sh
 python3 scripts/watch-test.py --idle-timeout 60 --hard-timeout 300
 ```
 
-A passing run ends with `[PASS] 139/140 tests passed`.
+A passing run ends with `[PASS]` for the headless integration suite.
+
+### Running Firefox
+
+Upstream Firefox runs as a windowed app on the in-kernel X11 compositor via the QEMU harness
+(KVM recommended; SMP=1 for the browser):
+
+```bash
+# Boot windowed Firefox against a real site (renders example.com content to verified pixels)
+python3 scripts/qemu-harness.py start \
+    --features firefox-test-core,kdb --smp 1 --ff-gui \
+    --ff-url https://example.com
+
+# Capture a screenshot of the live framebuffer
+python3 scripts/qemu-harness.py screendump <sid> firefox.png
+```
+
+See [docs/FIREFOX_PORT_ROADMAP.md](docs/FIREFOX_PORT_ROADMAP.md) for the milestone tracker and
+[docs/HARNESS.md](docs/HARNESS.md) for the full harness reference.
 
 ---
 
@@ -198,7 +228,7 @@ AstryxOS/
 ## Wave summary
 
 <details>
-<summary>Completed waves (1–9)</summary>
+<summary>Completed waves (1–10)</summary>
 
 | Wave | Theme | Key deliverables |
 |------|-------|-----------------|
@@ -211,6 +241,7 @@ AstryxOS/
 | 7 | Debug harness | `qemu-harness.py` Tier 1 (session/log) + Tier 2 (GDB RSP stub) |
 | 8 | X11 extensions | MIT-SHM, BIG-REQUESTS, XKB, XFIXES, SYNC, RENDER; glibc stack-canary fix |
 | 9 | Firefox infrastructure | X11 client oracle PASS; Firefox on data disk; C++ hello; MAP_FIXED mmap investigation |
+| 10 | Firefox bring-up | Windowed upstream Firefox (musl ESR-115, GTK3) on the in-kernel X11 server; HTTPS fetch over the TCP/IP stack; **example.com content rendered to verified pixels**; SMP=1 render-path fixes (scheduler quarantine throttle, `recvfrom` orderly-EOF) |
 
 </details>
 
