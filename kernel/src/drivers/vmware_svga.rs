@@ -171,10 +171,21 @@ fn fifo_reserve(svga: &VmwareSvga, bytes: u32) {
         loop {
             let next = fifo.add(SVGA_FIFO_NEXT_CMD).read_volatile();
             let stop = fifo.add(SVGA_FIFO_STOP).read_volatile();
-            let used = next.wrapping_sub(stop) % ring;
+            // `next`/`stop` are byte offsets in [min, max); `fifo_write` wraps
+            // NEXT_CMD back to `min` at `max`, so `next < stop` is a normal
+            // wrap state.  The ring size (max - min) is NOT a power of two
+            // (a 64 KiB FIFO gives ring = 0xFFC0), so `(next - stop) % ring`
+            // mis-computes `used` in the wrap case and over-reports free space
+            // — letting the producer lap the device-owned STOP.  Branch on the
+            // wrap instead (both offsets in [min,max) ⇒ stop - next < ring).
+            let used = if next >= stop { next - stop } else { ring - (stop - next) };
             let free = ring - used;
             if free >= need { return; }
             // Producer would lap the consumer: force a drain and re-check.
+            // NB: this drain spins on SVGA_REG_BUSY while SVGA.lock() is held
+            // (we are inside update_rect_async's locked region); it is only
+            // reached on the rare genuine-overrun path and is equivalent in
+            // shape to the old synchronous fifo_sync.
             write_reg(svga.io_base, SVGA_REG_SYNC, 1);
             while read_reg(svga.io_base, SVGA_REG_BUSY) != 0 {
                 core::hint::spin_loop();
