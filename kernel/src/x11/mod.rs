@@ -527,6 +527,91 @@ pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
     result
 }
 
+/// Live introspection of every X11 window's compositor-source surface, for the
+/// kdb `x11-windows` command.  Reports per-window geometry, mapped state, the
+/// allocated pixel-buffer length, and a count of non-zero (painted) bytes in
+/// `w.pixels`.  This is the dispositive (b)-paint-never-produced vs
+/// (c)-present-dropped probe for a large content surface: a mapped content
+/// window with `nonzero == 0` means the client never wrote pixels into the
+/// server's source-of-truth buffer (paint-never-produced); `nonzero > 0` while
+/// the screen is blank means the compositor blit dropped them (present-dropped).
+pub struct WindowDebug {
+    pub fd: u64,
+    pub win_id: u32,
+    pub parent: u32,
+    pub mapped: bool,
+    pub width: u16,
+    pub height: u16,
+    pub pixels_len: usize,
+    pub nonzero: usize,
+    pub abs_x: i32,
+    pub abs_y: i32,
+    /// Count of "real content" pixels (neither pure white 0xFFFFFF nor pure
+    /// black 0x000000) in the chrome strip (y < CHROME_STRIP_H) vs the content
+    /// region (y >= CHROME_STRIP_H).  Distinguishes a painted article (high
+    /// content-region colored count) from a blank/white-cleared content surface
+    /// (≈0 colored).  White is counted separately so a white-cleared region is
+    /// not mistaken for painted content by a bare non-zero test.
+    pub chrome_colored: usize,
+    pub content_colored: usize,
+    pub content_white: usize,
+}
+
+/// Window-local Y below which pixels are considered "chrome" (tab bar + toolbar
+/// + URL bar) rather than page content.  The Firefox toolbar block is ~85px.
+const CHROME_STRIP_H: i32 = 88;
+
+pub fn window_debug_summary() -> Vec<WindowDebug> {
+    let mut out = Vec::new();
+    if !X11_INITIALIZED.load(Ordering::Acquire) { return out; }
+    let srv = SERVER.lock();
+    for client in srv.clients.iter().filter_map(|s| s.as_ref()) {
+        for (rid, body) in client.resources.iter_all() {
+            if let resource::ResourceBody::Window(ref w) = body {
+                let mut nonzero = 0usize;
+                let mut chrome_colored = 0usize;
+                let mut content_colored = 0usize;
+                let mut content_white = 0usize;
+                let ww = w.width as usize;
+                let px = &w.pixels;
+                let npix = px.len() / 4;
+                for p in 0..npix {
+                    let o = p * 4;
+                    let b = px[o]; let g = px[o + 1]; let r = px[o + 2];
+                    if b != 0 || g != 0 || r != 0 { nonzero += 1; }
+                    let is_white = b == 0xFF && g == 0xFF && r == 0xFF;
+                    let is_black = b == 0 && g == 0 && r == 0;
+                    let y = if ww > 0 { (p / ww) as i32 } else { 0 };
+                    if y < CHROME_STRIP_H {
+                        if !is_white && !is_black { chrome_colored += 1; }
+                    } else if is_white {
+                        content_white += 1;
+                    } else if !is_black {
+                        content_colored += 1;
+                    }
+                }
+                let (ax, ay) = absolute_origin(client, rid);
+                out.push(WindowDebug {
+                    fd: client.fd,
+                    win_id: rid,
+                    parent: w.parent,
+                    mapped: w.mapped,
+                    width: w.width,
+                    height: w.height,
+                    pixels_len: w.pixels.len(),
+                    nonzero,
+                    abs_x: ax,
+                    abs_y: ay,
+                    chrome_colored,
+                    content_colored,
+                    content_white,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Test-only: read a single window-local BGRA pixel from a window's persistent
 /// pixel buffer (`w.pixels`, the compositor source of truth).  Searches every
 /// connected client for a window resource matching `win_id` (test windows use

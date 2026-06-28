@@ -6374,6 +6374,163 @@ def cmd_watch(args):
     })
 
 
+def cmd_watch_set(args):
+    """
+    Arm MULTIPLE hardware write watchpoints (up to 4 x86 DRs) spanning a
+    region, resume, and report the FIRST fire on ANY of them — naming the
+    writer RIP + which watched address fired + kernel/user mode.
+
+    Purpose (#655 double-map test): cover a whole saved-switch-frame region
+    with several 8-byte watches so a write through the VA cannot be missed by
+    a wrong-offset guess.  ZERO fires while the guest nonetheless corrupts the
+    frame is the dispositive proof that the corrupting store came through a
+    DIFFERENT virtual address mapping the same physical frame (a live
+    double-map) — a VA watchpoint only fires on the watched linear address.
+
+    Contract: session started with --gdb-port.  --addrs is a comma-separated
+    list of guest VAs (hex).  One-shot JSON on stdout.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    try:
+        addrs = [int(a, 0) for a in args.addrs.split(",") if a.strip()]
+    except ValueError:
+        _err(f"Invalid --addrs list: {args.addrs}")
+    if not addrs or len(addrs) > 4:
+        _err("watch-set: provide 1..4 comma-separated VAs (x86 has 4 DRs)")
+    length = args.length
+    timeout_s = args.timeout_ms / 1000.0
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port}")
+
+    armed = []
+    fires = []
+    try:
+        for a in addrs:
+            if gdb.set_watch(a, length, "write"):
+                armed.append(a)
+        if not armed:
+            _out({"ok": False, "error": "stub rejected all watchpoints (DRs exhausted?)"})
+            return
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            gdb.cont_no_wait()
+            stop = gdb.wait_for_stop(max(1.0, deadline - time.monotonic()))
+            if stop is None:
+                break  # timed out with no fire
+            try:
+                regs = gdb.read_regs()
+            except Exception:
+                regs = {}
+            rip = int(regs.get("rip", "0x0"), 0)
+            is_kernel = rip >= 0xFFFF_8000_0000_0000
+            # Identify which watched addr now differs / was hit (best-effort:
+            # report all current slot values; the writer RIP is the key datum).
+            slot_vals = {}
+            for a in armed:
+                try:
+                    slot_vals[hex(a)] = gdb.read_mem(a, length).hex()
+                except Exception:
+                    slot_vals[hex(a)] = None
+            try:
+                code = gdb.read_mem(rip, 16).hex()
+            except Exception:
+                code = None
+            # #655 corruptor discriminator: a benign live-stack write stores a
+            # real pointer (kernel VA >= 0xffff8.. or a canonical user VA); the
+            # CORRUPTING write leaves a small non-canonical value (the observed
+            # 0x7001/0x7008/0x700a garbage saved-RIP signature) in the slot.
+            # With --corrupt-only, skip fires whose slots all hold plausible
+            # pointers and only report a fire that left a small (< 0x10000)
+            # value in a watched slot — the saved-RIP-slot corruptor.
+            corrupt_hit = False
+            for hx, hv in slot_vals.items():
+                if hv is None:
+                    continue
+                try:
+                    val = int.from_bytes(bytes.fromhex(hv), "little")
+                except Exception:
+                    continue
+                if 0 < val < 0x10000:
+                    corrupt_hit = True
+                    break
+            # Enrich the catch with CR3 (names the active address space — which
+            # process's page tables were loaded when the kernel writer ran) via
+            # the QMP human monitor `info registers`, and a raw stack backtrace
+            # (best-effort): the return-address chain via the rbp frame links
+            # plus a flat dump of words at rsp.  Raw addresses only — the
+            # coordinator symbolizes against the kernel map.
+            cr3 = None
+            try:
+                hmp = _qmp_command(sess.get("qmp_sock", ""), "human-monitor-command",
+                                   {"command-line": "info registers"})
+                txt = hmp.get("return", "") if isinstance(hmp, dict) else ""
+                m = re.search(r"CR3=([0-9a-fA-F]+)", txt)
+                if m:
+                    cr3 = "0x" + m.group(1)
+            except Exception:
+                cr3 = None
+            bt_rbp = []
+            try:
+                fp = int(regs.get("rbp", "0x0"), 0)
+                for _ in range(16):
+                    if fp == 0 or fp < 0x1000:
+                        break
+                    saved_rbp = int.from_bytes(gdb.read_mem(fp, 8), "little")
+                    ret = int.from_bytes(gdb.read_mem(fp + 8, 8), "little")
+                    bt_rbp.append(hex(ret))
+                    if saved_rbp <= fp:
+                        break
+                    fp = saved_rbp
+            except Exception:
+                pass
+            stack_words = []
+            try:
+                rsp = int(regs.get("rsp", "0x0"), 0)
+                raw = gdb.read_mem(rsp, 8 * 32)
+                stack_words = [hex(int.from_bytes(raw[i*8:i*8+8], "little"))
+                               for i in range(32)]
+            except Exception:
+                pass
+            fire = {
+                "fire_index": len(fires) + 1,
+                "rip": hex(rip),
+                "mode": "kernel" if is_kernel else "user",
+                "cr3": cr3,
+                "code_at_rip": code,
+                "slot_vals": slot_vals,
+                "corrupt_hit": corrupt_hit,
+                "bt_rbp_chain": bt_rbp,
+                "stack_words_at_rsp": stack_words,
+                "regs": regs,
+            }
+            if getattr(args, "corrupt_only", False) and not corrupt_hit:
+                # benign live-stack write — keep watching for the corruptor.
+                continue
+            fires.append(fire)
+            break  # report the first (matching) fire on any watched addr
+        for a in armed:
+            try:
+                gdb.del_watch(a, length, "write")
+            except Exception:
+                pass
+    except Exception as e:
+        _err(f"GDB watch-set error: {e}")
+    finally:
+        gdb.close()
+
+    _out({
+        "ok": True,
+        "armed_addrs": [hex(a) for a in armed],
+        "length": length,
+        "fire_count": len(fires),
+        "writer": fires[0] if fires else None,
+        "all_fires": fires,
+    })
+
+
 def cmd_pause(args):
     """Pause QEMU via QMP 'stop'. Freezes all vCPUs."""
     sess     = _load_session(args.sid)
@@ -7011,7 +7168,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
+              "bell-stats", "compose-stats", "x11-windows", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
               # cpu-state: per-CPU scheduler/timer survey + TID-0 reactor
@@ -7095,6 +7252,17 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
+    if op == "cache-lookup":
+        # Resolve a page-cache key (mount, inode, page-aligned file offset) to
+        # its CURRENT backing phys + kernel physmap VA + 16-byte content sample.
+        #   kdb <sid> cache-lookup <mount> <inode> <off>
+        # All accept 0x-hex or decimal.
+        if len(rest) < 3:
+            raise ValueError("cache-lookup requires <mount> <inode> <off>")
+        return {"op": "cache-lookup",
+                "mount": str(int(rest[0], 0)),
+                "inode": str(int(rest[1], 0)),
+                "off":   str(int(rest[2], 0))}
     if op == "procmaps":
         # Terse file-backed VMA map for ASLR-base / addr2line symbolication.
         # Emits one JSON object per VMA with first_page_phys via PML4 walk.
@@ -12877,6 +13045,25 @@ def main():
     p_watch.add_argument("--timeout-ms", type=int, default=120000,
                           help="Overall budget for catching the writer")
 
+    # watch-set (multi-DR region watch; #655 double-map test)
+    p_watch_set = sub.add_parser(
+        "watch-set",
+        help="[Tier2] Arm up to 4 HW write watchpoints spanning a region; "
+             "report the first fire on any. Zero fires while the frame is "
+             "nonetheless corrupted proves a double-map (write via another VA).")
+    p_watch_set.add_argument("sid")
+    p_watch_set.add_argument("--addrs", required=True,
+                             help="Comma-separated guest VAs (1..4, hex)")
+    p_watch_set.add_argument("--length", type=int, default=8,
+                             help="Watch width per addr in bytes (default 8)")
+    p_watch_set.add_argument("--timeout-ms", type=int, default=120000,
+                             help="Overall budget")
+    p_watch_set.add_argument("--corrupt-only", dest="corrupt_only",
+                             action="store_true",
+                             help="Skip benign pointer writes; report only a "
+                                  "fire that left a small (<0x10000) value in a "
+                                  "watched slot (the saved-RIP corruptor sig).")
+
     # pause
     p_pause = sub.add_parser("pause", help="[Tier2] Pause QEMU via QMP stop")
     p_pause.add_argument("sid")
@@ -12960,7 +13147,8 @@ def main():
         "epoll-watch",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",
-        "bell-stats", "compose-stats", "cache-audit", "cache-aliasing",
+        "bell-stats", "compose-stats", "x11-windows", "cache-audit", "cache-aliasing",
+        "cache-lookup",
         "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
@@ -13784,6 +13972,7 @@ def main():
         "step":   cmd_step,
         "cont":   cmd_cont,
         "watch":  cmd_watch,
+        "watch-set": cmd_watch_set,
         "pause":  cmd_pause,
         "resume": cmd_resume,
         "autopsy": cmd_autopsy,

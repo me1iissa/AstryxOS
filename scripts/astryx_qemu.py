@@ -364,7 +364,17 @@ def _display_args(mode: str, show_window: bool) -> list[str]:
     - Headless (default): `-display none` + (for gui-test/firefox-test)
       a vmware VGA attached to VRAM so QMP `screendump` still works.
     - Windowed: shows the QEMU display for manual inspection.
+    - `ASTRYX_VNC=N` (env, opt-in): serve the vmware framebuffer over VNC on
+      127.0.0.1:(5900+N) for manual point-and-click testing on a headless host
+      (connect a VNC viewer through an SSH tunnel; QEMU routes the VNC
+      keyboard/mouse to the guest's PS/2 devices). Mirrors the ASTRYX_MEM_MIB
+      override; additive and localhost-bound. Accepts a bare display number
+      ("0") or a full host:display / :display spec.
     """
+    vnc = os.environ.get("ASTRYX_VNC")
+    if vnc:
+        spec = vnc if (":" in vnc or "." in vnc) else f"127.0.0.1:{vnc}"
+        return ["-vga", "vmware", "-vnc", spec]
     if show_window:
         # Always pick vmware VGA in windowed mode so the GUI compositor
         # has a framebuffer it understands.
