@@ -71,13 +71,23 @@ pub enum KeyEvent {
     FKey(u8),
 }
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 /// Modifier key state tracked across scancodes.
-static mut SHIFT_PRESSED: bool = false;
-static mut CTRL_PRESSED: bool = false;
-static mut ALT_PRESSED: bool = false;
-static mut CAPS_LOCK: bool = false;
+///
+/// These are read/written from `process_scancode`, which runs in the IRQ1
+/// (PS/2 keyboard) handler context, and could also be observed from other
+/// CPUs.  `AtomicBool` is used instead of `static mut` to avoid undefined
+/// behaviour and the data race a plain `static mut` would create under SMP
+/// (a torn modifier update would leave a "stuck" Shift/Ctrl/Alt).  Each flag
+/// is independent, so per-flag `Relaxed` atomics are sufficient — there is no
+/// cross-flag invariant to enforce.
+static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
+static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 /// Extended scancode prefix (0xE0) was received.
-static mut EXTENDED_PREFIX: bool = false;
+static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
 // ── i8042 low-level helpers ─────────────────────────────────────────────────
 
@@ -247,31 +257,29 @@ pub fn scancode_to_ascii(scancode: u8) -> Option<char> {
 ///
 /// Handles extended prefix (0xE0), modifier tracking, and CapsLock toggle.
 pub fn process_scancode(scancode: u8) -> Option<KeyEvent> {
-    // SAFETY: Single-threaded keyboard handling (interrupts serialize access).
-    unsafe {
+    {
         // Extended scancode prefix
         if scancode == 0xE0 {
-            EXTENDED_PREFIX = true;
+            EXTENDED_PREFIX.store(true, Ordering::Relaxed);
             return None;
         }
 
-        let is_extended = EXTENDED_PREFIX;
-        EXTENDED_PREFIX = false;
+        let is_extended = EXTENDED_PREFIX.swap(false, Ordering::Relaxed);
 
         // Key release (bit 7 set)
         if scancode & 0x80 != 0 {
             let released = scancode & 0x7F;
             if is_extended {
                 match released {
-                    0x38 => ALT_PRESSED = false,  // Right Alt release
-                    0x1D => CTRL_PRESSED = false,  // Right Ctrl release
+                    0x38 => ALT_PRESSED.store(false, Ordering::Relaxed),  // Right Alt release
+                    0x1D => CTRL_PRESSED.store(false, Ordering::Relaxed),  // Right Ctrl release
                     _ => {}
                 }
             } else {
                 match released {
-                    0x2A | 0x36 => SHIFT_PRESSED = false,
-                    0x1D => CTRL_PRESSED = false,
-                    0x38 => ALT_PRESSED = false,
+                    0x2A | 0x36 => SHIFT_PRESSED.store(false, Ordering::Relaxed),
+                    0x1D => CTRL_PRESSED.store(false, Ordering::Relaxed),
+                    0x38 => ALT_PRESSED.store(false, Ordering::Relaxed),
                     _ => {}
                 }
             }
@@ -291,25 +299,25 @@ pub fn process_scancode(scancode: u8) -> Option<KeyEvent> {
                 0x52 => Some(KeyEvent::Insert),
                 0x49 => Some(KeyEvent::PageUp),
                 0x51 => Some(KeyEvent::PageDown),
-                0x1D => { CTRL_PRESSED = true; None }  // Right Ctrl
-                0x38 => { ALT_PRESSED = true; None }   // Right Alt
+                0x1D => { CTRL_PRESSED.store(true, Ordering::Relaxed); None }  // Right Ctrl
+                0x38 => { ALT_PRESSED.store(true, Ordering::Relaxed); None }   // Right Alt
                 _ => None,
             };
         }
 
         // Modifier key presses
         match scancode {
-            0x2A | 0x36 => { SHIFT_PRESSED = true; return None; }
-            0x1D => { CTRL_PRESSED = true; return None; }
-            0x38 => { ALT_PRESSED = true; return None; }
-            0x3A => { CAPS_LOCK = !CAPS_LOCK; return None; }
+            0x2A | 0x36 => { SHIFT_PRESSED.store(true, Ordering::Relaxed); return None; }
+            0x1D => { CTRL_PRESSED.store(true, Ordering::Relaxed); return None; }
+            0x38 => { ALT_PRESSED.store(true, Ordering::Relaxed); return None; }
+            0x3A => { CAPS_LOCK.fetch_xor(true, Ordering::Relaxed); return None; }
             _ => {}
         }
 
-        let shift = SHIFT_PRESSED;
-        let ctrl = CTRL_PRESSED;
-        let alt = ALT_PRESSED;
-        let caps = CAPS_LOCK;
+        let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
+        let ctrl = CTRL_PRESSED.load(Ordering::Relaxed);
+        let alt = ALT_PRESSED.load(Ordering::Relaxed);
+        let caps = CAPS_LOCK.load(Ordering::Relaxed);
 
         // Special keys
         match scancode {

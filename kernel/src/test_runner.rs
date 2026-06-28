@@ -323,6 +323,14 @@ pub fn run() -> ! {
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
 
+    // ── Test 0g: PartitionBlockDevice forwards flush/RO/blksize ──────────
+    total += 1;
+    if test_partition_forwards_flush_ro_blksize() { passed += 1; }
+
+    // ── Test 0h: PS/2 keyboard modifier flags (atomics, no stuck mod) ────
+    total += 1;
+    if test_keyboard_modifier_state() { passed += 1; }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -3375,6 +3383,149 @@ fn kdb_runtime_loop(exit_code: u32) -> ! {
 }
 
 // ── Individual Tests ────────────────────────────────────────────────────────
+
+/// Number of `flush()` calls observed by the partition-forwarding probe device.
+static PART_PROBE_FLUSH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Mock `BlockDevice` whose flush/RO/blksize answers are observable, so we can
+/// assert that `PartitionBlockDevice` forwards them to its inner device rather
+/// than silently using the `BlockDevice` trait defaults (which would make
+/// partition-scoped `fsync(2)` a no-op and report a write-protected device as
+/// writable).
+struct PartProbeDevice {
+    ro: bool,
+    blk: u32,
+}
+
+impl crate::drivers::block::BlockDevice for PartProbeDevice {
+    fn sector_count(&self) -> u64 {
+        4096
+    }
+    fn read_sectors(
+        &self,
+        _lba: u64,
+        count: u32,
+        buf: &mut [u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        let len = (count as usize) * crate::drivers::block::SECTOR_SIZE;
+        if buf.len() < len {
+            return Err(crate::drivers::block::BlockError::BufferTooSmall);
+        }
+        for b in buf[..len].iter_mut() {
+            *b = 0;
+        }
+        Ok(())
+    }
+    fn write_sectors(
+        &self,
+        _lba: u64,
+        _count: u32,
+        _data: &[u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), crate::drivers::block::BlockError> {
+        PART_PROBE_FLUSH_CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn is_readonly(&self) -> bool {
+        self.ro
+    }
+    fn logical_block_size(&self) -> u32 {
+        self.blk
+    }
+}
+
+/// Regression: `PartitionBlockDevice` must forward `flush()`, `is_readonly()`,
+/// and `logical_block_size()` to the underlying device.  See block.rs for the
+/// FLUSH (virtio-blk T_FLUSH / ATA FLUSH CACHE) and RO/blksize semantics.
+fn test_partition_forwards_flush_ro_blksize() -> bool {
+    test_header!("Partition forwards flush/RO/blksize");
+    use crate::drivers::block::BlockDevice;
+
+    PART_PROBE_FLUSH_CALLS.store(0, Ordering::Relaxed);
+
+    let inner = Box::new(PartProbeDevice { ro: true, blk: 4096 });
+    let part = crate::drivers::partition::create_partition_device(inner, 64, 1024);
+
+    // (1) flush() must reach the inner device (not the no-op default).
+    let _ = part.flush();
+    let calls = PART_PROBE_FLUSH_CALLS.load(Ordering::Relaxed);
+    if calls != 1 {
+        test_fail!(
+            "partition_flush_forward",
+            "inner flush() called {} times, expected 1 (fsync-through-partition would be a silent no-op)",
+            calls
+        );
+        return false;
+    }
+
+    // (2) is_readonly() must reflect the inner device, not default false.
+    if !part.is_readonly() {
+        test_fail!(
+            "partition_ro_forward",
+            "PartitionBlockDevice reported writable for a read-only inner device — an RO device could be mounted RW"
+        );
+        return false;
+    }
+
+    // (3) logical_block_size() must reflect the inner device, not default 512.
+    let lbs = part.logical_block_size();
+    if lbs != 4096 {
+        test_fail!(
+            "partition_blksize_forward",
+            "logical_block_size() = {}, expected inner 4096",
+            lbs
+        );
+        return false;
+    }
+
+    test_pass!("Partition forwards flush/RO/blksize");
+    true
+}
+
+/// Regression: PS/2 keyboard modifier state (now `AtomicBool`, was `static mut`)
+/// must apply Shift/Ctrl and clear cleanly on key-release (no stuck modifier).
+/// Scancodes are PS/2 Set 1 (after i8042 translation).
+fn test_keyboard_modifier_state() -> bool {
+    test_header!("Keyboard modifier flags (atomics)");
+    use crate::drivers::keyboard::{process_scancode, KeyEvent};
+
+    // 0x1E = 'a' make code; 0x2A = Left Shift make; 0xAA = Left Shift break;
+    // 0x1D = Left Ctrl make; 0x9D = Left Ctrl break.
+
+    // Plain 'a' -> lowercase 'a'.
+    if process_scancode(0x1E) != Some(KeyEvent::Char('a')) {
+        test_fail!("keyboard_modifiers", "plain 0x1E did not yield 'a'");
+        return false;
+    }
+
+    // Shift held -> 'A'.
+    let _ = process_scancode(0x2A);
+    if process_scancode(0x1E) != Some(KeyEvent::Char('A')) {
+        test_fail!("keyboard_modifiers", "Shift+0x1E did not yield 'A'");
+        return false;
+    }
+
+    // Shift released -> back to 'a' (no stuck Shift).
+    let _ = process_scancode(0xAA);
+    if process_scancode(0x1E) != Some(KeyEvent::Char('a')) {
+        test_fail!("keyboard_modifiers", "Shift release left a stuck modifier (got non-'a')");
+        return false;
+    }
+
+    // Ctrl held -> Ctrl('a'); then release so we leave clean state.
+    let _ = process_scancode(0x1D);
+    let ctrl = process_scancode(0x1E);
+    let _ = process_scancode(0x9D);
+    if ctrl != Some(KeyEvent::Ctrl('a')) {
+        test_fail!("keyboard_modifiers", "Ctrl+0x1E did not yield Ctrl('a')");
+        return false;
+    }
+
+    test_pass!("Keyboard modifier flags (atomics)");
+    true
+}
 
 fn test_network_config() -> bool {
     test_header!("Network Configuration (ip)");

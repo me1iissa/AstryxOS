@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 // ── PCI constants ───────────────────────────────────────────────────────────
@@ -124,7 +124,12 @@ struct TxDesc {
 // ── Static driver state ─────────────────────────────────────────────────────
 
 /// MMIO base address for the e1000 registers.
-static MMIO_BASE: Mutex<u64> = Mutex::new(0);
+///
+/// Written exactly once, from `init_device()`, before the NIC is marked
+/// `AVAILABLE`; read on every register access (the RX/TX hot paths).  An
+/// `AtomicU64` removes the per-access `spin::Mutex` lock/unlock round-trip
+/// that the previous `Mutex<u64>` imposed on `mmio_read`/`mmio_write`.
+static MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the e1000 NIC has been initialized.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -249,7 +254,7 @@ fn rx_flush_nudge() {
 /// is the user's VMA mapping.  See the per-process page-table layout note
 /// at `mm/vmm.rs:31-35` for the deeper rationale.
 fn mmio_read(reg: u32) -> u32 {
-    let base = *MMIO_BASE.lock();
+    let base = MMIO_BASE.load(Ordering::Relaxed);
     unsafe {
         let ptr = phys_to_virt(base + reg as u64) as *const u32;
         core::ptr::read_volatile(ptr)
@@ -259,7 +264,7 @@ fn mmio_read(reg: u32) -> u32 {
 /// Write a 32-bit register in MMIO space.  See `mmio_read` for the
 /// physical-vs-virtual rationale.
 fn mmio_write(reg: u32, val: u32) {
-    let base = *MMIO_BASE.lock();
+    let base = MMIO_BASE.load(Ordering::Relaxed);
     unsafe {
         let ptr = phys_to_virt(base + reg as u64) as *mut u32;
         core::ptr::write_volatile(ptr, val);
@@ -328,7 +333,9 @@ fn init_device(bus: u8, dev: u8) -> bool {
         mmio_base
     };
 
-    *MMIO_BASE.lock() = mmio_base;
+    // Write-once: store the base before any register access (and before the
+    // NIC is marked AVAILABLE), so every subsequent mmio_read/mmio_write sees it.
+    MMIO_BASE.store(mmio_base, Ordering::Relaxed);
     crate::serial_println!("[E1000] MMIO base: {:#X}", mmio_base);
 
     // 2) Enable PCI bus mastering + memory space access

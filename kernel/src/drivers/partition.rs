@@ -380,6 +380,31 @@ impl BlockDevice for PartitionBlockDevice {
         }
         self.inner.write_sectors(self.start_lba + lba, count, data)
     }
+
+    // The wrapper MUST forward cache/geometry queries to the underlying
+    // device.  Falling back to the `BlockDevice` defaults here would make
+    // `fsync(2)` through a partition a silent no-op (FLUSH never reaches the
+    // drive) and would let a read-only device be mounted read-write because
+    // `is_readonly()` would report `false`.  See block.rs for the per-method
+    // wire/semantics references.
+
+    /// Forward FLUSH to the underlying device so partition-scoped `fsync(2)`
+    /// actually commits the drive's write-back cache to media.
+    fn flush(&self) -> Result<(), BlockError> {
+        self.inner.flush()
+    }
+
+    /// Inherit the underlying device's read-only status so filesystems refuse
+    /// an RW mount of a write-protected device at mount time.
+    fn is_readonly(&self) -> bool {
+        self.inner.is_readonly()
+    }
+
+    /// Inherit the underlying device's logical block size (the partition does
+    /// not change the device's addressing granularity).
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
 }
 
 /// Create a `PartitionBlockDevice` wrapping an inner device at the given LBA
