@@ -1419,6 +1419,10 @@ pub struct ConnSnap {
     pub remote_ip:   Ipv4Address,
     pub remote_port: u16,
     pub state:       TcpState,
+    /// Bytes queued in the receive buffer (awaiting recv(2)).
+    pub recv_len:    usize,
+    /// Bytes queued in the send buffer (not yet on the wire).
+    pub send_len:    usize,
 }
 
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
@@ -1431,6 +1435,8 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
         remote_ip:   c.remote_ip,
         remote_port: c.remote_port,
         state:       c.state,
+        recv_len:    c.recv_buffer.len(),
+        send_len:    c.send_buffer.len(),
     }).collect()
 }
 

@@ -506,16 +506,33 @@ pub fn socket_recv_status(id: u64, max_len: usize) -> Result<RecvOutcome, &'stat
             // CloseWait (or has progressed to LastAck/Closed/TimeWait); with
             // no buffered data that is an orderly EOF (RFC 793 §3.5).  An
             // Established (or still-handshaking) connection with an empty
-            // buffer is would-block.
-            let peer_closed = match super::tcp::get_state(sock.local_port) {
-                Some(st) => matches!(st,
-                    super::tcp::TcpState::CloseWait
-                    | super::tcp::TcpState::LastAck
-                    | super::tcp::TcpState::TimeWait
-                    | super::tcp::TcpState::Closed),
-                // No TCB found for this port: the flow is gone — treat as EOF
-                // so a reader drains to completion rather than spinning.
-                None => true,
+            // buffer is would-block.  Resolved by the full 4-tuple
+            // (`get_state_for`), not the local port alone, so a sibling
+            // session on the same port (RFC 9293 §3.4) cannot induce a
+            // spurious EOF on this connected socket.
+            let peer_closed = if sock.connected && sock.remote_port != 0 {
+                match super::tcp::get_state_for(sock.local_port,
+                                                sock.remote_ip,
+                                                sock.remote_port) {
+                    Some(st) => matches!(st,
+                        super::tcp::TcpState::CloseWait
+                        | super::tcp::TcpState::LastAck
+                        | super::tcp::TcpState::TimeWait
+                        | super::tcp::TcpState::Closed),
+                    // No TCB for this 4-tuple: the flow is gone — EOF so a
+                    // reader drains to completion rather than spinning.
+                    None => true,
+                }
+            } else {
+                // Legacy single-peer / unconnected fallback: port-only.
+                match super::tcp::get_state(sock.local_port) {
+                    Some(st) => matches!(st,
+                        super::tcp::TcpState::CloseWait
+                        | super::tcp::TcpState::LastAck
+                        | super::tcp::TcpState::TimeWait
+                        | super::tcp::TcpState::Closed),
+                    None => true,
+                }
             };
             if peer_closed { Ok(RecvOutcome::Eof) } else { Ok(RecvOutcome::WouldBlock) }
         }
@@ -628,11 +645,22 @@ pub fn socket_recvfrom(id: u64, max_len: usize) -> Result<(Vec<u8>, Ipv4Address,
             // the connected peer (RFC 793 + IEEE 1003.1).  An unconnected
             // listener wouldn't have any in-band data to read here, so a
             // zero peer in that edge case is harmless.
-            let peer_ip   = sock.remote_ip;
-            let peer_port = sock.remote_port;
+            let peer_ip    = sock.remote_ip;
+            let peer_port  = sock.remote_port;
             let local_port = sock.local_port;
+            let connected  = sock.connected;
             drop(sockets);
-            let data = super::tcp::read(local_port, max_len);
+            // Per-connection drain keyed on the full 4-tuple for a
+            // connect(2)ed / accept(2)-side socket (RFC 793 §3.8
+            // demultiplexing), matching `socket_recv` — the port-only drain
+            // could otherwise touch a sibling session sharing the local
+            // port.  Falls back to the port-only drain for the legacy
+            // single-peer case.
+            let data = if connected && peer_port != 0 {
+                super::tcp::read_from(local_port, peer_ip, peer_port, max_len)
+            } else {
+                super::tcp::read(local_port, max_len)
+            };
             Ok((data, peer_ip, peer_port))
         }
     };
@@ -736,8 +764,13 @@ pub fn socket_read_ready(id: u64) -> bool {
                 // CloseWait (or has progressed past it); with no buffered
                 // data that is an orderly EOF.  A vanished TCB is also EOF
                 // (the flow is gone — a reader must drain to completion
-                // rather than spin).
-                match super::tcp::get_state(sock.local_port) {
+                // rather than spin).  Keyed on the full 4-tuple
+                // (`get_state_for`), not the local port alone: a sibling
+                // session sharing the port (RFC 9293 §3.4 demultiplexing)
+                // must not make this flow report a spurious EOF.
+                match super::tcp::get_state_for(sock.local_port,
+                                                sock.remote_ip,
+                                                sock.remote_port) {
                     Some(st) => matches!(st,
                         super::tcp::TcpState::CloseWait
                         | super::tcp::TcpState::LastAck
@@ -835,6 +868,64 @@ pub fn socket_write_ready(id: u64) -> bool {
                 // Not connected (listener / fresh socket): a send() does
                 // not block; report writable so the eventual error surfaces.
                 true
+            }
+        }
+    }
+}
+
+/// True when a `recv(2)`/`recvfrom(2)` on this socket would return `0`
+/// (an orderly end-of-stream) rather than block — i.e. the read side is
+/// at EOF with no buffered data left to drain.  Strictly **non-destructive**
+/// (state inspection only): it is the EOF half of the [`socket_read_ready`]
+/// readability gate, used by the `recvfrom(2)` handler to map an *empty*
+/// drain to `0` (EOF) instead of `-EAGAIN`.
+///
+/// Without this distinction a peer-FINned connection (CLOSE-WAIT with an
+/// empty buffer) reads as `poll(2)`-readable (the next recv "won't block")
+/// yet `recvfrom` returns `-EAGAIN`, so a level-triggered event loop spins
+/// `poll → recvfrom → EAGAIN → poll …` forever and never observes the
+/// orderly close to deregister the fd (RFC 9293 §3.5; `man 2 recv`:
+/// "a return value of 0 means the peer has performed an orderly shutdown").
+/// EOF is keyed on the exact 4-tuple ([`super::tcp::get_state_for`]); a
+/// datagram (UDP) socket has no EOF concept and always reports `false`.
+pub fn socket_recv_would_eof(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    // shutdown(SHUT_RD): every subsequent recv returns 0 (EOF).
+    if sock.shut_rd { return true; }
+    if !sock.bound { return false; }
+    match sock.socket_type {
+        // UDP is connectionless: an empty queue is "no datagram yet"
+        // (would-block), never an orderly EOF.
+        SocketType::Udp => false,
+        SocketType::Tcp => {
+            if sock.connected && sock.remote_port != 0 {
+                // Buffered bytes remain ⇒ not at EOF (a recv returns data).
+                if super::tcp::has_data_for(sock.local_port,
+                                            sock.remote_ip,
+                                            sock.remote_port) {
+                    return false;
+                }
+                // Empty buffer: EOF iff the peer half-closed (CloseWait or
+                // beyond) or the TCB has vanished — keyed on this exact
+                // 4-tuple so a sibling session sharing the local port
+                // cannot induce a spurious EOF (RFC 9293 §3.4).
+                match super::tcp::get_state_for(sock.local_port,
+                                                sock.remote_ip,
+                                                sock.remote_port) {
+                    Some(st) => matches!(st,
+                        super::tcp::TcpState::CloseWait
+                        | super::tcp::TcpState::LastAck
+                        | super::tcp::TcpState::TimeWait
+                        | super::tcp::TcpState::Closed),
+                    None => true,
+                }
+            } else {
+                // Listener / unconnected: no peer, no EOF.
+                false
             }
         }
     }
@@ -1017,4 +1108,94 @@ pub fn socket_connect(id: u64, remote_ip: Ipv4Address, remote_port: u16) -> Resu
         }
     }
     Ok(())
+}
+
+// ── kdb poll-divergence diagnostic ────────────────────────────────────────────
+
+/// Per-socket poll-readiness diagnostic snapshot.  Captures, for each
+/// AF_INET socket, both the readiness `poll(2)`/`epoll(7)` would compute
+/// (`read_ready`/`write_ready`/`rdhup`/`hup`) AND the underlying TCB state
+/// resolved two ways: by local port alone (`port_state`, what the legacy
+/// `get_state` helper returns) versus by the exact 4-tuple (`tuple_state`).
+/// When those disagree, the port-only resolver is reporting a *sibling*
+/// connection's state for this flow — the exact condition that makes a
+/// live ESTABLISHED socket spuriously report POLLIN/EOF, which a consumer
+/// cannot drain (busy-poll livelock).  Diagnostic-only; `kdb`-gated.
+#[cfg(feature = "kdb")]
+#[derive(Clone, Copy)]
+pub struct SockPollDiag {
+    pub id:          u64,
+    pub is_tcp:      bool,
+    pub local_port:  u16,
+    pub remote_ip:   Ipv4Address,
+    pub remote_port: u16,
+    pub connected:   bool,
+    pub bound:       bool,
+    pub read_ready:  bool,
+    pub write_ready: bool,
+    pub rdhup:       bool,
+    pub hup:         bool,
+    pub recv_len:    usize,
+    pub send_len:    usize,
+    /// `get_state(local_port)` — the port-only resolver.
+    pub port_state:  Option<super::tcp::TcpState>,
+    /// `get_state_for(4-tuple)` — the exact-flow resolver.
+    pub tuple_state: Option<super::tcp::TcpState>,
+    /// Number of TCBs sharing this `local_port` (>1 ⇒ collision risk).
+    pub siblings_on_port: usize,
+    /// True when `port_state != tuple_state` for a connected socket — the
+    /// port-only resolver is mis-attributing a sibling TCB's state.
+    pub divergent:   bool,
+}
+
+/// Snapshot every AF_INET socket with its poll readiness + dual-resolver
+/// TCB state, for the kdb `socket-poll` op.  Locks SOCKETS only to copy
+/// the flat tuple set, then resolves each socket's readiness via the
+/// normal public predicates (which re-lock briefly) — so it observes
+/// exactly what `poll_revents` observes.
+#[cfg(feature = "kdb")]
+pub fn snapshot_poll_diag() -> alloc::vec::Vec<SockPollDiag> {
+    // 1. Flat copy of the socket tuples (drop SOCKETS before reaching tcp).
+    struct Flat { id: u64, is_tcp: bool, lp: u16, rip: Ipv4Address, rp: u16,
+                  connected: bool, bound: bool }
+    let flats: alloc::vec::Vec<Flat> = {
+        let sockets = SOCKETS.lock();
+        sockets.iter().map(|s| Flat {
+            id: s.id,
+            is_tcp: s.socket_type == SocketType::Tcp,
+            lp: s.local_port,
+            rip: s.remote_ip,
+            rp: s.remote_port,
+            connected: s.connected,
+            bound: s.bound,
+        }).collect()
+    };
+    // 2. One TCB-table snapshot for sibling-count + buffer depths.
+    let conns = super::tcp::snapshot_connections();
+    flats.into_iter().map(|f| {
+        let (rdhup, hup) = socket_hangup_status(f.id);
+        let port_state  = if f.is_tcp { super::tcp::get_state(f.lp) } else { None };
+        let tuple_state = if f.is_tcp && f.connected && f.rp != 0 {
+            super::tcp::get_state_for(f.lp, f.rip, f.rp)
+        } else { None };
+        let siblings_on_port = if f.is_tcp {
+            conns.iter().filter(|c| c.local_port == f.lp).count()
+        } else { 0 };
+        let (recv_len, send_len) = conns.iter()
+            .find(|c| c.local_port == f.lp && c.remote_ip == f.rip
+                      && c.remote_port == f.rp)
+            .map(|c| (c.recv_len, c.send_len))
+            .unwrap_or((0, 0));
+        let divergent = f.is_tcp && f.connected && f.rp != 0
+            && port_state != tuple_state;
+        SockPollDiag {
+            id: f.id, is_tcp: f.is_tcp, local_port: f.lp,
+            remote_ip: f.rip, remote_port: f.rp,
+            connected: f.connected, bound: f.bound,
+            read_ready:  socket_read_ready(f.id),
+            write_ready: socket_write_ready(f.id),
+            rdhup, hup, recv_len, send_len,
+            port_state, tuple_state, siblings_on_port, divergent,
+        }
+    }).collect()
 }

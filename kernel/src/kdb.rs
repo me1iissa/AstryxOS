@@ -429,6 +429,13 @@ pub fn dispatch(req: &str, out: &mut String) {
         // net-ipver: read or toggle the runtime IPv4/IPv6 address-family
         // enable flags (net::ipver).  One-shot, structured JSON output.
         "net-ipver"     => op_net_ipver(req, out),
+        // socket-poll: per-AF_INET-socket poll-readiness divergence report.
+        // For each socket dumps the readiness poll_revents would compute plus
+        // the TCB state resolved by local-port-only vs the exact 4-tuple; a
+        // mismatch (`divergent`) means a sibling TCB on the same local port is
+        // being mis-attributed (spurious POLLIN/EOF → busy-poll livelock).
+        // Emits a [SOCKPOLL] serial mirror so it survives a vCPU monopoly.
+        "socket-poll"   => op_socket_poll(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -4067,6 +4074,80 @@ fn op_net_ipver(req: &str, out: &mut String) {
         if v4 { "true" } else { "false" },
         if v6 { "true" } else { "false" },
     );
+}
+
+// ── socket-poll ─────────────────────────────────────────────────────────────
+//
+// Per-AF_INET-socket poll-readiness divergence report.  Names, per socket,
+// the readiness `poll_revents` computes AND the TCB state resolved by
+// local-port-only vs the exact 4-tuple; `divergent` flags the sticky-POLLIN
+// / spurious-EOF condition (a sibling TCB on the same local port being
+// mis-attributed).  A [SOCKPOLL] serial mirror is emitted so the result
+// survives a vCPU-monopoly busy-poll livelock (kdb starved).
+fn op_socket_poll(out: &mut String) {
+    use core::fmt::Write;
+    fn st_name(s: Option<crate::net::tcp::TcpState>) -> &'static str {
+        use crate::net::tcp::TcpState::*;
+        match s {
+            Some(Closed) => "CLOSED", Some(Listen) => "LISTEN",
+            Some(SynSent) => "SYN_SENT", Some(SynReceived) => "SYN_RCVD",
+            Some(Established) => "ESTABLISHED", Some(FinWait1) => "FIN_WAIT_1",
+            Some(FinWait2) => "FIN_WAIT_2", Some(CloseWait) => "CLOSE_WAIT",
+            Some(LastAck) => "LAST_ACK", Some(TimeWait) => "TIME_WAIT",
+            None => "NONE",
+        }
+    }
+    let diag = crate::net::socket::snapshot_poll_diag();
+    let mut divergent = 0usize;
+    let mut sticky_in = 0usize;
+    out.push('{');
+    let _ = write!(out, r#""count":{},"sockets":["#, diag.len());
+    for (i, d) in diag.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        j_kv(out, "id", &alloc::format!("{}", d.id));
+        j_kv_str(out, "type", if d.is_tcp { "tcp" } else { "udp" });
+        j_kv(out, "local_port", &alloc::format!("{}", d.local_port));
+        j_kv_str(out, "remote", &alloc::format!("{}.{}.{}.{}:{}",
+            d.remote_ip[0], d.remote_ip[1], d.remote_ip[2], d.remote_ip[3],
+            d.remote_port));
+        j_kv(out, "connected", if d.connected { "true" } else { "false" });
+        j_kv(out, "bound", if d.bound { "true" } else { "false" });
+        j_kv(out, "read_ready", if d.read_ready { "true" } else { "false" });
+        j_kv(out, "write_ready", if d.write_ready { "true" } else { "false" });
+        j_kv(out, "rdhup", if d.rdhup { "true" } else { "false" });
+        j_kv(out, "hup", if d.hup { "true" } else { "false" });
+        j_kv(out, "recv_len", &alloc::format!("{}", d.recv_len));
+        j_kv(out, "send_len", &alloc::format!("{}", d.send_len));
+        j_kv_str(out, "port_state", st_name(d.port_state));
+        j_kv_str(out, "tuple_state", st_name(d.tuple_state));
+        j_kv(out, "siblings_on_port", &alloc::format!("{}", d.siblings_on_port));
+        j_kv(out, "divergent", if d.divergent { "true" } else { "false" });
+        j_trim_comma(out);
+        out.push('}');
+        if d.divergent {
+            divergent += 1;
+            // Sticky POLLIN: poll reports readable but the exact-flow TCB has
+            // no buffered data and is not at a genuine EOF — recv can't drain.
+            if d.read_ready && d.recv_len == 0
+               && matches!(d.tuple_state, Some(crate::net::tcp::TcpState::Established)) {
+                sticky_in += 1;
+            }
+            crate::serial_println!(
+                "[SOCKPOLL] DIVERGENT id={} lport={} remote={}.{}.{}.{}:{} \
+                 port_state={} tuple_state={} read_ready={} recv_len={} \
+                 siblings={}",
+                d.id, d.local_port,
+                d.remote_ip[0], d.remote_ip[1], d.remote_ip[2], d.remote_ip[3],
+                d.remote_port, st_name(d.port_state), st_name(d.tuple_state),
+                d.read_ready, d.recv_len, d.siblings_on_port);
+        }
+    }
+    let _ = write!(out, r#"],"divergent":{},"sticky_pollin":{}}}"#,
+                   divergent, sticky_in);
+    crate::serial_println!(
+        "[SOCKPOLL] summary sockets={} divergent={} sticky_pollin={}",
+        diag.len(), divergent, sticky_in);
 }
 
 // ── procmaps ──────────────────────────────────────────────────────────────────

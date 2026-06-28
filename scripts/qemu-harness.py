@@ -7018,6 +7018,9 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               # placement.  Diagnoses SMP "de-facto single core" imbalance.
               "cpu-state",
               "coverage-flush", "proc-metrics",
+              # socket-poll: per-AF_INET-socket poll-readiness divergence report
+              # (sticky-POLLIN / spurious-EOF busy-poll localizer).
+              "socket-poll",
               "futex-stats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
               "blk-trace", "blk-trace-flush",
@@ -12971,6 +12974,10 @@ def main():
         # top-level subcommand below (drain|flush).
         "blk-trace", "blk-trace-flush",
         "coverage-flush", "proc-metrics", "thread-park-audit",
+        # socket-poll: per-AF_INET-socket poll-readiness divergence report
+        # (sticky-POLLIN / spurious-EOF busy-poll localizer). [SOCKPOLL]
+        # serial mirror survives a vCPU monopoly. See kdb::op_socket_poll.
+        "socket-poll",
         "rip-trace",
         "futex-ghost-hist",
         # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report:
