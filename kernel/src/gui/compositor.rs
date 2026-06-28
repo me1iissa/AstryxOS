@@ -56,9 +56,13 @@ static LAST_COMPOSE_TICK: AtomicU64 = AtomicU64::new(0);
 /// VM-exit/cycle reduction, not LAPIC-tick survival.)
 const COMPOSE_MIN_INTERVAL_TICKS: u64 = 2;
 
-/// Maximum ticks the compositor will skip even with no damage, so a stale
-/// frame (e.g. after a resolution/format change that did not route through a
-/// damage accessor) is eventually refreshed.  ~1 s at `TICK_HZ = 100`.
+/// Maximum ticks between idle-refresh checks even with no damage (~1 s at
+/// `TICK_HZ = 100`).  When this elapses with no damage advance the compositor
+/// takes the cheap [`idle_refresh`] path — re-presenting only the last damage
+/// area, or skipping when nothing bounded is pending — instead of forcing a
+/// full-surface recomposite.  (A genuine bypass-damage change, e.g. a live
+/// resolution/format change, routes through [`init`], which advances
+/// [`DAMAGE_SEQ`] so the next frame is presented in full.)
 const COMPOSE_MAX_IDLE_TICKS: u64 = 100;
 
 /// Record on-screen damage.  Lock-free; any code that mutates composited pixel
@@ -97,8 +101,64 @@ pub fn compose_if_due() {
     }
     LAST_COMPOSED_DAMAGE.store(cur_damage, Ordering::Relaxed);
     LAST_COMPOSE_TICK.store(now, Ordering::Relaxed);
+
+    // Idle refresh vs. real damage.  `compose_due_decision` returns true either
+    // because on-screen content changed (`cur_damage != last_damage`) OR because
+    // the bounded idle-refresh interval (`COMPOSE_MAX_IDLE_TICKS`) elapsed.  When
+    // the *only* reason is the idle interval — i.e. nothing changed since the last
+    // composited frame — the framebuffer already holds correct pixels, so forcing
+    // a full-surface recomposite here would blit the entire surface to VRAM every
+    // ~1 s for a perfectly static desktop (the defeat of the damage-region win:
+    // an idle frame cost one full 1920×1080×4 = 8.29 MB blit).  Take the cheap
+    // idle path instead.  A real damage advance always falls through to the full
+    // `compose()` below, so no on-screen change is ever dropped.
+    if cur_damage == last_damage {
+        idle_refresh();
+        return;
+    }
     COMPOSE_BLITTED.fetch_add(1, Ordering::Relaxed);
     compose();
+}
+
+/// Idle-refresh path: the compose gate is due (the bounded idle interval has
+/// elapsed) but no producer advanced [`DAMAGE_SEQ`] since the last composited
+/// frame, so on-screen content is unchanged.  Re-present the *last presented
+/// region set* — a cheap backbuffer→VRAM re-sync of pixels that are already
+/// correct — instead of forcing a full-surface recomposite.  Skips entirely
+/// when there is nothing bounded to re-present (the last frame was the full
+/// surface, or none has been presented yet): in that case the framebuffer is
+/// already correct and a full re-blit would reintroduce the per-interval
+/// full-screen cost this path exists to remove.  Mirrors the X11 DAMAGE region
+/// model (an empty/satisfied damage set ⇒ no present).
+fn idle_refresh() {
+    let regions: Vec<(u32, u32, u32, u32)> = {
+        let last = LAST_PRESENTED.lock();
+        if last.full || last.regions.is_empty() {
+            // Nothing bounded to re-present and nothing changed → skip the blit.
+            COMPOSE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        last.regions.clone()
+    };
+
+    let guard = COMPOSITOR.lock();
+    let comp = match guard.as_ref() {
+        Some(c) => c,
+        None => return,
+    };
+    let mut bytes_moved: u64 = 0;
+    let mut dirty_px: u64 = 0;
+    for &region in &regions {
+        let (b, p) = blit_region(comp, region);
+        bytes_moved += b;
+        dirty_px += p;
+    }
+    drop(guard);
+    crate::drivers::vmware_svga::present_kick();
+    COMPOSE_BLITTED.fetch_add(1, Ordering::Relaxed);
+    // Record the (bounded) idle re-present so `compose-stats` reflects that idle
+    // frames now move only the last damage area, never the full surface.
+    record_compose(0, bytes_moved, dirty_px);
 }
 
 /// Cumulative count of `compose_if_due` calls that issued a full-screen
@@ -149,6 +209,25 @@ struct DamageAccum {
 
 static DAMAGE: Mutex<DamageAccum> =
     Mutex::new(DamageAccum { rects: Vec::new(), full: true });
+
+/// The region set presented by the last [`compose`], used by [`idle_refresh`]
+/// to cheaply re-present (or skip) on the bounded idle interval instead of
+/// forcing a full-surface recomposite.  `full` records whether that frame was a
+/// full-surface present — in which case re-blitting it on every idle interval
+/// would reintroduce exactly the per-interval full-screen cost the idle path
+/// exists to remove, so [`idle_refresh`] skips instead.
+struct LastPresented {
+    regions: Vec<(u32, u32, u32, u32)>,
+    full: bool,
+}
+
+/// Lock order: a holder may take [`LAST_PRESENTED`] *while* holding
+/// [`COMPOSITOR`] (as [`compose`] does when recording the presented set), but
+/// never the reverse — [`idle_refresh`] takes and releases [`LAST_PRESENTED`]
+/// before acquiring [`COMPOSITOR`].  So the two locks are never both held in the
+/// inverse order and cannot deadlock.
+static LAST_PRESENTED: Mutex<LastPresented> =
+    Mutex::new(LastPresented { regions: Vec::new(), full: true });
 
 /// Active surface dimensions, published by [`init`] so [`damage_rect`] can clip
 /// without taking the compositor lock.
@@ -371,6 +450,39 @@ pub fn damage_region_selftest() -> bool {
         // (-5,-5,10,10) clips to (0,0,5,5).
         if acc.rects.len() != 1 || acc.rects[0] != (0, 0, 5, 5) {
             ok = false;
+        }
+    }
+
+    // 4b. Multi-rect, not single-bbox: two far-apart small rects (well under the
+    //     cap) must remain TWO separate clips, and their combined area must be
+    //     strictly less than the area of their union bounding box — otherwise the
+    //     compositor would blit the giant bbox covering everything between them
+    //     (e.g. a cursor at one corner + a spinner at the other).  This is the
+    //     property that distinguishes the per-clip present from a single-bbox
+    //     collapse.
+    {
+        let mut acc = DAMAGE.lock();
+        acc.rects.clear();
+        acc.full = false;
+    }
+    damage_rect(0, 0, 8, 8);
+    damage_rect((sw as i32 - 8).max(0), (sh as i32 - 8).max(0), 8, 8);
+    {
+        let acc = DAMAGE.lock();
+        if acc.rects.len() != 2 {
+            ok = false;
+        } else {
+            let combined: u64 = acc
+                .rects
+                .iter()
+                .map(|&(_, _, w, h)| w as u64 * h as u64)
+                .sum();
+            let bbox = damage_bounding_box(&acc.rects);
+            let bbox_area = bbox.2 as u64 * bbox.3 as u64;
+            // Two 8×8 rects at opposite corners: combined 128 px ≪ bbox area.
+            if combined >= bbox_area {
+                ok = false;
+            }
         }
     }
 
@@ -1247,6 +1359,17 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
         acc.rects.clear();
         acc.full = true;
     }
+    // Advance the damage sequence so the first frame after (re)init — including a
+    // live resolution/format change that does not route through a damage
+    // accessor — is treated as a real change and presented, rather than being
+    // collapsed into the idle path (which skips when nothing changed).  Reset the
+    // last-presented record so the idle path skips until a real frame is drawn.
+    DAMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut last = LAST_PRESENTED.lock();
+        last.regions.clear();
+        last.full = true;
+    }
     crate::serial_println!(
         "[GUI] Compositor initialized ({}x{}, stride={}, fb=0x{:X})",
         width,
@@ -1435,6 +1558,17 @@ pub fn compose() {
         dirty_px += p;
     }
     crate::drivers::vmware_svga::present_kick();
+
+    // Remember the presented region set so a subsequent idle refresh can cheaply
+    // re-present it (or skip, when this frame was full-surface) rather than
+    // forcing another full-surface recomposite.  Recorded while holding
+    // COMPOSITOR (lock order COMPOSITOR → LAST_PRESENTED; see LAST_PRESENTED).
+    {
+        let mut last = LAST_PRESENTED.lock();
+        last.full = full;
+        last.regions.clear();
+        last.regions.extend_from_slice(&regions);
+    }
 
     // --- 8. Frame counter + timing ---
     comp.frame_count += 1;
