@@ -748,7 +748,21 @@ fn reap_dead_threads_sched() {
     // once a frame is provably no longer referenced.  Safe under the reaper's
     // IF=0 contract (takes its own short THREAD_TABLE + quarantine locks,
     // releases before PMM ops).
-    drain_pending_kstack_free();
+    //
+    // Throttled to at most once per `TICK_COUNT` advance: the survey is
+    // O(entries × live-threads) and its eligibility gates are wall-clock based
+    // (minimum 2 ticks, see `entry_is_quiesced`), so re-running it within a
+    // single tick reclaims nothing while still paying the full scan on every
+    // schedule.  Gating it to per-tick bounds the reaper cost and prevents the
+    // near-full-quarantine survey from starving cooperative kernel threads,
+    // without changing which frames are freed or when.  See
+    // `LAST_KSTACK_DRAIN_TICK`.
+    {
+        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        if kstack_drain_due(&LAST_KSTACK_DRAIN_TICK, now) {
+            drain_pending_kstack_free();
+        }
+    }
 
     // IMPORTANT: Never reap the CURRENT thread. The caller is still running on
     // its kernel stack — freeing the stack while executing on it is a UAF.
@@ -1387,6 +1401,58 @@ struct PendingKstackFree {
 const MAX_PENDING_KSTACK_FREES: usize = 256;
 static PENDING_KSTACK_FREE: spin::Mutex<alloc::vec::Vec<PendingKstackFree>> =
     spin::Mutex::new(alloc::vec::Vec::new());
+
+/// `TICK_COUNT` at the last `drain_pending_kstack_free` survey, plus the
+/// reaper's per-tick throttle gate.
+///
+/// The quarantine survey is O(entries × live-threads): for each pending frame
+/// it walks the whole `THREAD_TABLE` (`saved_rsp_aliases_live_frame`).  The
+/// reaper runs at the top of every `schedule()`, so calling the survey on every
+/// schedule made the cost scale with both the quarantine depth (which climbs to
+/// `MAX_PENDING_KSTACK_FREES` whenever a frame's VA is recycled to a live
+/// thread and the alias gate therefore *correctly, permanently* withholds it)
+/// and the live-thread count.  Under a thread-churning workload that pinned a
+/// near-full quarantine, the survey dominated the single CPU and starved the
+/// cooperative kernel service threads (net poll / display / compositor).
+///
+/// The survey gates are purely wall-clock / generation based: the earliest an
+/// entry can clear is `DEAD_STACK_QUIESCE_TICKS` (2 ticks) and the slowest is
+/// the escape valve at `DEAD_STACK_QUIESCE_TICKS * 8` (16 ticks).  Re-running it
+/// more than once per `TICK_COUNT` advance therefore reclaims nothing — no entry
+/// can become eligible within a single tick that was not eligible at the start
+/// of it.  Gating the survey to at most once per tick bounds the reaper's cost
+/// to O(entries × threads) per tick (≈ once per 10 ms at TICK_HZ=100) instead of
+/// per schedule, with zero change to *which* entries are freed or *when* they
+/// become eligible (the quiescence + alias correctness gates are untouched).
+static LAST_KSTACK_DRAIN_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Per-tick throttle gate for the quarantine survey.  Returns `true` at most
+/// once per distinct `now` value across all callers: the atomic swap publishes
+/// `now` and the prior occupant of `slot` decides.  The first caller to observe
+/// a new tick swaps in `now`, reads back the *previous* tick (`!= now`) and
+/// drains; every later caller in the same tick reads back `now` (`== now`) and
+/// skips.  Under SMP this admits exactly one drain per tick — the swap is a
+/// single atomic RMW, so concurrent callers cannot both read back a value other
+/// than `now` (Intel SDM Vol. 3A §8.1.2.2: locked read-modify-write operations
+/// are atomic).  `Relaxed` ordering suffices: the gate carries no data, and the
+/// drain it guards takes its own `THREAD_TABLE` / quarantine / PMM locks which
+/// provide the ordering for the actual reclamation.  Initialising `slot` to
+/// `u64::MAX` guarantees the first-ever call drains (no real `TICK_COUNT` value
+/// equals `u64::MAX`).
+#[inline]
+fn kstack_drain_due(slot: &AtomicU64, now: u64) -> bool {
+    slot.swap(now, Ordering::Relaxed) != now
+}
+
+/// Test-only: exercise the per-tick drain-throttle gate against a caller-owned
+/// `slot`, so the suite can assert the once-per-tick invariant without
+/// perturbing the production `LAST_KSTACK_DRAIN_TICK` (which a sibling CPU's
+/// reaper may be reading concurrently).  Identical code path to the production
+/// call site in `reap_dead_threads_sched`.
+#[cfg(feature = "test-mode")]
+pub fn test_kstack_drain_due(slot: &AtomicU64, now: u64) -> bool {
+    kstack_drain_due(slot, now)
+}
 
 /// Quarantine an emergency-tier / cache-overflow kstack frame for a gated PMM
 /// free.  Stamps the quiescence snapshot exactly like `push_dead_stack`.
