@@ -47,7 +47,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use crate::hal;
 use crate::mm::pmm;
@@ -159,8 +159,6 @@ struct VirtioNetDevice {
     tx_bufs_phys: u64,
     /// Last seen used ring index for RX queue.
     rxq_last_used: u16,
-    /// Last seen used ring index for TX queue.
-    txq_last_used: u16,
     /// Next descriptor index to use for available ring in RX queue.
     rxq_avail_idx: u16,
     /// Next TX slot (wraps at NUM_TX_SLOTS).
@@ -169,6 +167,17 @@ struct VirtioNetDevice {
 
 static VIRTIO_NET: Mutex<Option<VirtioNetDevice>> = Mutex::new(None);
 static VIRTIO_NET_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Count of RX used-ring entries discarded as malformed (length <= the
+/// virtio_net_hdr, or an out-of-range descriptor id).  Such entries still have
+/// their descriptor re-posted so the device never starves for RX buffers; this
+/// counter exists only for observability of burst/overflow loss.
+static RX_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the running count of dropped (malformed) RX frames.
+pub fn rx_drops() -> u64 {
+    RX_DROPS.load(Ordering::Relaxed)
+}
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -384,7 +393,6 @@ pub fn init() -> bool {
             rx_bufs_phys,
             tx_bufs_phys,
             rxq_last_used: 0,
-            txq_last_used: 0,
             rxq_avail_idx: rx_use, // we already posted rx_use descriptors
             tx_slot: 0,
         });
@@ -422,11 +430,14 @@ fn find_virtio_net_pci() -> Option<crate::drivers::pci::PciDevice> {
 /// Send a raw Ethernet frame via virtio-net.
 ///
 /// The caller passes the raw frame (no virtio_net_hdr).  This function:
-/// 1. Copies the frame into a driver-owned TX buffer slot.
-/// 2. Prepends a zeroed virtio_net_hdr (no offloads).
-/// 3. Posts a 2-descriptor chain (hdr + frame) onto the TX virtqueue.
-/// 4. Kicks the notification register.
-/// 5. Spin-polls the used ring for completion before returning.
+/// 1. Lazily reclaims TX descriptors completed since the previous call.
+/// 2. Copies the frame into a driver-owned TX buffer slot.
+/// 3. Prepends a zeroed virtio_net_hdr (no offloads).
+/// 4. Posts a 2-descriptor chain (hdr + frame) onto the TX virtqueue.
+/// 5. Kicks the notification register and returns *without* spin-waiting for
+///    completion.  The descriptor/buffer for this send is reclaimed on a later
+///    call; back-pressure (a brief bounded spin) is applied only when every TX
+///    slot is still in flight.
 pub fn send_packet(data: &[u8]) {
     if !VIRTIO_NET_AVAILABLE.load(Ordering::Acquire) { return; }
     if data.is_empty() || data.len() > (RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE) { return; }
@@ -440,10 +451,61 @@ pub fn send_packet(data: &[u8]) {
     let io_base    = dev.io_base;
     let qs         = dev.txq_size;
     let txq_base   = phys_to_virt::<u8>(dev.txq_phys);
+    let tx_slots   = core::cmp::min(qs / 2, NUM_TX_SLOTS as u16) as usize;
 
-    // Pick the next TX slot (wraps at NUM_TX_SLOTS).
+    // ── Deferred TX reclaim + back-pressure ──────────────────────────────────
+    // Previously this function spun on the used ring (~5M iterations) after
+    // every kick, holding the device mutex the whole time — serialising the
+    // whole TX path on device completion latency.  Instead, reclaim lazily:
+    // read the used-ring index (= count of completed chains) and treat any TX
+    // slot whose chain has completed as free.  Only when *all* tx_slots are
+    // still outstanding must we wait — and then only briefly, bounded — before
+    // reusing a slot whose buffer the device may still be reading.
+    //
+    // SAFETY: the used/avail ring live in PMM memory we own; the device only
+    // writes the used ring and reads the avail ring/descriptors.
+    unsafe {
+        let used_idx_ptr  = txq_base.add(used_ring_offset(qs)).add(2) as *const u16;
+        let avail_idx_ptr = txq_base.add(avail_ring_offset(qs)).add(2) as *const u16;
+
+        // Reclaim everything the device has completed so far: the used-ring
+        // index *is* the count of completed chains, so no per-slot bookkeeping
+        // is needed — a slot is free once `posted - used >= tx_slots` no longer
+        // holds for it.
+        let used_now = used_idx_ptr.read_volatile();
+
+        // Outstanding = posted (avail idx) − completed (used idx).
+        let posted = avail_idx_ptr.read_volatile();
+        let mut outstanding = posted.wrapping_sub(used_now) as usize;
+
+        if outstanding >= tx_slots {
+            // Queue full: wait (bounded) for at least one completion so the
+            // slot we are about to reuse is no longer device-owned.
+            let mut timeout = 5_000_000u32;
+            loop {
+                let used_cur = used_idx_ptr.read_volatile();
+                outstanding = posted.wrapping_sub(used_cur) as usize;
+                if outstanding < tx_slots {
+                    break;
+                }
+                timeout = match timeout.checked_sub(1) {
+                    Some(v) => v,
+                    None => {
+                        crate::serial_println!(
+                            "[VIRTIO-NET] TX queue full — dropping frame (device not draining)"
+                        );
+                        return;
+                    }
+                };
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    // Pick the next TX slot (wraps at tx_slots).  The back-pressure check above
+    // guarantees this slot's previous chain has completed, so reusing its
+    // descriptors/buffer cannot race the device.
     let slot = dev.tx_slot as usize;
-    let tx_slots = core::cmp::min(qs / 2, NUM_TX_SLOTS as u16) as usize;
     dev.tx_slot = ((slot + 1) % tx_slots) as u16;
 
     // Each slot occupies RX_BUF_SIZE bytes: first VIRTIO_NET_HDR_SIZE bytes
@@ -507,26 +569,11 @@ pub fn send_packet(data: &[u8]) {
         // Kick the device: writing queue 1 to QUEUE_NOTIFY triggers TX.
         hal::outw(io_base + VIRTIO_REG_QUEUE_NOTIFY, QUEUE_TX);
 
-        // Spin-poll the used ring until the device marks completion.
-        // The used ring layout: flags(u16), idx(u16), ring[qs]({id,len} each 8 bytes).
-        let used_base = txq_base.add(used_ring_offset(qs));
-        let used_idx_ptr = used_base.add(2) as *const u16;
-        let expected = dev.txq_last_used.wrapping_add(1);
-
-        let mut timeout = 5_000_000u32;
-        loop {
-            let current = used_idx_ptr.read_volatile();
-            if current == expected { break; }
-            timeout = match timeout.checked_sub(1) {
-                Some(v) => v,
-                None => {
-                    crate::serial_println!("[VIRTIO-NET] TX timeout waiting for used ring");
-                    break;
-                }
-            };
-            core::hint::spin_loop();
-        }
-        dev.txq_last_used = expected;
+        // Return immediately — completion is reclaimed lazily on a later
+        // send_packet() call (see the deferred-reclaim block above).  The TX
+        // buffer for this slot is not reused until tx_slots further sends have
+        // occurred, by which point the back-pressure guard has confirmed the
+        // device finished reading it.
     }
 }
 
@@ -546,62 +593,89 @@ pub fn send_packet(data: &[u8]) {
 pub fn poll_rx() {
     if !VIRTIO_NET_AVAILABLE.load(Ordering::Acquire) { return; }
 
-    // Process one completed RX descriptor per call.  If the caller wants to
-    // drain the queue it should call poll_rx() in a loop.
-    let mut frame_buf = [0u8; RX_BUF_SIZE];
-    let mut frame_len = 0usize;
-    let mut desc_id_to_repost: Option<u16> = None;
-
-    {
-        let mut guard = VIRTIO_NET.lock();
-        let dev = match guard.as_mut() {
-            Some(d) => d,
+    // Drain the RX used ring: process *every* completed descriptor, not just
+    // one per call.  Processing a single descriptor per poll meant that under
+    // a receive burst the device-side ring filled faster than we consumed it
+    // and frames were dropped.  Per iteration we copy the frame out while
+    // holding the device lock, re-post the descriptor, release the lock, and
+    // deliver lock-free (the stack may re-enter send_packet, which also takes
+    // VIRTIO_NET — so we must not hold it across handle_rx_packet).
+    //
+    // The loop is bounded by the RX queue size: at most that many descriptors
+    // can be outstanding, so a misbehaving device cannot wedge us in an
+    // unbounded loop.  Any frames that arrive after the bound are picked up by
+    // the next poll_rx() call.
+    let max_iters = {
+        let guard = VIRTIO_NET.lock();
+        match guard.as_ref() {
+            Some(d) => d.rxq_size as u32,
             None => return,
-        };
-
-        let io_base = dev.io_base;
-        let qs      = dev.rxq_size;
-
-        // SAFETY: All accesses below are to PMM-allocated memory we own.
-        // The device owns only descriptors in the available ring; used-ring
-        // entries are returned to us.
-        unsafe {
-            let rxq_virt  = phys_to_virt::<u8>(dev.rxq_phys);
-            let used_base = rxq_virt.add(used_ring_offset(qs));
-            let used_idx  = (used_base.add(2) as *const u16).read_volatile();
-
-            if used_idx == dev.rxq_last_used {
-                return; // nothing received
-            }
-
-            // Read the used-ring entry for our current position.
-            let entry_off   = 4 + ((dev.rxq_last_used % qs) as usize) * 8;
-            let desc_id     = (used_base.add(entry_off)     as *const u32).read_volatile() as usize;
-            let total_len   = (used_base.add(entry_off + 4) as *const u32).read_volatile() as usize;
-
-            dev.rxq_last_used = dev.rxq_last_used.wrapping_add(1);
-
-            if total_len > VIRTIO_NET_HDR_SIZE && desc_id < qs as usize {
-                let flen    = total_len - VIRTIO_NET_HDR_SIZE;
-                let buf_phys = dev.rx_bufs_phys + (desc_id * RX_BUF_SIZE) as u64;
-                let src     = phys_to_virt::<u8>(buf_phys + VIRTIO_NET_HDR_SIZE as u64);
-                let copy_len = core::cmp::min(flen, RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE);
-                core::ptr::copy_nonoverlapping(src, frame_buf.as_mut_ptr(), copy_len);
-                frame_len = copy_len;
-            }
-
-            // Re-post the descriptor regardless of frame validity so the
-            // device never runs out of RX buffers.
-            let rxq_virt_repost = phys_to_virt::<u8>(dev.rxq_phys);
-            re_post_rx_desc(rxq_virt_repost, qs, dev, desc_id as u16, io_base);
-            desc_id_to_repost = Some(desc_id as u16);
         }
-    } // mutex released here
+    };
 
-    // Now call up into the stack with no locks held.
-    let _ = desc_id_to_repost; // already re-posted inside the lock
-    if frame_len > 0 {
-        super::handle_rx_packet(&frame_buf[..frame_len]);
+    for _ in 0..max_iters {
+        let mut frame_buf = [0u8; RX_BUF_SIZE];
+        let mut frame_len = 0usize;
+        let mut malformed = false;
+
+        {
+            let mut guard = VIRTIO_NET.lock();
+            let dev = match guard.as_mut() {
+                Some(d) => d,
+                None => return,
+            };
+
+            let io_base = dev.io_base;
+            let qs      = dev.rxq_size;
+
+            // SAFETY: All accesses below are to PMM-allocated memory we own.
+            // The device owns only descriptors in the available ring; used-ring
+            // entries are returned to us.
+            unsafe {
+                let rxq_virt  = phys_to_virt::<u8>(dev.rxq_phys);
+                let used_base = rxq_virt.add(used_ring_offset(qs));
+                let used_idx  = (used_base.add(2) as *const u16).read_volatile();
+
+                if used_idx == dev.rxq_last_used {
+                    return; // ring fully drained
+                }
+
+                // Read the used-ring entry for our current position.
+                let entry_off   = 4 + ((dev.rxq_last_used % qs) as usize) * 8;
+                let desc_id     = (used_base.add(entry_off)     as *const u32).read_volatile() as usize;
+                let total_len   = (used_base.add(entry_off + 4) as *const u32).read_volatile() as usize;
+
+                dev.rxq_last_used = dev.rxq_last_used.wrapping_add(1);
+
+                if total_len > VIRTIO_NET_HDR_SIZE && desc_id < qs as usize {
+                    let flen    = total_len - VIRTIO_NET_HDR_SIZE;
+                    let buf_phys = dev.rx_bufs_phys + (desc_id * RX_BUF_SIZE) as u64;
+                    let src     = phys_to_virt::<u8>(buf_phys + VIRTIO_NET_HDR_SIZE as u64);
+                    let copy_len = core::cmp::min(flen, RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE);
+                    core::ptr::copy_nonoverlapping(src, frame_buf.as_mut_ptr(), copy_len);
+                    frame_len = copy_len;
+                } else {
+                    // Malformed used entry (runt or out-of-range desc id): the
+                    // descriptor is still re-posted below so the device never
+                    // starves for RX buffers; just record the loss.
+                    malformed = true;
+                }
+
+                // Re-post the descriptor regardless of frame validity so the
+                // device never runs out of RX buffers.
+                let rxq_virt_repost = phys_to_virt::<u8>(dev.rxq_phys);
+                re_post_rx_desc(rxq_virt_repost, qs, dev, desc_id as u16, io_base);
+            }
+        } // mutex released here
+
+        if malformed {
+            RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Now call up into the stack with no locks held.
+        if frame_len > 0 {
+            super::handle_rx_packet(&frame_buf[..frame_len]);
+        }
     }
 }
 
