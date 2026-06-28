@@ -151,7 +151,14 @@ def _cpu_args(mode: str, kvm: bool, cpu_override: Optional[str] = None) -> list[
 
 
 def _memory_args(mode: str) -> list[str]:
-    mib = _MEM_MIB.get(mode, 1024)
+    # ASTRYX_MEM_MIB env override (mirrors ASTRYX_SMP) — lets an operator size
+    # guest RAM independent of the per-mode default for memory-pressure A/B
+    # testing without editing the per-mode table.
+    env_mib = os.environ.get("ASTRYX_MEM_MIB")
+    if env_mib:
+        mib = int(env_mib)
+    else:
+        mib = _MEM_MIB.get(mode, 1024)
     # Use M suffix so QEMU shows the value in MiB in its own logs
     return ["-m", f"{mib}M"]
 
