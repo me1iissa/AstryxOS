@@ -68,9 +68,18 @@ from typing import Optional
 # ── Canonical constants ──────────────────────────────────────────────────────
 
 #: Memory in MiB keyed by mode.
+#:
+#: ``gui-test`` (the windowed ``--ff-gui`` path) runs a full upstream Firefox
+#: against real web content. A heavy page (e.g. a Wikipedia article: ~7
+#: processes, libxul + per-process copy-on-write working set + page cache)
+#: needs well over 1 GiB of usable guest RAM; at 1 GiB it exhausts the page
+#: allocator mid-load and the content/parent process is torn down before the
+#: page composites. 3072 MiB gives comfortable headroom (windowed-Firefox
+#: Wikipedia content was verified to render to pixels at 2048 MiB with zero
+#: out-of-memory events; 3072 keeps margin for heavier pages).
 _MEM_MIB = {
     "test":         1024,
-    "gui-test":     1024,
+    "gui-test":     3072,
     "firefox-test": 2048,
 }
 
@@ -151,7 +160,14 @@ def _cpu_args(mode: str, kvm: bool, cpu_override: Optional[str] = None) -> list[
 
 
 def _memory_args(mode: str) -> list[str]:
-    mib = _MEM_MIB.get(mode, 1024)
+    # ASTRYX_MEM_MIB env override (mirrors ASTRYX_SMP) — lets an operator size
+    # guest RAM independent of the per-mode default for memory-pressure A/B
+    # testing without editing the per-mode table.
+    env_mib = os.environ.get("ASTRYX_MEM_MIB")
+    if env_mib:
+        mib = int(env_mib)
+    else:
+        mib = _MEM_MIB.get(mode, 1024)
     # Use M suffix so QEMU shows the value in MiB in its own logs
     return ["-m", f"{mib}M"]
 
