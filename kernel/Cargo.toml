@@ -342,6 +342,12 @@ w215-diag = ["firefox-test"]
 # firehose; the shared DR0-DR3 + handle_db_exception plumbing is compiled
 # in via the widened module gate any(w215-diag, 582-diag).
 582-diag = ["firefox-test-core"]
+# #655 diagnostic: the PER_CPU_EXEC_FRAME alias-discriminating probe + the
+# double-dispatch detector (`sched::alias_probe`).  DIAGNOSTIC ONLY — verify
+# branch only; never enabled in production.  Pulls in `firefox-test-core` for
+# the free-shadow lookup (`mm::w215_diag::free_shadow_lookup`).  Off-feature the
+# probe module is absent and every call site compiles to nothing.
+kstack-pte-scan = ["firefox-test-core"]
 # W133: opt-out for cross-CPU TLB shootdown.  Default builds run the full
 # shootdown protocol (IPI vector 0xF0, per-CPU active-CR3 mask).  Enable
 # this feature only for bisect/baseline runs where you want to compare
