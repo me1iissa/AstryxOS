@@ -244,6 +244,25 @@ pub fn init() {
                 GDT_INSTANCE.tss_aps[ap] = make_tss_descriptor(&raw const TSS_APS[ap]);
             }
 
+            // ── #655 probe: register the static / IST / interrupt stack
+            //    spans the THREAD_TABLE-based alloc guard cannot see, so a
+            //    Candidate-A hit can name which invisible span the alias
+            //    landed on (DIAGNOSTIC; off-feature compiles away). ─────────
+            #[cfg(feature = "kstack-pte-scan")]
+            {
+                const STK: u64 = 16384;
+                crate::sched::alias_probe::register_static_stack(
+                    fix((&raw const INTERRUPT_STACK) as *const u8 as u64), STK, 1);
+                crate::sched::alias_probe::register_static_stack(
+                    fix((&raw const DOUBLE_FAULT_STACK) as *const u8 as u64), STK, 2);
+                for ap in 0..MAX_AP {
+                    crate::sched::alias_probe::register_static_stack(
+                        fix((&raw const AP_INTERRUPT_STACKS[ap]) as *const u8 as u64), STK, 3);
+                    crate::sched::alias_probe::register_static_stack(
+                        fix((&raw const AP_DOUBLE_FAULT_STACKS[ap]) as *const u8 as u64), STK, 4);
+                }
+            }
+
             // ── BSP TSS descriptor ────────────────────────────────────
             GDT_INSTANCE.tss_bsp = make_tss_descriptor(&raw const TSS_BSP);
 
@@ -344,6 +363,10 @@ pub unsafe fn update_tss_rsp0(stack_top: u64) {
             TSS_APS[ap_idx].rsp[0] = stack_top;
         }
     }
+    // #655 probe: publish this CPU's TSS.rsp0 frame for the Candidate-B
+    // (stale-rsp0) discriminator (DIAGNOSTIC; off-feature compiles away).
+    #[cfg(feature = "kstack-pte-scan")]
+    crate::sched::alias_probe::note_rsp0(stack_top);
 }
 
 /// Read the current CPU's TSS.rsp[0] value (for diagnostics).

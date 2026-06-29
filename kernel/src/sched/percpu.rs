@@ -874,6 +874,14 @@ fn desired_slot(t: &proc::Thread) -> MirrorSlot {
 /// (THREAD_TABLE held; the RQS locks are leaves taken in ascending CPU order
 /// inside this function).
 pub fn mirror_maintain(threads: &mut [proc::Thread]) {
+    // #655 alias-discriminating probe (DIAGNOSTIC; off-feature compiles away).
+    // Runs at entry — before any runqueue lock is taken — and only reads
+    // lock-free per-CPU atomics, so it adds no lock-order edge.  Discriminates
+    // a physical kstack alias (Candidate A) from a stale TSS.rsp0 foreign frame
+    // (Candidate B); see `super::alias_probe`.
+    #[cfg(feature = "kstack-pte-scan")]
+    super::alias_probe::alias_scan();
+
     let pass = MAINTAIN_PASSES.fetch_add(1, Ordering::Relaxed);
     let audit_due = pass % (AUDIT_EVERY_PASSES as u32) == 0;
 

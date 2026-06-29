@@ -897,6 +897,9 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
             #[cfg(feature = "test-mode")]
             crate::serial_println!("[KSTACK/ALLOC] cache hit base={:#x}", cached_base);
             write_stack_canary(cached_base);
+            // #655 DD-probe genesis ring (DIAGNOSTIC; zero-cost off-feature).
+            #[cfg(feature = "kstack-pte-scan")]
+            crate::sched::alias_probe::record_kstack_genesis(cached_base, cached_size, "cache");
             return Some((cached_base, cached_base + cached_size));
         }
         #[cfg(feature = "test-mode")]
@@ -913,6 +916,9 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
                 continue;
             }
             write_stack_canary(stack_base);
+            // #655 DD-probe genesis ring (DIAGNOSTIC; zero-cost off-feature).
+            #[cfg(feature = "kstack-pte-scan")]
+            crate::sched::alias_probe::record_kstack_genesis(stack_base, KERNEL_STACK_SIZE, "pmm");
             return Some((stack_base, stack_top));
         }
         // Both the cache and the contiguous-256K PMM path produced nothing
@@ -997,6 +1003,9 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
                 stack_base,
             );
         }
+        // #655 DD-probe genesis ring (DIAGNOSTIC; zero-cost off-feature).
+        #[cfg(feature = "kstack-pte-scan")]
+        crate::sched::alias_probe::record_kstack_genesis(stack_base, span_bytes, "emergency");
         return Some((stack_base, stack_top));
     }
     None

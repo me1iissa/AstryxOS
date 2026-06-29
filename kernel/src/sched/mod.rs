@@ -18,6 +18,11 @@ use crate::arch::x86_64::apic::MAX_CPUS;
 /// decision.  See [`percpu`] for the design and the phased plan.
 pub mod percpu;
 
+/// #655 alias-discriminating probe (DIAGNOSTIC ONLY, gated on `kstack-pte-scan`).
+/// Off-feature the module is absent and every call site compiles to nothing.
+#[cfg(feature = "kstack-pte-scan")]
+pub mod alias_probe;
+
 /// Whether the scheduler is active.
 static SCHEDULER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -100,6 +105,10 @@ pub fn note_switch_completed() {
     // live kernel stack could be recycled into a new thread (a two-CPU-one-stack
     // kstack double-use crash class).  See `proc::PER_CPU_ONSTACK_TID`.
     crate::proc::set_onstack_tid(crate::proc::current_tid());
+    // #655 probe: now running on the incoming thread's kernel stack — publish
+    // this CPU's OwnStack physical span (DIAGNOSTIC; off-feature compiles away).
+    #[cfg(feature = "kstack-pte-scan")]
+    alias_probe::note_own_stack_for_current();
 }
 
 /// Read the current switch generation for `cpu` (Acquire).  Used both to
