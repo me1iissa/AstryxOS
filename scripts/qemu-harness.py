@@ -4001,7 +4001,12 @@ def cmd_start(args):
     # via astryx_qemu._display_args) so the kernel framebuffer compositor
     # has somewhere to write and QMP can pull the image.  Idempotent guard
     # so an explicit caller-supplied `-vga` is not duplicated.
-    if ("xeyes-test" in feats or ff_gui) and not any(a == "-vga" for a in extra_qemu_args):
+    # ASTRYX_VNC already makes astryx_qemu._display_args emit `-vga vmware`
+    # (plus `-vnc`) in the base argv, so skip the injection in that case to
+    # avoid a duplicate `-vga` (QEMU rejects two VGA cards).
+    if ("xeyes-test" in feats or ff_gui) \
+            and not any(a == "-vga" for a in extra_qemu_args) \
+            and not os.environ.get("ASTRYX_VNC"):
         # The windowed (--ff-gui) Firefox path drives the in-kernel Xastryx
         # server, whose compositor blits into the VMware SVGA II framebuffer
         # (kernel/src/gui/compositor.rs).  Without a VGA card QEMU comes up
@@ -12626,6 +12631,78 @@ def cmd_screendump(args):
             pass
 
 
+def cmd_input(args):
+    """
+    Inject a pointer event via QMP `input-send-event` (QEMU QMP spec).
+
+    This drives the guest's *absolute* pointing device — a `virtio-tablet-pci`
+    when one is attached (see astryx_qemu._input_args).  Absolute axis values
+    use QEMU's normalized 0..32767 range (INPUT_EVENT_ABS_MAX = 0x7fff), so
+    `--frac` maps a 0.0..1.0 screen fraction onto it; `--abs-x/--abs-y` pass a
+    raw device value.
+
+    Examples:
+      input <sid> --frac 0.5 0.5                 # centre the pointer
+      input <sid> --abs-x 16384 --abs-y 8192     # raw device coords
+      input <sid> --frac 0.3 0.4 --click left    # move then left-click
+    """
+    sess = _load_session(args.sid)
+    qmp_sock = sess["qmp_sock"]
+    ABS_MAX = 0x7FFF
+
+    abs_x = None
+    abs_y = None
+    if args.frac is not None:
+        fx, fy = args.frac
+        abs_x = max(0, min(ABS_MAX, int(round(fx * ABS_MAX))))
+        abs_y = max(0, min(ABS_MAX, int(round(fy * ABS_MAX))))
+    if args.abs_x is not None:
+        abs_x = args.abs_x
+    if args.abs_y is not None:
+        abs_y = args.abs_y
+
+    move_events = []
+    if abs_x is not None:
+        move_events.append({"type": "abs", "data": {"axis": "x", "value": abs_x}})
+    if abs_y is not None:
+        move_events.append({"type": "abs", "data": {"axis": "y", "value": abs_y}})
+
+    responses = []
+    if move_events:
+        responses.append(
+            _qmp_command(qmp_sock, "input-send-event", {"events": move_events})
+        )
+
+    if args.click:
+        btn = args.click
+        # A click = press then release, each its own atomic event batch.
+        responses.append(_qmp_command(
+            qmp_sock, "input-send-event",
+            {"events": [{"type": "btn", "data": {"button": btn, "down": True}}]},
+        ))
+        responses.append(_qmp_command(
+            qmp_sock, "input-send-event",
+            {"events": [{"type": "btn", "data": {"button": btn, "down": False}}]},
+        ))
+    elif args.button and args.down is not None:
+        responses.append(_qmp_command(
+            qmp_sock, "input-send-event",
+            {"events": [{"type": "btn",
+                         "data": {"button": args.button, "down": args.down}}]},
+        ))
+
+    errors = [r for r in responses if "error" in r]
+    _out({
+        "ok": not errors,
+        "abs_x": abs_x,
+        "abs_y": abs_y,
+        "click": args.click,
+        "responses": responses,
+    })
+    if errors:
+        sys.exit(1)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -13783,6 +13860,30 @@ def main():
     p_screendump.add_argument("sid")
     p_screendump.add_argument("dst", help="Host-side destination path for the PNG")
 
+    # input — inject an absolute pointer move / click via QMP input-send-event
+    p_input = sub.add_parser(
+        "input",
+        help="Inject a pointer move/click via QMP input-send-event (drives the "
+             "virtio-tablet absolute pointer). Example: input <sid> --frac "
+             "0.5 0.5 --click left",
+    )
+    p_input.add_argument("sid")
+    p_input.add_argument("--frac", nargs=2, type=float, metavar=("FX", "FY"),
+                         help="Screen-fraction (0..1) coordinates, mapped onto "
+                              "QEMU's 0..32767 absolute axis range.")
+    p_input.add_argument("--abs-x", type=int, dest="abs_x",
+                         help="Raw absolute X (0..32767), overrides --frac.")
+    p_input.add_argument("--abs-y", type=int, dest="abs_y",
+                         help="Raw absolute Y (0..32767), overrides --frac.")
+    p_input.add_argument("--click", choices=["left", "right", "middle"],
+                         help="Press+release the named button after moving.")
+    p_input.add_argument("--button", choices=["left", "right", "middle"],
+                         help="Button for a single press/release (with --down).")
+    p_input.add_argument("--down", dest="down", action="store_true", default=None,
+                         help="With --button: press (default release).")
+    p_input.add_argument("--up", dest="down", action="store_false",
+                         help="With --button: release.")
+
     # ci-run: one-shot build+boot+test+report for CI.  Replaces the banned
     # watch-test.py wrapper.  All filtering (--allow-fail) is applied here
     # rather than at the CI YAML level, keeping the logic in one place.
@@ -14018,6 +14119,7 @@ def main():
         "read-ff-png": cmd_read_ff_png,
         "kdb-read-png": cmd_kdb_read_png,
         "screendump": cmd_screendump,
+        "input":      cmd_input,
         # Shared session context
         "context": cmd_context,
         # Linux reference strace (ABI conformance)
