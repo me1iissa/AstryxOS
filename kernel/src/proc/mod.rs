@@ -658,36 +658,37 @@ pub fn kstack_candidate_aliases_live(
         if t.kernel_stack_base == 0 || t.kernel_stack_size == 0 {
             continue;
         }
-        // #655 defence-in-depth: a Dead thread's stack is a hazard if (and only
-        // if) the thread is STILL physically on it on some CPU.  The previous
-        // rule excluded ALL Dead threads on the assumption that "Dead ⇒ off its
-        // stack ⇒ the reaper will reclaim it safely".  That assumption has a
-        // window: a thread marked Dead out-of-band (a sibling's `exit_group`)
-        // keeps running on its kernel stack until it reaches its next context
-        // switch, and a thread in the publish→switch window (current TID already
-        // re-published as the successor, `ctx_rsp_valid` already set, RSP not yet
-        // moved off) is likewise still on its stack.  Excluding such a thread let
-        // a candidate frame that overlaps its LIVE stack be handed out — the
-        // #655 two-CPU-one-stack double-use.  Consult the post-switch
-        // `is_tid_on_stack_any_cpu` so a Dead-but-still-on-stack thread is
-        // treated as the live hazard it is; only a Dead thread provably off every
-        // CPU's stack is skipped.
-        if t.state == ThreadState::Dead && !is_tid_on_stack_any_cpu(t.tid) {
+        // Defence-in-depth: a Dead thread's stack is a hazard while ANY CPU is
+        // still executing on (or about to execute on) it.  The original rule
+        // excluded ALL Dead threads on the assumption "Dead ⇒ off its stack ⇒
+        // the reaper reclaims it safely".  That has two windows: a thread marked
+        // Dead out-of-band (a sibling's `exit_group`) keeps running on its kernel
+        // stack until its next context switch (still current AND on-stack); a
+        // thread in the switch-OUT window is no longer current but still on its
+        // stack (`PER_CPU_ONSTACK_TID` still names it); a thread in the switch-IN
+        // window is already re-published as current but its successor has not yet
+        // published it on-stack.  Mirror the reaper's UNION gate: only skip a Dead
+        // thread that is NEITHER current NOR on-stack on any CPU — otherwise treat
+        // its frame as the live hazard it is.
+        if t.state == ThreadState::Dead
+            && !is_tid_on_stack_any_cpu(t.tid)
+            && !is_tid_current_on_any_cpu(t.tid)
+        {
             continue;
         }
         let kbase = t.kernel_stack_base;
         let kend = kbase.wrapping_add(t.kernel_stack_size);
         // Half-open overlap test: [cand_base, cand_end) ∩ [kbase, kend) ≠ ∅.
         if cand_base < kend && kbase < cand_end {
-            // Count a catch that the pre-#655 rule would have MISSED (the
-            // aliased owner is Dead but still on a CPU's stack) so verification
-            // can prove the defence layer actually fired against the race.
+            // Count a catch that the original "skip all Dead" rule would have
+            // MISSED (the aliased owner is Dead but still on/headed-to a CPU's
+            // stack) so verification can confirm the defence layer fired.
             if t.state == ThreadState::Dead {
-                let n = KSTACK655_ALLOC_GUARD_CATCHES
+                let n = KSTACK_ALLOC_GUARD_CATCHES
                     .fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 16 || n % 256 == 0 {
                     crate::serial_println!(
-                        "[655/FIX] alloc-guard rejected Dead-but-on-stack frame \
+                        "[KSTACK/RECLAIM] alloc-guard rejected Dead-but-live frame \
                          cand=[{:#x},{:#x}) owner_tid={} owner_kstack=[{:#x},{:#x}) \
                          total_catches={}",
                         cand_base, cand_end, t.tid, kbase, kend, n,
@@ -700,16 +701,16 @@ pub fn kstack_candidate_aliases_live(
     None
 }
 
-/// #655 verification counter: number of times the alloc-side alias guard
-/// rejected a candidate frame whose aliased owner was Dead but still physically
-/// on a CPU's kernel stack — i.e. a double-use the pre-#655 "skip all Dead"
-/// rule would have allowed.  A non-zero value proves the defence-in-depth layer
-/// caught the race.  Read via [`kstack655_alloc_guard_catches`].
-static KSTACK655_ALLOC_GUARD_CATCHES: AtomicU64 = AtomicU64::new(0);
+/// Observability counter: number of times the alloc-side alias guard rejected a
+/// candidate frame whose aliased owner was Dead but still on (or headed to) a
+/// CPU's kernel stack — a reuse the original "skip all Dead" rule would have
+/// allowed.  A non-zero value confirms the defence-in-depth layer fired.  Read
+/// via [`kstack_alloc_guard_catches`].
+static KSTACK_ALLOC_GUARD_CATCHES: AtomicU64 = AtomicU64::new(0);
 
-/// Read the #655 alloc-guard catch counter (see [`KSTACK655_ALLOC_GUARD_CATCHES`]).
-pub fn kstack655_alloc_guard_catches() -> u64 {
-    KSTACK655_ALLOC_GUARD_CATCHES.load(Ordering::Relaxed)
+/// Read the alloc-guard catch counter (see [`KSTACK_ALLOC_GUARD_CATCHES`]).
+pub fn kstack_alloc_guard_catches() -> u64 {
+    KSTACK_ALLOC_GUARD_CATCHES.load(Ordering::Relaxed)
 }
 
 /// Test-only: the pure overlap core of [`kstack_candidate_aliases_live`], run
@@ -764,7 +765,7 @@ static PER_CPU_CURRENT_PID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
 
 /// TID **physically executing on each CPU's kernel stack** — the "on-CPU"
-/// lifecycle bit (#655).
+/// lifecycle bit (switch-OUT-window half of the stack-reclaim gate).
 ///
 /// This is deliberately DISTINCT from [`PER_CPU_CURRENT_TID`].  The scheduler
 /// publishes `PER_CPU_CURRENT_TID = next` *before* `switch_context_asm` runs
@@ -774,12 +775,12 @@ static PER_CPU_CURRENT_PID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
 /// window in which the OUTGOING thread is (a) no longer the published
 /// `PER_CPU_CURRENT_TID` and (b) flagged `ctx_rsp_valid`, yet is still
 /// physically executing on its kernel stack.  If that thread was marked Dead
-/// out-of-band (e.g. a sibling's `exit_group`), the cross-CPU reaper's
-/// `Dead && !current_on_any_cpu && ctx_rsp_valid` gate would consider it
-/// reapable and recycle its still-live stack into the dead-stack cache — handed
-/// to a NEW thread while the OLD owner is still on it.  Two different-CR3
-/// threads then run on one physical stack and cross-corrupt each other's saved
-/// frames (#655 two-CPU-one-stack).
+/// out-of-band (e.g. a sibling's `exit_group`), a reaper gate that consulted
+/// only `!current_on_any_cpu && ctx_rsp_valid` would consider it reapable and
+/// recycle its still-live stack into the dead-stack cache — handed to a NEW
+/// thread while the OLD owner is still on it.  Two threads then run on one
+/// physical stack and cross-corrupt each other's saved frames (a
+/// two-CPU-one-stack kstack double-use crash class).
 ///
 /// `PER_CPU_ONSTACK_TID[cpu]` instead lags the switch: it is updated to the
 /// incoming thread ONLY by the successor, AFTER `switch_context_asm` has flipped
@@ -1381,15 +1382,17 @@ pub fn set_onstack_tid(tid: Tid) {
 /// Returns `true` if `tid` is the thread **physically executing on the kernel
 /// stack of any logical processor** — including a CPU other than the caller's.
 ///
-/// This is the #655 strengthening of [`is_tid_current_on_any_cpu`].  Where the
-/// latter surveys `PER_CPU_CURRENT_TID` (published *before* the context switch,
-/// so it can already name the incoming thread while the outgoing thread is still
-/// on its stack), this surveys [`PER_CPU_ONSTACK_TID`] (published *after* the
-/// switch, by the successor).  A `false` result therefore means no CPU was
-/// executing on `tid`'s kernel stack at a point no earlier than this call — the
-/// precise condition under which `tid`'s kernel stack may be recycled.  It is
-/// the kernel analogue of the `task_on_cpu()` predicate other SMP kernels gate
-/// teardown on.
+/// This is the switch-OUT-window companion to [`is_tid_current_on_any_cpu`].
+/// The latter surveys `PER_CPU_CURRENT_TID` (published *before* the context
+/// switch, so it can already name the incoming thread while the outgoing thread
+/// is still on its stack); this surveys [`PER_CPU_ONSTACK_TID`] (published
+/// *after* the switch, by the successor).  Stack reclaim must gate on BOTH (their
+/// union): a `false` here means no CPU is executing on `tid`'s stack, but a
+/// thread freshly published current and not yet on-stack is covered by the other
+/// predicate.  Together they realise a "no CPU is executing on (or about to
+/// execute on) this thread" condition — the POSIX clone(2) lifecycle contract
+/// that a thread's execution-state resources not be reclaimed while any CPU
+/// still references them.
 ///
 /// `tid == 0` is the per-CPU idle/bootstrap sentinel and never a reapable user
 /// thread, so a zero query short-circuits to `false`.

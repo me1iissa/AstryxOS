@@ -50878,32 +50878,28 @@ ineligible (Running/Blocked/mid-publish/pinned/idle-class) skipped / same-CPU no
     true
 }
 
-// ── Test 671: kstack on-stack survey gate (#655 two-CPU-one-stack) ────────────
+// ── Test 671: kstack on-stack survey gate + union-gate property ───────────────
 //
-// Regression for the SMP>1 kernel-stack double-use bugcheck (KERNEL_PAGE_FAULT
-// 0xdead0006 / KERNEL_GPF 0xdead0007).  A live capture showed two different-CR3
-// threads concurrently executing on ONE physical kstack page, cross-corrupting
-// each other's saved frames.  Root: the scheduler publishes `PER_CPU_CURRENT_TID
-// = next` BEFORE `switch_context_asm`, and `switch_context_asm` sets the outgoing
-// thread's `ctx_rsp_valid = 1` BEFORE the `mov rsp` that leaves the old stack —
-// so a Dead thread can be "not current" and `ctx_rsp_valid` while still on its
-// stack.  The pre-#655 reaper gate (`!is_tid_current_on_any_cpu && ctx_rsp_valid`)
-// and the alloc-alias guard (which skipped ALL Dead threads) both miss this
-// window and recycle the live frame.
+// Hardening guard for the SMP>1 kernel-stack reuse-while-live bugcheck class
+// (KERNEL_PAGE_FAULT 0xdead0006 / KERNEL_GPF 0xdead0007), where a stack is
+// reclaimed while a CPU is still executing on it.  The scheduler's two publish
+// points straddle the stack switch: `PER_CPU_CURRENT_TID` is set to the incoming
+// thread BEFORE `switch_context_asm`, and `PER_CPU_ONSTACK_TID` is published by
+// the SUCCESSOR AFTER the stack flip (`note_switch_completed`).  Neither survey
+// alone is sufficient — one leaves the switch-OUT window open, the other the
+// switch-IN window — so stack reclaim must gate on their UNION (defer while a
+// thread is current OR on-stack on any CPU).
 //
-// The fix adds `PER_CPU_ONSTACK_TID`, published by the SUCCESSOR AFTER the stack
-// flip (`note_switch_completed`), and gates both the reaper and the alloc guard
-// on `is_tid_on_stack_any_cpu`.  This test pins that primitive — the load-bearing
-// signal of the fix — and proves it DIVERGES from `is_tid_current_on_any_cpu`
-// exactly in the publish→switch window the fix closes:
+// This test pins both primitives AND the union property:
 //   1. The calling thread IS on-stack on this CPU (the successor published it
 //      when this thread was switched in).
 //   2. A phantom TID no CPU ever ran → on-stack false.
 //   3. Sentinel TID 0 → on-stack false.
-//   4. DIVERGENCE: with the on-stack slot pointed elsewhere (simulating the
-//      window where the successor has not yet republished it) the calling thread
-//      is still `current` but no longer `on_stack` — so the reaper, gated on
-//      on-stack, would NOT reap it, while the old current-gate would have.
+//   4. DIVERGENCE + UNION: with the on-stack slot pointed elsewhere (simulating
+//      the switch-IN window) the calling thread is still `current` but no longer
+//      `on_stack`; the on-stack survey ALONE would deem it reclaimable, so the
+//      UNION (`current OR on_stack`) must still DEFER.  This is the property
+//      whose absence would reap a still-current thread's live stack.
 fn test_671_kstack_onstack_survey_gate() -> bool {
     const NAME: &str = "[SCHED/SMP] kstack on-stack survey gate (Test 671)";
     test_header!(NAME);
@@ -50932,32 +50928,47 @@ fn test_671_kstack_onstack_survey_gate() -> bool {
         return false;
     }
 
-    // (4) Divergence between `current` and `on_stack` — the exact window #655
-    //     closes.  Repoint this CPU's on-stack slot at a sentinel (simulating
-    //     the publish→switch window before the successor republishes it), then
-    //     observe: still `current`, no longer `on_stack`.  NO yield between the
-    //     repoint and the restore, so the live scheduler never observes the
-    //     transient slot (and the reaper would not touch this non-Dead thread
-    //     regardless).  Restore by republishing my_tid, exactly as
+    // (4) Divergence + UNION-GATE property — the switch-IN window the union gate
+    //     must cover.  Repoint this CPU's on-stack slot at a sentinel (simulating
+    //     the window where a thread is published `current` but its successor has
+    //     not yet published it on-stack), then observe my_tid as still `current`
+    //     yet NOT `on_stack`.  Stack reclaim gates on the UNION of both surveys:
+    //     in this state the on-stack survey ALONE would (wrongly) judge my_tid
+    //     reclaimable, but the union must DEFER because `current` is still set.
+    //     This pins the exact property whose absence is a reap-a-live-stack bug.
+    //     NO yield between repoint and restore, so the live scheduler never
+    //     observes the transient slot (and the reaper would not touch this
+    //     non-Dead thread anyway).  Restore by republishing my_tid, exactly as
     //     `note_switch_completed` does on every resume.
     if my_tid != 0 {
         const SENTINEL: u64 = 0xFFFF_FFF0;
         crate::proc::set_onstack_tid(SENTINEL);
         let still_current = crate::proc::is_tid_current_on_any_cpu(my_tid);
-        let now_offstack = !crate::proc::is_tid_on_stack_any_cpu(my_tid);
+        let onstack_now = crate::proc::is_tid_on_stack_any_cpu(my_tid);
+        // The union gate's "must defer" predicate: current OR on-stack.
+        let union_defers = still_current || onstack_now;
         crate::proc::set_onstack_tid(my_tid); // restore the live invariant
-        if !still_current || !now_offstack {
+        if !still_current || onstack_now {
             test_fail!(NAME,
-                "on-stack/current did not diverge in the simulated publish→switch \
-                 window (still_current={} now_offstack={}) — gate would not close \
-                 the #655 race", still_current, now_offstack);
+                "surveys did not diverge in the simulated switch-IN window \
+                 (still_current={} onstack_now={}) — cannot exercise the union gate",
+                still_current, onstack_now);
+            return false;
+        }
+        // The load-bearing assertion: with on-stack false, the on-stack-only
+        // gate would have reclaimed a still-current thread; the UNION must defer.
+        if !union_defers {
+            test_fail!(NAME,
+                "UNION gate failed to defer a current-but-not-on-stack thread \
+                 (the switch-IN reap-a-live-stack hazard) — current={} on_stack={}",
+                still_current, onstack_now);
             return false;
         }
     }
 
     test_println!(
         "  on_stack(self)=true phantom_absent=true sentinel0_absent=true \
-         diverges_from_current=true",
+         diverges_from_current=true union_defers_switch_in=true",
     );
     test_pass!(NAME);
     true
