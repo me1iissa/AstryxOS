@@ -658,20 +658,58 @@ pub fn kstack_candidate_aliases_live(
         if t.kernel_stack_base == 0 || t.kernel_stack_size == 0 {
             continue;
         }
-        // Dead threads are excluded: their stack is no longer live (the reaper
-        // will reclaim it).  Any non-Dead thread's stack is live and must not
-        // be aliased.
-        if t.state == ThreadState::Dead {
+        // #655 defence-in-depth: a Dead thread's stack is a hazard if (and only
+        // if) the thread is STILL physically on it on some CPU.  The previous
+        // rule excluded ALL Dead threads on the assumption that "Dead ⇒ off its
+        // stack ⇒ the reaper will reclaim it safely".  That assumption has a
+        // window: a thread marked Dead out-of-band (a sibling's `exit_group`)
+        // keeps running on its kernel stack until it reaches its next context
+        // switch, and a thread in the publish→switch window (current TID already
+        // re-published as the successor, `ctx_rsp_valid` already set, RSP not yet
+        // moved off) is likewise still on its stack.  Excluding such a thread let
+        // a candidate frame that overlaps its LIVE stack be handed out — the
+        // #655 two-CPU-one-stack double-use.  Consult the post-switch
+        // `is_tid_on_stack_any_cpu` so a Dead-but-still-on-stack thread is
+        // treated as the live hazard it is; only a Dead thread provably off every
+        // CPU's stack is skipped.
+        if t.state == ThreadState::Dead && !is_tid_on_stack_any_cpu(t.tid) {
             continue;
         }
         let kbase = t.kernel_stack_base;
         let kend = kbase.wrapping_add(t.kernel_stack_size);
         // Half-open overlap test: [cand_base, cand_end) ∩ [kbase, kend) ≠ ∅.
         if cand_base < kend && kbase < cand_end {
+            // Count a catch that the pre-#655 rule would have MISSED (the
+            // aliased owner is Dead but still on a CPU's stack) so verification
+            // can prove the defence layer actually fired against the race.
+            if t.state == ThreadState::Dead {
+                let n = KSTACK655_ALLOC_GUARD_CATCHES
+                    .fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 16 || n % 256 == 0 {
+                    crate::serial_println!(
+                        "[655/FIX] alloc-guard rejected Dead-but-on-stack frame \
+                         cand=[{:#x},{:#x}) owner_tid={} owner_kstack=[{:#x},{:#x}) \
+                         total_catches={}",
+                        cand_base, cand_end, t.tid, kbase, kend, n,
+                    );
+                }
+            }
             return Some((t.tid, kbase, t.kernel_stack_size));
         }
     }
     None
+}
+
+/// #655 verification counter: number of times the alloc-side alias guard
+/// rejected a candidate frame whose aliased owner was Dead but still physically
+/// on a CPU's kernel stack — i.e. a double-use the pre-#655 "skip all Dead"
+/// rule would have allowed.  A non-zero value proves the defence-in-depth layer
+/// caught the race.  Read via [`kstack655_alloc_guard_catches`].
+static KSTACK655_ALLOC_GUARD_CATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Read the #655 alloc-guard catch counter (see [`KSTACK655_ALLOC_GUARD_CATCHES`]).
+pub fn kstack655_alloc_guard_catches() -> u64 {
+    KSTACK655_ALLOC_GUARD_CATCHES.load(Ordering::Relaxed)
 }
 
 /// Test-only: the pure overlap core of [`kstack_candidate_aliases_live`], run
@@ -723,6 +761,37 @@ static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
 /// a stale-but-self-consistent (tid, pid) pair — which is exactly the same
 /// invariant `recover_current_tid` already documents.
 static PER_CPU_CURRENT_PID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
+
+/// TID **physically executing on each CPU's kernel stack** — the "on-CPU"
+/// lifecycle bit (#655).
+///
+/// This is deliberately DISTINCT from [`PER_CPU_CURRENT_TID`].  The scheduler
+/// publishes `PER_CPU_CURRENT_TID = next` *before* `switch_context_asm` runs
+/// (so that when `next` resumes it reads itself back as current), and
+/// `switch_context_asm` sets the outgoing thread's `ctx_rsp_valid = 1` *before*
+/// the `mov rsp, rsi` that actually leaves the old stack.  There is therefore a
+/// window in which the OUTGOING thread is (a) no longer the published
+/// `PER_CPU_CURRENT_TID` and (b) flagged `ctx_rsp_valid`, yet is still
+/// physically executing on its kernel stack.  If that thread was marked Dead
+/// out-of-band (e.g. a sibling's `exit_group`), the cross-CPU reaper's
+/// `Dead && !current_on_any_cpu && ctx_rsp_valid` gate would consider it
+/// reapable and recycle its still-live stack into the dead-stack cache — handed
+/// to a NEW thread while the OLD owner is still on it.  Two different-CR3
+/// threads then run on one physical stack and cross-corrupt each other's saved
+/// frames (#655 two-CPU-one-stack).
+///
+/// `PER_CPU_ONSTACK_TID[cpu]` instead lags the switch: it is updated to the
+/// incoming thread ONLY by the successor, AFTER `switch_context_asm` has flipped
+/// the stack (see `sched::note_switch_completed`).  So it names the predecessor
+/// until the CPU is provably executing on a *different* stack — the precise
+/// "this task is off its kernel stack" signal.  This realises the POSIX
+/// clone(2) lifecycle requirement that a thread's execution-state resources not
+/// be reclaimed while any CPU still references them, and accounts for the fact
+/// that an interrupt can still land an exception frame on the old stack via
+/// TSS.RSP[0] until the stack pointer has actually moved (Intel SDM Vol. 3A
+/// §6.14).
+static PER_CPU_ONSTACK_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
 
 /// Kernel stack size per thread: 256 KiB (64 pages).
@@ -1289,6 +1358,49 @@ pub fn is_tid_current_on_any_cpu(tid: Tid) -> bool {
         .min(crate::arch::x86_64::apic::MAX_CPUS);
     for cpu in 0..ncpus {
         if PER_CPU_CURRENT_TID[cpu].load(Ordering::Acquire) == tid {
+            return true;
+        }
+    }
+    false
+}
+
+/// Publish the thread now executing on the calling CPU's kernel stack.
+///
+/// Called by [`crate::sched::note_switch_completed`] from the two
+/// post-`switch_context` resume points (resumed-kernel in `schedule()` and
+/// first-run in `user_mode_bootstrap`).  Because it runs AFTER the stack has
+/// flipped, the value it publishes (the now-current TID) is provably the thread
+/// the CPU is physically on; the predecessor it replaces is provably off its
+/// stack.  `Release` so a reaper on another CPU that observes the new value also
+/// observes the predecessor's final stack writes as retired.  See
+/// [`PER_CPU_ONSTACK_TID`].
+pub fn set_onstack_tid(tid: Tid) {
+    PER_CPU_ONSTACK_TID[cpu_index()].store(tid, Ordering::Release);
+}
+
+/// Returns `true` if `tid` is the thread **physically executing on the kernel
+/// stack of any logical processor** — including a CPU other than the caller's.
+///
+/// This is the #655 strengthening of [`is_tid_current_on_any_cpu`].  Where the
+/// latter surveys `PER_CPU_CURRENT_TID` (published *before* the context switch,
+/// so it can already name the incoming thread while the outgoing thread is still
+/// on its stack), this surveys [`PER_CPU_ONSTACK_TID`] (published *after* the
+/// switch, by the successor).  A `false` result therefore means no CPU was
+/// executing on `tid`'s kernel stack at a point no earlier than this call — the
+/// precise condition under which `tid`'s kernel stack may be recycled.  It is
+/// the kernel analogue of the `task_on_cpu()` predicate other SMP kernels gate
+/// teardown on.
+///
+/// `tid == 0` is the per-CPU idle/bootstrap sentinel and never a reapable user
+/// thread, so a zero query short-circuits to `false`.
+pub fn is_tid_on_stack_any_cpu(tid: Tid) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+        .min(crate::arch::x86_64::apic::MAX_CPUS);
+    for cpu in 0..ncpus {
+        if PER_CPU_ONSTACK_TID[cpu].load(Ordering::Acquire) == tid {
             return true;
         }
     }

@@ -91,6 +91,15 @@ pub fn note_switch_completed() {
         // observes all of this CPU's prior stack writes as retired.
         CPU_SWITCH_GEN[cpu].fetch_add(1, Ordering::Release);
     }
+    // #655: publish the thread now physically on this CPU's kernel stack.  This
+    // runs AFTER `switch_context_asm` has flipped the stack, so the now-current
+    // TID is provably the one executing here and the predecessor it replaces is
+    // provably off its stack.  The reaper and the kstack alloc-alias guard
+    // survey `is_tid_on_stack_any_cpu` to gate stack reclaim on this signal,
+    // closing the publish→switch window in which a Dead-but-still-on-stack
+    // thread's live kernel stack could be recycled into a new thread (the #655
+    // two-CPU-one-stack double-use).  See `proc::PER_CPU_ONSTACK_TID`.
+    crate::proc::set_onstack_tid(crate::proc::current_tid());
 }
 
 /// Read the current switch generation for `cpu` (Acquire).  Used both to
@@ -746,6 +755,18 @@ fn saved_rsp_aliases_live_frame(
 
 /// Reap dead threads and free their kernel stacks.
 ///
+/// #655 verification counter: number of Dead threads whose kstack reclaim the
+/// reaper DEFERRED because they were still physically on a CPU's kernel stack
+/// (the publish→switch window the pre-#655 `is_tid_current_on_any_cpu` gate
+/// missed).  A non-zero value proves the two-CPU-one-stack race was being hit
+/// and the primary fix now catches it.  Read via [`kstack655_reap_deferred`].
+static KSTACK655_REAP_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the #655 reaper-defer counter (see [`KSTACK655_REAP_DEFERRED`]).
+pub fn kstack655_reap_deferred() -> u64 {
+    KSTACK655_REAP_DEFERRED.load(Ordering::Relaxed)
+}
+
 /// MUST be called with interrupts already disabled so that pmm::free_page()
 /// cannot deadlock with a concurrent timer ISR that also acquires PMM_LOCK.
 /// Called at the start of schedule() which guarantees IF=0 via disable_interrupts().
@@ -802,21 +823,57 @@ fn reap_dead_threads_sched() {
         // switched IN, not when it switched out), so the ctx_rsp_valid gate alone
         // does NOT exclude it.  Reaping it would push its kernel stack to the
         // dead-stack cache (which zero-fills the stack) or free it to the PMM
-        // while that stack is live on the other CPU — the sibling's next
-        // `ret`/`iretq` then loads a zeroed/recycled return slot and transfers
-        // control to RIP=0 (#PF IFETCH) or a torn low address (#GP).  Gate on
-        // `is_tid_current_on_any_cpu` — the kernel analogue of `task_on_cpu()` —
-        // so a Dead-but-still-executing thread is skipped until it actually
-        // leaves its CPU (and publishes ctx_rsp_valid via switch_context_asm).
+        // while that stack is live on the other CPU.
+        //
+        // #655: the earlier guard used `is_tid_current_on_any_cpu`, which surveys
+        // `PER_CPU_CURRENT_TID` — the slot the scheduler publishes as the SUCCESSOR
+        // *before* `switch_context_asm` runs.  Combined with `switch_context_asm`
+        // setting the outgoing thread's `ctx_rsp_valid = 1` BEFORE the `mov rsp`
+        // that leaves the old stack, there is a window in which a Dead outgoing
+        // thread is no longer named `current` yet is still physically on its
+        // stack — exactly the window in which a live frame was recycled and two
+        // different-CR3 threads ended up on one physical kstack, cross-corrupting
+        // each other's saved frames (#655 two-CPU-one-stack).  Gate instead on
+        // `is_tid_on_stack_any_cpu`, which surveys `PER_CPU_ONSTACK_TID` —
+        // published by the SUCCESSOR *after* the stack flip — so a Dead thread is
+        // reaped only once a different task has provably run on its CPU and it is
+        // off its stack (the kernel analogue of `task_on_cpu()`; the POSIX
+        // clone(2) "no CPU references the thread" lifecycle contract).
         let dead_indices: alloc::vec::Vec<usize> = threads.iter().enumerate()
             .filter(|(_, t)| {
                 t.is_reapable()
                     && t.tid != current_tid
-                    && !crate::proc::is_tid_current_on_any_cpu(t.tid)
+                    && !crate::proc::is_tid_on_stack_any_cpu(t.tid)
                     && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
             })
             .map(|(i, _)| i)
             .collect();
+        // #655 verification: count Dead threads that the OLD gate
+        // (`!is_tid_current_on_any_cpu`) would have reaped this pass but the NEW
+        // gate (`!is_tid_on_stack_any_cpu`) defers because they are still on a
+        // CPU's stack.  A non-zero count proves the race was being hit and the
+        // primary fix now catches it.  Cheap (only walks threads the old gate
+        // would have admitted); does not change which threads are reaped.
+        {
+            let deferred = threads.iter().filter(|t| {
+                t.is_reapable()
+                    && t.tid != current_tid
+                    && !crate::proc::is_tid_current_on_any_cpu(t.tid)
+                    && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+                    && crate::proc::is_tid_on_stack_any_cpu(t.tid)
+            }).count() as u64;
+            if deferred > 0 {
+                let n = KSTACK655_REAP_DEFERRED.fetch_add(deferred, Ordering::Relaxed)
+                    + deferred;
+                if n <= 16 || n % 256 < deferred {
+                    crate::serial_println!(
+                        "[655/FIX] reaper deferred {} Dead-but-on-stack thread(s) \
+                         (still on a CPU's kstack) total_deferred={}",
+                        deferred, n,
+                    );
+                }
+            }
+        }
         if dead_indices.is_empty() {
             return;
         }
