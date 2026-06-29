@@ -111,6 +111,48 @@ pub fn note_switch_completed() {
     alias_probe::note_own_stack_for_current();
 }
 
+/// On-CPU dispatch-interlock counter: number of times a candidate was DEFERRED
+/// from dispatch/work-steal because it was still live (current or on-stack) on
+/// another CPU.  A non-zero value proves the #655 double-dispatch race was
+/// occurring and is now being caught.  Read via [`double_dispatch_defers`].
+static DOUBLE_DISPATCH_DEFERS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the on-CPU dispatch-interlock defer counter (see
+/// [`DOUBLE_DISPATCH_DEFERS`]).
+#[inline]
+pub fn double_dispatch_defers() -> u64 {
+    DOUBLE_DISPATCH_DEFERS.load(Ordering::Relaxed)
+}
+
+/// The on-CPU dispatch interlock, applied at every dispatch/resume/work-steal
+/// site: returns `true` (and counts, rate-limited-logs) when `tid` must NOT be
+/// dispatched on `self_cpu` because it is still live on another CPU.
+///
+/// A deferred thread is NOT lost — it remains Ready/enqueued and is selected
+/// normally on a later pass once the other CPU has switched off it (both the
+/// current- and on-stack signals clear).  This is the skip-and-defer form of the
+/// SMP wakeup/migration interlock (a task is never re-placed on a runqueue while
+/// still on-CPU elsewhere); for a cooperative picker, deferring the *selection*
+/// is equivalent to — and cheaper than — spin-waiting on the marker.  Closes the
+/// #655 window in which one live thread was dispatched onto two CPUs and the two
+/// executions tore its single kernel stack's saved switch frame in place.
+#[inline]
+pub(crate) fn defer_if_live_on_other_cpu(tid: proc::Tid, self_cpu: usize) -> bool {
+    if proc::is_tid_live_on_other_cpu(tid, self_cpu) {
+        let n = DOUBLE_DISPATCH_DEFERS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n % 4096 == 0 {
+            crate::serial_println!(
+                "[SCHED/INTERLOCK] deferred dispatch of tid={} on cpu={} \
+                 (still live on another CPU) total_defers={}",
+                tid, self_cpu, n,
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Read the current switch generation for `cpu` (Acquire).  Used both to
 /// snapshot at reap time and to test eligibility at pop time.
 #[inline]
@@ -2263,7 +2305,14 @@ was_emergency_4k={}",
             cpu,
             (1..len)
                 .map(|i| (current_idx + i) % len)
-                .filter(|&idx| matches!(threads[idx].mirror_slot, Some((c, _)) if c == percpu_cpu)),
+                .filter(|&idx| matches!(threads[idx].mirror_slot, Some((c, _)) if c == percpu_cpu))
+                // ── #655 on-CPU dispatch interlock (the dispatch chokepoint) ──
+                // Skip-and-defer any candidate still live (current or on-stack)
+                // on another CPU, so one thread is never dispatched onto two CPUs
+                // at once (which would tear its single kernel stack's saved
+                // switch frame in place).  Inert on SMP=1 (no other CPU) ⇒
+                // bit-for-bit unchanged.  See `defer_if_live_on_other_cpu`.
+                .filter(|&idx| !defer_if_live_on_other_cpu(threads[idx].tid, cpu as usize)),
             now,
         );
 

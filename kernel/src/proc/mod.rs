@@ -1419,6 +1419,42 @@ pub fn is_tid_on_stack_any_cpu(tid: Tid) -> bool {
     false
 }
 
+/// On-CPU dispatch interlock: returns `true` if `tid` is still live — currently
+/// dispatched (`PER_CPU_CURRENT_TID`) **or** physically executing on its kernel
+/// stack (`PER_CPU_ONSTACK_TID`) — on any logical CPU OTHER than `self_cpu`.
+///
+/// A thread that is still live on another CPU must never be dispatched/resumed
+/// here: it owns a single kernel stack, and running it on two CPUs at once lets
+/// each tear the other's saved `switch_context` frame in place (the SMP
+/// kernel-stack double-dispatch corruption).  This is the realisation, at our
+/// cooperative pick site, of the standard SMP wakeup interlock — a task carries
+/// an "on-CPU" marker held across the context switch, and a remote runqueue must
+/// not re-place the task until that marker clears.  Both signals are published
+/// with `Release` (`set_current_tid` / `set_onstack_tid`); the `Acquire` loads
+/// here pair with them so observing a CPU as no longer running/holding `tid` also
+/// observes that CPU's final stack writes for `tid` as retired.
+///
+/// `self_cpu` is excluded so a thread legitimately re-selected on the very CPU
+/// it last ran on (the common no-migration case) is never spuriously deferred.
+pub fn is_tid_live_on_other_cpu(tid: Tid, self_cpu: usize) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+        .min(crate::arch::x86_64::apic::MAX_CPUS);
+    for cpu in 0..ncpus {
+        if cpu == self_cpu {
+            continue;
+        }
+        if PER_CPU_CURRENT_TID[cpu].load(Ordering::Acquire) == tid
+            || PER_CPU_ONSTACK_TID[cpu].load(Ordering::Acquire) == tid
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Read the currently running PID for an arbitrary CPU index.  See
 /// [`current_tid_on_cpu`].
 pub fn current_pid_on_cpu(cpu: usize) -> Pid {

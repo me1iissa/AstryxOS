@@ -415,6 +415,16 @@ pub fn try_steal_to(threads: &mut [proc::Thread], dst_cpu: u8, ncpus: usize) -> 
         if !t.ctx_rsp_valid.load(Ordering::Acquire) {
             continue;
         }
+        // #655 on-CPU interlock (source side): never re-home a thread still live
+        // (current or on-stack) on another CPU.  `ctx_rsp_valid` flips true the
+        // instant `switch_context_asm` saves the outgoing RSP, but the source
+        // CPU is still physically on that stack through the switch epilogue;
+        // stealing it here would let the destination CPU resume it onto the very
+        // stack the source CPU is still unwinding.  Defer until the source CPU is
+        // provably off it (both signals clear).  Inert on SMP=1.
+        if super::defer_if_live_on_other_cpu(t.tid, dst_cpu as usize) {
+            continue;
+        }
         // Respect hard affinity: never steal a thread pinned elsewhere.
         if let Some(a) = t.cpu_affinity {
             if a != dst_cpu {
