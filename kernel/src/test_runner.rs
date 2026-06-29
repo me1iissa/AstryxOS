@@ -19763,6 +19763,59 @@ fn test_find_free_range() -> bool {
             MMAP_BASE - 0x20 * PAGE);
     }
 
+    // (7) Sort-invariant regression — a low SysV-SHM attach must not corrupt
+    //     find_free_range's single descending pass (the ipc::sysv_shm::shmat
+    //     raw-push bug).  find_free_range relies on `areas` being strictly
+    //     ascending by base.  shmat attaches low in the address space
+    //     (pick_vaddr ~ 0x6000_0000) while the list already holds high VMAs
+    //     (libraries / thread stacks near the top of the mmap window).  A raw
+    //     `areas.push()` left the low VMA at the END of the Vec, so the
+    //     descending pass visited it FIRST, computed a phantom whole-window
+    //     free gap, and returned a ceiling-flush base that actually OVERLAPPED
+    //     the high top-of-window VMA — which insert_vma's order-independent
+    //     overlap scan then rejected, failing the mmap spuriously with ENOMEM.
+    {
+        let shm_low = 0x6000_0000u64;            // MIT-SHM attach base
+        let shm_len = 0x40 * PAGE;
+        let top_len = 0x80 * PAGE;
+        let top = MMAP_BASE - top_len;           // a library/stack VMA at the top
+        let req = 0x10 * PAGE;
+
+        // (a) Correctly SORTED (the fix's behaviour): the low SHM VMA precedes
+        //     the high VMA.  find_free_range must return a NON-OVERLAPPING base
+        //     directly below the top VMA (the highest fitting gap).
+        let sorted = space_with(alloc::vec![(shm_low, shm_len), (top, top_len)]);
+        let got = sorted.find_free_range(req);
+        if got != Some(top - req) {
+            test_fail!("[VMA] find_free_range",
+                "shm-sorted: expected {:#x}, got {:?}", top - req, got);
+            return false;
+        }
+        if let Some(b) = got {
+            if sorted.areas.iter().any(|a| a.overlaps(b, req)) {
+                test_fail!("[VMA] find_free_range",
+                    "shm-sorted: returned OVERLAPPING base {:#x}", b);
+                return false;
+            }
+        }
+        test_println!("  [7a] low SHM attach kept sorted → non-overlapping {:#x} ✓",
+            top - req);
+
+        // (b) Negative control documenting the bug: with the low SHM VMA
+        //     appended out of order (the raw-push regression), the descending
+        //     pass is fooled into returning the OCCUPIED ceiling-flush slot.
+        let unsorted = space_with(alloc::vec![(top, top_len), (shm_low, shm_len)]);
+        let bad = unsorted.find_free_range(req);
+        if bad != Some(MMAP_BASE - req) {
+            test_fail!("[VMA] find_free_range",
+                "shm-unsorted control: expected buggy {:#x}, got {:?}",
+                MMAP_BASE - req, bad);
+            return false;
+        }
+        test_println!("  [7b] unsorted (raw-push) control returns occupied slot {:#x} (the bug the sorted insert prevents) ✓",
+            MMAP_BASE - req);
+    }
+
     test_pass!("[VMA] find_free_range top-down O(n) gap search (Test 308)");
     true
 }

@@ -3427,14 +3427,11 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         crate::mm::vmm::unmap_and_free_range_in(cr3, base, length);
     }
 
-    let vma = VmArea {
-        base,
-        length,
-        prot,
-        flags,
-        backing,
-        name,
-    };
+    // The VMA record is constructed inside Phase 3 (below) rather than here:
+    // for a non-FIXED placement the base may need to be re-chosen under the
+    // Phase 3 lock if a concurrent same-VmSpace mmap claimed the gap in the
+    // window after Phase 1 dropped the lock (the SMP TOCTOU closed below), so
+    // `backing` must remain available to clone for each insert attempt.
 
     // `[MMAP]` is verbose: every dlopen / runtime malloc / JIT page emits a
     // line, which under the demo workload runs into the thousands.  Gate it
@@ -3464,8 +3461,61 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             None => break 'phase3 -3,
         };
 
-        match space.insert_vma(vma) {
-            Ok(()) => {
+        // Close the Phase-1/Phase-3 placement TOCTOU for kernel-chosen
+        // (non-FIXED) mappings.
+        //
+        // For a non-FIXED mmap the base was picked by find_free_range /
+        // find_free_stack_range in Phase 1 under a PROCESS_TABLE lock that was
+        // then RELEASED before this point.  On SMP a concurrent mmap into the
+        // SAME address space (sibling thread / shared CR3) can claim that gap
+        // in the window, so `insert_vma` here would fail with Overlap and we
+        // would wrongly return ENOMEM even though free address space remains —
+        // a spurious failure that POSIX mmap(2) forbids for a kernel-chosen
+        // address.  (Observed live under SMP=2: a sibling thread's memfd
+        // MAP_SHARED mmap lost this race, the userland SharedMemory map failed,
+        // and a downstream NULL dereference of the unmapped region followed.)
+        //
+        // Re-pick the gap and re-insert under the lock we now hold; with the
+        // lock held the find→insert pair is atomic, so the retry cannot itself
+        // race.  This is safe because a non-FIXED sys_mmap installs NO page
+        // table entries (frames are demand-faulted later): the chosen base
+        // lives only in the VMA record, so re-choosing it here is complete —
+        // the return value and every subsequent fault use the recorded base.
+        //
+        // MAP_FIXED placements keep the caller-supplied base unchanged (no
+        // re-pick): their Overlap is a genuine caller error and Phase 2b has
+        // already edited the page table for that exact base.
+        let mut cur_base = base;
+        let mut attempts = 0u32;
+        let installed: Option<u64> = loop {
+            let vma = VmArea {
+                base: cur_base,
+                length,
+                prot,
+                flags,
+                backing: backing.clone(),
+                name,
+            };
+            match space.insert_vma(vma) {
+                Ok(()) => break Some(cur_base),
+                Err(crate::mm::vma::VmaError::Overlap) if !is_fixed && attempts < 8 => {
+                    attempts += 1;
+                    let repick = if is_stack_alloc {
+                        space.find_free_stack_range(length)
+                    } else {
+                        space.find_free_range(length)
+                    };
+                    match repick {
+                        Some(nb) => { cur_base = nb; continue; }
+                        None => break None, // genuine address-space exhaustion
+                    }
+                }
+                Err(_) => break None,
+            }
+        };
+
+        match installed {
+            Some(b) => {
                 // Lower `mmap_hint` only when this allocation participates in the
                 // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
                 // MAP_STACK kernel-chosen allocation.  See
@@ -3475,20 +3525,20 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 // seeded by `randomised_mmap_hint()` before any NULL-hint
                 // allocation is ever issued (POSIX mmap(2), CWE-330).
                 let hint_before = space.mmap_hint;
-                space.note_mmap_placement(base, is_fixed, is_stack_alloc);
+                space.note_mmap_placement(b, is_fixed, is_stack_alloc);
                 let hint_after = space.mmap_hint;
                 #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
                 crate::serial_println!(
-                    "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={}",
-                    pid, base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8
+                    "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={} attempts={}",
+                    pid, b, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8, attempts
                 );
                 let _ = (hint_before, hint_after);
-                base as i64
+                b as i64
             }
-            Err(_) => {
+            None => {
                 crate::serial_println!(
-                    "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
-                    pid, base, length, flags, fd as i64
+                    "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={} attempts={}",
+                    pid, cur_base, length, flags, fd as i64, attempts
                 );
                 -12 // ENOMEM
             }

@@ -174,14 +174,30 @@ pub fn shmat(shmid: u32, shmaddr: u64, _shmflg: i32) -> i64 {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
             if let Some(vs) = proc.vm_space.as_mut() {
-                vs.areas.push(crate::mm::vma::VmArea {
+                let shm_vma = crate::mm::vma::VmArea {
                     base:    map_vaddr,
                     length:  size,
                     prot:    crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
                     flags:   crate::mm::vma::MAP_SHARED,
                     backing: crate::mm::vma::VmBacking::Device { phys_base },
                     name:    "[shm]",
-                });
+                };
+                // Insert at the sorted position rather than a raw push.  The
+                // areas list is maintained strictly ascending by base, and
+                // VmSpace::find_free_range performs a single DESCENDING pass
+                // (areas.iter().rev()) that relies on that ordering.  shmat
+                // typically attaches low in the address space (pick_vaddr ~
+                // 0x6000_0000) while the list already holds much higher VMAs
+                // (libraries, thread stacks near the top of the mmap window);
+                // a raw push left that low-base VMA at the END of the Vec, so
+                // the descending pass visited it FIRST, computed a phantom
+                // free gap spanning the whole window, and returned a base that
+                // was actually occupied — making later kernel-chosen mmap()s
+                // fail spuriously with ENOMEM (insert_vma's order-independent
+                // overlap scan then rejected the bogus placement).
+                let pos = vs.areas.iter().position(|v| v.base > shm_vma.base)
+                    .unwrap_or(vs.areas.len());
+                vs.areas.insert(pos, shm_vma);
                 // W216 H_5j-B: notify the PFH install loop of the VMA-list
                 // mutation (this site bypasses insert_vma).
                 vs.generation.fetch_add(1, core::sync::atomic::Ordering::Release);
