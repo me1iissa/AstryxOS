@@ -888,10 +888,18 @@ impl Ext2Fs {
             // first hole, the first non-contiguous block, or end-of-request.
             if off_in_block == 0 && (to_read - read_total) >= self.block_size {
                 // Cap the coalesced run so the sector count fits the device
-                // request ABI (u16 sectors) with margin: 512 sectors = 256 KiB
-                // at 1 KiB blocks, comfortably larger than the 128 KiB
-                // demand-fault readahead window while staying well inside u16.
-                const MAX_RUN_SECTORS: usize = 512;
+                // request ABI (u16 sectors) with margin.  4096 sectors =
+                // 2 MiB, which matches the page-cache prepopulate burst size
+                // (mm::cache::prepopulate_file reads in 2 MiB chunks): a
+                // disk-contiguous chunk now coalesces into ONE ext2 run, and
+                // the virtio-blk layer splits that single run into its 1 MiB
+                // (2048-sector) request batches — so a 2 MiB read costs two
+                // device round-trips instead of eight.  Even at the maximum
+                // 4 KiB block size the resulting sector_count is 4096, well
+                // inside u16 (65535).  The dst slice is a sub-slice of the
+                // caller's buffer, so the contiguity requirement is unchanged
+                // from the prior 256 KiB cap — only the run length grows.
+                const MAX_RUN_SECTORS: usize = 4096;
                 let sectors_per_block_usz = (self.block_size / 512).max(1);
                 let max_run_by_sectors = MAX_RUN_SECTORS / sectors_per_block_usz;
                 let max_whole_blocks =
