@@ -1729,8 +1729,21 @@ user_pref("security.sandbox.content.level", 0);
                                     crate::proc::ThreadState::Dead => p1_dead += 1,
                                 }
                             }
-                            serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={})",
-                                elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead);
+                            // Net throughput counters alongside the sc/pf
+                            // heartbeat: a network-bound load tail shows rx_b
+                            // climbing while sc is flat; a CPU-serialization
+                            // tail shows the inverse (rx_b plateaued, sc
+                            // exploding).  Sizing that split was previously
+                            // impossible from this line — the only net
+                            // visibility was per-event [TCP]/[UDP] markers,
+                            // which miss data carried on already-open
+                            // connections.  rx_ovr surfaces e1000 RX-ring
+                            // drops (MPC); it reads 0 on the virtio-net path.
+                            let (nrx, ntx, brx, btx) = crate::net::stats();
+                            let nov = crate::net::rx_overruns();
+                            serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={}) net:rx_pkt={} tx_pkt={} rx_b={} tx_b={} rx_ovr={}",
+                                elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead,
+                                nrx, ntx, brx, btx, nov);
                         }
                         None => {
                             serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping",
