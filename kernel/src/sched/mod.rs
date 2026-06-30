@@ -405,23 +405,34 @@ const STARVE_FORCE_TICKS: u64 = 100;
 /// Like an interactive task in a virtual-deadline fair scheduler, TID 0 spends
 /// almost no CPU and yields early every iteration, so it is owed a much earlier
 /// deadline than the compute-bound workers it competes with.  At TICK_HZ = 100,
-/// 2 ticks (≈20 ms) bounds the reactor's worst-case run-queue latency at the
-/// compositor's own frame cadence: `gui::compositor` rate-gates presents at
-/// `COMPOSE_MIN_INTERVAL_TICKS = 2` (≈50 Hz), so a reactor force-deadline of 2
-/// is exactly the cadence needed to *saturate* that cap under a 50+-thread
-/// userspace load.  A coarser deadline (the previous 8 ticks ≈ 12.5 Hz) capped
-/// the reactor — and therefore the present rate — at ~4× below the compositor's
-/// own ceiling, so a busy windowed app composited only ~1 frame every few ticks
-/// even though the gate would have allowed 50 Hz.  The reactor early-yields each
-/// iteration and the compositor self-throttles, so a forced run that finds no
-/// owed frame is a cheap skip (see `compose_if_due` / `COMPOSE_SKIPPED`); this
-/// raises present cadence without handing TID 0 a larger share of the vCPU.
-/// The score-based aging usually selects TID 0 even sooner; this deadline bounds
-/// the reactor's worst-case latency well below the coarse `STARVE_FORCE_TICKS`
-/// global ceiling.  (Cite POSIX sched(7): every runnable thread eventually runs;
-/// an early-yielding latency-sensitive task is owed an earlier virtual deadline
-/// than compute-bound peers.)
-const STARVE_FORCE_TICKS_BSP: u64 = 2;
+/// 1 tick (≈10 ms) bounds the reactor's worst-case run-queue latency at the
+/// finest granularity the periodic timer can resolve — every scheduler tick the
+/// reactor is at or past deadline, so it is force-selected at the next
+/// preemption point regardless of how many userspace threads are runnable.
+///
+/// Why 1 and not 2 (single-core Firefox-load measurement, 2026-06-30): under a
+/// ~100-thread windowed-Firefox load the reactor's measured service rate was
+/// only ~20-30 Hz, not the 50 Hz a 2-tick deadline nominally allows — roughly
+/// half of each re-selection period is dead time (the reactor's post-yield idle
+/// `hlt` waits out the remainder of a tick, and ~10 userspace threads are
+/// continuously Ready and out-score the `PRIORITY_IDLE` reactor on every normal
+/// pick, so it advances only via this force backstop).  A 1-tick deadline lifts
+/// the force ceiling to the 100 Hz periodic-timer limit, roughly doubling the
+/// reactor's worst-case wakeup rate so it drains net::poll / services the
+/// in-kernel X server / pumps the event loop about twice as often, which is the
+/// single-core analogue of the dedicated execution context a second CPU gives
+/// the reactor.  The reactor early-yields every iteration and the compositor
+/// self-throttles at `COMPOSE_MIN_INTERVAL_TICKS = 2` (≈50 Hz), so the extra
+/// (odd-tick) forced runs that find no owed frame are cheap skips (see
+/// `compose_if_due` / `COMPOSE_SKIPPED`): the higher cadence buys more net/X
+/// service WITHOUT handing TID 0 a larger share of the vCPU and WITHOUT raising
+/// the present rate above the compositor's own ceiling.  The score-based aging
+/// usually selects TID 0 even sooner; this deadline bounds the reactor's
+/// worst-case latency well below the coarse `STARVE_FORCE_TICKS` global ceiling.
+/// (Cite POSIX sched(7): every runnable thread eventually runs; an early-yielding
+/// latency-sensitive task is owed an earlier virtual deadline than compute-bound
+/// peers — the proportional-share / virtual-deadline fair-scheduler family.)
+const STARVE_FORCE_TICKS_BSP: u64 = 1;
 
 /// Throttle factor for the `[SCHED/STARVE] force-select` diagnostic: the line
 /// is emitted on the first force and then once per this many force-selects.

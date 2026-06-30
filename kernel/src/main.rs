@@ -1730,7 +1730,12 @@ user_pref("security.sandbox.content.level", 0);
             // fault later.
             crate::mm::pmm::bootstrap_stack_assert_rsp_reserved();
 
+            // Reactor-loop iteration counter — printed in the heartbeat so the
+            // reactor's effective service rate (iterations / 10 s) is directly
+            // observable for single-core poll-reactor bandwidth measurement.
+            let mut reactor_iters: u64 = 0;
             loop {
+                reactor_iters += 1;
                 gui::input::pump_input();
                 crate::net::poll();
                 crate::x11::poll();
@@ -1788,7 +1793,8 @@ user_pref("security.sandbox.content.level", 0);
                     match crate::proc::THREAD_TABLE.try_lock() {
                         Some(threads) => {
                             let total = threads.len();
-                            let mut p1_run = 0u32;
+                            let mut p1_run = 0u32;   // Running
+                            let mut p1_rdy = 0u32;   // Ready (runnable, waiting for CPU)
                             let mut p1_blk = 0u32;
                             let mut p1_dead = 0u32;
                             let mut p1_total = 0u32;
@@ -1796,18 +1802,23 @@ user_pref("security.sandbox.content.level", 0);
                                 p1_total += 1;
                                 match t.state {
                                     crate::proc::ThreadState::Running => p1_run += 1,
-                                    crate::proc::ThreadState::Ready => p1_run += 1, // count as active
+                                    crate::proc::ThreadState::Ready => p1_rdy += 1,
                                     crate::proc::ThreadState::Blocked => p1_blk += 1,
                                     crate::proc::ThreadState::Sleeping => p1_blk += 1,
                                     crate::proc::ThreadState::Dead => p1_dead += 1,
                                 }
                             }
-                            serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={})",
-                                elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead);
+                            // `force=` is the cumulative anti-starvation force-select count
+                            // (≈ reactor TID-0 wakeups under load); `rloop=` is the reactor
+                            // loop-iteration count.  Their per-heartbeat deltas quantify the
+                            // reactor's service rate vs the FF run-queue depth (`rdy=`).
+                            serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},rdy={},blk={},dead={}) force={} rloop={}",
+                                elapsed, sc, pf, total, p1_total, p1_run, p1_rdy, p1_blk, p1_dead,
+                                crate::sched::starve_force_count(), reactor_iters);
                         }
                         None => {
-                            serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping",
-                                elapsed, sc, pf);
+                            serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping force={} rloop={}",
+                                elapsed, sc, pf, crate::sched::starve_force_count(), reactor_iters);
                         }
                     }
                 }
@@ -1956,15 +1967,33 @@ user_pref("security.sandbox.content.level", 0);
                 // storm and never resume, freezing the scheduler tick and
                 // TICK_COUNT (the dual-core path is immune — a sibling CPU
                 // keeps the global clock alive).  `idle_tick` reports whether
-                // the timer is healthy: if so we `hlt` and the next tick wakes
-                // us; if it is starved, `idle_tick` has already driven a
-                // software scheduler tick from the TSC and we MUST spin (not
-                // `hlt`) because a dead timer provides no wakeup.  A healthy
-                // timer — every SMP run — makes this a cheap `true` + `hlt`.
-                if crate::arch::x86_64::irq::idle_tick(5) {
-                    unsafe { core::arch::asm!("hlt"); }
-                } else {
-                    core::hint::spin_loop();
+                // the timer is healthy AND drives the dead-timer self-heal
+                // (software scheduler tick from the TSC), so it is always
+                // called.
+                let timer_ok = crate::arch::x86_64::irq::idle_tick(5);
+                // Single-core poll-reactor bandwidth: only sleep the reactor
+                // when the run queue is otherwise EMPTY.  When userspace peers
+                // are Ready (the ~100-thread Firefox load), `hlt`-ing here
+                // wasted the rest of the tick before the reactor's next
+                // net::poll / x11::poll service — measured ~20-30 Hz reactor
+                // service when 50 Hz was nominally available, because each
+                // post-yield `hlt` parked the reactor until the next periodic
+                // tick.  With runnable peers present, `yield_cpu()` above has
+                // already handed the CPU to them, so we loop straight back to
+                // poll instead of sleeping — the reactor services net/X as
+                // fast as the scheduler re-selects it (bounded by its 1-tick
+                // force deadline) rather than once per idle tick.  This is the
+                // single-core analogue of the dedicated context a second CPU
+                // gives the reactor.  Per POSIX sched(7), a CPU must never idle
+                // while a runnable peer exists.  Only `hlt` (power-save) when
+                // genuinely idle, and spin instead if the timer is dead (a
+                // dead timer provides no wakeup to end the `hlt`).
+                if crate::sched::ready_depth() == 0 {
+                    if timer_ok {
+                        unsafe { core::arch::asm!("hlt"); }
+                    } else {
+                        core::hint::spin_loop();
+                    }
                 }
             }
 

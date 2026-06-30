@@ -2168,6 +2168,26 @@ fn op_change_property(fd: u64, data: &[u8]) {
             }
         });
     }
+    // Doc-load progress marker: a client sets WM_NAME on its toplevel exactly
+    // when it has a title to show — for a browser that is the moment the
+    // document has been parsed far enough to know <title>.  Emitting the tick
+    // here gives a low-cost "document parsed" timestamp on the serial log for
+    // page-load latency measurement (no equivalent existed in the perf profile).
+    // WM_NAME is the fixed predefined atom (39); fires only on title changes
+    // (rare), so the cost is negligible.
+    if prop == atoms::ATOM_WM_NAME && !pdata.is_empty() {
+        let mut title = [0u8; 96];
+        let n = core::cmp::min(pdata.len(), title.len());
+        for (dst, &b) in title[..n].iter_mut().zip(pdata[..n].iter()) {
+            *dst = if (0x20..=0x7e).contains(&b) { b } else { b'.' };
+        }
+        if let Ok(s) = core::str::from_utf8(&title[..n]) {
+            crate::serial_println!(
+                "[FF/TITLE] tick={} wm_name={:?}",
+                crate::arch::x86_64::irq::get_ticks(), s
+            );
+        }
+    }
     // Deliver PropertyNotify to all clients watching this window.
     deliver_property_notify(wid, prop, false);
 }
