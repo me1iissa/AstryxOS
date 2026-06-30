@@ -1275,6 +1275,79 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 "/disk/opt/firefox/libxul.so",              // 157 MB — glibc variant
                 "/disk/usr/lib/firefox-esr/libxul.so",      // 130 MB — musl variant (firefox-esr 115.x)
                 "/disk/usr/lib/firefox/libxul.so",          // 130 MB — musl variant (firefox 132.x)
+
+                // ── Firefox start-up shared-library closure ──────────────
+                // After libxul, ld-musl demand-pages the REST of Firefox's
+                // DSO closure as the browser initialises XPCOM, the GTK
+                // widget toolkit, PSM/crypto and the GPU-feature probe.
+                // Without pre-loading, each object is faulted in piecemeal —
+                // thousands of single-page readahead misses, every one a
+                // busy-polled virtio round-trip (no MSI-X) — adding seconds
+                // before the first window maps.  Pre-loading them here turns
+                // that scatter into one sequential precache burst.
+                //
+                // Each entry is a SONAME symlink that resolves to the
+                // versioned object on the ext2 data disk; an absent path
+                // returns 0 pages benignly (prepopulate_file -> resolve Err),
+                // so the list is safe to ship for both the firefox-esr (115.x)
+                // and firefox (132.x) staging variants.  The bulk read is
+                // bounded by prepopulate_file's PMM low-water guard, so a
+                // tight-memory boot sheds the TAIL of this list rather than
+                // starving the kernel — hence the ordering: most load-bearing
+                // objects first, the largest/most-optional last.
+                //
+                // GTK3 widget toolkit + GLib object/IO core
+                "/disk/usr/lib/libgtk-3.so.0",              // 8.1 MB
+                "/disk/usr/lib/libgdk-3.so.0",              // 938 KB
+                "/disk/usr/lib/libgio-2.0.so.0",            // 1.9 MB
+                "/disk/usr/lib/libglib-2.0.so.0",           // 1.3 MB
+                "/disk/usr/lib/libgobject-2.0.so.0",        // 378 KB
+                // ICU (Unicode/intl tables, pulled in by XPCOM init)
+                "/disk/usr/lib/libicui18n.so.74",           // 2.6 MB
+                "/disk/usr/lib/libicuuc.so.74",             // 1.6 MB
+                // NSS / NSPR (PSM crypto + TLS handshake init)
+                "/disk/usr/lib/libnss3.so",                 // 1.2 MB
+                "/disk/usr/lib/libnspr4.so",                // 236 KB
+                "/disk/usr/lib/libssl3.so",                 // 406 KB
+                "/disk/usr/lib/libsmime3.so",               // 166 KB
+                "/disk/usr/lib/libnssutil3.so",             // 174 KB
+                "/disk/usr/lib/libsoftokn3.so",             // 337 KB
+                "/disk/usr/lib/libfreeblpriv3.so",          // 914 KB
+                // C++ runtime + compression/parse base libs
+                "/disk/usr/lib/libstdc++.so.6",             // 2.6 MB
+                "/disk/usr/lib/libgcc_s.so.1",              // 138 KB
+                "/disk/lib/libz.so.1",                      // 102 KB
+                "/disk/usr/lib/libexpat.so.1",              // 134 KB
+                "/disk/usr/lib/libbrotlidec.so.1",          // 54 KB
+                // 2D text/graphics: cairo, pango, harfbuzz, freetype,
+                // fontconfig, pixman, pixbuf, png
+                "/disk/usr/lib/libcairo.so.2",              // 935 KB
+                "/disk/usr/lib/libpango-1.0.so.0",          // 335 KB
+                "/disk/usr/lib/libpangocairo-1.0.so.0",     // 54 KB
+                "/disk/usr/lib/libpangoft2-1.0.so.0",       // 82 KB
+                "/disk/usr/lib/libharfbuzz.so.0",           // 1.1 MB
+                "/disk/usr/lib/libfreetype.so.6",           // 650 KB
+                "/disk/usr/lib/libfontconfig.so.1",         // 250 KB
+                "/disk/usr/lib/libpixman-1.so.0",           // 566 KB
+                "/disk/usr/lib/libgdk_pixbuf-2.0.so.0",     // 150 KB
+                "/disk/usr/lib/libpng16.so.16",             // 182 KB
+                "/disk/usr/lib/libgraphite2.so.3",          // 122 KB
+                // Mozilla support DSOs (dependentlibs.list closure)
+                "/disk/usr/lib/firefox-esr/libmozsqlite3.so",       // 1.3 MB
+                "/disk/usr/lib/firefox-esr/libmozsandbox.so",       // 162 KB
+                "/disk/usr/lib/firefox-esr/liblgpllibs.so",         // 36 KB
+                "/disk/usr/lib/firefox-esr/libipcclientcerts.so",   // 375 KB
+                // Mesa GL client + dispatch (glxtest GPU-feature probe)
+                "/disk/usr/lib/libGL.so.1",                 // 614 KB
+                "/disk/usr/lib/libglapi.so.0",              // 226 KB
+                "/disk/usr/lib/libEGL.so.1",                // 275 KB
+                // Mesa software rasteriser (llvmpipe/gallium) — the largest
+                // single object; demand-faulted by the glxtest probe and the
+                // GL compositor path.  Listed LAST so the PMM low-water guard
+                // sheds it first on a tight-memory boot.  All three driver
+                // SONAMEs (libgallium_dri/swrast_dri/kms_swrast_dri) are
+                // symlinks to this one inode, so caching it covers them all.
+                "/disk/usr/lib/xorg/modules/dri/libgallium_dri.so", // 34 MB
             ] {
                 let t0 = arch::x86_64::irq::get_ticks();
                 let pages = mm::cache::prepopulate_file(path);
