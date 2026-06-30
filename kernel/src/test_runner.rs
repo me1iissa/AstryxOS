@@ -49933,7 +49933,7 @@ fn test_648_percpu_pick_equivalence() -> bool {
     const NAME: &str = "[SCHED/P2] per-CPU pick == legacy pick (Test 648, equivalence proof)";
     test_header!(NAME);
 
-    let bsp_deadline = crate::sched::bsp_force_deadline_ticks();      // 2
+    let bsp_deadline = crate::sched::bsp_force_deadline_ticks();      // 1
     let global_deadline = crate::sched::global_force_deadline_ticks(); // 100
 
     // Build a Ready candidate Thread on CPU `cpu_pin`/`last_cpu`, aged
@@ -50263,7 +50263,7 @@ fn test_649_percpu_min_deadline_gate() -> bool {
         Ok(())
     }
 
-    let bsp = crate::sched::bsp_force_deadline_ticks();        // 2
+    let bsp = crate::sched::bsp_force_deadline_ticks();        // 1
     let glob = crate::sched::global_force_deadline_ticks();    // 100
 
     // Scenario A: empty / no non-idle Ready thread → never overdue.
