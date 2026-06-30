@@ -1238,6 +1238,11 @@ pub fn run() -> ! {
     total += 1;
     if test_map_page_in_cow_if_unchanged_anti_alias() { passed += 1; }
 
+    // Test 98g3: demand-paging gen-revalidate file-VMA identity predicate
+    // (SMP gen-abort false-abort fix).
+    total += 1;
+    if test_pf_file_vma_identity_match() { passed += 1; }
+
     // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
@@ -33356,6 +33361,79 @@ fn test_map_page_in_cow_if_unchanged_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_cow_if_unchanged anti-aliasing");
+    true
+}
+
+/// Regression test for the demand-paging generation-revalidation predicate
+/// (`file_vma_identity_matches`) that fixes the SMP gen-abort false-abort.
+///
+/// When a concurrent UNRELATED mapping (a sibling thread's `mmap`, or a
+/// `clone` mmapping a worker stack/TLS) bumps the COARSE whole-address-space
+/// `VmSpace::generation` while a demand-page is mid-flight, the install arms in
+/// `handle_page_fault` must NOT blindly abort: a bare abort returns `false`
+/// (→ fatal SIGSEGV, there is no re-fault path), killing the process on every
+/// such race.  Instead the arms re-confirm the SPECIFIC faulting VMA via this
+/// predicate and proceed only if the (mount, inode, offset, base, end) identity
+/// is unchanged — preserving the W216 MAP_PRIVATE anti-aliasing guarantee while
+/// no longer SIGSEGV-ing on an unrelated bump.
+///
+/// This unit-tests the pure identity predicate; the full slow-path helper
+/// additionally walks PROCESS_TABLE → vm_space → find_vma and is exercised
+/// end-to-end by the SMP windowed-Firefox boot oracle.  Refs: POSIX mmap(2)
+/// MAP_PRIVATE; Intel SDM Vol. 3A §4.10.5 (demand paging).
+fn test_pf_file_vma_identity_match() -> bool {
+    test_header!("page-fault gen-revalidate: file VMA identity predicate");
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ, PROT_WRITE,
+                         MAP_PRIVATE, MAP_ANONYMOUS};
+    use crate::arch::x86_64::idt::file_vma_identity_matches;
+
+    let base: u64 = 0x7eff_6000_0000;
+    let len:  u64 = 0x71000;
+    let end:  u64 = base + len;
+    let file = VmArea {
+        base,
+        length: len,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_PRIVATE,
+        backing: VmBacking::File { mount_idx: 0, inode: 141, offset: 0, elf_load_delta: 0 },
+        name: "test.so",
+    };
+
+    // (1) Exact identity → match (an unrelated generation bump is safe to
+    //     proceed past; the faulting VMA describes exactly what we read).
+    if !file_vma_identity_matches(&file, 0, 141, 0, base, end) {
+        test_fail!("pf_vma_id", "exact identity should match");
+        return false;
+    }
+    // (2) Different backing identity (inode / mount / file offset) → no match.
+    if file_vma_identity_matches(&file, 0, 142, 0, base, end)
+        || file_vma_identity_matches(&file, 1, 141, 0, base, end)
+        || file_vma_identity_matches(&file, 0, 141, 0x1000, base, end) {
+        test_fail!("pf_vma_id", "different file backing must NOT match");
+        return false;
+    }
+    // (3) Replaced VMA extent (base or end moved, e.g. MAP_FIXED) → no match;
+    //     this is the genuine teardown case that MUST still abort (W216).
+    if file_vma_identity_matches(&file, 0, 141, 0, base + 0x1000, end)
+        || file_vma_identity_matches(&file, 0, 141, 0, base, end + 0x1000) {
+        test_fail!("pf_vma_id", "changed base/end must NOT match");
+        return false;
+    }
+    // (4) Anonymous backing at the same extent → no match (file predicate).
+    let anon = VmArea {
+        base,
+        length: len,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_PRIVATE | MAP_ANONYMOUS,
+        backing: VmBacking::Anonymous,
+        name: "[anon]",
+    };
+    if file_vma_identity_matches(&anon, 0, 141, 0, base, end) {
+        test_fail!("pf_vma_id", "anonymous VMA must NOT match a file identity");
+        return false;
+    }
+
+    test_pass!("page-fault gen-revalidate file VMA identity predicate");
     true
 }
 

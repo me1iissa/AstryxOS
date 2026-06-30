@@ -306,3 +306,50 @@ presets:
         reg: rdx
         offset: 0
         len: 40
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # userspace-pf-context
+  # ───────────────────────────────────────────────────────────────────────────
+  # USERSPACE page-fault / SIGSEGV autopsy.  Break at
+  # deliver_sigsegv_from_isr(cr2, error_code, frame) — the kernel's
+  # ring-3 unhandled-fault path.  By sysV AMD64 ABI §3.2.3 the args land
+  # in RDI=cr2 (== faulting CR2), RSI=error_code, RDX=&InterruptFrame.
+  # The InterruptFrame is #[repr(C)] { rip(+0), cs(+8), rflags(+16),
+  # rsp(+24), ss(+32) } (Intel SDM Vol. 3A §6.12.1: the CPU-pushed
+  # exception frame), so RDX+0 yields the FAULTING USERSPACE RIP and the
+  # user RSP, and the 16 pushed user GPRs sit just below the frame at
+  # RDX-128..RDX (isr_with_error push order: rax,rcx,rdx,rsi,rdi,r8,r9,
+  # r10,r11,rbx,rbp,r12,r13,r14,r15 — frame[-2]=rax … frame[-16]=r15).
+  # Resolve frame.rip against the faulting process's DSO load bases (its
+  # VMA list / ld.so trace) to name the userspace function + the struct
+  # field at the faulting offset; the captured user GPRs identify which
+  # base register held the near-NULL pointer that was dereferenced.
+  # NB: the saved user RIP/RSP live in memory (the InterruptFrame), not in
+  # a register at this breakpoint, so code-around-RIP and the user-stack
+  # window are resolved offline from the DSO + the captured frame.rsp
+  # rather than via a reg-relative read.
+  userspace-pf-context:
+    description: |
+      Userspace SIGSEGV/#PF context at deliver_sigsegv_from_isr() entry.
+      RDI=cr2, RSI=error_code, RDX=&InterruptFrame.  Captures the GPR
+      snapshot, the InterruptFrame (faulting user RIP/CS/RFLAGS/RSP/SS),
+      and the 16 pushed user GPRs so the faulting userspace instruction
+      and its near-NULL base register are fully reconstructable offline.
+    steps:
+      - name: regs
+        kind: regs
+      - name: interrupt_frame
+        kind: mem_via_reg
+        reg: rdx
+        offset: 0
+        len: 40
+      - name: pushed_user_gprs
+        kind: mem_via_reg
+        reg: rdx
+        offset: -128
+        len: 144
+      - name: kstack_window
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 256
