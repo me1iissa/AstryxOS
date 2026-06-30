@@ -353,3 +353,54 @@ presets:
         reg: rsp
         offset: 0
         len: 256
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # heap-canary
+  # ───────────────────────────────────────────────────────────────────────────
+  # Break at heap::heap_corrupt_canary ENTRY (the kernel-heap red-zone
+  # corruption handler).  This handler is reached the instant a live
+  # allocation's front or rear canary is found clobbered on free; capturing
+  # it at ENTRY recovers the full corruption picture BEFORE the handler's own
+  # caller_return_address() read (mov [rbp+8]) can fault on an omit-frame-
+  # pointer rbp and mask the signal with a KERNEL_PAGE_FAULT.
+  #
+  # heap_corrupt_canary(reason: &str, block_start: usize, data_ptr: usize,
+  #                     found: u64, expected: u64, user_size: usize).
+  # By sysV AMD64 ABI §3.2.3 the args land in:
+  #   rdi = reason.ptr, rsi = reason.len, rdx = block_start, rcx = data_ptr,
+  #   r8  = found, r9 = expected; the 7th arg (user_size) is the first stacked
+  #   arg, at [rsp+8] at entry ([rsp] = return address of the dealloc caller).
+  # The AllocHeader (heap-canary build) is 32 B {block_start, block_size,
+  # user_size, front_canary} and sits immediately below data_ptr, so the
+  # front canary is at data_ptr-8.  Reading rcx-32..rcx+224 captures the whole
+  # header plus the start of the user region; r8 (found) is the clobber value
+  # and r9 (expected) names which edge (CANARY_FRONT vs CANARY_REAR).
+  heap-canary:
+    description: |
+      heap::heap_corrupt_canary entry.  rdx=block_start, rcx=data_ptr,
+      r8=found(clobber value), r9=expected(edge magic), [rsp]=dealloc caller
+      return addr, [rsp+8]=user_size.  Captures the AllocHeader + user-region
+      start at rcx, the reason string at rdi, and the FreeBlock origin at rdx.
+    steps:
+      - name: regs
+        kind: regs
+      - name: reason_str
+        kind: mem_via_reg
+        reg: rdi
+        offset: 0
+        len: 64
+      - name: alloc_header_and_data
+        kind: mem_via_reg
+        reg: rcx
+        offset: -32
+        len: 256
+      - name: block_origin
+        kind: mem_via_reg
+        reg: rdx
+        offset: -16
+        len: 96
+      - name: caller_and_usersize
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 32
