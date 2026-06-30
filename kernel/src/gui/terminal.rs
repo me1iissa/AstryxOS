@@ -1100,7 +1100,14 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // toplevel surface is allocated and presented, so we must not suppress
         // it here.
         "MOZ_X11_EGL=0",
-        "MOZ_ACCELERATED=0",
+        // NB: we intentionally do NOT set MOZ_ACCELERATED=0.  That env disables
+        // the hardware-compositing feature, which cascades to force-disable the
+        // WebRender GL feature at runtime precedence — beating the
+        // gfx.webrender.all user-force-enable — and would pin the compositor
+        // back to Firefox's own SWGL rasteriser.  We want WebRender to drive
+        // the GL path (Mesa llvmpipe over GLX), so hardware compositing stays
+        // enabled and LIBGL_ALWAYS_SOFTWARE below routes the GL context to the
+        // CPU rasteriser.  Ref: Firefox gfx feature/compositing prefs.
         "LIBGL_ALWAYS_SOFTWARE=1",
         // Mesa software-GL (Gallium llvmpipe) selection.  There is no GPU and no
         // DRM render node on this target, so we pin Mesa to the CPU rasteriser

@@ -1346,11 +1346,25 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             //
             // Heavy real-site (multi-resource) render trims, on top of the
             // background-network and cubeb prefs above:
-            //   gfx.webrender.software = true           — force the software
-            //     WebRender backend (CPU rasteriser).  There is no GPU/DRM on
-            //     this target; pinning SW-WebRender keeps the compositor wholly
-            //     in-process and off any GL path.  Pairs with the launch env's
-            //     LIBGL_ALWAYS_SOFTWARE / MOZ_ACCELERATED=0.
+            //   gfx.webrender.all = true                — user-force-enable the
+            //     hardware (GL) WebRender feature.  This target has no GPU/DRM,
+            //     so the GL context is served by Mesa's CPU rasteriser
+            //     (Gallium llvmpipe) over GLX; user-force-enable is required
+            //     because the gfxInfo blocklist otherwise routes a software GL
+            //     renderer to SW-WebRender by default.
+            //   gfx.webrender.software = false          — do NOT pin Firefox's
+            //     own SWGL rasteriser; we want WebRender to drive the GL path
+            //     (llvmpipe) instead so the compositor renders through OpenGL.
+            //   gfx.webrender.reject-software-driver = false — defaults true on
+            //     this platform and makes the WebRender renderer refuse a GL
+            //     context whose GL_RENDERER advertises "llvmpipe"; clear it so
+            //     the software (llvmpipe) GL driver is accepted.
+            //   Pairs with the launch env's LIBGL_ALWAYS_SOFTWARE=1 /
+            //     GALLIUM_DRIVER=llvmpipe (Mesa serves llvmpipe over GLX) and
+            //     with NOT setting MOZ_ACCELERATED=0 (which would disable
+            //     hardware compositing and cascade WebRender back to SWGL).
+            //   Refs: Mesa 3D env-var docs (LIBGL_*, GALLIUM_DRIVER); the
+            //     OpenGL/GLX 1.4 spec; Firefox gfx.webrender.* prefs.
             //   layout.frame_rate = 0                   — "ASAP" refresh-driver
             //     mode.  A value of 0 removes the vsync-throttled cadence and
             //     drives layout/paint/composite as fast as the event loop will
@@ -1432,8 +1446,10 @@ user_pref("network.http.network_access_on_socket_process.enabled", false);
 user_pref("media.cubeb.force_null_context", true);
 user_pref("media.cubeb.sandbox", false);
 user_pref("media.volume_scale", "0.0");
-user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.software", false);
 user_pref("gfx.webrender.software.opengl", false);
+user_pref("gfx.webrender.reject-software-driver", false);
 user_pref("layout.frame_rate", 0);
 user_pref("dom.serviceWorkers.enabled", false);
 user_pref("dom.ipc.processCount", 2);
