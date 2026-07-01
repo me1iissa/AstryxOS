@@ -1063,11 +1063,20 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         crate::proc::proc_metrics::enter_syscall(_metrics_pid, num, tick);
     }
 
-    // ── Per-process syscall ring buffer (firefox-test only) ──────────────────
+    // ── Per-process syscall ring buffer (syscall-trace opt-in) ───────────────
     // Record the call at entry so that the path/return-value hooks inside
     // sys_read_linux / sys_open_linux can attach extra context before we
     // patch the return value after the match dispatch completes.
-    #[cfg(feature = "firefox-test-core")]
+    //
+    // This per-syscall entry HEAP-ALLOCATES a ring Entry (String + Vec) and
+    // reads the caller's return address via a user-stack walk
+    // (`get_user_caller_rip`) on every syscall — a heavy fast-path tax at a
+    // busy process's ~10^5 syscalls/sec.  It is diagnostic only, so gate it
+    // behind the explicit `syscall-trace` opt-in rather than the fast
+    // `firefox-test-core` functional profile.  `firefox-test`/`--trace` pull
+    // `syscall-trace` (see Cargo.toml), so full-trace debugging boots are
+    // unaffected; a bare `firefox-test-core` perf boot stays lean.
+    #[cfg(feature = "syscall-trace")]
     let ring_entry_idx = {
         let pid = crate::proc::current_pid_lockless();
         // Auto-track every user-process PID >= 1 that makes a Linux syscall —
@@ -1087,7 +1096,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             None
         }
     };
-    #[cfg(not(feature = "firefox-test-core"))]
+    #[cfg(not(feature = "syscall-trace"))]
     let _ring_entry_idx: Option<usize> = None;
 
     // ── Transient debug trace: log Linux syscalls from user processes ─────────
@@ -1139,7 +1148,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // sys_open_linux can attach path / read-content context to the pending
     // entry without needing to thread it through every syscall signature.
     // Syscalls are serialised per CPU, so a single atomic per CPU is safe.
-    #[cfg(feature = "firefox-test-core")]
+    #[cfg(feature = "syscall-trace")]
     crate::subsys::linux::syscall_ring::set_current_entry(ring_entry_idx);
 
     // Route through dispatch_body() so an early `return` inside any match
@@ -1148,7 +1157,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     let ret: i64 = dispatch_body(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     // ── Close out the ring entry with the syscall's return value ─────────────
-    #[cfg(feature = "firefox-test-core")]
+    #[cfg(feature = "syscall-trace")]
     {
         let pid = crate::proc::current_pid_lockless();
         crate::syscall::ring::end(pid, ring_entry_idx, ret);

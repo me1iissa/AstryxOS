@@ -73,8 +73,12 @@ firefox-test-core = ["heap-canary"]
 # diagnostic — no correctness role.  Depends on `firefox-test-core` because the
 # trace emitters reuse core-only diagnostic plumbing (e.g. the syscall-ring
 # `dump_futex_wait_stack` rbp-chain walker) — trace is a strict superset of the
-# functional core, never a standalone.
-firefox-test-trace = ["firefox-test-core"]
+# functional core, never a standalone.  Also pulls `syscall-trace` so the heavy
+# per-syscall ring (heap-alloc Entry + user-stack-walk caller-RIP) and the kdb
+# syscall-trend producer stay ON for full-trace debugging boots — they were
+# moved OFF the fast `firefox-test-core` functional profile (a ~10^5 syscalls/s
+# fast-path tax) and behind the explicit `syscall-trace` opt-in.
+firefox-test-trace = ["firefox-test-core", "syscall-trace"]
 # Backward-compatible super-feature: `--features firefox-test` enables both the
 # functional core and the full diagnostic trace, so existing debugging
 # invocations are byte-identical to before this split.  Perf/render/CI boots
