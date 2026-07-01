@@ -2008,7 +2008,7 @@ pub fn exit_thread(exit_code: i64) {
                 .map(|t| t.clear_child_tid)
                 .unwrap_or(0)
         };
-        #[cfg(feature = "firefox-test-core")]
+        #[cfg(feature = "firefox-test-trace")]
         crate::serial_println!(
             "[CLEARTID] tid={} pid={} clear_addr={:#x}",
             tid, pid, clear_addr
@@ -2019,7 +2019,7 @@ pub fn exit_thread(exit_code: i64) {
                 let procs = PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
             };
-            #[cfg(feature = "firefox-test-core")]
+            #[cfg(feature = "firefox-test-trace")]
             crate::serial_println!("[CLEARTID] tid={} cr3={:#x}", tid, cr3);
             if cr3 != 0 {
                 crate::syscall::write_u32_to_user_pub(cr3, clear_addr, 0);
