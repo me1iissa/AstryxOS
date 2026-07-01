@@ -1289,7 +1289,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
                 crate::net::socket::socket_close(socket_id);
             }
-            // If it's an eventfd, free the counter slot.
+            // If it's an eventfd, drop one open-file-description reference.
+            // The counter slot is freed only when the LAST reference goes
+            // away (POSIX close(2)) — an eventfd inherited across fork(2)
+            // or duplicated via dup(2)/SCM_RIGHTS is one shared object, so
+            // a child's pre-execve close-on-exec scrub must not destroy
+            // the counter the parent still writes to.
             if crate::syscall::is_eventfd_fd(pid, fd) {
                 let efd_id = crate::syscall::get_eventfd_id(pid, fd);
                 crate::ipc::eventfd::close(efd_id);
@@ -2414,6 +2419,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                                 // on drain (scm_drop_fds path).
                                                 crate::vfs::pin_inode(
                                                     fdesc.mount_idx, fdesc.inode);
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::EventFd
+                                            {
+                                                // The in-flight copy is one more
+                                                // reference to the same open file
+                                                // description (unix(7) SCM_RIGHTS);
+                                                // balanced by the receiver's later
+                                                // close(2), or by scm_drop_fds if
+                                                // the batch is never received.
+                                                crate::ipc::eventfd::inc_ref(
+                                                    fdesc.inode);
                                             }
                                         }
                                         cloned

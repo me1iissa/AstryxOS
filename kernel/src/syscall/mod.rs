@@ -666,7 +666,9 @@ pub fn scm_drain_receiver(receiver_id: u64) -> Vec<crate::vfs::FileDescriptor> {
 ///     (`vfs::pin_inode`); when that was the last reference to a deferred-
 ///     deleted (unlinked) memfd, the inode is freed by `unpin_inode`.  Without
 ///     this the pin (and thus the inode) would leak forever.
-///   * eventfd / other sentinel fds → no per-object refcount to balance.
+///   * eventfd → drop one open-file-description reference
+///     (`ipc::eventfd::close`); the counter slot is freed on the last drop.
+///   * other sentinel fds → no per-object refcount to balance.
 ///
 /// MUST be called with no unix `TABLE` / `PENDING_SCM` lock held — it re-enters
 /// `net::unix::close`, which takes the unix TABLE lock.
@@ -689,8 +691,11 @@ pub fn scm_drop_fds(fds: Vec<crate::vfs::FileDescriptor>) {
             && fd.mount_idx != usize::MAX
         {
             crate::vfs::unpin_inode(fd.mount_idx, fd.inode);
+        } else if fd.file_type == crate::vfs::FileType::EventFd {
+            // Balance the inc_ref taken at SCM enqueue time.
+            crate::ipc::eventfd::close(fd.inode);
         }
-        // eventfds / other sentinel fds: no per-object refcount to drop.
+        // Other sentinel fds: no per-object refcount to drop.
     }
 }
 
@@ -1726,6 +1731,14 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                             && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                         {
                             crate::net::unix::close(f.inode);
+                        }
+                        // Drop the eventfd open-file-description ref too —
+                        // the slot is freed only on the LAST reference
+                        // (POSIX close(2)), so a CLOEXEC-marked eventfd
+                        // inherited from the parent does not destroy the
+                        // counter the parent still posts to.
+                        if f.file_type == crate::vfs::FileType::EventFd {
+                            crate::ipc::eventfd::close(f.inode);
                         }
                     }
                 }
@@ -4095,6 +4108,12 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
             crate::ipc::pipe::pipe_add_reader(fd_clone.inode);
         }
     }
+    // And eventfd slots — the duplicate is one more reference to the same
+    // open file description (POSIX.1-2017 §2.14 / dup(2)); close(2) frees
+    // the counter slot only when the last reference drops.
+    if fd_clone.file_type == crate::vfs::FileType::EventFd {
+        crate::ipc::eventfd::inc_ref(fd_clone.inode);
+    }
 
     // Find lowest free fd
     for i in 0..proc.file_descriptors.len() {
@@ -4156,6 +4175,10 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
             crate::ipc::pipe::pipe_add_reader(fd_clone.inode);
         }
     }
+    // And eventfd slots (same open-file-description rule as sys_dup).
+    if fd_clone.file_type == crate::vfs::FileType::EventFd {
+        crate::ipc::eventfd::inc_ref(fd_clone.inode);
+    }
 
     // Grow the table if needed
     while proc.file_descriptors.len() <= new_fd {
@@ -4173,6 +4196,10 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
             && prev.flags & UNIX_SOCKET_FLAG != 0
         {
             crate::net::unix::close(prev.inode);
+        }
+        // A displaced eventfd loses one open-file-description ref too.
+        if prev.file_type == crate::vfs::FileType::EventFd {
+            crate::ipc::eventfd::close(prev.inode);
         }
     }
     proc.file_descriptors[new_fd] = Some(fd_clone);
