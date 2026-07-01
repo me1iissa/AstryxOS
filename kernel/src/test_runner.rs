@@ -39010,7 +39010,80 @@ fn test_pipe_wake_hook() -> bool {
 // last reader gone fails with -EPIPE.  Per write(2), pipe(7), POSIX.1-2017.
 
 fn test_pipe_blocking_write_semantics() -> bool {
-    test_header!("pipe blocking write — EAGAIN (no no-progress 0) / atomicity / EPIPE");
+    test_header!("pipe blocking write — capacity / EAGAIN (no no-progress 0) / atomicity / EPIPE");
+
+    // Pipes now default to the Linux 64 KiB capacity (pipe(7)); the
+    // exact-fill arithmetic throughout this test was written against the
+    // POSIX-minimum 4 KiB ring, so pin each test pipe back to 4 KiB via
+    // fcntl(2) F_SETPIPE_SZ (which returns the actual capacity).
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
+    let pin4k = |wfd: u64| -> i64 {
+        crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, wfd, F_SETPIPE_SZ, 4096, 0, 0, 0)
+    };
+
+    // ── Sub-test 0: capacity defaults + fcntl(F_SETPIPE_SZ/F_GETPIPE_SZ) ──
+    // pipe(7): "the pipe capacity is 16 pages (i.e., 65,536 bytes)".
+    // fcntl(2): F_SETPIPE_SZ rounds the request up (power of two, floor
+    // PIPE_BUF), fails with EBUSY when the new size cannot hold the
+    // buffered bytes, and EPERM beyond the pipe-max-size ceiling.
+    {
+        let mut fds0 = [0u32; 2];
+        let r = crate::syscall::dispatch_linux_kernel(
+            293 /*pipe2*/, fds0.as_mut_ptr() as u64, 0x0800 /*O_NONBLOCK*/, 0, 0, 0, 0);
+        if r != 0 {
+            test_fail!("pipe_blocking_write", "pipe2 for capacity sub-test returned {}", r);
+            return false;
+        }
+        let (rfd0, wfd0) = (fds0[0] as u64, fds0[1] as u64);
+        let cap = crate::syscall::dispatch_linux_kernel(72, wfd0, F_GETPIPE_SZ, 0, 0, 0, 0);
+        if cap != 65536 {
+            test_fail!("pipe_blocking_write",
+                "F_GETPIPE_SZ default returned {} (expected 65536 per pipe(7))", cap);
+            return false;
+        }
+        // Round-up: 5000 → 8192.
+        let cap2 = crate::syscall::dispatch_linux_kernel(72, wfd0, F_SETPIPE_SZ, 5000, 0, 0, 0);
+        if cap2 != 8192 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ(5000) returned {} (expected round-up to 8192)", cap2);
+            return false;
+        }
+        // EBUSY: buffer 5000 bytes, then try to shrink to 4096.
+        let big = alloc::vec![0x5Au8; 5000];
+        let wn = crate::syscall::dispatch_linux_kernel(
+            1 /*write*/, wfd0, big.as_ptr() as u64, big.len() as u64, 0, 0, 0);
+        if wn != 5000 {
+            test_fail!("pipe_blocking_write",
+                "capacity sub-test 5000B write returned {} (expected 5000 on an 8 KiB ring)", wn);
+            return false;
+        }
+        let shr = crate::syscall::dispatch_linux_kernel(72, wfd0, F_SETPIPE_SZ, 4096, 0, 0, 0);
+        if shr != -16 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ shrink below buffered bytes returned {} (expected -EBUSY)", shr);
+            return false;
+        }
+        // EPERM: beyond the 1 MiB pipe-max-size ceiling.
+        let huge = crate::syscall::dispatch_linux_kernel(
+            72, wfd0, F_SETPIPE_SZ, (1u64 << 20) + 1, 0, 0, 0);
+        if huge != -1 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ(>1MiB) returned {} (expected -EPERM)", huge);
+            return false;
+        }
+        // Non-pipe fd → EBADF.  (Use a never-opened high slot — fd 0 can
+        // legitimately be a pipe in the kernel-test harness context.)
+        let nonpipe = crate::syscall::dispatch_linux_kernel(72, 987, F_SETPIPE_SZ, 4096, 0, 0, 0);
+        if nonpipe != -9 {
+            test_fail!("pipe_blocking_write",
+                "F_SETPIPE_SZ on non-pipe fd returned {} (expected -EBADF)", nonpipe);
+            return false;
+        }
+        crate::syscall::dispatch_linux_kernel(3, rfd0, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd0, 0, 0, 0, 0, 0);
+        test_println!("  capacity: default 65536, round-up 5000→8192, shrink-EBUSY, >1MiB-EPERM, non-pipe-EBADF ✓");
+    }
 
     // ── Sub-test 1: O_NONBLOCK full pipe → -EAGAIN (atomicity preserved) ──
     // pipe2(O_NONBLOCK) so both ends are non-blocking.
@@ -39022,6 +39095,12 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd_nb, wfd_nb) = (fds[0] as u64, fds[1] as u64);
+    if pin4k(wfd_nb) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 1)");
+        crate::syscall::dispatch_linux_kernel(3, rfd_nb, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd_nb, 0, 0, 0, 0, 0);
+        return false;
+    }
 
     // Fill the 4 KiB ring exactly (one PIPE_BUF write fits atomically).
     let filler = [0xABu8; 4096];
@@ -39106,6 +39185,12 @@ fn test_pipe_blocking_write_semantics() -> bool {
         return false;
     }
     let (rfd3, wfd3) = (fds3[0] as u64, fds3[1] as u64);
+    if pin4k(wfd3) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 3)");
+        crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
+        return false;
+    }
     let pipe_id3 = crate::syscall::get_pipe_id(
         crate::proc::current_pid() as u64, wfd3 as usize);
 
@@ -39164,7 +39249,387 @@ fn test_pipe_blocking_write_semantics() -> bool {
     crate::syscall::dispatch_linux_kernel(3, rfd3, 0, 0, 0, 0, 0);
     crate::syscall::dispatch_linux_kernel(3, wfd3, 0, 0, 0, 0, 0);
 
-    test_pass!("pipe blocking write — EAGAIN / atomicity / EPIPE / reader-wakes-writer");
+    // ── Shared drainer infrastructure for the multi-threaded sub-tests ────
+    use core::sync::atomic::AtomicU32;
+    let pid = crate::proc::current_pid_lockless();
+
+    // A drainer runs as its OWN kernel process and drains via the REAL read(2)
+    // syscall.  Pipe ops are keyed by global pipe-id, but read(2)/write(2)
+    // resolve the fd in the CALLER's process, so each helper process needs its
+    // own fd (with the refcount bumped so neither end drops to zero early).
+    fn install_pipe_read_fd(pid: u64, pipe_id: u64) -> i64 {
+        let read_fd = crate::vfs::FileDescriptor {
+            mount_idx: usize::MAX,
+            inode: pipe_id,
+            offset: 0,
+            flags: 0x8000_0000, // pipe read end
+            is_console: false,
+            cloexec: false,
+            file_type: crate::vfs::FileType::Pipe,
+            open_path: alloc::string::String::new(),
+        };
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3, // ESRCH
+        };
+        let mut idx = None;
+        for i in 0..proc.file_descriptors.len() {
+            if proc.file_descriptors[i].is_none() { idx = Some(i); break; }
+        }
+        let i = match idx {
+            Some(i) => { proc.file_descriptors[i] = Some(read_fd); i }
+            None => {
+                if proc.file_descriptors.len() >= crate::vfs::MAX_FDS_PER_PROCESS {
+                    return -24; // EMFILE
+                }
+                let i = proc.file_descriptors.len();
+                proc.file_descriptors.push(Some(read_fd));
+                i
+            }
+        };
+        drop(procs);
+        crate::ipc::pipe::pipe_add_reader(pipe_id);
+        i as i64
+    }
+    fn install_pipe_write_fd(pid: u64, pipe_id: u64) -> i64 {
+        let write_fd = crate::vfs::FileDescriptor {
+            mount_idx: usize::MAX,
+            inode: pipe_id,
+            offset: 0,
+            flags: 0x8000_0001, // pipe write end
+            is_console: false,
+            cloexec: false,
+            file_type: crate::vfs::FileType::Pipe,
+            open_path: alloc::string::String::new(),
+        };
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let mut idx = None;
+        for i in 0..proc.file_descriptors.len() {
+            if proc.file_descriptors[i].is_none() { idx = Some(i); break; }
+        }
+        let i = match idx {
+            Some(i) => { proc.file_descriptors[i] = Some(write_fd); i }
+            None => {
+                if proc.file_descriptors.len() >= crate::vfs::MAX_FDS_PER_PROCESS { return -24; }
+                let i = proc.file_descriptors.len();
+                proc.file_descriptors.push(Some(write_fd));
+                i
+            }
+        };
+        drop(procs);
+        crate::ipc::pipe::pipe_add_writer(pipe_id);
+        i as i64
+    }
+
+    static DRAIN_STOP: AtomicU32 = AtomicU32::new(0);
+    static DRAINED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static DRAIN_RFD: AtomicU64 = AtomicU64::new(0);
+    static DRAIN_GATE: AtomicU32 = AtomicU32::new(0);
+
+    // Drainer entry: spin until armed, then drain via real read(2) until the
+    // stop flag is set and the pipe is empty.  Each nonzero read(2) goes
+    // through sys_read_linux, whose pipe arm calls wake_writers_all — that is
+    // the wake under test.
+    fn drainer_entry() {
+        crate::hal::enable_interrupts();
+        while DRAIN_GATE.load(Ordering::SeqCst) == 0 {
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+        let rfd = DRAIN_RFD.load(Ordering::SeqCst);
+        let mut buf = [0u8; 512];
+        loop {
+            let n = crate::syscall::dispatch_linux_kernel(
+                0 /*read*/, rfd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+            if n > 0 {
+                DRAINED_TOTAL.fetch_add(n as u64, Ordering::SeqCst);
+            } else {
+                if DRAIN_STOP.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                crate::sched::yield_cpu();
+                crate::hal::enable_interrupts();
+                for _ in 0..200u32 { core::hint::spin_loop(); }
+            }
+        }
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // ── Sub-test 4: blocking ATOMIC write (count <= PIPE_BUF) into a pipe with
+    //   insufficient nonzero space must PARK (not spin / return 0) and complete
+    //   only after a real read frees >= count room ─────────────────────────
+    //
+    // The atomic-write livelock regression: pre-fix the atomic arm set
+    // writable_now = 0 (space < count) and wait_writable returned Ready on ANY
+    // space, so the loop spun check -> Ready -> continue at 100% CPU forever.
+    // Post-fix the writer parks on the needs-aware predicate (need == count).
+    let mut fds4 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds4.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for atomic-park test returned {}", r);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let (rfd4, wfd4) = (fds4[0] as u64, fds4[1] as u64);
+    if crate::syscall::dispatch_linux_kernel(72, wfd4, 1031, 4096, 0, 0, 0) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 4)");
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let pipe_id4 = crate::syscall::get_pipe_id(pid, wfd4 as usize);
+
+    // Pre-fill so that 0 < space < ATOMIC: write 3000 bytes → space = 1096.
+    // Then a blocking atomic write of 2000 needs 2000 > 1096 → MUST park.
+    const PREFILL: usize = 3000;
+    const ATOMIC: usize = 2000;
+    let prefill_buf = [0x11u8; PREFILL];
+    let pn = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd4, prefill_buf.as_ptr() as u64, PREFILL as u64, 0, 0, 0);
+    if pn != PREFILL as i64 {
+        test_fail!("pipe_blocking_write",
+            "atomic-park prefill write returned {} (expected {})", pn, PREFILL);
+        crate::syscall::dispatch_linux_kernel(3, rfd4, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd4, 0, 0, 0, 0, 0);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+
+    DRAIN_STOP.store(0, Ordering::SeqCst);
+    DRAINED_TOTAL.store(0, Ordering::SeqCst);
+    DRAIN_GATE.store(0, Ordering::SeqCst);
+    let drainer4_pid = crate::proc::create_kernel_process(
+        "pipe_atomic_park_drain", drainer_entry as *const () as u64);
+    let drain4_rfd = install_pipe_read_fd(drainer4_pid, pipe_id4);
+    if drain4_rfd < 0 {
+        test_fail!("pipe_blocking_write",
+            "install_pipe_read_fd(atomic drainer) returned {}", drain4_rfd);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    DRAIN_RFD.store(drain4_rfd as u64, Ordering::SeqCst);
+
+    // Watchdog: arm the drainer ONLY after the writer parks.  If the write spun
+    // (the livelock) it would never park, the watchdog would never observe a
+    // waiter, and the write would never return — the outer settle-loop then
+    // fails the sub-test.
+    static ATOMIC_PARK_OBSERVED: AtomicU32 = AtomicU32::new(0);
+    static ATOMIC_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+    ATOMIC_PARK_OBSERVED.store(0, Ordering::SeqCst);
+    ATOMIC_PIPE_ID.store(pipe_id4, Ordering::SeqCst);
+    fn atomic_watchdog_entry() {
+        crate::hal::enable_interrupts();
+        let pid4 = ATOMIC_PIPE_ID.load(Ordering::SeqCst);
+        loop {
+            if crate::ipc::pipe::debug_writer_waiter_count(pid4) >= 1 {
+                ATOMIC_PARK_OBSERVED.store(1, Ordering::SeqCst);
+                DRAIN_GATE.store(1, Ordering::SeqCst); // release the drainer
+                break;
+            }
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+        }
+        crate::proc::exit_thread(0);
+    }
+    let _wd_pid = crate::proc::create_kernel_process(
+        "pipe_atomic_watchdog", atomic_watchdog_entry as *const () as u64);
+
+    // Blocking atomic write of 2000 into 1096 free.  Must park (watchdog proves
+    // it) and return exactly 2000 once the drainer frees >= 2000.
+    let atomic_buf = [0x22u8; ATOMIC];
+    let an = crate::syscall::dispatch_linux_kernel(
+        1 /*write*/, wfd4, atomic_buf.as_ptr() as u64, ATOMIC as u64, 0, 0, 0);
+
+    DRAIN_STOP.store(1, Ordering::SeqCst);
+    for _ in 0..256u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if DRAINED_TOTAL.load(Ordering::SeqCst) >= (PREFILL + ATOMIC) as u64 { break; }
+    }
+    let leaked4 = crate::ipc::pipe::debug_writer_waiter_count(pipe_id4);
+    let parked = ATOMIC_PARK_OBSERVED.load(Ordering::SeqCst);
+    crate::syscall::dispatch_linux_kernel(3, rfd4, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd4, 0, 0, 0, 0, 0);
+
+    if parked != 1 {
+        test_fail!("pipe_blocking_write",
+            "blocking ATOMIC write into insufficient space did NOT park (livelock — watchdog never saw a writer on PIPE_WRITE_WAITERS)");
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if an != ATOMIC as i64 {
+        test_fail!("pipe_blocking_write",
+            "blocking ATOMIC write returned {} (expected {} — whole record after park+drain, never short/0)", an, ATOMIC);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    if leaked4 != 0 {
+        test_fail!("pipe_blocking_write",
+            "{} stale writer(s) on PIPE_WRITE_WAITERS after atomic-park completion", leaked4);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    test_println!("  blocking ATOMIC {}B write parked on insufficient space, woke+completed via read(2) drain ✓", ATOMIC);
+
+    // ── Sub-test 5: concurrent two-writer <=PIPE_BUF atomicity ────────────
+    //
+    // Two writers each blocking-write a distinct <= PIPE_BUF record (all-0xA1
+    // and all-0xB2) into a pipe with room for ~1.5 records.  A reader drains.
+    // Per pipe(7) PIPE_BUF atomicity, each record MUST emerge whole and
+    // contiguous — never split or interleaved.  Pre-fix the check (pipe_space)
+    // and the deposit (pipe_write) were separate locks, so both writers could
+    // observe space >= count, each deposit a SHORT capped record, and publish
+    // two interleaved partials.  Post-fix the single-lock pipe_write_atomic
+    // makes the check-and-deposit indivisible.
+    const REC: usize = 2500; // two records (5000) > 4096 ring → one must park
+    static W5_A_DONE: AtomicU32 = AtomicU32::new(0);
+    static W5_B_DONE: AtomicU32 = AtomicU32::new(0);
+    static W5_A_RET: AtomicU64 = AtomicU64::new(0);
+    static W5_B_RET: AtomicU64 = AtomicU64::new(0);
+    static W5_A_WFD: AtomicU64 = AtomicU64::new(0);
+    static W5_B_WFD: AtomicU64 = AtomicU64::new(0);
+
+    let mut fds5 = [0u32; 2];
+    let r = crate::syscall::dispatch_linux_kernel(
+        293 /*pipe2*/, fds5.as_mut_ptr() as u64, 0 /*blocking*/, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe_blocking_write", "pipe2(blocking) for concurrent test returned {}", r);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let (rfd5, wfd5) = (fds5[0] as u64, fds5[1] as u64);
+    if crate::syscall::dispatch_linux_kernel(72, wfd5, 1031, 4096, 0, 0, 0) != 4096 {
+        test_fail!("pipe_blocking_write", "F_SETPIPE_SZ pin to 4096 failed (sub-test 5)");
+        crate::syscall::dispatch_linux_kernel(3, rfd5, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd5, 0, 0, 0, 0, 0);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    let pipe_id5 = crate::syscall::get_pipe_id(pid, wfd5 as usize);
+
+    fn writer_a_entry() {
+        crate::hal::enable_interrupts();
+        let wfd = W5_A_WFD.load(Ordering::SeqCst);
+        let buf = [0xA1u8; REC];
+        let ret = crate::syscall::dispatch_linux_kernel(
+            1 /*write*/, wfd, buf.as_ptr() as u64, REC as u64, 0, 0, 0);
+        W5_A_RET.store(ret as u64, Ordering::SeqCst);
+        W5_A_DONE.store(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+    fn writer_b_entry() {
+        crate::hal::enable_interrupts();
+        let wfd = W5_B_WFD.load(Ordering::SeqCst);
+        let buf = [0xB2u8; REC];
+        let ret = crate::syscall::dispatch_linux_kernel(
+            1 /*write*/, wfd, buf.as_ptr() as u64, REC as u64, 0, 0, 0);
+        W5_B_RET.store(ret as u64, Ordering::SeqCst);
+        W5_B_DONE.store(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    W5_A_DONE.store(0, Ordering::SeqCst);
+    W5_B_DONE.store(0, Ordering::SeqCst);
+    let wa_pid = crate::proc::create_kernel_process(
+        "pipe_writer_a", writer_a_entry as *const () as u64);
+    let wb_pid = crate::proc::create_kernel_process(
+        "pipe_writer_b", writer_b_entry as *const () as u64);
+    let wa_fd = install_pipe_write_fd(wa_pid, pipe_id5);
+    let wb_fd = install_pipe_write_fd(wb_pid, pipe_id5);
+    if wa_fd < 0 || wb_fd < 0 {
+        test_fail!("pipe_blocking_write",
+            "install_pipe_write_fd returned a={} b={}", wa_fd, wb_fd);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    W5_A_WFD.store(wa_fd as u64, Ordering::SeqCst);
+    W5_B_WFD.store(wb_fd as u64, Ordering::SeqCst);
+
+    // Let both writers attempt their writes before the reader drains, to
+    // maximise the interleave window the old separate-lock code would lose on.
+    for _ in 0..64u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+
+    // Reader: drain the whole pipe via real read(2), reconstructing the byte
+    // stream so we can verify each record is contiguous.
+    let mut stream: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 * REC);
+    let mut chunk5 = [0u8; 256];
+    let mut spins = 0u32;
+    while stream.len() < 2 * REC && spins < 4096 {
+        let rn = crate::syscall::dispatch_linux_kernel(
+            0 /*read*/, rfd5, chunk5.as_mut_ptr() as u64, chunk5.len() as u64, 0, 0, 0);
+        if rn > 0 {
+            stream.extend_from_slice(&chunk5[..rn as usize]);
+        } else {
+            crate::sched::yield_cpu();
+            crate::hal::enable_interrupts();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
+            spins += 1;
+            if W5_A_DONE.load(Ordering::SeqCst) == 1
+                && W5_B_DONE.load(Ordering::SeqCst) == 1
+                && !crate::ipc::pipe::pipe_has_data(pipe_id5)
+            {
+                break;
+            }
+        }
+    }
+
+    let a_ret = W5_A_RET.load(Ordering::SeqCst) as i64;
+    let b_ret = W5_B_RET.load(Ordering::SeqCst) as i64;
+    let leaked5 = crate::ipc::pipe::debug_writer_waiter_count(pipe_id5);
+    crate::syscall::dispatch_linux_kernel(3, rfd5, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd5, 0, 0, 0, 0, 0);
+    if !was_active { crate::sched::disable(); }
+
+    if a_ret != REC as i64 || b_ret != REC as i64 {
+        test_fail!("pipe_blocking_write",
+            "concurrent writers returned a={} b={} (expected {} each — a short return means a partial atomic record)", a_ret, b_ret, REC);
+        return false;
+    }
+    if stream.len() != 2 * REC {
+        test_fail!("pipe_blocking_write",
+            "drained {} bytes from concurrent writers (expected {})", stream.len(), 2 * REC);
+        return false;
+    }
+    // Atomicity check: each record is all-0xA1 or all-0xB2; with atomicity there
+    // are EXACTLY two contiguous same-byte runs, each of length REC.  A split /
+    // interleaved record shows up as a short run or a third run.
+    let mut runs: alloc::vec::Vec<(u8, usize)> = alloc::vec::Vec::new();
+    for &b in stream.iter() {
+        match runs.last_mut() {
+            Some((val, len)) if *val == b => { *len += 1; }
+            _ => runs.push((b, 1)),
+        }
+    }
+    let bad = runs.iter().any(|(v, l)| (*v != 0xA1 && *v != 0xB2) || *l != REC);
+    if runs.len() != 2 || bad {
+        test_fail!("pipe_blocking_write",
+            "concurrent atomicity VIOLATED: expected 2 contiguous runs of {} (0xA1, 0xB2); got {} runs {:?} (a split/interleaved <=PIPE_BUF record)",
+            REC, runs.len(), runs);
+        return false;
+    }
+    if leaked5 != 0 {
+        test_fail!("pipe_blocking_write",
+            "{} stale writer(s) on PIPE_WRITE_WAITERS after concurrent completion", leaked5);
+        return false;
+    }
+    test_println!("  concurrent two-writer atomicity: 2 contiguous {}B records, no interleave ✓", REC);
+
+    test_pass!("pipe blocking write — capacity / atomic-park / concurrent-atomicity / EAGAIN / EPIPE / reader-wakes-writer");
     true
 }
 
@@ -39199,6 +39664,15 @@ fn test_pipe_console_drain_on_park() -> bool {
     }
     let (rfd, wfd) = (fds[0] as u64, fds[1] as u64);
     let pipe_id = crate::syscall::get_pipe_id(me, wfd as usize);
+    // Pipes now default to the Linux 64 KiB capacity (pipe(7)); this test's
+    // exact-fill / empty-space arithmetic is written against a 4 KiB ring, so
+    // pin it back via fcntl(2) F_SETPIPE_SZ (cmd 1031, returns the capacity).
+    if crate::syscall::dispatch_linux_kernel(72, wfd, 1031, 4096, 0, 0, 0) != 4096 {
+        test_fail!("pipe_console_drain", "F_SETPIPE_SZ pin to 4096 failed");
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
 
     let filler = [0x5Au8; 4096];
     let n = crate::syscall::dispatch_linux_kernel(

@@ -27,8 +27,29 @@ use spin::Mutex;
 
 use crate::ipc::waitlist::{ring_poll_bell_for, wake_tids, PollBellSource, WaitList};
 
-/// Pipe buffer size (4 KiB).
+/// POSIX write-atomicity threshold (`limits.h` `PIPE_BUF`; 4096 on Linux).
+/// Writes of at most this many bytes land all-or-nothing and never
+/// interleave with a concurrent writer's record (POSIX.1-2017 write(2),
+/// pipe(7)).  This is a *semantic* bound, distinct from the ring capacity
+/// below — POSIX only requires the ring capacity be at least `PIPE_BUF`.
 const PIPE_BUF_SIZE: usize = 4096;
+
+/// Default ring capacity for a newly created pipe — 64 KiB, matching the
+/// Linux default documented in pipe(7) ("Since Linux 2.6.11, the pipe
+/// capacity is 16 pages (i.e., 65,536 bytes ...)").
+///
+/// The ring used to be `PIPE_BUF`-sized (4 KiB, the bare POSIX minimum).
+/// Combined with the POSIX block-on-full write contract, that
+/// 16×-smaller-than-Linux capacity turns any bursty stdout/stderr producer
+/// into a convoy: a diagnostic burst fills the ring, `writev(2)` parks for
+/// seconds at a time, and — because stderr writes serialize under the libc
+/// FILE lock — unrelated threads pile up behind the parked writer.
+pub const PIPE_DEFAULT_CAPACITY: usize = 65536;
+
+/// Upper bound accepted from fcntl(F_SETPIPE_SZ), mirroring the default
+/// `/proc/sys/fs/pipe-max-size` limit (1 MiB) that applies to unprivileged
+/// callers on Linux (fcntl(2)).
+pub const PIPE_MAX_CAPACITY: usize = 1 << 20;
 
 /// Next pipe ID.
 static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -36,7 +57,11 @@ static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 /// A kernel pipe — a bounded ring buffer.
 pub struct Pipe {
     pub id: u64,
-    buffer: [u8; PIPE_BUF_SIZE],
+    /// Ring storage.  Heap-allocated so capacity is per-pipe adjustable
+    /// (fcntl F_SETPIPE_SZ) and `PIPE_TABLE`'s `Vec<Pipe>` reallocations
+    /// stay cheap.  Invariant: `buffer.len()` is the pipe capacity, a
+    /// power of two >= `PIPE_BUF_SIZE`.
+    buffer: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
     count: usize,
@@ -51,7 +76,7 @@ impl Pipe {
     fn new(id: u64) -> Self {
         Self {
             id,
-            buffer: [0; PIPE_BUF_SIZE],
+            buffer: alloc::vec![0; PIPE_DEFAULT_CAPACITY],
             read_pos: 0,
             write_pos: 0,
             count: 0,
@@ -61,8 +86,38 @@ impl Pipe {
         }
     }
 
+    /// Resize the ring to hold `want` bytes, per fcntl(2) F_SETPIPE_SZ:
+    /// the kernel rounds the request up to the next power of two (with a
+    /// floor of `PIPE_BUF_SIZE` — capacity may never drop below the POSIX
+    /// atomicity bound), refuses to exceed `PIPE_MAX_CAPACITY` with
+    /// `EPERM`, and refuses to shrink below the currently buffered byte
+    /// count with `EBUSY`.  Returns the actual capacity on success.
+    fn set_capacity(&mut self, want: usize) -> Result<usize, i32> {
+        let mut cap = PIPE_BUF_SIZE;
+        while cap < want {
+            cap <<= 1;
+            if cap > PIPE_MAX_CAPACITY {
+                return Err(-1); // EPERM — beyond pipe-max-size
+            }
+        }
+        if self.count > cap {
+            return Err(-16); // EBUSY — unread data would not fit
+        }
+        // Linearize the live bytes into the new ring.
+        let mut nb = alloc::vec![0u8; cap];
+        let old_len = self.buffer.len();
+        for i in 0..self.count {
+            nb[i] = self.buffer[(self.read_pos + i) % old_len];
+        }
+        self.buffer = nb;
+        self.read_pos = 0;
+        self.write_pos = self.count % cap;
+        Ok(cap)
+    }
+
     /// Read up to `buf.len()` bytes from the pipe. Returns bytes read.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let cap = self.buffer.len();
         let to_read = buf.len().min(self.count);
         // SMAP bracket — `buf` typically points to user memory (the
         // syscall layer passes user `buf_ptr` through `from_raw_parts_mut`).
@@ -72,7 +127,7 @@ impl Pipe {
         let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_read {
             buf[i] = self.buffer[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
+            self.read_pos = (self.read_pos + 1) % cap;
         }
         self.count -= to_read;
         to_read
@@ -80,13 +135,14 @@ impl Pipe {
 
     /// Write up to `data.len()` bytes into the pipe. Returns bytes written.
     pub fn write(&mut self, data: &[u8]) -> usize {
-        let space = PIPE_BUF_SIZE - self.count;
+        let cap = self.buffer.len();
+        let space = cap - self.count;
         let to_write = data.len().min(space);
         // SMAP bracket — `data` typically points to user memory.
         let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_write {
             self.buffer[self.write_pos] = data[i];
-            self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;
+            self.write_pos = (self.write_pos + 1) % cap;
         }
         self.count += to_write;
         to_write
@@ -122,7 +178,12 @@ impl Pipe {
 
     /// Free space remaining in the ring buffer.
     pub fn space(&self) -> usize {
-        PIPE_BUF_SIZE - self.count
+        self.buffer.len() - self.count
+    }
+
+    /// Current ring capacity (fcntl F_GETPIPE_SZ).
+    pub fn capacity(&self) -> usize {
+        self.buffer.len()
     }
 }
 
@@ -206,6 +267,53 @@ pub fn pipe_write(pipe_id: u64, data: &[u8]) -> Option<usize> {
     let mut pipes = PIPE_TABLE.lock();
     let pipe = pipes.iter_mut().find(|p| p.id == pipe_id)?;
     Some(pipe.write(data))
+}
+
+/// Outcome of an atomic (`count <= PIPE_BUF`) deposit attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AtomicWrite {
+    /// Every byte of `data` was deposited in one contiguous piece.
+    Wrote,
+    /// Not enough room for the whole record — NOTHING was written.  The
+    /// caller must park (never publish a partial `<= PIPE_BUF` record).
+    NoSpace,
+    /// Pipe id no longer exists (both ends closed) — treat as `EBADF`.
+    Gone,
+}
+
+/// Atomically deposit `data` iff the pipe has room for ALL of it, under a
+/// SINGLE `PIPE_TABLE` critical section.
+///
+/// Per `man 7 pipe` (`PIPE_BUF`): a write of at most `PIPE_BUF` bytes is
+/// delivered in one contiguous piece — never interleaved with another
+/// writer's data and never split into a short write on a blocking fd.
+/// Performing the space-check and the deposit under one lock is what
+/// enforces that.  Two SEPARATE `PIPE_TABLE` acquisitions (a `pipe_space`
+/// probe followed by `pipe_write`) let two concurrent atomic writers both
+/// observe `space >= count`, after which the ring's self-cap
+/// (`Pipe::write` copies `min(data.len(), space)`) publishes two
+/// interleaved partial records.  This helper closes that window: the
+/// check and the deposit are indivisible.
+///
+/// Returns `Wrote` once the whole record is deposited, `NoSpace` when the
+/// buffer lacks room for all of `data` (nothing written — the caller
+/// parks via [`wait_writable`] with `need == data.len()`), or `Gone` when
+/// the pipe has vanished.
+pub fn pipe_write_atomic(pipe_id: u64, data: &[u8]) -> AtomicWrite {
+    let mut pipes = PIPE_TABLE.lock();
+    let pipe = match pipes.iter_mut().find(|p| p.id == pipe_id) {
+        Some(p) => p,
+        None => return AtomicWrite::Gone,
+    };
+    if pipe.space() < data.len() {
+        return AtomicWrite::NoSpace;
+    }
+    // Room for the whole record — deposit it in one shot.  `Pipe::write`
+    // copies `min(data.len(), space)`, which given the guard above is
+    // exactly `data.len()`, so the published record is whole and contiguous.
+    let n = pipe.write(data);
+    debug_assert_eq!(n, data.len(), "atomic pipe write must deposit the whole record");
+    AtomicWrite::Wrote
 }
 
 /// True if every read end of `pipe_id` is closed (or the pipe no longer
@@ -322,9 +430,11 @@ pub fn pipe_drain_console(pipe_id: u64) -> usize {
     let mut scratch = [0u8; PIPE_BUF_SIZE];
     let mut total = 0usize;
     loop {
-        // Bounded by the ring capacity: at most PIPE_BUF_SIZE bytes are ever
-        // buffered, so this loop drains a full pipe in one pass and then sees
-        // a zero-length read and stops.  `pipe_read` returns None only if the
+        // The ring capacity can exceed this `PIPE_BUF_SIZE` scratch (the
+        // default is 64 KiB per pipe(7); the launcher pipe is provisioned
+        // larger still), so a full pipe may take several passes: each read
+        // drains up to `scratch.len()` bytes and we loop until a short read
+        // signals the ring is empty.  `pipe_read` returns None only if the
         // pipe id has vanished (both ends closed) — treat as "nothing more".
         let n = match pipe_read(pipe_id, &mut scratch) {
             Some(n) => n,
@@ -347,6 +457,35 @@ pub fn pipe_drain_console(pipe_id: u64) -> usize {
         }
     }
     total
+}
+
+/// Ring capacity of `pipe_id` (fcntl F_GETPIPE_SZ).  `None` = no such pipe.
+pub fn pipe_capacity(pipe_id: u64) -> Option<usize> {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id).map(|p| p.capacity())
+}
+
+/// Set the ring capacity of `pipe_id` (fcntl F_SETPIPE_SZ semantics — see
+/// `Pipe::set_capacity` for the rounding/EBUSY/EPERM contract).  On a
+/// successful GROW, wakes any writer parked on the previously-full ring:
+/// new space is a write-readiness edge exactly like a reader drain, so the
+/// parked writer must re-evaluate (POSIX write(2) blocking contract).
+pub fn pipe_set_capacity(pipe_id: u64, want: usize) -> Result<usize, i32> {
+    let (res, grew) = {
+        let mut pipes = PIPE_TABLE.lock();
+        let pipe = match pipes.iter_mut().find(|p| p.id == pipe_id) {
+            Some(p) => p,
+            None => return Err(-9), // EBADF — pipe vanished
+        };
+        let before = pipe.capacity();
+        let res = pipe.set_capacity(want);
+        let grew = matches!(res, Ok(c) if c > before);
+        (res, grew)
+    };
+    if grew {
+        wake_writers_all(pipe_id);
+    }
+    res
 }
 
 /// Check if a pipe has data.
@@ -433,10 +572,26 @@ pub fn wait_readable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
     WaitOutcome::Enqueued
 }
 
-/// Atomic check-then-park for a writer on `pipe_id`.  Symmetric with
-/// `wait_readable`; a writer parks when the pipe is full unless the
-/// reader has gone away (in which case the caller will return EPIPE).
-pub fn wait_writable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
+/// Needs-aware check-then-park for a writer on `pipe_id`.  Symmetric with
+/// `wait_readable`; a writer parks unless it can make the progress it
+/// needs.  `need` is the number of free bytes the writer requires before it
+/// should re-attempt:
+///   * atomic write (`count <= PIPE_BUF`): `need == count` — the writer
+///     must NOT wake until the whole record fits, or it would spin
+///     check -> Ready-on-any-space -> retry -> still-can't-write at 100%
+///     CPU (a write into `0 < space < count` makes no progress);
+///   * large write (`count > PIPE_BUF`): `need == 1` — any free byte is
+///     forward progress.
+///
+/// `Ready` is returned when `space() >= need` (enough room to advance) OR
+/// `readers == 0` (the writer must wake to observe `EPIPE`).  Otherwise the
+/// caller is parked.  The re-check runs under `PIPE_WRITE_WAITERS` while
+/// briefly holding `PIPE_TABLE`, closing the TOCTOU window against a reader
+/// drain that frees space between the caller's own space probe and the park:
+/// a drain that frees `>= need` wakes us (`wake_writers_all`) and we
+/// re-evaluate; a drain that frees `< need` leaves the predicate `Enqueued`
+/// here, so we genuinely park rather than spin (no spurious wake-consume).
+pub fn wait_writable(pipe_id: u64, need: usize, wake_tick: u64) -> WaitOutcome {
     let tid = crate::proc::current_tid();
     let mut waiters = PIPE_WRITE_WAITERS.lock();
 
@@ -444,7 +599,7 @@ pub fn wait_writable(pipe_id: u64, wake_tick: u64) -> WaitOutcome {
         let pipes = PIPE_TABLE.lock();
         match pipes.iter().find(|p| p.id == pipe_id) {
             None => WaitOutcome::Gone,
-            Some(p) if p.space() > 0 || p.readers == 0 => WaitOutcome::Ready,
+            Some(p) if p.space() >= need || p.readers == 0 => WaitOutcome::Ready,
             Some(_) => WaitOutcome::Enqueued,
         }
     };
