@@ -7060,9 +7060,12 @@ fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
 /// never drains, so no frame is ever presented).
 ///
 ///   * **Atomicity (`count <= PIPE_BUF`)** — delivered all in one piece or
-///     not at all.  On a blocking fd we park until `count` contiguous bytes
-///     of space exist, then write them in a single shot; a blocking fd never
-///     returns a short write for `count <= PIPE_BUF`.
+///     not at all.  On a blocking fd we park until `count` bytes of space
+///     exist, then deposit them in a single `PIPE_TABLE` critical section
+///     (`pipe::pipe_write_atomic`): the space-check and the deposit are
+///     indivisible, so two concurrent atomic writers can never both observe
+///     `space >= count` and publish interleaved partial records.  A blocking
+///     fd never returns a short write for `count <= PIPE_BUF`.
 ///   * **Large writes (`count > PIPE_BUF`)** — may be split: write what
 ///     fits, wake readers, block for more space, continue.
 ///   * **`O_NONBLOCK`** — if no progress can be made, return `-EAGAIN`; for
@@ -7109,38 +7112,52 @@ fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {
             return -32; // EPIPE
         }
 
-        let space = crate::ipc::pipe::pipe_space(pipe_id);
-        let remaining = count - total;
-
-        // How much we may write THIS pass without violating atomicity:
-        //   * count <= PIPE_BUF: all-or-nothing — only when the whole
-        //     remaining (== count) fits.
-        //   * count  > PIPE_BUF: whatever fits, up to `remaining`.
-        let writable_now = if atomic {
-            if space >= remaining { remaining } else { 0 }
-        } else {
-            space.min(remaining)
-        };
-
-        if writable_now > 0 {
-            let chunk = &data[total..total + writable_now];
-            match crate::ipc::pipe::pipe_write(pipe_id, chunk) {
-                Some(n) => {
-                    if n > 0 {
-                        total += n;
-                        // Wake readers parked on an empty pipe (man 7 pipe).
-                        crate::ipc::pipe::wake_readers_all(pipe_id);
-                    }
-                    if total >= count {
-                        return total as i64;
-                    }
-                    // Partial (count > PIPE_BUF) — loop to write the rest.
-                    continue;
+        // ── Atomic arm (count <= PIPE_BUF) ────────────────────────────────
+        // The check-and-deposit happens under ONE PIPE_TABLE lock so the
+        // record is published whole or not at all, never interleaved with a
+        // concurrent atomic writer (man 7 pipe, PIPE_BUF).  `total` is always
+        // 0 here — an atomic write makes no partial progress, so a NoSpace
+        // just parks (needs-aware `need == count`) until the WHOLE record
+        // fits rather than depositing a short/interleaved partial.
+        if atomic {
+            match crate::ipc::pipe::pipe_write_atomic(pipe_id, data) {
+                crate::ipc::pipe::AtomicWrite::Wrote => {
+                    // Whole record landed — wake readers parked on an empty
+                    // pipe (man 7 pipe) and report the full count.
+                    crate::ipc::pipe::wake_readers_all(pipe_id);
+                    return count as i64;
                 }
-                // Pipe vanished mid-write: EBADF if no progress, else partial.
-                None => {
-                    if total > 0 { return total as i64; }
-                    return -9; // EBADF
+                crate::ipc::pipe::AtomicWrite::Gone => return -9, // EBADF
+                crate::ipc::pipe::AtomicWrite::NoSpace => {
+                    // Not enough contiguous room.  Fall through to the
+                    // O_NONBLOCK / signal / backstop / park handling below.
+                }
+            }
+        } else {
+            // ── Large arm (count > PIPE_BUF) — partials allowed ───────────
+            let space = crate::ipc::pipe::pipe_space(pipe_id);
+            let remaining = count - total;
+            let writable_now = space.min(remaining);
+            if writable_now > 0 {
+                let chunk = &data[total..total + writable_now];
+                match crate::ipc::pipe::pipe_write(pipe_id, chunk) {
+                    Some(n) => {
+                        if n > 0 {
+                            total += n;
+                            // Wake readers parked on an empty pipe (man 7 pipe).
+                            crate::ipc::pipe::wake_readers_all(pipe_id);
+                        }
+                        if total >= count {
+                            return total as i64;
+                        }
+                        // Partial — loop to write the rest.
+                        continue;
+                    }
+                    // Pipe vanished mid-write: EBADF if no progress, else partial.
+                    None => {
+                        if total > 0 { return total as i64; }
+                        return -9; // EBADF
+                    }
                 }
             }
         }
@@ -7160,30 +7177,35 @@ fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {
             return -4; // EINTR
         }
 
-        // ── Inline console-drain (windowed-Firefox first-paint wedge) ─────────
+        // ── Inline console-drain — LAST-RESORT backstop only ─────────────────
         //
         // The read end of the kernel-owned console pipe (a child's stdout/stderr
-        // wired up at launch in `gui::terminal`) is drained ONLY by the
-        // cooperatively-scheduled `gui::terminal::poll_output()` on an in-kernel
-        // poll thread.  Under Firefox's ~70-thread `clone(2)` startup burst that
-        // poll thread is starved long enough for this 4 KiB pipe to fill, at
-        // which point a blocking `writev(fd=2)` would park here and — with no
-        // timely drain — never be woken, wedging the whole thread group before
-        // any frame is painted.
+        // wired up at launch in `gui::terminal`) is normally drained by the
+        // dedicated `gui::terminal::output_drain_thread`, which is woken
+        // DIRECTLY by this write and frees ring space AND wakes this parked
+        // writer (`pipe_read_and_wake`) WITHOUT discarding the bytes.  When that
+        // thread owns the pipe we therefore prefer to PARK below (a
+        // byte-preserving wake) over the historical drain-and-*discard* here,
+        // which throws the child's diagnostics away and each cycle costs a
+        // lock+memcpy pass over the whole ring.
         //
-        // Because this pipe has NO real peer reader (only the kernel drains it),
-        // it is always safe to discard its buffered bytes from the writer's own
-        // syscall context.  Doing so here makes forward progress independent of
-        // any poll-thread scheduling: drain inline, then re-evaluate space via
-        // `continue` instead of parking.  A normal user<->user pipe is NEVER the
-        // console drain target (`console_drain_pipe_id()` returns 0 unless THIS
-        // pipe is the running child's stdout/stderr), so this path leaves every
-        // ordinary pipe's blocking-write semantics untouched.
+        // The discard path survives only as a last-resort backstop for a
+        // build/context where NO drain thread owns the pipe (e.g. the drain
+        // thread was never started): there, because this pipe has no real peer
+        // reader, it is safe to discard its buffered bytes from the writer's own
+        // syscall context so a blocking `writev(fd=2)` is never wedged for want
+        // of a timely drain.  A normal user<->user pipe is NEVER the console
+        // drain target (`console_drain_pipe_id()` returns 0 unless THIS pipe is
+        // the running child's stdout/stderr), so this path leaves every ordinary
+        // pipe's blocking-write semantics untouched.
         //
         // `pipe_drain_console` reads into a kernel buffer and takes/drops
         // `PIPE_TABLE` internally, so no pipe lock is held across it and it
         // cannot recurse into this writer.  Refs: write(2), pipe(7).
-        if pipe_id != 0 && pipe_id == crate::gui::terminal::console_drain_pipe_id() {
+        if pipe_id != 0
+            && pipe_id == crate::gui::terminal::console_drain_pipe_id()
+            && !crate::gui::terminal::drain_thread_owns_pipe()
+        {
             let drained = crate::ipc::pipe::pipe_drain_console(pipe_id);
             if drained > 0 {
                 // Freed space — retry the write without parking.
@@ -7191,21 +7213,28 @@ fn pipe_write_blocking(pid: u64, fd: usize, pipe_id: u64, data: &[u8]) -> i64 {
             }
             // Nothing was buffered (a transient zero-space read can race the
             // child's own writes); fall through to the normal park so the
-            // writer is still woken by `poll_output`'s `wake_writers_all` if it
-            // does manage to run, and by the close paths on EOF/EPIPE.  This
-            // keeps the inline drain a pure progress *accelerator*, never the
-            // sole liveness mechanism.
+            // writer is still woken by a drain's `wake_writers_all` and by the
+            // close paths on EOF/EPIPE.  This keeps the backstop a pure progress
+            // *accelerator*, never the sole liveness mechanism.
         }
 
-        // Park atomically against the reader's `wake_writers_all`.  The lock
-        // order PIPE_WRITE_WAITERS -> PIPE_TABLE is taken and released
+        // Park atomically against the reader's `wake_writers_all`, using a
+        // needs-aware predicate so a writer does NOT wake-spin when a reader
+        // frees less room than this write requires:
+        //   * atomic write (count <= PIPE_BUF): need == count — park until the
+        //     WHOLE record fits (a write into 0 < space < count makes no
+        //     progress, so waking on any space would livelock at 100% CPU);
+        //   * large write (count > PIPE_BUF): need == 1 — any free byte is
+        //     forward progress, so wake as soon as room appears.
+        // The lock order PIPE_WRITE_WAITERS -> PIPE_TABLE is taken and released
         // entirely inside `wait_writable`; we hold no pipe lock across the
         // `schedule()` below.
+        let need = if atomic { count } else { 1 };
         let tid = crate::proc::current_tid();
-        match crate::ipc::pipe::wait_writable(pipe_id, u64::MAX) {
-            // Space appeared (or the reader closed) between our check and the
-            // wait-list re-check — retry the loop, which re-evaluates
-            // reader-closed (EPIPE) and available space.
+        match crate::ipc::pipe::wait_writable(pipe_id, need, u64::MAX) {
+            // Enough room appeared (or the reader closed) between our check and
+            // the wait-list re-check — retry the loop, which re-evaluates
+            // reader-closed (EPIPE) and re-attempts the atomic/large deposit.
             crate::ipc::pipe::WaitOutcome::Ready => continue,
             // Pipe id no longer exists — EBADF if no progress, else partial.
             crate::ipc::pipe::WaitOutcome::Gone => {
@@ -8333,6 +8362,32 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
                 }
             }
             -9 // EBADF
+        }
+        // F_SETPIPE_SZ / F_GETPIPE_SZ — pipe capacity control (fcntl(2)).
+        //
+        // Per fcntl(2): F_SETPIPE_SZ changes the pipe's ring capacity; the
+        // kernel rounds the request up (power of two, floor PIPE_BUF) and
+        // returns the actual capacity.  A sub-page request (including 0) is
+        // rounded up to the minimum rather than rejected, matching Linux.
+        // EBUSY when the new capacity cannot hold the currently buffered
+        // bytes; EPERM when the request exceeds the pipe-max-size limit.
+        // F_GETPIPE_SZ returns the capacity.  Both return EBADF when the
+        // descriptor does not refer to a pipe.
+        1031 /* F_SETPIPE_SZ */ => {
+            if !crate::syscall::is_pipe_fd(pid, fd as usize) { return -9; } // EBADF
+            let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
+            match crate::ipc::pipe::pipe_set_capacity(pipe_id, arg as usize) {
+                Ok(cap) => cap as i64,
+                Err(e) => e as i64,
+            }
+        }
+        1032 /* F_GETPIPE_SZ */ => {
+            if !crate::syscall::is_pipe_fd(pid, fd as usize) { return -9; } // EBADF
+            let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
+            match crate::ipc::pipe::pipe_capacity(pipe_id) {
+                Some(cap) => cap as i64,
+                None => -9, // EBADF — pipe vanished
+            }
         }
         // F_ADD_SEALS / F_GET_SEALS — memfd sealing API.
         //

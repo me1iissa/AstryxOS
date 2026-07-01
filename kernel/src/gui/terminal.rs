@@ -72,6 +72,133 @@ const NO_EXEC_EXIT: i64 = i64::MIN;
 static LAST_EXEC_EXIT_CODE: core::sync::atomic::AtomicI64 =
     core::sync::atomic::AtomicI64::new(NO_EXEC_EXIT);
 
+/// Render-throttle state for the launcher-pipe drain: tick of the last
+/// framebuffer repaint, and whether drained-but-unrendered text is pending.
+/// Draining the launcher pipe (which frees space for POSIX-blocked writers)
+/// must not be rate-limited by framebuffer blit speed, so the dedicated
+/// drain thread only flags `RENDER_DIRTY`; `poll_output()` on the desktop
+/// reactor performs the throttled repaint.
+static LAST_RENDER_TICK: AtomicU64 = AtomicU64::new(0);
+static RENDER_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// One-shot guard and single source of truth for drain OWNERSHIP of the
+/// launcher pipe.
+///
+/// Exactly one consumer may dequeue bytes from a pipe at a time.  Once this
+/// flag is `true` the dedicated [`output_drain_thread`] owns byte consumption
+/// of whatever `EXEC_STDOUT_PIPE` currently names, and both `poll_output()`
+/// and the inline console-drain backstop (`pipe_write_blocking`) must defer to
+/// it: a second consumer appending to the terminal grid under a separate
+/// TERMINAL-lock acquisition would interleave the child's output on screen.
+///
+/// There is never a window in which NO drainer is responsible for the pipe
+/// (the deadlock class #551 closed): the drain thread never exits — it parks
+/// when no exec is attached and re-snapshots `EXEC_STDOUT_PIPE`/`EXEC_RUNNING`
+/// on every wake — so "flag is true" ⟺ "a live drainer owns the pipe".  Before
+/// the thread is started (pre-first-launch) `poll_output()` remains the drainer
+/// and the inline backstop stays armed.
+static DRAIN_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// True once the dedicated drain thread owns byte consumption of the launcher
+/// pipe (so `poll_output()` skips its own dequeue and the inline console-drain
+/// backstop defers to a REAL, byte-preserving drain).  See
+/// [`DRAIN_THREAD_STARTED`].
+#[inline]
+pub fn drain_thread_owns_pipe() -> bool {
+    DRAIN_THREAD_STARTED.load(Ordering::Acquire)
+}
+
+/// Dedicated kernel-thread drain loop for the launcher stdout/stderr pipe.
+///
+/// `poll_output()` runs only on the shared desktop reactor, whose iteration
+/// latency is bounded but non-zero; POSIX write(2) blocks a writer on a full
+/// pipe, so a child whose diagnostic output outruns the reactor drain would
+/// park its writers.  Two pre-existing mechanisms already suppress the park —
+/// the 64 KiB (launcher: 1 MiB) ring absorbs bursts, and an inline
+/// console-drain backstop in `pipe_write_blocking` frees the ring from the
+/// writer's own context — but the backstop *discards* the drained bytes (data
+/// loss for anyone reading the child's stdout/stderr).
+///
+/// This thread provides a REAL, byte-preserving drain decoupled from the
+/// reactor: it parks on the pipe's reader wait-list (`wait_readable`), is woken
+/// DIRECTLY by the child's `write(2)` (`wake_readers_all`), and drains via
+/// `pipe_read_and_wake` — which both frees ring space and wakes any parked
+/// writer (so a blocked `writev(fd=2)` is never wedged) WITHOUT throwing the
+/// bytes away.  Drained text is mirrored to serial (for the harness) and, when
+/// a terminal window exists, appended to the grid; the throttled repaint stays
+/// with `poll_output()` via `RENDER_DIRTY`.
+fn output_drain_thread() {
+    crate::hal::enable_interrupts();
+    let mut raw = [0u8; 4096];
+    loop {
+        // Snapshot the live drain target from the authoritative atomics (NOT
+        // `TERMINAL.running_exec`, which a GUI re-init can clear out from under
+        // a live child — see `EXEC_STDOUT_PIPE`).
+        let running = EXEC_RUNNING.load(Ordering::Acquire);
+        let pipe_id = EXEC_STDOUT_PIPE.load(Ordering::Acquire);
+        if !running || pipe_id == 0 {
+            // No child attached — park on the global poll bell with a bounded
+            // resync so an attach we missed is re-checked within ~100 ms.
+            let now = crate::arch::x86_64::irq::get_ticks();
+            crate::ipc::waitlist::wait_poll_event(now + 10, || {
+                EXEC_RUNNING.load(Ordering::Acquire)
+                    && EXEC_STDOUT_PIPE.load(Ordering::Acquire) != 0
+            });
+            continue;
+        }
+
+        // REAL drain: frees ring space AND wakes any writer parked on a full
+        // pipe (POSIX write(2); man 7 pipe) — WITHOUT discarding the bytes.
+        let n = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut raw).unwrap_or(0);
+        if n > 0 {
+            // Mirror the child's stdout/stderr to serial for the harness — the
+            // same child-output stream `poll_output()` emits, NOT a per-read
+            // diagnostic marker (kept off the fast-path spam budget).
+            #[cfg(any(feature = "xeyes-test", feature = "firefox-test-core"))]
+            {
+                let text = core::str::from_utf8(&raw[..n]).unwrap_or("\u{FFFD}");
+                crate::serial_println!("[CHILD-OUT] {}", text.trim_end_matches('\n'));
+            }
+            // Append to the terminal grid for display when a window exists
+            // (windowed Firefox runs with `TERMINAL == None`, in which case
+            // only the serial mirror + the load-bearing drain happen).
+            if let Some(state) = TERMINAL.lock().as_mut() {
+                let text = core::str::from_utf8(&raw[..n]).unwrap_or("\u{FFFD}");
+                state.write_ansi_str(text);
+            }
+            RENDER_DIRTY.store(true, Ordering::Release);
+            continue; // keep draining while data is flowing
+        }
+
+        // Empty: park until the child's next write wakes us (bounded by a
+        // 100-tick resync so an exec swap or a missed wake can never strand us).
+        let now = crate::arch::x86_64::irq::get_ticks();
+        match crate::ipc::pipe::wait_readable(pipe_id, now + 100) {
+            crate::ipc::pipe::WaitOutcome::Ready => continue,
+            crate::ipc::pipe::WaitOutcome::Gone => {
+                // Pipe vanished (exec teardown) — bounded idle, then re-snap.
+                crate::ipc::waitlist::wait_poll_event(now + 10, || false);
+            }
+            crate::ipc::pipe::WaitOutcome::Enqueued => {
+                crate::sched::schedule();
+                crate::ipc::pipe::waiter_cleanup_reader(
+                    pipe_id, crate::proc::current_tid());
+            }
+        }
+    }
+}
+
+/// Start the launcher-pipe drain thread (idempotent — first launch wins).
+fn ensure_output_drain_thread() {
+    if DRAIN_THREAD_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = crate::proc::create_kernel_process(
+            "term_out_drain", output_drain_thread as *const () as u64);
+    }
+}
+
 use crate::wm::window::{self, WindowHandle};
 
 // ---------------------------------------------------------------------------
@@ -338,10 +465,10 @@ pub fn handle_key(msg: u32, wparam: u64, _lparam: u64) {
                     // Async path: spawn child with stdout → pipe.
                     match spawn_async(trimmed) {
                         Ok((pid, pipe_id)) => {
+                            // `spawn_async` already published EXEC_STDOUT_PIPE/
+                            // EXEC_PID/EXEC_RUNNING before unblocking the child;
+                            // set only the cosmetic `running_exec` here.
                             state.running_exec = Some((pid, pipe_id));
-                            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
-                            EXEC_PID.store(pid, Ordering::Release);
-                            EXEC_RUNNING.store(true, Ordering::Release);
                             // Don't draw prompt yet — poll_output() will do it on exit.
                         }
                         Err(msg) => {
@@ -1176,7 +1303,31 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
 
     // Attach pipe to stdout/stderr while the child is still blocked.
     let pipe_id = crate::ipc::pipe::create_pipe();
+    // The launcher pipe captures the child's fd 1/2.  Under a heavy child
+    // (a Firefox page load emits >1 MiB of diagnostic stderr), the POSIX
+    // write(2) block-on-full contract turns an undersized ring into a
+    // convoy: the ring fills, writev(2) parks, and — because stderr writes
+    // serialize under the libc FILE lock — unrelated threads pile up behind
+    // the parked writer.  The console pipe is drained cooperatively
+    // (`poll_output` on the desktop reactor, plus the inline console-drain
+    // in the blocking-write path), so provision the maximum capacity
+    // (fcntl(2) F_SETPIPE_SZ ceiling) to absorb a whole page-load's burst
+    // without the writer ever parking.
+    let _ = crate::ipc::pipe::pipe_set_capacity(
+        pipe_id, crate::ipc::pipe::PIPE_MAX_CAPACITY);
     crate::proc::attach_stdout_pipe(pid, pipe_id);
+    // Start the dedicated byte-preserving drain thread (idempotent).  Once it
+    // owns the launcher pipe, `poll_output()` and the inline console-drain
+    // backstop both defer to it (see `DRAIN_THREAD_STARTED`).
+    ensure_output_drain_thread();
+
+    // Publish the authoritative drain handle BEFORE unblocking the child, so
+    // there is no window in which the child can run (and fill its console pipe)
+    // while the drain thread / poll_output still read `EXEC_STDOUT_PIPE == 0`
+    // and park.  Callers only need to set the cosmetic `TERMINAL.running_exec`.
+    EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
+    EXEC_PID.store(pid, Ordering::Release);
+    EXEC_RUNNING.store(true, Ordering::Release);
 
     // Now allow the scheduler to run the child.
     crate::proc::unblock_process(pid);
@@ -1203,13 +1354,10 @@ pub fn launch_process(path: &str) {
 
     match spawn_async(path) {
         Ok((pid, pipe_id)) => {
-            // Publish the drain handle FIRST, unconditionally — `poll_output()`
-            // drains `EXEC_STDOUT_PIPE` regardless of whether `TERMINAL` is
-            // currently `Some` or gets re-`init()`d later (which would reset
-            // `running_exec`).  This is the authoritative console-pipe handle.
-            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
-            EXEC_PID.store(pid, Ordering::Release);
-            EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
+            // `spawn_async` already published the authoritative drain handle
+            // (`EXEC_STDOUT_PIPE`/`EXEC_PID`/`EXEC_RUNNING`) before unblocking
+            // the child, so `poll_output()` drains it regardless of `TERMINAL`
+            // re-`init()`.  Here we only set the cosmetic `running_exec` handle.
             let mut guard = TERMINAL.lock();
             if let Some(ref mut state) = *guard {
                 state.running_exec = Some((pid, pipe_id));
@@ -1458,17 +1606,27 @@ pub fn poll_output() {
     let mut raw = [0u8; 4096];
     let mut any_data = false;
 
-    // First pass: read all available data before locking TERMINAL
+    // Single drain ownership: once the dedicated `output_drain_thread` owns the
+    // launcher pipe it is the SOLE byte consumer (see `DRAIN_THREAD_STARTED`);
+    // `poll_output()` must NOT also dequeue, or the two drainers append to the
+    // terminal grid under separate TERMINAL-lock acquisitions with no ordering
+    // and the child's output interleaves.  In that mode `poll_output()` does
+    // only the throttled render (the drain thread flags `RENDER_DIRTY`) plus the
+    // reap/teardown below.  Before the drain thread is started `poll_output()`
+    // remains the drainer.
+    //
+    // `pipe_read_and_wake` wakes any writer (e.g. the Firefox stdout/stderr
+    // producer) parked for buffer space once this drain frees it.  Without the
+    // wake the producer parks forever and never returns to its event loop — the
+    // actual deadlock this consumer must avoid (`man 7 pipe`).
     let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
-    loop {
-        // `pipe_read_and_wake` wakes any writer (e.g. the Firefox stdout/stderr
-        // producer) parked for buffer space once this drain frees it.  Without
-        // the wake the producer parks forever and never returns to its event
-        // loop — the actual deadlock this consumer must avoid (`man 7 pipe`).
-        let n = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut raw).unwrap_or(0);
-        if n == 0 { break; }
-        chunks.push(raw[..n].to_vec());
-        any_data = true;
+    if !drain_thread_owns_pipe() {
+        loop {
+            let n = crate::ipc::pipe::pipe_read_and_wake(pipe_id, &mut raw).unwrap_or(0);
+            if n == 0 { break; }
+            chunks.push(raw[..n].to_vec());
+            any_data = true;
+        }
     }
 
     // Non-blocking waitpid: did the child become a zombie?
@@ -1490,12 +1648,28 @@ pub fn poll_output() {
     // case), the drain above has already done the load-bearing work (freeing
     // pipe space + waking the parked writer); skipping the grid update here is
     // purely cosmetic and must NOT skip the exit handling below.
+    if any_data {
+        RENDER_DIRTY.store(true, Ordering::Release);
+    }
+    // Repaint at most once per throttle window (≤ 20 fps).  This covers text we
+    // drained here (`any_data`) AND text the dedicated drain thread appended to
+    // the grid and flagged via `RENDER_DIRTY`, so the pipe-drain throughput is
+    // never coupled to framebuffer blit speed.  When no window exists (windowed
+    // Firefox: `TERMINAL == None`) the grid work is skipped and the drain
+    // already did the load-bearing byte transfer.
+    const RENDER_THROTTLE_TICKS: u64 = 5; // ≥ 50 ms between repaints (≤ 20 fps)
     if let Some(state) = TERMINAL.lock().as_mut() {
         for chunk in &chunks {
             let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
             state.write_ansi_str(text);
         }
-        if any_data {
+        let now = crate::arch::x86_64::irq::get_ticks();
+        if RENDER_DIRTY.load(Ordering::Acquire)
+            && now.wrapping_sub(LAST_RENDER_TICK.load(Ordering::Relaxed))
+                >= RENDER_THROTTLE_TICKS
+        {
+            LAST_RENDER_TICK.store(now, Ordering::Relaxed);
+            RENDER_DIRTY.store(false, Ordering::Release);
             state.render_to_surface();
         }
     }
