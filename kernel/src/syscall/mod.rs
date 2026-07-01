@@ -1022,8 +1022,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 
     // kdb syscall-trend ring: append (tick, pid, nr) so the kdb
     // `syscall-trend` op can produce a per-PID histogram of recent activity.
-    // Wait-free; no allocation; produces zero overhead in non-kdb builds.
-    #[cfg(feature = "kdb")]
+    // Wait-free; no allocation — but the producer reads `get_ticks()`
+    // (rdtsc + a 64-bit divide) on EVERY syscall, which at a busy process's
+    // ~10^5 syscalls/sec is a measurable fast-path tax.  Gate it behind the
+    // explicit `syscall-trace` opt-in (in addition to `kdb`, which owns the
+    // ring storage) so a plain `kdb` boot — the common fast profiling build —
+    // pays nothing.  `kdb syscall-trend` therefore requires `syscall-trace`.
+    #[cfg(all(feature = "kdb", feature = "syscall-trace"))]
     {
         let pid = crate::proc::current_pid_lockless();
         crate::perf::record_syscall_event(pid, num);
