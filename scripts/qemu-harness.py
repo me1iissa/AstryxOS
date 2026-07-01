@@ -1703,6 +1703,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           snapshottable: bool = False,
                           data_overlay: Optional[str] = None,
                           vmstate_qcow2: Optional[str] = None,
+                          data_img_override: Optional[str] = None,
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -1729,7 +1730,10 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     wt = _get_watch_test()
     ROOT     = wt.ROOT
     ESP_DIR  = Path(esp_dir_override) if esp_dir_override else wt.ESP_DIR
-    DATA_IMG = wt.DATA_IMG
+    # data_img_override lets `start` boot a prebuilt per-variant image (e.g.
+    # build/data-glibc.img) WITHOUT repointing the shared build/data.img symlink
+    # — the shared musl image on disk is never touched.  Absent => unchanged.
+    DATA_IMG = data_img_override if data_img_override else wt.DATA_IMG
     OVMF_CODE     = wt.OVMF_CODE
     OVMF_VARS_SRC = wt.OVMF_VARS_SRC
 
@@ -1857,6 +1861,60 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
 # is sufficient. We early-exit on the first newer file.
 _STALENESS_SCAN_FILE_BUDGET = 20000
 _STALENESS_SCAN_TIME_BUDGET_S = 4.0
+
+# Canonical (non-worktree) build root; a worktree's build/data.img is usually a
+# symlink back to here, so variant images live alongside the canonical data.img.
+_CANONICAL_BUILD_DIR = Path("/home/ubuntu/AstryxOS/build")
+
+
+def _variant_data_img_candidate(data_img_path: Path,
+                                 requested_variant: str,
+                                 explicit_override) -> "Path | None":
+    """
+    Resolve the prebuilt, per-variant data image for `--firefox-variant`.
+
+    Today only the ``glibc`` variant ships a separate prebuilt image
+    (``build/data-glibc.img``): the shared ``build/data.img`` carries the musl
+    Firefox, and the glibc Firefox lives on its own image so the two can coexist
+    without a re-stage.  When the caller asks for the glibc variant (and did NOT
+    pass an explicit ``--data-img``), this returns the first candidate image
+    that exists so ``start`` can boot it NON-destructively (the shared musl
+    ``build/data.img`` file is never touched).
+
+    Returns the resolved image ``Path`` when a prebuilt variant image should be
+    used, else ``None`` (fall back to the on-disk ``build/data.img`` and the
+    normal staleness / variant-regen machinery).
+
+    Purely functional (no I/O beyond ``exists()``) so it is host-unit-testable.
+
+    Candidate search order (first existing wins):
+      1. ``$ASTRYX_GLIBC_DATA_IMG`` (explicit env escape hatch)
+      2. ``<dir of data_img_path>/data-<variant>.img`` (worktree-local)
+      3. ``<canonical build>/data-<variant>.img`` (shared repo tree)
+    """
+    # An explicit --data-img always wins; never second-guess it.
+    if explicit_override:
+        return None
+    # Only glibc ships a separate prebuilt image; musl is the shared default.
+    if requested_variant != "glibc":
+        return None
+    candidates = []
+    env_override = os.environ.get("ASTRYX_GLIBC_DATA_IMG")
+    if env_override:
+        candidates.append(Path(env_override))
+    fname = f"data-{requested_variant}.img"
+    try:
+        candidates.append(Path(data_img_path).parent / fname)
+    except Exception:
+        pass
+    candidates.append(_CANONICAL_BUILD_DIR / fname)
+    for cand in candidates:
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            continue
+    return None
 
 
 def _data_img_staleness(data_img: Path, disk_dir: Path,
@@ -3551,6 +3609,40 @@ def cmd_start(args):
     # visible banner regardless so the operator always knows the state.
     _data_img_path = Path(wt.DATA_IMG)
 
+    # ── --firefox-variant glibc → prebuilt data-glibc.img (NON-destructive) ──
+    # The shared build/data.img carries the musl Firefox; the glibc Firefox
+    # ships as a SEPARATE prebuilt image (build/data-glibc.img).  When the
+    # caller asks for the glibc variant and did NOT pass an explicit --data-img,
+    # boot that image directly — WITHOUT repointing/unlinking the shared
+    # build/data.img (that file is left untouched, so a concurrent musl session
+    # and a later musl re-stage both keep working).  The image path is threaded
+    # into _launch_qemu_harness(data_img_override=...) at launch time; the
+    # on-disk staleness / variant-regen machinery is skipped for a prebuilt
+    # image (a prebuilt image is authoritative, exactly like --data-img).
+    # Additive: when no prebuilt variant image exists this is a no-op and the
+    # legacy re-stage path below runs unchanged.
+    _prebuilt_data_img = None   # str path to boot, or None (use build/data.img)
+    _variant_prebuilt_img = _variant_data_img_candidate(
+        _data_img_path,
+        getattr(args, "firefox_variant", None) or "musl",
+        getattr(args, "data_img_override", None),
+    )
+    if _variant_prebuilt_img is not None:
+        _prebuilt_data_img = str(_variant_prebuilt_img)
+        # A prebuilt image must not be regenerated from build/disk/.
+        try:
+            setattr(args, "no_regen_data_img", True)
+        except Exception:
+            pass
+        print(
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  --firefox-variant glibc → prebuilt image (no-regen, shared   ║\n"
+            "║  build/data.img left untouched)                              ║\n"
+            f"║  {_prebuilt_data_img[:60]:<60}  ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            file=sys.stderr,
+        )
+
     # --data-img OVERRIDE: point the worktree's build/data.img at an explicit
     # prebuilt image (e.g. /home/ubuntu/gui-complete.img) by replacing the
     # worktree symlink target.  A prebuilt complete image is authoritative — we
@@ -3676,6 +3768,11 @@ def cmd_start(args):
         "restage_extra_flags": list(_demo_bin["flags"]),
         "restage_extra_env":   dict(_demo_bin["env"]),
         "restage_flag_sources": dict(_demo_bin["sources"]),
+        # Prebuilt per-variant image booted NON-destructively (build/data-glibc.img
+        # for --firefox-variant glibc), or None when the shared build/data.img is
+        # used.  Additive; downstream agents may read it to confirm the glibc
+        # discriminator booted the intended image.
+        "prebuilt_data_img": _prebuilt_data_img,
     }
     # D10 fix-it: in worktrees the local build/disk/ is typically absent;
     # if build/data.img is a symlink into the canonical tree, inspect that
@@ -3698,7 +3795,7 @@ def cmd_start(args):
         _data_img_staleness_info = _data_img_staleness(
             _data_img_path, _disk_dir, extra_src_dirs=_extra_src_dirs)
         _data_img_stale = bool(_data_img_staleness_info.get("stale"))
-    if _data_img_stale:
+    if _data_img_stale and _prebuilt_data_img is None:
         _newest = _data_img_staleness_info.get("newest_path") or "?"
         _di_mt  = _data_img_staleness_info.get("data_img_mtime")
         _new_mt = _data_img_staleness_info.get("newest_mtime")
@@ -3780,6 +3877,7 @@ def cmd_start(args):
     _need_variant_regen = (
         not _data_img_missing
         and not _data_img_regenerated  # avoid back-to-back regens
+        and _prebuilt_data_img is None  # prebuilt variant image is authoritative
         and _staged_family is not None
         and _staged_family != _requested_variant
     )
@@ -4061,7 +4159,10 @@ def cmd_start(args):
     snap_topology = None
     if snapshottable:
         wt_for_di = _get_watch_test()
-        snap_topology = _make_snap_topology(sid, str(wt_for_di.DATA_IMG))
+        # A prebuilt per-variant image (build/data-glibc.img) is the snapshot
+        # backing file when one was selected; else the shared build/data.img.
+        _snap_base_img = _prebuilt_data_img or str(wt_for_di.DATA_IMG)
+        snap_topology = _make_snap_topology(sid, _snap_base_img)
 
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
@@ -4076,7 +4177,8 @@ def cmd_start(args):
                                  extra_qemu_args=extra_qemu_args,
                                  snapshottable=snapshottable,
                                  data_overlay=(snap_topology or {}).get("data_overlay"),
-                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"))
+                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"),
+                                 data_img_override=_prebuilt_data_img)
 
     session = {
         "sid":        sid,
@@ -12810,15 +12912,25 @@ def main():
                                "disk must carry: 'musl' (Alpine packages at "
                                "/usr/lib/firefox*) or 'glibc' (Mozilla tarball "
                                "at /opt/firefox).  Default 'musl' — the "
-                               "primary demo target.  When the staged tree "
-                               "doesn't match, the harness re-runs "
-                               "scripts/create-data-disk.sh with "
-                               "ASTRYXOS_FIREFOX_VARIANT exported so the boot "
-                               "image carries the requested binaries.  After "
+                               "primary demo target.  'glibc' boots a SEPARATE "
+                               "prebuilt image (build/data-glibc.img, or "
+                               "$ASTRYX_GLIBC_DATA_IMG) NON-destructively when "
+                               "present — the shared musl build/data.img file is "
+                               "never touched or regenerated, so the glibc "
+                               "'does the ~50x slowdown reproduce?' discriminator "
+                               "needs no re-stage.  Build that image with "
+                               "`ASTRYXOS_FIREFOX_VARIANT=glibc "
+                               "ASTRYXOS_BUILD_DIR=build-glibc "
+                               "scripts/create-data-disk.sh "
+                               "--output=build/data-glibc.img --force`.  If no "
+                               "prebuilt glibc image exists the legacy in-place "
+                               "re-stage path runs instead (create-data-disk.sh "
+                               "with ASTRYXOS_FIREFOX_VARIANT exported).  After "
                                "boot the kernel's [FFTEST] FF binary probe "
                                "line is parsed and a `firefox_variant_probe` "
                                "event records the actual selection (read it "
-                               "via `events <sid>` or `status <sid>`). "
+                               "via `events <sid>` or `status <sid>`; the chosen "
+                               "image is in firefox_variant_info.prebuilt_data_img). "
                                "Suppress the auto-restage with "
                                "--no-regen-data-img — the mismatch is still "
                                "warned about on stderr.")

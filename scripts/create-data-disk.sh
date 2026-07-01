@@ -16,10 +16,33 @@
 #   ./scripts/create-data-disk.sh 128       # Create 128 MiB image
 #   ./scripts/create-data-disk.sh --force   # Recreate even if it exists
 #
+# Isolated / alternate-image builds (additive — default behaviour unchanged):
+#   --output=PATH        Write the produced image to PATH instead of
+#                        build/data.img (env: ASTRYXOS_DATA_IMG).  Lets a
+#                        variant image (e.g. build/data-glibc.img) be built
+#                        WITHOUT clobbering the shared build/data.img.
+#   --build-dir=PATH     Stage into PATH/disk instead of build/disk (env:
+#                        ASTRYXOS_BUILD_DIR).  Exported to the install-*.sh
+#                        sub-scripts so a variant build never overwrites the
+#                        shared build/disk staging tree.  When --output is
+#                        omitted the image defaults to PATH/data.img.
+# Example — build a glibc Firefox image in an isolated tree:
+#   ASTRYXOS_FIREFOX_VARIANT=glibc ASTRYXOS_BUILD_DIR="${PWD}/build-glibc" \
+#     ./scripts/create-data-disk.sh --output="${PWD}/build/data-glibc.img" --force
+#
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build"
+# BUILD_DIR (staging root) and the output image are overridable via env or the
+# --build-dir / --output flags so a variant image can be produced in isolation.
+# The sub-scripts (install-glibc.sh, install-firefox.sh, ...) honour the same
+# ASTRYXOS_BUILD_DIR env, so exporting it below keeps the whole pipeline pointed
+# at one staging root.  Precedence: flag > env > ${ROOT_DIR}/build default.
+BUILD_DIR="${ASTRYXOS_BUILD_DIR:-${ROOT_DIR}/build}"
+# Output-image override captured here from env; the --output flag replaces it in
+# the arg loop.  DATA_IMG is finalised (from this override or ${BUILD_DIR}/data.img)
+# after BUILD_DIR is known — see the normalisation block below the arg loop.
+DATA_IMG_OVERRIDE="${ASTRYXOS_DATA_IMG:-}"
 DATA_IMG="${BUILD_DIR}/data.img"
 SIZE_MB=2048
 FORCE=false
@@ -178,6 +201,8 @@ for arg in "$@"; do
         --firefox-debug=*) FIREFOX_DEBUG="${arg#--firefox-debug=}" ;;
         --firefox-debug)   FIREFOX_DEBUG=1 ;;
         --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
+        --output=*)    DATA_IMG_OVERRIDE="${arg#--output=}" ;;
+        --build-dir=*) BUILD_DIR="${arg#--build-dir=}" ;;
         --xeyes) XEYES=1; FORCE=true ;;
         --busybox) BUSYBOX_CLI=1; FORCE=true ;;
         --sshd) SSHD=1; FORCE=true ;;
@@ -198,6 +223,22 @@ case "${FIREFOX_VARIANT}" in
         ;;
 esac
 echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT}"
+
+# ── Finalise the staging root + output image (after --build-dir / --output) ───
+# Export ASTRYXOS_BUILD_DIR so every install-*.sh sub-script stages into the
+# SAME (possibly isolated) build root rather than its own ${ROOT_DIR}/build.
+# This is what keeps a variant build (e.g. glibc) from overwriting the shared
+# build/disk musl staging tree.  Output-image precedence: --output flag /
+# ASTRYXOS_DATA_IMG env > ${BUILD_DIR}/data.img.
+export ASTRYXOS_BUILD_DIR="${BUILD_DIR}"
+if [ -n "${DATA_IMG_OVERRIDE}" ]; then
+    DATA_IMG="${DATA_IMG_OVERRIDE}"
+else
+    DATA_IMG="${BUILD_DIR}/data.img"
+fi
+mkdir -p "$(dirname "${DATA_IMG}")" 2>/dev/null || true
+echo "[DATA-DISK] Staging root: ${BUILD_DIR}"
+echo "[DATA-DISK] Output image: ${DATA_IMG}"
 
 case "${FIREFOX_PACKAGE}" in
     firefox-esr|firefox) ;;
