@@ -1110,7 +1110,11 @@ fn build_setup_ok() -> [u8; 128] {
 fn handle_request(fd: u64, data: &[u8]) {
     if data.len() < 4 { return; }
     let opcode = data[0];
-    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+    // Per-request protocol trace ([X11] req#… + [X11HEX]…): diagnostic only.
+    // Gate behind the full-trace profile (was `firefox-test-core`) so the lean
+    // perf/CI boot skips the per-request atomic + drawable decode + serial emit;
+    // keep it on `xeyes-test` for the X11 client bring-up path.
+    #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
     {
         static X11_REQ_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = X11_REQ_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2119,6 +2123,10 @@ fn op_intern_atom(fd: u64, data: &[u8], seq: u16) {
     let atom = atoms::intern(name, oie);
     let mut b = [0u8; 32]; b[0]=1; w16(&mut b,2,seq); w32(&mut b,8,atom);
     with_client(fd, |c| c.send(&b));
+    // Per-InternAtom-request decode line: redundant with the (now trace-gated)
+    // `[X11] req#` line for the same request, so keep the X11 trace coherent by
+    // gating it to the same full-trace / xeyes-test profile.
+    #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
     crate::serial_println!("[X11] InternAtom({:?}) -> {}", name, atom);
 }
 
@@ -4535,7 +4543,10 @@ fn op_damage(fd: u64, data: &[u8], seq: u16) {
 fn op_xinput(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     let minor = data[1];
-    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
+    // Per-XI-request trace: uncapped, so it is the hot X11 serial line under a
+    // Firefox render load (GTK drives XInput2 heavily).  Gate behind the
+    // full-trace profile; keep it on `xeyes-test`.
+    #[cfg(any(feature = "firefox-test-trace", feature = "xeyes-test"))]
     crate::serial_println!("[X11/XI] minor={} len={}", minor, data.len());
     match minor {
         // ── XI v1 (subset commonly issued by libXi during device discovery) ───

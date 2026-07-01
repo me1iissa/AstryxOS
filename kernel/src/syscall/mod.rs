@@ -2275,7 +2275,7 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
             alloc::vec::Vec::new()
         }
     };
-    #[cfg(feature = "firefox-test-core")]
+    #[cfg(feature = "firefox-test-trace")]
     {
         // Snapshot remaining keys for diagnosis if our lookup missed.
         let waiters = FUTEX_WAITERS.lock();
@@ -3234,9 +3234,11 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // can emit a `[FFTEST/mmap-so]` trace AFTER dropping the lock.  Letting
         // the print happen under PROCESS_TABLE could block other CPUs on a
         // slow serial port.  The capture is gated to match the emit cfg
-        // below — the `*-trace` features — so neither the per-mmap String
-        // allocation nor the serial line is paid in the fast/perf builds.
-        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+        // below — `firefox-test-core` (the lean profile also needs the
+        // load-base table for harness user-RIP symbolisation) or `test-mode` —
+        // so on a bare default kernel neither the per-mmap String allocation
+        // nor the serial line is paid.
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
         let so_trace_path: Option<alloc::string::String> = {
             let fd_num = fd as usize;
             proc.file_descriptors
@@ -3298,18 +3300,18 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
-        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base, so_trace_path)
         }
-        #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
+        #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode-trace")))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base)
         }
     };
-    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
     let (cr3, backing, name, base, so_trace_path_out) = mmap_setup;
-    #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
+    #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode-trace")))]
     let (cr3, backing, name, base) = mmap_setup;
 
     // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
@@ -3342,17 +3344,18 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // The first executable LOAD segment for a given .so is the load base;
     // later segments are placed by ld-linux at base+seg_vaddr via MAP_FIXED.
     //
-    // The host symboliser in `qemu-harness.py` consumes these lines to
-    // resolve user RIPs to `<library>+offset`.  Emit on any of:
-    //   - `firefox-test` (W101 plateau investigation requires symbolised
-    //     RIP samples; the cost is one log line per mmap, ~80 lines total
-    //     across a Firefox boot)
+    // The host symboliser in `qemu-harness.py` (`rip-sample --symbolise`,
+    // `ustack`, `autopsy`, `rip-trace-resolve`) consumes these lines to build
+    // the RIP→DSO load-base map and resolve user RIPs to `<library>+offset`.
+    // Emit on any of:
+    //   - `firefox-test-core` (the lean perf/render/CI profile): user-RIP
+    //     symbolisation must work on lean boots too, so the load-base table is
+    //     part of the functional core, not the trace superset.  This is one log
+    //     line per DSO mmap (~80 lines total across a Firefox boot) — a cheap
+    //     boot-time table, NOT a hot per-syscall emitter, so it belongs on the
+    //     fast profile.  `firefox-test-trace` still emits it (it pulls the core).
     //   - `test-mode` (headless dynamic-linker tests verify placement)
-    // The previous `firefox-trace-verbose` gate was an oversight — without
-    // mmap-so traces the harness symbolicator cannot resolve user RIPs to
-    // `<lib>+offset`, which made `rip-trace`'s output uninterpretable for
-    // PIE binaries.
-    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
     if let Some(path) = so_trace_path_out {
         crate::serial_println!(
             "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
