@@ -351,18 +351,45 @@ fn heap_corrupt_canary(
 /// `[rbp + 8]` per the System V AMD64 ABI §3.4.1 frame-pointer convention.
 ///
 /// This is a *hint* only — the kernel is built with `-fomit-frame-pointer` in
-/// some translation units, so the value may not be a true return address.  We
-/// only ever format it (never dereference it), so a garbage read is harmless,
-/// and on the common path (`heap_corrupt` keeps a frame pointer) it points at
-/// the alloc/dealloc call site that tripped the corruption check.
+/// some translation units, so `rbp` is a general scratch register there and
+/// may hold a non-pointer value.  Therefore we must **not** dereference `rbp`
+/// unconditionally: a `mov rax, [rbp+8]` on a garbage `rbp` page-faults, and
+/// because this helper runs inside the corruption *panic* path that fault
+/// replaces the located, greppable `[HEAP CORRUPT]` report with an opaque
+/// `KERNEL_PAGE_FAULT` bugcheck (observed under SMP=2 heavy render: `rbp` held
+/// `0x0000_0000_017a_f600`, so `[rbp+8]` faulted at CR2 `0x017a_f608`).
+///
+/// We therefore validate `rbp` as a canonical, 8-aligned higher-half kernel
+/// stack address before the load — the same guard `mm::cache::caller_rip`
+/// already applies (System V AMD64 ABI §3.2.2 stack alignment; the kernel
+/// higher-half begins at `0xFFFF_8000_0000_0000`).  If `rbp` is implausible
+/// the hint is simply unavailable and we return `0`, never faulting, so the
+/// `[HEAP CORRUPT]` panic always prints.
 #[inline(always)]
 fn caller_return_address() -> usize {
-    let ra: usize;
-    // SAFETY: read-only load through RBP; the value is only formatted into the
-    // panic string, never used as a pointer.  No memory is written.
+    let rbp: usize;
+    // SAFETY: reads the frame-pointer register only; no memory access.
     unsafe {
         core::arch::asm!(
-            "mov {ra}, [rbp + 8]",
+            "mov {rbp}, rbp",
+            rbp = out(reg) rbp,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    // A valid saved frame pointer on a kernel stack is non-null, 8-aligned and
+    // in the higher half.  Anything else is an `-fomit-frame-pointer` leftover
+    // — do not dereference it (return the "unavailable" sentinel 0).
+    if rbp == 0 || (rbp & 0x7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
+        return 0;
+    }
+    let ra: usize;
+    // SAFETY: read-only load through a validated higher-half, 8-aligned RBP;
+    // the value is only formatted into the panic string, never used as a
+    // pointer.  No memory is written.
+    unsafe {
+        core::arch::asm!(
+            "mov {ra}, [{rbp} + 8]",
+            rbp = in(reg) rbp,
             ra = out(reg) ra,
             options(nostack, readonly, preserves_flags),
         );
