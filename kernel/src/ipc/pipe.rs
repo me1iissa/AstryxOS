@@ -219,7 +219,14 @@ pub enum WaitOutcome {
 /// Create a new pipe. Returns the pipe ID.
 pub fn create_pipe() -> u64 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
-    PIPE_TABLE.lock().push(Pipe::new(id));
+    // Allocate + zero the ring (PIPE_DEFAULT_CAPACITY bytes) BEFORE taking the
+    // global PIPE_TABLE lock, then insert the ready-made pipe under the lock.
+    // Evaluating `Pipe::new(id)` as the `push` argument would run the 64 KiB
+    // memset while the guard is held, serialising all pipe traffic
+    // system-wide across the allocation — expensive on the FF IPC hot path,
+    // which creates many pipes.
+    let pipe = Pipe::new(id);
+    PIPE_TABLE.lock().push(pipe);
     id
 }
 

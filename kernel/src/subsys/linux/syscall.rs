@@ -8367,13 +8367,14 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
         //
         // Per fcntl(2): F_SETPIPE_SZ changes the pipe's ring capacity; the
         // kernel rounds the request up (power of two, floor PIPE_BUF) and
-        // returns the actual capacity.  EBUSY when the new capacity cannot
-        // hold the currently buffered bytes; EPERM when the request exceeds
-        // the pipe-max-size limit.  F_GETPIPE_SZ returns the capacity.
-        // Both return EBADF when the descriptor does not refer to a pipe.
+        // returns the actual capacity.  A sub-page request (including 0) is
+        // rounded up to the minimum rather than rejected, matching Linux.
+        // EBUSY when the new capacity cannot hold the currently buffered
+        // bytes; EPERM when the request exceeds the pipe-max-size limit.
+        // F_GETPIPE_SZ returns the capacity.  Both return EBADF when the
+        // descriptor does not refer to a pipe.
         1031 /* F_SETPIPE_SZ */ => {
             if !crate::syscall::is_pipe_fd(pid, fd as usize) { return -9; } // EBADF
-            if arg == 0 { return -22; } // EINVAL
             let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
             match crate::ipc::pipe::pipe_set_capacity(pipe_id, arg as usize) {
                 Ok(cap) => cap as i64,

@@ -465,10 +465,10 @@ pub fn handle_key(msg: u32, wparam: u64, _lparam: u64) {
                     // Async path: spawn child with stdout → pipe.
                     match spawn_async(trimmed) {
                         Ok((pid, pipe_id)) => {
+                            // `spawn_async` already published EXEC_STDOUT_PIPE/
+                            // EXEC_PID/EXEC_RUNNING before unblocking the child;
+                            // set only the cosmetic `running_exec` here.
                             state.running_exec = Some((pid, pipe_id));
-                            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
-                            EXEC_PID.store(pid, Ordering::Release);
-                            EXEC_RUNNING.store(true, Ordering::Release);
                             // Don't draw prompt yet — poll_output() will do it on exit.
                         }
                         Err(msg) => {
@@ -1321,6 +1321,14 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
     // backstop both defer to it (see `DRAIN_THREAD_STARTED`).
     ensure_output_drain_thread();
 
+    // Publish the authoritative drain handle BEFORE unblocking the child, so
+    // there is no window in which the child can run (and fill its console pipe)
+    // while the drain thread / poll_output still read `EXEC_STDOUT_PIPE == 0`
+    // and park.  Callers only need to set the cosmetic `TERMINAL.running_exec`.
+    EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
+    EXEC_PID.store(pid, Ordering::Release);
+    EXEC_RUNNING.store(true, Ordering::Release);
+
     // Now allow the scheduler to run the child.
     crate::proc::unblock_process(pid);
 
@@ -1346,13 +1354,10 @@ pub fn launch_process(path: &str) {
 
     match spawn_async(path) {
         Ok((pid, pipe_id)) => {
-            // Publish the drain handle FIRST, unconditionally — `poll_output()`
-            // drains `EXEC_STDOUT_PIPE` regardless of whether `TERMINAL` is
-            // currently `Some` or gets re-`init()`d later (which would reset
-            // `running_exec`).  This is the authoritative console-pipe handle.
-            EXEC_STDOUT_PIPE.store(pipe_id, Ordering::Release);
-            EXEC_PID.store(pid, Ordering::Release);
-            EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
+            // `spawn_async` already published the authoritative drain handle
+            // (`EXEC_STDOUT_PIPE`/`EXEC_PID`/`EXEC_RUNNING`) before unblocking
+            // the child, so `poll_output()` drains it regardless of `TERMINAL`
+            // re-`init()`.  Here we only set the cosmetic `running_exec` handle.
             let mut guard = TERMINAL.lock();
             if let Some(ref mut state) = *guard {
                 state.running_exec = Some((pid, pipe_id));

@@ -39733,6 +39733,19 @@ fn test_pipe_console_drain_on_park() -> bool {
         return false;
     }
     let (ctl_rfd, ctl_wfd) = (ctl_fds[0] as u64, ctl_fds[1] as u64);
+    // Pin the control pipe to 4 KiB too (fcntl F_SETPIPE_SZ, cmd 1031): with
+    // the new 64 KiB default a 4096-byte fill would leave 61440 free, so the
+    // 256-byte O_NONBLOCK write below would legitimately succeed instead of
+    // EAGAIN.  This sub-test needs a FULL control pipe to prove the inline
+    // drain is NOT applied to ordinary (non-console) pipes.
+    if crate::syscall::dispatch_linux_kernel(72, ctl_wfd, 1031, 4096, 0, 0, 0) != 4096 {
+        test_fail!("pipe_console_drain", "F_SETPIPE_SZ pin to 4096 failed (control pipe)");
+        crate::syscall::dispatch_linux_kernel(3, ctl_rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, ctl_wfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
     crate::syscall::dispatch_linux_kernel(
         1 /*write*/, ctl_wfd, filler.as_ptr() as u64, 4096, 0, 0, 0);
     let ctrl = crate::syscall::dispatch_linux_kernel(
