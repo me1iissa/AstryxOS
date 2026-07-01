@@ -803,6 +803,15 @@ pub fn mirror_audit_failures() -> u32 {
     MIRROR_AUDIT_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Snapshot of [`MAINTAIN_PASSES`]: the number of `mirror_maintain` calls, i.e.
+/// scheduling passes that reached the picker.  A monotone, always-advancing
+/// value while the scheduler is live; a diagnostic reader that sees this frozen
+/// across a wall-clock interval knows `schedule()` itself is not running (as
+/// opposed to running but declining to pick a Ready thread).
+pub fn maintain_passes() -> u32 {
+    MAINTAIN_PASSES.load(Ordering::Relaxed)
+}
+
 /// Cumulative count of live scheduling passes (debug builds only) where the
 /// phase-2b per-CPU runqueue pick selected a DIFFERENT thread than the
 /// authoritative legacy table-scan pick.  Must stay zero on SMP=1: a non-zero

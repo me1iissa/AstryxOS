@@ -1898,9 +1898,9 @@ fn op_cpu_state(out: &mut String) {
                 let crv = t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Relaxed);
                 let _ = write!(
                     out,
-                    r#"{{"tid":{},"pid":{},"st":"{:?}","lcpu":{},"aff":{},"mcpu":{},"mprio":{},"prio":{},"wt":{},"crv":{}}}"#,
+                    r#"{{"tid":{},"pid":{},"st":"{:?}","lcpu":{},"aff":{},"mcpu":{},"mprio":{},"prio":{},"wt":{},"crv":{},"rst":{}}}"#,
                     t.tid, t.pid, t.state, t.last_cpu, aff, ms_cpu, ms_prio,
-                    t.priority, t.wake_tick, crv as u8);
+                    t.priority, t.wake_tick, crv as u8, t.ready_since_tick);
             }
             out.push(']');
         }
@@ -1908,6 +1908,31 @@ fn op_cpu_state(out: &mut String) {
             out.push_str(r#","threads":"THREAD_TABLE held""#);
         }
     }
+
+    // ── Scheduler-liveness + candidate-gate skip population ──────────────────
+    // `maintain_passes` and `ctx_switches` advance once per picker pass / real
+    // context switch; a reader sampling them twice across a STARVE window can
+    // tell whether `schedule()` is running (H3: gate/stamp artifact) or frozen
+    // (H2: a monopolising in-kernel path).  `force_total` is the cumulative
+    // anti-starvation force-select count.  `gate_skips` (feature `sched-gate-
+    // stats`) is the population of Ready threads skipped by each candidate gate.
+    let _ = write!(
+        out,
+        r#","sched":{{"maintain_passes":{},"ctx_switches":{},"force_total":{}"#,
+        crate::sched::percpu::maintain_passes(),
+        crate::perf::context_switches(),
+        crate::sched::starve_force_count(),
+    );
+    #[cfg(feature = "sched-gate-stats")]
+    {
+        let (ctx_rsp, aff, mirror, self_resume) = crate::sched::gate_stats::snapshot();
+        let _ = write!(
+            out,
+            r#","gate_skips":{{"ctx_rsp_invalid":{},"affinity":{},"mirror":{},"self_resume_ready":{}}}"#,
+            ctx_rsp, aff, mirror, self_resume);
+    }
+    out.push('}');
+
     out.push('}');
 }
 
