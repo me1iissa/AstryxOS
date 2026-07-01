@@ -452,6 +452,48 @@ pub fn starve_force_count() -> u64 {
     SCHED_STARVE_FORCE_TOTAL.load(Ordering::Relaxed)
 }
 
+// ── Candidate-gate skip population counters (diagnostic, feature-gated) ──────
+//
+// The force-select backstop only logs a thread whose stale wait-age survives
+// past its deadline; a Ready thread skipped by a candidate gate for a sub-log
+// interval leaves no trace.  These counters record the POPULATION of gate
+// skips so an A/B can show how often each gate hides a Ready thread from the
+// fairness ladder, and how often the picker returns to a self-resuming Ready
+// current (the path that historically left an uncleared `ready_since_tick`).
+//
+// Gated behind `sched-gate-stats` so the shipped hot path (default and
+// `firefox-test-core`) is byte-identical — the increments compile out entirely.
+#[cfg(feature = "sched-gate-stats")]
+pub mod gate_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// A Ready candidate was skipped because `ctx_rsp_valid == false` (its saved
+    /// kernel RSP is not yet valid — mid switch-out or self-resume window).
+    pub static SKIP_CTX_RSP_INVALID: AtomicU64 = AtomicU64::new(0);
+    /// A Ready candidate was skipped because its hard `cpu_affinity` pin does
+    /// not match the picking CPU.
+    pub static SKIP_AFFINITY: AtomicU64 = AtomicU64::new(0);
+    /// A Ready non-idle thread was filtered out of the per-CPU candidate set
+    /// because its `mirror_slot` targets a different CPU (or is still `None`).
+    pub static SKIP_MIRROR: AtomicU64 = AtomicU64::new(0);
+    /// The picker found no other Ready peer and returned to the current thread
+    /// whose state the due-wake drain had flipped to Ready (self-resume).  This
+    /// is the path that must reset `ready_since_tick`; the counter measures how
+    /// often it is taken so a stale-stamp regression is visible as a divergence
+    /// between this count and the force-select count.
+    pub static SELF_RESUME_READY: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn snapshot() -> (u64, u64, u64, u64) {
+        (
+            SKIP_CTX_RSP_INVALID.load(Ordering::Relaxed),
+            SKIP_AFFINITY.load(Ordering::Relaxed),
+            SKIP_MIRROR.load(Ordering::Relaxed),
+            SELF_RESUME_READY.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// The BSP poll-reactor (TID 0) force-deadline in 100 Hz ticks.  Exposed for
 /// the scheduler regression test to assert the latency guarantee without
 /// reaching into the private constant.
@@ -1814,6 +1856,21 @@ pub fn test_saved_rsp_aliases(
     saved_rsp_aliases_live_frame(threads, base, size, excluding_tid)
 }
 
+/// Test-only: run the picker's self-resume promotion against a caller-supplied
+/// thread slice.  Lets the test suite verify the self-resume bookkeeping
+/// invariant (a Ready current that the picker returns to in place must be
+/// promoted to `Running` with its `ready_since_tick` cleared, so a stale wait
+/// stamp cannot later mis-fire the anti-starvation force backstop; a non-Ready
+/// current must be left untouched) without spinning a live scheduler.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_resume_current_if_ready(
+    threads: &mut [proc::Thread],
+    current_tid: proc::Tid,
+    cpu: u8,
+) -> Option<ThreadState> {
+    resume_current_if_ready(threads, current_tid, cpu)
+}
+
 /// Pure selection core: the scoring loop + two-pass split + force-backstop
 /// resolution, with NO side effects (no `READY_DEPTH` publish, no
 /// `SCHED_STARVE_FORCE_TOTAL` bump, no diagnostic).  Returns the selected table
@@ -1849,10 +1906,14 @@ fn select_next_core(
             ready_peers += 1;
         }
         if !t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire) {
+            #[cfg(feature = "sched-gate-stats")]
+            gate_stats::SKIP_CTX_RSP_INVALID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             continue;
         }
         if let Some(aff) = t.cpu_affinity {
             if aff != cpu {
+                #[cfg(feature = "sched-gate-stats")]
+                gate_stats::SKIP_AFFINITY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 continue;
             }
         }
@@ -2008,6 +2069,52 @@ fn test_percpu_candidates(
     out
 }
 
+/// Resolve the current thread when the picker reaches its "no other Ready peer"
+/// fallback, promoting a self-resuming Ready current back to `Running`.
+///
+/// The picker's candidate walk deliberately excludes the current thread's own
+/// index (`(1..len)` rotation), so the current thread is never selected by the
+/// scoring loop.  When no OTHER thread is Ready, `schedule()` returns to the
+/// current thread in place (no context switch).  Normally the current thread is
+/// still `Running`, but the in-picker due-wake drain can flip a current thread
+/// that had blocked with a sleep/timeout deadline back to `Ready` when that
+/// deadline elapses during this same pass — and then this fallback runs it.
+///
+/// That in-place resume IS a selection of the current thread to run, so it must
+/// apply the same post-selection bookkeeping the normal pick applies to the
+/// thread it selects (see the `Some(idx)` arm: `state = Running`,
+/// `ready_since_tick = 0`).  Otherwise the thread keeps a `Ready` state and its
+/// original `ready_since_tick` while it actually runs; the anti-starvation
+/// design (`ready_since_tick` "cleared the moment the thread is selected to
+/// Run") is then violated, and when the thread later yields to a freshly-Ready
+/// peer it re-enters the ready set carrying that stale stamp — the force-select
+/// backstop then rescues it on a wait age that was never real.
+///
+/// `ctx_rsp_valid` is deliberately NOT touched: the thread runs on its live
+/// kernel stack and its saved `context.rsp` is stale until the next real
+/// switch-out re-validates it — the exact invariant the picker's
+/// `ctx_rsp_valid` candidate gate and the #672/#673 on-CPU interlock rely on
+/// (a thread must never be dispatched onto another CPU via a stale saved RSP).
+/// Promoting the state to `Running` here only STRENGTHENS that exclusion (a
+/// `Running` thread is not a candidate at all), so it cannot weaken the SMP
+/// interlock.  Returns the state observed BEFORE promotion so the caller's
+/// match arms (and the self-resume diagnostic) are unchanged.
+#[inline]
+fn resume_current_if_ready(
+    threads: &mut [proc::Thread],
+    current_tid: proc::Tid,
+    cpu: u8,
+) -> Option<ThreadState> {
+    let t = threads.iter_mut().find(|t| t.tid == current_tid)?;
+    let observed = t.state;
+    if observed == ThreadState::Ready {
+        t.state = ThreadState::Running;
+        t.last_cpu = cpu;
+        t.ready_since_tick = 0;
+    }
+    Some(observed)
+}
+
 /// Schedule the next thread to run.
 ///
 /// This is the core scheduling function. It:
@@ -2146,10 +2253,10 @@ was_emergency_4k={}",
             //                         ever produce another runnable
             //                         thread on this kernel.  Returning
             //                         would sysretq into dead user code.
-            let current_state = threads
-                .iter()
-                .find(|t| t.tid == current_tid)
-                .map(|t| t.state);
+            // Promote a self-resuming Ready current back to Running and clear
+            // its run-queue wait stamp (a successful in-place pick of the
+            // current thread — see `resume_current_if_ready`).
+            let current_state = resume_current_if_ready(&mut threads, current_tid, cpu);
             drop(threads);
             match current_state {
                 // Running, or freshly re-Readied (e.g. by the due-wake drain
@@ -2160,6 +2267,10 @@ was_emergency_4k={}",
                 // it is exactly the intended self-resume.  Clear the burst so a
                 // brief wedge that just self-resolved does not leave stale state.
                 Some(ThreadState::Running) | Some(ThreadState::Ready) => {
+                    #[cfg(feature = "sched-gate-stats")]
+                    if current_state == Some(ThreadState::Ready) {
+                        gate_stats::SELF_RESUME_READY.fetch_add(1, Ordering::Relaxed);
+                    }
                     clear_picker_burst();
                     crate::arch::x86_64::irq::reset_watchdog_counter();
                     crate::hal::enable_interrupts();
@@ -2307,7 +2418,18 @@ was_emergency_4k={}",
             cpu,
             (1..len)
                 .map(|i| (current_idx + i) % len)
-                .filter(|&idx| matches!(threads[idx].mirror_slot, Some((c, _)) if c == percpu_cpu))
+                .filter(|&idx| {
+                    let on_this_cpu =
+                        matches!(threads[idx].mirror_slot, Some((c, _)) if c == percpu_cpu);
+                    #[cfg(feature = "sched-gate-stats")]
+                    if !on_this_cpu
+                        && threads[idx].state == ThreadState::Ready
+                        && threads[idx].tid < 0x1000
+                    {
+                        gate_stats::SKIP_MIRROR.fetch_add(1, Ordering::Relaxed);
+                    }
+                    on_this_cpu
+                })
                 // ── #655 on-CPU dispatch interlock (the dispatch chokepoint) ──
                 // Skip-and-defer any candidate still live (current or on-stack)
                 // on another CPU, so one thread is never dispatched onto two CPUs
@@ -2474,10 +2596,10 @@ was_emergency_4k={}",
                 //                         to Ready, then continue 'pick.
                 //                         Returning would sysretq into
                 //                         dead user code.
-                let current_state = threads
-                    .iter()
-                    .find(|t| t.tid == current_tid)
-                    .map(|t| t.state);
+                // Promote a self-resuming Ready current back to Running and
+                // clear its run-queue wait stamp (a successful in-place pick of
+                // the current thread — see `resume_current_if_ready`).
+                let current_state = resume_current_if_ready(&mut threads, current_tid, cpu);
                 drop(threads);
                 match current_state {
                     // Running, or freshly re-Readied by the due-wake drain at
@@ -2491,6 +2613,10 @@ was_emergency_4k={}",
                     // then self-resumed would carry a stale burst into the next
                     // transient idle.
                     Some(ThreadState::Running) | Some(ThreadState::Ready) => {
+                        #[cfg(feature = "sched-gate-stats")]
+                        if current_state == Some(ThreadState::Ready) {
+                            gate_stats::SELF_RESUME_READY.fetch_add(1, Ordering::Relaxed);
+                        }
                         clear_picker_burst();
                         crate::perf::record_idle_tick();
                         crate::arch::x86_64::irq::reset_watchdog_counter();

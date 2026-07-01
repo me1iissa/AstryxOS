@@ -16,6 +16,12 @@ default = []
 # deterministic Test 648 is the authoritative merge gate; this is supplementary
 # live evidence.
 sched-pick-xcheck = []
+# `sched-gate-stats` — count the population of Ready threads skipped by each
+# scheduler candidate gate (ctx_rsp_valid / affinity / mirror-slot) and how
+# often the picker returns to a self-resuming Ready current.  Diagnostic-only:
+# the increments compile out entirely by default so the pick hot path (and the
+# `firefox-test-core` profile) stays byte-identical.  Read via kdb `cpu-state`.
+sched-gate-stats = []
 # `heap-canary` — fence every live kernel-heap allocation with front/rear
 # magic red-zone words (validated on free) so an out-of-bounds write that
 # clobbers free-list metadata is caught at free-time, naming the victim
