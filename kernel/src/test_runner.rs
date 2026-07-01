@@ -15595,28 +15595,39 @@ fn test_unix_peer_close_sever_and_recycle() -> bool {
     }
     test_println!("  write after peer close → -EPIPE ✓");
 
-    // (4) Recycle b's slot index into a fresh pair.  The allocator scans for
-    // the lowest Free slot, so one of (c, d) re-uses b's index.
+    // (4) Recycle b's slot index into a fresh pair, DETERMINISTICALLY.  The
+    // allocator returns the two lowest Free slots, lowest first.  At the first
+    // socketpair, a and b were those two lowest-free slots (nothing free below
+    // a, nothing free between a and b); a is still occupied and nothing below b
+    // has been freed since, so after close(b) the lowest Free slot is exactly
+    // b's index.  Under the single-threaded test runner the recycle therefore
+    // MUST return c == b — we assert it rather than skip-with-note, so the
+    // isolation leg below is exercised against a genuinely recycled slot and
+    // never silently passes vacuously.
     let (c, d) = unix::socketpair(unix::SockKind::Stream, creds);
     if c == u64::MAX || d == u64::MAX {
         test_fail!("unix_sever", "recycle socketpair returned MAX");
         unix::close(a);
         return false;
     }
-    if c != b && d != b {
-        // Environmental: another slot was free below b.  The severing already
-        // proved (get_peer == MAX); isolation cannot be exercised — pass with
-        // a note rather than fail spuriously.
-        test_println!("  note: fresh pair ({}, {}) did not re-use slot {} — \
-                       isolation leg skipped", c, d, b);
+    if c != b {
+        // The recycle did not reuse b's freed index — the isolation leg would
+        // be untested (stale-survivor ops aimed at an unrelated slot).  This
+        // can only mean the slot allocator no longer returns lowest-free,
+        // which itself is worth surfacing.  Fail loudly, do not vacuously pass.
+        test_fail!("unix_sever",
+            "recycle did not reuse freed slot {}: fresh pair=({}, {})", b, c, d);
+        unix::close(a); unix::close(c); unix::close(d);
+        return false;
     }
+    test_println!("  recycled b's freed slot {} into fresh pair (c={}, d={}) ✓", b, c, d);
     // Stale survivor must be fully severed: no path back to the recycled slot.
     if unix::get_peer(a) != u64::MAX {
         test_fail!("unix_sever", "survivor peer_id not severed: {}", unix::get_peer(a));
         unix::close(a); unix::close(c); unix::close(d);
         return false;
     }
-    // Stale write must NOT inject into the new pair.
+    // Stale write must NOT inject into the new pair (c now occupies b's index).
     let _ = unix::write(a, b"INJECT");
     if unix::bytes_available(c) != 0 || unix::bytes_available(d) != 0 {
         test_fail!("unix_sever",
