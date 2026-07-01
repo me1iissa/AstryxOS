@@ -27148,9 +27148,25 @@ fn test_execve_no_pmm_leak() -> bool {
     // How many exec iterations to exercise.
     const ITERS: usize = 3;
     // Maximum tolerated PMM leak per exec iteration (in 4 KiB pages).
-    // A small slop is allowed for kernel heap fragmentation and CoW refcount
-    // pages that are legitimately not freed until after this measurement.
-    const TOLERANCE_PER_ITER: u64 = 8;
+    //
+    // A slop is allowed for two effects that are NOT leaks: (1) kernel-heap
+    // fragmentation and CoW refcount pages that are legitimately not freed
+    // until after this measurement, and (2) asynchronous background reclamation
+    // (dead-thread kstack recycling + deferred GC) that has not fully drained at
+    // the sample point even after wait_dead_stacks_quiesced() — its residual lag
+    // is timing-sensitive and inflates on a loaded (e.g. shared-CI TCG) host.
+    //
+    // This bound is a hygiene widening (8 -> 16 per iter, total 24 -> 48): the
+    // old 24-page total flaked green->red->green on same-head CI reruns (observed
+    // 38 pages > 24 on a comment-only diff, then green on rerun). 48 clears that
+    // async-GC jitter with margin while remaining meaningful: the regressions
+    // this test guards against are far larger — a free_vm_space() that reverts to
+    // a no-op leaks the whole old VmSpace every iteration (>= USER_STACK_PAGES(16)
+    // eager stack frames + code/data + page tables ~= 18-20/iter ~= 54-60 total),
+    // and a non-recycled kernel stack is KERNEL_STACK_PAGES(64). Both exceed 48,
+    // so a genuine per-exec leak still fails; only the sub-64-page async-GC jitter
+    // is tolerated.
+    const TOLERANCE_PER_ITER: u64 = 16;
 
     // Use the embedded HELLO_ELF — always present, no disk dependency.
     let elf_data = &crate::proc::hello_elf::HELLO_ELF;
