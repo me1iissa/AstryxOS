@@ -803,6 +803,10 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_pollout_writable_gate() { passed += 1; }
 
+    // ── AF_UNIX peer-close: sever pairing, drain-then-EOF, no recycle bleed ─
+    total += 1;
+    if test_unix_peer_close_sever_and_recycle() { passed += 1; }
+
     // ── Test 54: AF_UNIX bind/listen/connect/accept ───────────────────────
 
     total += 1;
@@ -15515,6 +15519,148 @@ fn test_writev_contiguous_prefix_on_short_write() -> bool {
     crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
     crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
     test_pass!("writev contiguous-prefix on AF_UNIX short write");
+    true
+}
+
+// ── AF_UNIX peer-close: sever pairing, drain-then-EOF, no recycle bleed ─────────
+//
+// Proves the slot-recycling safety contract of the global AF_UNIX socket table
+// against POSIX (recv(2), send(2), poll(2)) and `man 7 unix`:
+//   (1) Drain-then-EOF — bytes queued by the peer before it fully closed are
+//       still returned by read(); only THEN does read() report the orderly
+//       EOF (recv(2): queued data first, then 0).
+//   (2) write() on the survivor returns -EPIPE (peer gone), never "success
+//       into nowhere".
+//   (3) The survivor reports POLLHUP (fully_hung_up) + read_shutdown + writable
+//       (write can no longer block).
+//   (4) NO RECYCLE BLEED: after the dead peer's slot index is re-allocated to a
+//       brand-new pair, neither write() nor shutdown() nor close() on the stale
+//       survivor may touch the new pair — no injected bytes, no spurious EOF.
+//       (This was the live Gate-1 failure shape: a stale survivor's writes /
+//       half-close state landing on a freshly-spawned process's IPC channel.)
+fn test_unix_peer_close_sever_and_recycle() -> bool {
+    use crate::net::unix;
+    test_header!("AF_UNIX peer-close severing + slot-recycle isolation");
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream, creds);
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("unix_sever", "socketpair returned MAX");
+        return false;
+    }
+
+    // Queue 5 bytes b→a, then fully close b.  a's reads must drain the bytes
+    // FIRST and only then observe EOF.
+    let n = unix::write(b, b"HELLO");
+    if n != 5 {
+        test_fail!("unix_sever", "seed write returned {} (expected 5)", n);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    unix::close(b);
+
+    // (3) readiness edges on the survivor.
+    if !unix::read_shutdown(a) || !unix::fully_hung_up(a) || !unix::writable(a) {
+        test_fail!("unix_sever",
+            "survivor edges wrong: rdshut={} hup={} writable={}",
+            unix::read_shutdown(a), unix::fully_hung_up(a), unix::writable(a));
+        unix::close(a);
+        return false;
+    }
+    test_println!("  survivor: POLLIN/RDHUP+POLLHUP+writable edges ✓");
+
+    // (1) drain-then-EOF.
+    let mut buf = [0u8; 16];
+    let r1 = unix::read(a, &mut buf);
+    if r1 != 5 || &buf[..5] != b"HELLO" {
+        test_fail!("unix_sever",
+            "drain read returned {} (expected 5 queued bytes before EOF)", r1);
+        unix::close(a);
+        return false;
+    }
+    let r2 = unix::read(a, &mut buf);
+    if r2 != 0 {
+        test_fail!("unix_sever", "post-drain read returned {} (expected 0 EOF)", r2);
+        unix::close(a);
+        return false;
+    }
+    test_println!("  drain-then-EOF: 5 bytes then 0 ✓");
+
+    // (2) write → EPIPE.
+    let w = unix::write(a, b"X");
+    if w != -32 {
+        test_fail!("unix_sever", "write to dead peer returned {} (expected -EPIPE)", w);
+        unix::close(a);
+        return false;
+    }
+    test_println!("  write after peer close → -EPIPE ✓");
+
+    // (4) Recycle b's slot index into a fresh pair, DETERMINISTICALLY.  The
+    // allocator returns the two lowest Free slots, lowest first.  At the first
+    // socketpair, a and b were those two lowest-free slots (nothing free below
+    // a, nothing free between a and b); a is still occupied and nothing below b
+    // has been freed since, so after close(b) the lowest Free slot is exactly
+    // b's index.  Under the single-threaded test runner the recycle therefore
+    // MUST return c == b — we assert it rather than skip-with-note, so the
+    // isolation leg below is exercised against a genuinely recycled slot and
+    // never silently passes vacuously.
+    let (c, d) = unix::socketpair(unix::SockKind::Stream, creds);
+    if c == u64::MAX || d == u64::MAX {
+        test_fail!("unix_sever", "recycle socketpair returned MAX");
+        unix::close(a);
+        return false;
+    }
+    if c != b {
+        // The recycle did not reuse b's freed index — the isolation leg would
+        // be untested (stale-survivor ops aimed at an unrelated slot).  This
+        // can only mean the slot allocator no longer returns lowest-free,
+        // which itself is worth surfacing.  Fail loudly, do not vacuously pass.
+        test_fail!("unix_sever",
+            "recycle did not reuse freed slot {}: fresh pair=({}, {})", b, c, d);
+        unix::close(a); unix::close(c); unix::close(d);
+        return false;
+    }
+    test_println!("  recycled b's freed slot {} into fresh pair (c={}, d={}) ✓", b, c, d);
+    // Stale survivor must be fully severed: no path back to the recycled slot.
+    if unix::get_peer(a) != u64::MAX {
+        test_fail!("unix_sever", "survivor peer_id not severed: {}", unix::get_peer(a));
+        unix::close(a); unix::close(c); unix::close(d);
+        return false;
+    }
+    // Stale write must NOT inject into the new pair (c now occupies b's index).
+    let _ = unix::write(a, b"INJECT");
+    if unix::bytes_available(c) != 0 || unix::bytes_available(d) != 0 {
+        test_fail!("unix_sever",
+            "stale write bled into recycled pair (avail c={} d={})",
+            unix::bytes_available(c), unix::bytes_available(d));
+        unix::close(a); unix::close(c); unix::close(d);
+        return false;
+    }
+    // Stale shutdown(SHUT_WR) and close must NOT flip EOF state on the new pair.
+    let _ = unix::shutdown(a, false, true);
+    unix::close(a);
+    if unix::read_shutdown(c) || unix::read_shutdown(d)
+        || unix::fully_hung_up(c) || unix::fully_hung_up(d)
+    {
+        test_fail!("unix_sever",
+            "stale shutdown/close bled into recycled pair (rdshut c={} d={})",
+            unix::read_shutdown(c), unix::read_shutdown(d));
+        unix::close(c); unix::close(d);
+        return false;
+    }
+    // New pair still fully functional.
+    let wn = unix::write(c, b"OK");
+    let mut nb = [0u8; 4];
+    let rn = unix::read(d, &mut nb);
+    unix::close(c); unix::close(d);
+    if wn != 2 || rn != 2 || &nb[..2] != b"OK" {
+        test_fail!("unix_sever",
+            "recycled pair round-trip broken (w={} r={})", wn, rn);
+        return false;
+    }
+    test_println!("  recycled pair isolated from stale survivor ✓");
+
+    test_pass!("AF_UNIX peer-close severing + slot-recycle isolation");
     true
 }
 

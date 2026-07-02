@@ -2475,6 +2475,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 // drop-the-lock-before-ring discipline.
                                 crate::ipc::waitlist::ring_poll_bell_for(
                                     crate::ipc::waitlist::PollBellSource::UnixWrite);
+                            } else {
+                                // No receive queue to bind the batch to: the
+                                // peer is gone.  `scm_bind_peer_id` is u64::MAX
+                                // either because the fd is not a connected
+                                // AF_UNIX socket or because get_peer() was
+                                // SEVERED to u64::MAX at the peer's teardown
+                                // (net::unix::close).  The subsequent data push
+                                // returns -EPIPE, so nothing will ever deliver
+                                // or revoke this batch — release the per-object
+                                // references taken at clone time (unix inc_ref /
+                                // pipe add_writer/reader / regular-file
+                                // pin_inode) instead of dropping the cloned
+                                // descriptors on the floor.  Without this a
+                                // sendmsg(SCM_RIGHTS) racing a peer's full close
+                                // leaks a bounded ref/pin per passed fd
+                                // (CWE-772; unix(7)/recvmsg(2) SCM_RIGHTS:
+                                // undeliverable fds are dropped, mirroring
+                                // close(2) of a delivered copy).  Same release
+                                // as the revoke arms below and the receive-queue
+                                // drain in net::unix::close.
+                                crate::syscall::scm_drop_fds(sender_fds);
                             }
                         }
                     }
