@@ -13,8 +13,13 @@ use spin::Mutex;
 use super::{FileSystemOps, FileStat, FileType, VfsError, VfsResult, alloc_inode_number};
 
 /// Get current uptime in seconds (used as a pseudo-timestamp).
+///
+/// Reads the TSC-derived `get_ticks()` rather than the raw ISR-published
+/// `TICK_COUNT` so file timestamps keep advancing at wall-clock rate even if
+/// the LAPIC periodic timer stops delivering (the raw counter would freeze,
+/// pinning every ramfs mtime/ctime at the moment the timer died).
 fn now_secs() -> u64 {
-    crate::arch::x86_64::irq::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed) / 100
+    crate::arch::x86_64::irq::get_ticks() / 100
 }
 
 /// Entry type within a directory.

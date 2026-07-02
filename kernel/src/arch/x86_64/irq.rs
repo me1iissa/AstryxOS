@@ -74,6 +74,19 @@ const PIC_EOI: u8 = 0x20;
 /// advance N× faster than wall time, which silently breaks every consumer
 /// that schedules deadlines from CLOCK_MONOTONIC (the userspace vDSO fast
 /// path among them).  See `timer_tick` for the TSC-monotone update logic.
+///
+/// # Reading this counter
+///
+/// This is the *raw ISR-published* count.  It advances only while the LAPIC
+/// periodic timer ISR (`timer_tick`) is delivering; if that timer stops
+/// (e.g. a KVM vCPU whose LAPIC injection is suppressed — Intel SDM Vol. 3A
+/// §11.5.4) the value **freezes** while wall time keeps moving.  Therefore any
+/// code that makes a *time-dependent decision* — a timeout, a deadline, a
+/// quiescence window, a throttle, a rate limiter — MUST read [`get_ticks`]
+/// (which returns `max(TICK_COUNT, tsc_floor)` and so keeps advancing off the
+/// invariant TSC, Intel SDM Vol. 3B §17.17) and NOT this field directly.  Read
+/// `TICK_COUNT` directly only for diagnostics that specifically want the
+/// ISR-published value (liveness checks, ISR-vs-TSC skew probes).
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// TSC value at boot — captured by [`set_tsc_calibration`] right after the

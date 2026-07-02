@@ -843,7 +843,12 @@ fn reap_dead_threads_sched() {
     // without changing which frames are freed or when.  See
     // `LAST_KSTACK_DRAIN_TICK`.
     {
-        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        // `get_ticks()`, not raw `TICK_COUNT`: the throttle gate advances
+        // `LAST_KSTACK_DRAIN_TICK` by swapping in `now`; if `now` froze (dead
+        // LAPIC timer) the gate would admit exactly one drain and then wedge
+        // forever, stalling the quarantine reaper.  The TSC-derived tick keeps
+        // it ticking at ~TICK_HZ regardless of LAPIC delivery.
+        let now = crate::arch::x86_64::irq::get_ticks();
         if kstack_drain_due(&LAST_KSTACK_DRAIN_TICK, now) {
             drain_pending_kstack_free();
         }
@@ -1136,7 +1141,7 @@ mod d582_push_prov {
         let s = slot(phys);
         s.pfn.store(pfn, Ordering::Relaxed);
         s.tick
-            .store(crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+            .store(crate::arch::x86_64::irq::get_ticks(), Ordering::Relaxed);
         s.pusher_tid.store(pusher_tid, Ordering::Relaxed);
     }
 
@@ -1245,13 +1250,25 @@ struct CachedDeadStack {
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<CachedDeadStack>> =
     spin::Mutex::new(alloc::vec::Vec::new());
 
-/// Read the current global tick count for use as a quiescence snapshot.
+/// Read the current wall-clock tick for use as a quiescence snapshot.
 ///
-/// Uses `TICK_COUNT` rather than per-CPU `TIMER_ISR_PER_CPU` — see the
+/// Uses `get_ticks()` (a single global value advanced by whichever online
+/// CPU's timer ISR runs) rather than per-CPU `TIMER_ISR_PER_CPU` — see the
 /// `CachedDeadStack` struct doc for the rationale.
+///
+/// Deliberately `get_ticks()` and NOT the raw `TICK_COUNT`: `get_ticks()`
+/// returns `max(published_tick, tsc_floor)`, so it keeps advancing at
+/// wall-clock rate off the invariant TSC (Intel SDM Vol. 3B §17.17,
+/// constant-rate TSC) even when the LAPIC periodic timer stops delivering and
+/// the ISR-published `TICK_COUNT` freezes.  A frozen source here would peg the
+/// quiescence delta (`now - push_tick`) at zero forever, so no cached dead
+/// stack would ever satisfy the tick gate and the reaper's drain throttle
+/// would wedge — a reclaim stall, not a UAF, but a real dead-timer robustness
+/// hole.  Both the push stamp and every quiescence comparison read through
+/// this one helper, so the two can never drift.
 #[inline]
 fn current_tick_for_quiesce() -> u64 {
-    crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed)
+    crate::arch::x86_64::irq::get_ticks()
 }
 
 /// Decide whether a cached entry has quiesced — the global `TICK_COUNT`
@@ -1275,7 +1292,12 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
     // Gate 2 (wall-clock tick — defence-in-depth): bounds the re-issue
     // against any in-flight switch the generation counter cannot attribute
     // to a specific CPU.  The minimum wait is `DEAD_STACK_QUIESCE_TICKS`.
-    let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    // Same wall-clock source as the push stamp (`current_tick_for_quiesce`),
+    // so the delta is honest even if the LAPIC timer died and `TICK_COUNT`
+    // froze.  Gate 1 (the switch-generation counter) is the primary signal;
+    // this tick gate is defence-in-depth and MUST keep advancing to release
+    // entries whose `last_cpu` cannot be attributed to the generation gate.
+    let now = current_tick_for_quiesce();
     let tick_ok = now >= entry.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS);
 
     // Liveness escape valve: if `last_cpu` goes idle (parks in `sti;hlt;cli`
@@ -1465,7 +1487,9 @@ pub fn pop_dead_stack() -> Option<(u64, u64)> {
     #[cfg(feature = "test-mode")]
     if idx_found.is_none() && !cache.is_empty() {
         let e = &cache[0];
-        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        // Mirror the production quiescence source so the diagnostic reflects
+        // the same `now` the gate actually sees.
+        let now = current_tick_for_quiesce();
         let cur_gen = cpu_switch_gen(e.last_cpu);
         crate::serial_println!(
             "[KSTACK/QUIESCE] push_tick={} now={} need={} tick_ok={} \
@@ -1739,23 +1763,25 @@ pub fn dead_stack_cache_len() -> usize {
     DEAD_STACK_CACHE.lock().len()
 }
 
-/// Wait (yield-based) until the global `TICK_COUNT` has advanced by
+/// Wait (yield-based) until the wall-clock tick has advanced by
 /// `DEAD_STACK_QUIESCE_TICKS + 1` ticks from the current instant.
 ///
 /// After this returns, any dead-stack cache entry pushed BEFORE the call
-/// will satisfy `entry_is_quiesced` — `TICK_COUNT` is the same counter
-/// that `entry_is_quiesced` now reads (see `CachedDeadStack.push_tick`).
+/// will satisfy `entry_is_quiesced` — this reads through the same
+/// `current_tick_for_quiesce` source that `entry_is_quiesced` and the push
+/// stamp use (see `CachedDeadStack.push_tick`), so it is immune to a frozen
+/// `TICK_COUNT` under a dead LAPIC timer just like the gate it mirrors.
 ///
 /// Test-mode only: used by the PMM-leak test to ensure the child's kstack
 /// is recycled on the next iteration rather than forcing a fresh PMM alloc.
 #[cfg(feature = "test-mode")]
 pub fn wait_dead_stacks_quiesced() {
     const NEEDED: u64 = DEAD_STACK_QUIESCE_TICKS + 1;
-    let baseline = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let baseline = current_tick_for_quiesce();
     loop {
         crate::hal::enable_interrupts();
         yield_cpu();
-        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        let now = current_tick_for_quiesce();
         if now >= baseline.saturating_add(NEEDED) { break; }
         for _ in 0..200 { core::hint::spin_loop(); }
     }
@@ -1795,6 +1821,16 @@ pub fn test_entry_quiesced(push_tick: u64, last_cpu: usize, last_cpu_gen: u64) -
 #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub fn test_cpu_switch_gen(cpu: usize) -> u64 {
     cpu_switch_gen(cpu)
+}
+
+/// Test-only: read the quiescence time source the kstack cache uses.
+///
+/// Exposed so the dead-timer-immunity regression can assert this source keeps
+/// advancing (off the TSC) even when the raw ISR-published `TICK_COUNT` is
+/// pinned behind wall time by a dead LAPIC periodic timer.
+#[cfg(feature = "test-mode")]
+pub fn test_current_tick_for_quiesce() -> u64 {
+    current_tick_for_quiesce()
 }
 
 /// Test-only: run the saved-RSP survey against a caller-supplied thread slice.
