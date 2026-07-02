@@ -9,3 +9,4 @@ BusyBox/
 *.bak
 *.swp
 __pycache__/
+build-glibc*/
