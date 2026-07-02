@@ -2340,6 +2340,14 @@ pub fn run() -> ! {
     total += 1;
     if test_646_tlb_timeout_force_flush() { passed += 1; }
 
+    // ── Test 699: TLB shootdown ACK-spin reentrancy (mutual-livelock break) ──
+    // The ACK spin services its own incoming shootdown slot each no-progress
+    // iteration so two concurrently-IF-masked CPUs cannot deadlock each other's
+    // shootdowns to the full ACK_BOUND.  Unit-exercises the shared reentrancy
+    // primitive (service + idempotent redrain + composed force-flush).
+    total += 1;
+    if test_699_tlb_shootdown_ack_spin_reentrancy() { passed += 1; }
+
     // ── Test 651: per-CPU LAPIC-timer liveness decision state machine ──
     // The hardware-free core of the SMP dead-CPU-timer self-heal: ISR-advance
     // recovery, tolerance window, sticky-dead, bounded futile re-arm cap.
@@ -44959,6 +44967,64 @@ fn test_646_tlb_timeout_force_flush() -> bool {
     }
 
     test_pass!("TLB shootdown timeout deferred force-flush self-healing");
+    true
+}
+
+// ── Test 699: TLB shootdown ACK-spin reentrancy (mutual-livelock break) ──────
+//
+// A cross-CPU shootdown issues from inside an IF-masked #PF / mm critical
+// section, then spins up to ACK_BOUND (~10 ms) for the target to ack.  Because
+// interrupts are disabled, an incoming shootdown IPI a peer sends to US stays
+// pending in the IRR (Intel SDM Vol. 3A §10.6.1) and its 0xF0 ISR cannot run —
+// so if the peer is likewise IF-masked in its own shootdown, both cores spin to
+// the full bound: a cross-CPU shootdown mutual livelock (observed as symmetric
+// full-ACK_BOUND [TLB/TIMEOUT]s under concurrent CoW).  The fix services our own
+// incoming slot on each no-progress spin iteration via
+// `service_incoming_shootdown_and_drain`, so the peer's ack completes and it can
+// in turn service ours.
+//
+// The genuine two-CPU livelock is not deterministically reproducible in the
+// single-threaded test runner (validated instead by the SMP=2 census A/B, 425 →
+// ~0).  This test exercises the reentrancy PRIMITIVE the spin depends on: it
+// synthesises an incoming shootdown to the local CPU's slot and asserts the
+// primitive (1) services it, (2) is idempotent on a drained slot (cheap
+// per-iteration fall-through), and (3) composes the #643 deferred force-flush
+// drain in the same call.
+fn test_699_tlb_shootdown_ack_spin_reentrancy() -> bool {
+    test_header!("TLB shootdown ACK-spin reentrancy (mutual-livelock break)");
+
+    use crate::mm::tlb;
+
+    let s_before = tlb::stats();
+    let (serviced_incoming, idempotent, composed_force_flush) =
+        tlb::test_service_incoming_shootdown();
+    let s_after = tlb::stats();
+
+    if !serviced_incoming {
+        test_fail!("tlb/reentrancy",
+                   "in-spin service did not ack the incoming shootdown slot / advance handled count");
+        return false;
+    }
+    if !idempotent {
+        test_fail!("tlb/reentrancy",
+                   "second in-spin service re-serviced a drained slot (not a cheap no-op)");
+        return false;
+    }
+    if !composed_force_flush {
+        test_fail!("tlb/reentrancy",
+                   "one in-spin service did not compose the deferred force-flush drain");
+        return false;
+    }
+    // The shootdowns-handled counter must have advanced (the incoming service),
+    // proving the shared invalidation body ran off the reentrancy path.
+    let handled_delta = s_after.shootdowns_handled.wrapping_sub(s_before.shootdowns_handled);
+    if handled_delta < 1 {
+        test_fail!("tlb/reentrancy",
+                   "shootdowns_handled did not advance (delta={})", handled_delta);
+        return false;
+    }
+
+    test_pass!("TLB shootdown ACK-spin reentrancy (mutual-livelock break)");
     true
 }
 

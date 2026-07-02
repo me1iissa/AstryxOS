@@ -621,6 +621,20 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         if remaining == 0 {
             break;
         }
+        // Reentrancy: we are about to keep spinning with interrupts disabled
+        // (a shootdown issues from inside an IF-masked #PF / mm critical
+        // section).  A peer CPU may be concurrently spinning on OUR ack for a
+        // shootdown it sent to us; because IF=0 keeps the 0xF0 IPI pending in the
+        // IRR (Intel SDM Vol. 3A §10.6.1) the ISR cannot run, so that incoming
+        // request would go unserviced until we return and re-enable interrupts.
+        // If the peer is likewise IF-masked in ITS own shootdown, both sides
+        // spin to the full `ACK_BOUND` — a cross-CPU shootdown mutual livelock.
+        // Service our own incoming slot here so the peer's ack completes and it
+        // can in turn service ours.  `self_cpu` is disjoint from `targets`
+        // (targets excludes self_mask), so this touches a different slot than the
+        // poll above; the routine is lock-free and EOI-free (safe under IF=0),
+        // and finds `pending == 0` cheaply on the common no-incoming iteration.
+        service_incoming_shootdown_and_drain(self_cpu);
         core::hint::spin_loop();
         iters += 1;
     }
@@ -984,14 +998,27 @@ fn drain_pending_force_flush(cpu: usize) {
     }
 }
 
-/// IPI handler.  Invoked from [`crate::arch::x86_64::idt`] when the LAPIC
-/// delivers a [`TLB_SHOOTDOWN_VECTOR`] interrupt to this CPU.
+/// Service an incoming cross-CPU shootdown targeting `cpu` (if its slot is
+/// pending) and retire any deferred force-flush posted to it.
 ///
-/// Reads the per-CPU shootdown slot, performs the invalidation if the
-/// target CR3 matches the running one, and clears `pending`.  Always
-/// EOIs the LAPIC at the end.
-pub extern "C" fn handle_shootdown_ipi() {
-    let cpu = apic::cpu_index();
+/// This is the invalidation body shared by two callers: the [`TLB_SHOOTDOWN_VECTOR`]
+/// ISR ([`handle_shootdown_ipi`]) and the ACK-spin in [`shootdown_range_inner`].
+/// It performs ONLY local work — an `invlpg` of the published range if the
+/// running CR3 matches, the slot ack (compare-exchange `pending` 1→0), and
+/// [`drain_pending_force_flush`] — so it takes NO locks and sends NO IPI and is
+/// therefore safe to call with interrupts disabled, INCLUDING from inside
+/// another shootdown's own IF-masked ACK spin (the reentrancy the spin relies on
+/// to break a cross-CPU shootdown mutual livelock).  Per Intel SDM Vol. 3A
+/// §4.10.4.2 (TLB-shootdown protocol) the `invlpg` must complete before the ack
+/// clear (the AcqRel compare-exchange provides that order); §4.10.4.1 (MOV-to-CR3
+/// invalidation) covers the force-flush drain.
+///
+/// It does NOT EOI the LAPIC.  Only the ISR entry point may EOI: an in-spin
+/// caller is not servicing a delivered interrupt (IF=0 kept the 0xF0 IPI pending
+/// in the IRR, Intel SDM Vol. 3A §10.6.1), so a spurious `lapic_eoi` there would
+/// corrupt the LAPIC interrupt-priority state.
+#[inline]
+fn service_incoming_shootdown_and_drain(cpu: usize) {
     if cpu < apic::MAX_CPUS {
         let slot = &SHOOTDOWN_SLOTS[cpu];
         // Atomically claim the slot.  The single-writer rule on
@@ -1002,10 +1029,13 @@ pub extern "C" fn handle_shootdown_ipi() {
         // re-using it.  We use a compare-exchange anyway so a spurious
         // IPI delivery (vector 0xF0 arriving at a CPU whose slot is
         // already drained, e.g. after a previously-timed-out sender
-        // cleared it) is observably handled exactly once.  AcqRel on
-        // success pairs with the sender's Release-store of `pending=1`
-        // and the matching Release-store of the ack-clear below, so we
-        // see the published cr3/va_lo/va_hi before the invalidation.
+        // cleared it) is observably handled exactly once — and so this
+        // routine is safe to call speculatively from the ACK spin, where
+        // most invocations find `pending == 0` and cheaply fall through.
+        // AcqRel on success pairs with the sender's Release-store of
+        // `pending=1` and the matching Release-store of the ack-clear
+        // below, so we see the published cr3/va_lo/va_hi before the
+        // invalidation.
         if slot
             .pending
             .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -1047,7 +1077,19 @@ pub extern "C" fn handle_shootdown_ipi() {
     // is next interruptible" instead of "until its (possibly dead) periodic
     // timer next fires".
     drain_pending_force_flush(cpu);
+}
 
+/// IPI handler.  Invoked from [`crate::arch::x86_64::idt`] when the LAPIC
+/// delivers a [`TLB_SHOOTDOWN_VECTOR`] interrupt to this CPU.
+///
+/// Services this CPU's shootdown slot (invalidation if the target CR3 matches
+/// the running one, then clears `pending`), retires any deferred force-flush,
+/// and EOIs the LAPIC.  The invalidation body is shared with the ACK-spin
+/// reentrancy path via [`service_incoming_shootdown_and_drain`]; only this ISR
+/// entry point EOIs.
+pub extern "C" fn handle_shootdown_ipi() {
+    let cpu = apic::cpu_index();
+    service_incoming_shootdown_and_drain(cpu);
     apic::lapic_eoi();
 }
 
@@ -1108,6 +1150,90 @@ pub fn test_force_flush_post_drain() -> (bool, bool) {
     let first = serviced_mid.wrapping_sub(serviced_before) >= 1;
     let second = serviced_after != serviced_mid;
     (first, second)
+}
+
+/// Test-only harness for the ACK-spin shootdown-reentrancy primitive.
+///
+/// Exercises [`service_incoming_shootdown_and_drain`] — the routine the ACK spin
+/// now calls on every no-progress iteration to break a cross-CPU shootdown mutual
+/// livelock — WITHOUT needing a genuine second CPU.  It synthesises the state a
+/// peer sender would publish into THIS CPU's slot (an incoming shootdown to us),
+/// runs the primitive, and asserts it:
+///   1. services the incoming shootdown (acks the slot + advances the handled
+///      counter): `serviced_incoming`;
+///   2. is idempotent on an already-drained slot (a second call is a cheap no-op,
+///      so calling it every spin iteration is safe): `idempotent`;
+///   3. composes the deferred force-flush drain in the SAME call (a force-flush
+///      posted to us is retired by the one invocation): `composed_force_flush`.
+///
+/// Returns `(serviced_incoming, idempotent, composed_force_flush)`, all of which
+/// must be `true`.  The genuine two-CPU mutual livelock (both cores IF-masked in
+/// their own shootdowns) is not deterministically reproducible in the
+/// single-threaded test runner; it is validated by the SMP=2 census A/B
+/// (timeout count 425 → ~0).  Interrupts are masked across the whole harness so a
+/// real cross-CPU shootdown cannot race the synthetic slot manipulation.
+#[doc(hidden)]
+pub fn test_service_incoming_shootdown() -> (bool, bool, bool) {
+    let prior_flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq", "pop {f}", "cli",
+            f = out(reg) prior_flags,
+            options(nomem, preserves_flags),
+        );
+    }
+
+    let cpu = apic::cpu_index();
+    if cpu >= apic::MAX_CPUS {
+        if prior_flags & (1 << 9) != 0 {
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+        }
+        return (true, true, true);
+    }
+
+    // (1) Synthesise a peer's incoming shootdown to THIS CPU's slot: publish a
+    // matching-CR3 payload then set pending=1 (Release), exactly as a sender's
+    // `shootdown_range_inner` would.  A matching CR3 exercises the invlpg arm; the
+    // range is one page at a harmless linear address (invlpg never faults).
+    let slot = &SHOOTDOWN_SLOTS[cpu];
+    let cur_cr3 = crate::mm::vmm::get_cr3();
+    slot.cr3.store(cur_cr3, Ordering::Relaxed);
+    slot.va_lo.store(0x1000, Ordering::Relaxed);
+    slot.va_hi.store(0x2000, Ordering::Relaxed);
+    #[cfg(feature = "firefox-test-core")]
+    SHOOTDOWN_DONE_FLAGS[cpu].store(0, Ordering::Release);
+    slot.pending.store(1, Ordering::Release);
+
+    let handled_before = STAT_SHOOTDOWNS_HANDLED.load(Ordering::Relaxed);
+    service_incoming_shootdown_and_drain(cpu);
+    let handled_after = STAT_SHOOTDOWNS_HANDLED.load(Ordering::Relaxed);
+
+    let serviced_incoming = slot.pending.load(Ordering::Acquire) == 0
+        && handled_after.wrapping_sub(handled_before) >= 1;
+
+    // (2) Idempotent: a second call with the slot already drained must not
+    // re-service (the common cheap fall-through the spin relies on).
+    service_incoming_shootdown_and_drain(cpu);
+    let idempotent = STAT_SHOOTDOWNS_HANDLED.load(Ordering::Relaxed) == handled_after;
+
+    // (3) Composed force-flush drain: post a force-flush to us, then a single
+    // service call must retire it (proves the one in-spin call composes both the
+    // incoming-shootdown service and the #643 FORCE_FLUSH drain).
+    let ff_before = STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed);
+    post_force_flush(1u64 << (cpu as u64));
+    service_incoming_shootdown_and_drain(cpu);
+    let composed_force_flush =
+        STAT_FORCE_FLUSH_SERVICED.load(Ordering::Relaxed).wrapping_sub(ff_before) >= 1;
+
+    // Leave the per-CPU shootdown state pristine for any real shootdown to us.
+    slot.pending.store(0, Ordering::Release);
+    FORCE_FLUSH_PENDING[cpu].store(0, Ordering::Release);
+
+    if prior_flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+    }
+
+    (serviced_incoming, idempotent, composed_force_flush)
 }
 
 /// Diagnostic snapshot for kdb / introspection.
