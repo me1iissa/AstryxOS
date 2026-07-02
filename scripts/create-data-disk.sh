@@ -387,6 +387,27 @@ if [ -f "${ROOT_DIR}/scripts/install-dbus-real.sh" ]; then
         echo "[DATA-DISK] WARNING: install-dbus-real.sh failed — libdbus-1 stub remains"
 fi
 
+# ── Overlay REAL glibc GTK3 + X11 client closure (non-fatal) ─────────────────
+# install-firefox-stubs.sh stubs libgtk-3 / libgdk-3 / libX11 / libxcb / the
+# whole GTK/Pango/Cairo/GLib closure with no-op functions; its gdk_display_open
+# returns NULL, so the glibc variant can only run --headless.  The windowed
+# "~50x wiki-load slowdown" discriminator needs a real display-open, so
+# install-gtk-real-glibc.sh overlays the real upstream (Ubuntu 24.04 "noble",
+# glibc 2.39 <= image glibc) GTK3 + X11 closure over those stubs — exactly the
+# real-lib-over-stub paradigm install-fonts-real.sh and install-dbus-real.sh
+# already use.  libasound (audio) and libdbus-glib-1 (deprecated) stay stubs.
+# Must run AFTER install-firefox-stubs.sh (evicts its stubs) and after
+# install-fonts-real.sh / install-dbus-real.sh (its libatspi/libcairo depend on
+# the real libfontconfig/libfreetype/libdbus-1 those ship).  Requires outbound
+# access to archive.ubuntu.com; failure only produces a warning (the headless
+# stub build still works).
+if [ -f "${ROOT_DIR}/scripts/install-gtk-real-glibc.sh" ]; then
+    GTK_FLAGS=""
+    [ "${FORCE}" = true ] && GTK_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-gtk-real-glibc.sh" ${GTK_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-gtk-real-glibc.sh failed — GTK/X11 stubs remain (headless only)"
+fi
+
 # ── Build libfontconfig-interposer.so (defensive wrapper) ────────────────────
 # Real libfontconfig (installed by install-fonts-real.sh above) follows the
 # spec strictly: FcPatternGetString leaves *out untouched on FcResultNoMatch.
