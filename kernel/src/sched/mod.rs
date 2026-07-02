@@ -614,7 +614,9 @@ pub fn timer_tick_schedule() {
 /// states/deadlines count as "due".
 ///
 /// The caller MUST already hold `THREAD_TABLE`.  `now` is the current
-/// `TICK_COUNT` (monotone); pass the value read by the caller so a single tick
+/// `get_ticks()` value (TSC-derived, monotone — the callers `wake_sleeping_threads`
+/// and `drain_due_wakes_if_pending` both read it, so timed wakes stay immune to a
+/// frozen `TICK_COUNT`); pass the value read by the caller so a single tick
 /// snapshot drives the whole pass.  Returns the number of threads flipped to
 /// `Ready` (diagnostic only).
 #[inline]
@@ -848,6 +850,15 @@ fn reap_dead_threads_sched() {
         // LAPIC timer) the gate would admit exactly one drain and then wedge
         // forever, stalling the quarantine reaper.  The TSC-derived tick keeps
         // it ticking at ~TICK_HZ regardless of LAPIC delivery.
+        //
+        // This computes `get_ticks()` (rdtsc + one divide + a few atomic loads)
+        // on every `schedule()` — the throttle is a per-tick edge detector, so
+        // `now` is inherently needed each pass to detect a tick boundary.  We
+        // deliberately do NOT gate it behind a lock-free "quarantine non-empty"
+        // pre-check: `PENDING_KSTACK_FREE` has no lock-free depth, and adding a
+        // synchronised counter to this race-sensitive reaper path is not worth
+        // ~one rdtsc+divide per schedule vs the O(entries×threads) survey it
+        // gates (which itself fast-returns on an empty quarantine).
         let now = crate::arch::x86_64::irq::get_ticks();
         if kstack_drain_due(&LAST_KSTACK_DRAIN_TICK, now) {
             drain_pending_kstack_free();

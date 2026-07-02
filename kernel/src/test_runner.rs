@@ -47784,10 +47784,18 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_header!("sched: dead-kstack switch-generation quiescence gate (SMP #DB)");
 
     // Use a long-elapsed push_tick (0) so the wall-clock tick gate is always
-    // satisfied; this isolates the *generation* condition.  TICK_COUNT is well
-    // past the escape-valve margin by the time the test suite runs, so we
-    // pick a recent push_tick for the cases that must observe withholding.
-    let now = crate::arch::x86_64::irq::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    // satisfied; this isolates the *generation* condition.  The quiescence
+    // clock is well past the escape-valve margin by the time the suite runs, so
+    // we pick a recent push_tick for the cases that must observe withholding.
+    //
+    // Read `now` from the SAME source the gate reads (`entry_is_quiesced` calls
+    // `current_tick_for_quiesce()` = `get_ticks()`), NOT the raw `TICK_COUNT`.
+    // Under a dead LAPIC timer `get_ticks()` can lead the frozen raw counter by
+    // many ticks; a `recent = raw − 3` push_tick would then sit ≥16 ticks below
+    // the gate's `get_ticks()` view, spuriously flipping `escape_ok` true and
+    // failing the withholding cases (A, E) on a local KVM run. Same-clock keeps
+    // the `now − push_tick` delta honest regardless of timer liveness.
+    let now = crate::sched::test_current_tick_for_quiesce();
     let cpu0_gen = crate::sched::test_cpu_switch_gen(0);
 
     // Case A: gen NOT advanced (snapshot == live), recent push → WITHHELD.
@@ -47839,9 +47847,17 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_println!("  D: gen-not-advanced + escape-margin → eligible via valve (ok)");
 
     // Case E: too-recent push → base tick gate not met → WITHHELD even with
-    // the unknown-CPU sentinel.  push_tick = now → only 0 ticks elapsed.
-    if crate::sched::test_entry_quiesced(now, 0, u64::MAX) && now != 0 {
-        // now != 0 guard: at the very first tick the saturating arithmetic
+    // the unknown-CPU sentinel.  RE-READ the quiescence clock here rather than
+    // reuse the top-of-test `now`: cases A-D each emit serial output, which
+    // burns several ticks of wall time under KVM PIO, so the shared snapshot is
+    // stale by the time this runs.  `entry_is_quiesced` reads its own
+    // `get_ticks()` internally; if push_tick lags that read by ≥2 ticks the
+    // "0-tick" entry looks old enough to pass the tick gate and the case
+    // spuriously fails.  A fresh read makes push_tick == the gate's `now`
+    // (within a few instructions ≪ 1 tick) → genuinely 0 ticks elapsed.
+    let now_fresh = crate::sched::test_current_tick_for_quiesce();
+    if crate::sched::test_entry_quiesced(now_fresh, 0, u64::MAX) && now_fresh != 0 {
+        // now_fresh != 0 guard: at the very first tick the saturating arithmetic
         // makes the 2-tick threshold equal to now, which is a benign edge.
         test_fail!("test294", "too-recent entry (0 ticks) was eligible — tick gate open");
         return false;
@@ -47968,10 +47984,15 @@ fn test_659_kstack_drain_per_tick_throttle() -> bool {
 // source would echo the frozen value, the tick gate would never elapse, and the
 // reaper would stall — a dead-timer robustness hole.
 //
-// Deterministic on SMP: the assertions compare against an independently-computed
-// TSC floor, so a sibling CPU's ISR healing the raw counter back up cannot flip
-// the result (it only raises the raw value, which the TSC-floor bound already
-// dominates).  The forced-behind store is restored with a monotone `fetch_max`.
+// SMP note: the assertions compare against an independently-computed TSC floor,
+// so this never FALSE-FAILS on SMP=2 — a sibling CPU's ISR monotone-CAS-healing
+// the raw counter back up only raises the raw value, which the TSC-floor bound
+// already dominates.  It does not guarantee the strongest DISCRIMINATION on
+// SMP=2 though: if a sibling heals `TICK_COUNT` inside the store→read window a
+// hypothetically-buggy raw read could be masked and still pass.  That is
+// acceptable — the whole-machine-frozen regime this fix targets is a single-core
+// phenomenon, so the decisive discrimination is on SMP=1.  The forced-behind
+// store is restored with a monotone `fetch_max`.
 #[cfg(feature = "test-mode")]
 fn test_688_quiesce_immune_to_frozen_tick() -> bool {
     use core::sync::atomic::Ordering;
