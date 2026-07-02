@@ -273,6 +273,17 @@ pub fn run() -> ! {
         if test_641_crossproc_mapshared_memfd_visibility() { passed += 1; }
     }
 
+    // ── W101 op-trace instrumentation (syscall ring optrace, Phase 0) ────
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_optrace_ring_fields_and_wake() { passed += 1; }
+        total += 1;
+        if test_optrace_freeze_trigger() { passed += 1; }
+        total += 1;
+        if test_optrace_freeze_gate_and_depth() { passed += 1; }
+    }
+
     // ── Test 0bc3: vfork/CLONE_VM child thread has tls_base=0 ────────────
     total += 1;
     if test_vfork_clone_vm_child_tls_base_zero() { passed += 1; }
@@ -58495,5 +58506,207 @@ fn test_relative_futex_timeout_no_undershoot() -> bool {
     test_println!("  all relative intervals (1/5/10/15/100 ms): wake_tick >= deadline, \
                    over-shoot < 2 ticks ✓");
     test_pass!("relative futex timeout — wake never precedes the requested interval (Test 296)");
+    true
+}
+
+// ── W101 op-trace instrumentation tests (syscall ring optrace) ──────────────
+//
+// Exercise the Phase-0 additions to the per-process syscall ring:
+//   • ns / tid / wake-reason fields plumbed through begin()/end()
+//   • the per-CPU wake-reason slot resets per-syscall and folds into the entry
+//   • the gap-end freeze trigger arithmetic + freeze gate + depth control
+//
+// Pure in-kernel logic — no process creation, no scheduler dependency.  The
+// ring module is compiled under `test-mode` as well as `firefox-test-core`
+// (nothing is ever auto-tracked under `test-mode`, so this is the only path
+// that populates a ring in the test build).
+
+/// Read RFLAGS.IF so the per-CPU-slot critical section can be run with
+/// interrupts masked (another thread doing a poll/futex wait could otherwise
+/// clobber this CPU's wake-reason slot between our note() and end()).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+#[inline]
+fn _optrace_irqs_enabled() -> bool {
+    let f: u64;
+    unsafe {
+        core::arch::asm!("pushfq", "pop {0}", out(reg) f, options(nomem, preserves_flags));
+    }
+    (f & (1 << 9)) != 0
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_optrace_ring_fields_and_wake() -> bool {
+    use crate::syscall::ring::{self, WakeReason};
+    let pid: u64 = 0xF00D_0001;
+    ring::drop_ring(pid);          // clean slate (removes any prior ring)
+    ring::enable_for(pid);
+
+    let cur_tid = crate::proc::current_tid();
+    let irqs = _optrace_irqs_enabled();
+    crate::hal::disable_interrupts();
+
+    // Entry A: a blocking wait that timed out on a futex.
+    let idx_a = ring::begin(pid, 202, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xdead, 0xbeef);
+    ring::note_wake_reason(WakeReason::FutexTimeout);
+    ring::end(pid, idx_a, -110);
+    let snap_a = ring::snapshot_last(pid);
+
+    // Entry B: a non-blocking syscall — begin() must have reset the slot, so
+    // with no note the recorded reason is NeverBlocked (proves per-syscall
+    // reset, not stale inheritance from entry A).
+    let idx_b = ring::begin(pid, 39, 0, 0, 0, 0, 0, 0, 0x1111, 0x2222);
+    ring::end(pid, idx_b, 42);
+    let snap_b = ring::snapshot_last(pid);
+
+    // Entry C: a poll that ended on a bell (data/readiness arrived).
+    let idx_c = ring::begin(pid, 7, 0, 0, 0, 0, 0, 0, 0x3333, 0x4444);
+    ring::note_wake_reason(WakeReason::Bell);
+    ring::end(pid, idx_c, 1);
+    let snap_c = ring::snapshot_last(pid);
+
+    let count = ring::entry_count(pid);
+    if irqs { crate::hal::enable_interrupts(); }
+
+    ring::drop_ring(pid);
+
+    if idx_a.is_none() || idx_b.is_none() || idx_c.is_none() {
+        test_fail!("optrace_ring_fields_and_wake", "begin() returned None while tracked");
+        return false;
+    }
+    let (nr_a, tid_a, _ns_a, wake_a, ret_a) = match snap_a {
+        Some(s) => s, None => { test_fail!("optrace_ring_fields_and_wake", "no entry A"); return false; }
+    };
+    if nr_a != 202 || ret_a != -110 || wake_a != WakeReason::FutexTimeout || tid_a != cur_tid {
+        test_fail!("optrace_ring_fields_and_wake",
+            "entry A: nr={} ret={} wake={} tid={} (want 202/-110/futex_timeout/{})",
+            nr_a, ret_a, wake_a.as_str(), tid_a, cur_tid);
+        return false;
+    }
+    let (nr_b, _tb, _nb, wake_b, ret_b) = match snap_b {
+        Some(s) => s, None => { test_fail!("optrace_ring_fields_and_wake", "no entry B"); return false; }
+    };
+    if nr_b != 39 || ret_b != 42 || wake_b != WakeReason::NeverBlocked {
+        test_fail!("optrace_ring_fields_and_wake",
+            "entry B: nr={} ret={} wake={} (want 39/42/never_blocked — reset failed)",
+            nr_b, ret_b, wake_b.as_str());
+        return false;
+    }
+    let (_nc, _tc, _nsc, wake_c, _rc) = match snap_c {
+        Some(s) => s, None => { test_fail!("optrace_ring_fields_and_wake", "no entry C"); return false; }
+    };
+    if wake_c != WakeReason::Bell {
+        test_fail!("optrace_ring_fields_and_wake",
+            "entry C: wake={} (want bell)", wake_c.as_str());
+        return false;
+    }
+    if count < 3 {
+        test_fail!("optrace_ring_fields_and_wake", "entry_count={} (want >=3)", count);
+        return false;
+    }
+    test_pass!("optrace ring ns/tid/wake fields + per-syscall reset (W101 Phase 0)");
+    true
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_optrace_freeze_trigger() -> bool {
+    use crate::syscall::ring::{self, optrace};
+    let pid: u64 = 0xF00D_0002;
+    ring::drop_ring(pid);
+    ring::enable_for(pid);
+
+    // Deterministic synthetic clock (ns).  arm: 2000 ms quiet / 100 ms grace.
+    optrace::unfreeze();
+    optrace::arm(2000, 100);
+    let quiet_ns: u64 = 2_000_000_000;
+    let grace_ns: u64 = 100_000_000;
+    let t0: u64 = 10_000_000_000;
+
+    // First send: seeds last-send, must NOT trigger (no prior send).
+    if optrace::tcp_send_at(pid, t0) {
+        test_fail!("optrace_freeze_trigger", "first send fired the trigger");
+        ring::drop_ring(pid); return false;
+    }
+    // A send within the quiet window: still must NOT trigger.
+    if optrace::tcp_send_at(pid, t0 + quiet_ns / 2) {
+        test_fail!("optrace_freeze_trigger", "in-window send fired the trigger");
+        ring::drop_ring(pid); return false;
+    }
+    // A send after >= quiet since the last one: the gap-end trigger fires.
+    let t_gap_end = t0 + quiet_ns / 2 + quiet_ns + 1;
+    if !optrace::tcp_send_at(pid, t_gap_end) {
+        test_fail!("optrace_freeze_trigger", "gap-end send did NOT fire the trigger");
+        ring::drop_ring(pid); return false;
+    }
+    // freeze_at must be now + grace; frozen only once now >= freeze_at.
+    let (_armed, _q, _g, _last, freeze_at, _fr) = optrace::status();
+    let want_freeze = t_gap_end + grace_ns;
+    if freeze_at != want_freeze {
+        test_fail!("optrace_freeze_trigger",
+            "freeze_at={} (want {})", freeze_at, want_freeze);
+        ring::drop_ring(pid); return false;
+    }
+    if optrace::is_frozen_at(freeze_at - 1) {
+        test_fail!("optrace_freeze_trigger", "frozen before the grace window elapsed");
+        ring::drop_ring(pid); return false;
+    }
+    if !optrace::is_frozen_at(freeze_at) {
+        test_fail!("optrace_freeze_trigger", "not frozen at the freeze deadline");
+        ring::drop_ring(pid); return false;
+    }
+    // A second gap-end send must NOT move the freeze deadline (first wins).
+    let _ = optrace::tcp_send_at(pid, t_gap_end + 10 * quiet_ns);
+    let (_a2, _q2, _g2, _l2, freeze_at2, _f2) = optrace::status();
+    if freeze_at2 != want_freeze {
+        test_fail!("optrace_freeze_trigger", "second gap moved freeze_at to {}", freeze_at2);
+        ring::drop_ring(pid); return false;
+    }
+
+    optrace::unfreeze();
+    optrace::disarm();
+    ring::drop_ring(pid);
+    test_pass!("optrace gap-end freeze trigger arithmetic + gate (W101 Phase 0)");
+    true
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_optrace_freeze_gate_and_depth() -> bool {
+    use crate::syscall::ring::{self, optrace};
+    let pid: u64 = 0xF00D_0003;
+    ring::drop_ring(pid);
+    ring::enable_for(pid);
+
+    // Depth control: raise this pid's ring to a capture depth and confirm.
+    let applied = ring::resize_ring(pid, 8192);
+    if applied != 8192 || ring::ring_capacity(pid) != 8192 {
+        test_fail!("optrace_freeze_gate_and_depth",
+            "resize_ring -> {} (cap now {}), want 8192", applied, ring::ring_capacity(pid));
+        ring::drop_ring(pid); return false;
+    }
+
+    // Manual freeze must make begin() a no-op (None) so the storm cannot
+    // overwrite the captured tail; unfreeze restores recording.
+    optrace::unfreeze();
+    let before = ring::begin(pid, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    ring::end(pid, before, 0);
+    if before.is_none() {
+        test_fail!("optrace_freeze_gate_and_depth", "begin() None while unfrozen+tracked");
+        ring::drop_ring(pid); return false;
+    }
+    optrace::freeze_now();
+    let during = ring::begin(pid, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    if during.is_some() {
+        test_fail!("optrace_freeze_gate_and_depth", "begin() recorded while frozen");
+        optrace::unfreeze(); ring::drop_ring(pid); return false;
+    }
+    optrace::unfreeze();
+    let after = ring::begin(pid, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    ring::end(pid, after, 0);
+    if after.is_none() {
+        test_fail!("optrace_freeze_gate_and_depth", "begin() None after unfreeze");
+        ring::drop_ring(pid); return false;
+    }
+
+    ring::drop_ring(pid);
+    test_pass!("optrace freeze gate skips begin() + per-pid depth resize (W101 Phase 0)");
     true
 }

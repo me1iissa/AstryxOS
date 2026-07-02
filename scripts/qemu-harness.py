@@ -7292,8 +7292,36 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               # op_virtio_wait_hist.
               "virtio-wait-hist", "virtio-wait-reset",
               # INFRA-3 record/replay: zero-arg introspection.
-              "record-status"):
+              "record-status",
+              # optrace: W101 gap-end freeze-trigger controls (zero-arg).
+              "optrace-disarm", "optrace-status",
+              "optrace-freeze", "optrace-unfreeze"):
         return {"op": op}
+    if op == "optrace-arm":
+        # Arm the gap-end freeze trigger.  Optional positional
+        # `[quiet_ms [grace_ms]]` (defaults 2000 / 500).
+        d = {"op": op}
+        if len(rest) >= 1:
+            d["quiet_ms"] = str(int(rest[0]))
+        if len(rest) >= 2:
+            d["grace_ms"] = str(int(rest[1]))
+        return d
+    if op == "optrace-depth":
+        # Set per-pid ring depth for a capture: `<depth> [pid]`.  With pid,
+        # resize that ring; without, set the default for new rings.
+        if not rest:
+            raise ValueError("optrace-depth requires <depth> [pid]")
+        d = {"op": op, "depth": str(int(rest[0]))}
+        if len(rest) >= 2:
+            d["pid"] = str(int(rest[1]))
+        return d
+    if op == "scrings-dump":
+        # Non-destructively dump the frozen ring(s) to serial for `scrings`.
+        # Optional positional `[pid]` (absent = every tracked pid).
+        d = {"op": op}
+        if rest:
+            d["pid"] = str(int(rest[0]))
+        return d
     if op == "virtio-wait-mode":
         # Flip the wait strategy at runtime: adaptive (poll + peer-aware yield) |
         # legacy (unconditional schedule()-yield).  Absent → query-only.  Carried
@@ -10864,29 +10892,44 @@ def _scan_line(line_bytes: bytes, tests: list, libs_loaded: list,
 # ── scrings: parse per-process syscall ring-buffer dumps ─────────────────────
 #
 # The kernel (with the firefox-test feature) emits ring-buffer traces on any
-# `exit_group(code)` where `code != 0`.  Format, from kernel/src/syscall/ring.rs:
+# `exit_group(code)` where `code != 0`, and on demand via the kdb
+# `scrings-dump` op (W101 op-trace).  Format, from kernel/src/syscall/ring.rs:
 #
-#   [SC-RING-BEGIN] pid=<N> exit_code=<N> entries=<N>
+#   [SC-RING-BEGIN] pid=<N> exit_code=<N> entries=<N> [kind=<exit|frozen> ns_now=<N>]
 #   [SC-RING] i=NNN t=<tick> <name>/<nr> rip=0x.. a1=0x.. a2=0x.. a3=0x.. \
-#             a4=0x.. a5=0x.. a6=0x.. ret=<i64>
+#             a4=0x.. a5=0x.. a6=0x.. ret=<i64> [ns=<N> tid=<N> wake=<label>]
 #   [SC-RING-PATH] i=NNN path="..."                    (for open/openat only)
 #   [SC-RING-BYTES] i=NNN len=<N> hex=<hex-ascii>      (for captured reads)
 #   [SC-RING-END] pid=<N>
 #
+# The `kind`/`ns_now` (BEGIN) and `ns`/`tid`/`wake` (per-entry) fields are
+# additive: they appear only on optrace-capable kernels and are parsed with
+# separate optional regexes so pre-optrace logs still parse.  `wake` is the
+# wake-source annotation (never_blocked|bell|resync|timeout|signal|
+# futex_wake|futex_timeout|unknown).
+#
 # `scrings` finds every dump in the serial log and returns a JSON array — one
-# object per dump — each containing pid, exit_code, and a chronological list
-# of parsed entries.  The path / bytes lines are attached to their parent
-# [SC-RING] entry by matching `i=NNN`.
+# object per dump — each containing pid, exit_code, kind, ns_now, and a
+# chronological list of parsed entries.  The path / bytes lines are attached to
+# their parent [SC-RING] entry by matching `i=NNN`.
 
 _SC_RING_BEGIN = re.compile(
     r"\[SC-RING-BEGIN\] pid=(\d+) exit_code=(-?\d+) entries=(\d+)"
 )
+# Additive tail on the BEGIN line: `kind=<exit|frozen>` distinguishes an
+# exit-time dump from an on-demand frozen-ring dump; `ns_now=<n>` is the
+# monotonic-ns clock at dump time.  Absent on pre-optrace logs.
+_SC_RING_BEGIN_EXT = re.compile(r"kind=(\w+) ns_now=(\d+)")
 _SC_RING_LINE = re.compile(
     r"\[SC-RING\] i=(\d+) t=(\d+) (\S+) rip=(0x[0-9a-fA-F]+) "
     r"a1=(0x[0-9a-fA-F]+) a2=(0x[0-9a-fA-F]+) a3=(0x[0-9a-fA-F]+) "
     r"a4=(0x[0-9a-fA-F]+) a5=(0x[0-9a-fA-F]+) a6=(0x[0-9a-fA-F]+) "
     r"ret=(-?\d+)"
 )
+# Additive per-entry tail (appended after ret=): monotonic-ns timestamp,
+# calling thread id, and the wake-source annotation.  Absent on pre-optrace
+# logs, so parsed with a separate optional regex to keep back-compat.
+_SC_RING_LINE_EXT = re.compile(r"ns=(\d+) tid=(\d+) wake=(\w+)")
 _SC_RING_PATH = re.compile(r'\[SC-RING-PATH\] i=(\d+) path="([^"]*)"')
 _SC_RING_BYTES = re.compile(r'\[SC-RING-BYTES\] i=(\d+) len=(\d+) hex=([0-9a-fA-F]+)')
 _SC_RING_END = re.compile(r"\[SC-RING-END\] pid=(\d+)")
@@ -10904,8 +10947,16 @@ def _parse_ring_dump(lines):
                 "pid":         int(m.group(1)),
                 "exit_code":   int(m.group(2)),
                 "entry_count": int(m.group(3)),
+                # kind: "exit" (non-zero exit dump) | "frozen" (on-demand
+                # optrace dump) | None (pre-optrace log).
+                "kind":        None,
+                "ns_now":      None,
                 "entries":     [],
             }
+            mx = _SC_RING_BEGIN_EXT.search(ln)
+            if mx:
+                cur["kind"] = mx.group(1)
+                cur["ns_now"] = int(mx.group(2))
             entries_by_idx = {}
             continue
         if cur is None:
@@ -10924,10 +10975,19 @@ def _parse_ring_dump(lines):
                 "a5":   int(m.group(9), 16),
                 "a6":   int(m.group(10), 16),
                 "ret":  int(m.group(11)),
+                # Additive optrace fields (None on pre-optrace logs).
+                "ns":   None,
+                "tid":  None,
+                "wake": None,
                 "path": None,
                 "bytes_hex": None,
                 "bytes_len": 0,
             }
+            mx = _SC_RING_LINE_EXT.search(ln)
+            if mx:
+                e["ns"]   = int(mx.group(1))
+                e["tid"]  = int(mx.group(2))
+                e["wake"] = mx.group(3)
             cur["entries"].append(e)
             entries_by_idx[e["i"]] = e
             continue
@@ -13299,6 +13359,16 @@ def main():
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
         # See subsys/linux/futex_cluster.rs.
         "futex-stats", "futex-set-cluster-wake",
+        # optrace: W101 op-trace gap-end freeze trigger + on-demand frozen
+        # per-pid ring dump.  `optrace-arm [quiet_ms [grace_ms]]` arms the
+        # trigger; `optrace-status` reports state + per-pid ring depth;
+        # `optrace-freeze`/`optrace-unfreeze` are the manual fallback;
+        # `optrace-depth <depth> [pid]` sizes the capture ring;
+        # `scrings-dump [pid]` emits the frozen ring(s) for the `scrings`
+        # parser.  See syscall::ring::optrace + kdb::op_optrace_*.
+        "optrace-arm", "optrace-disarm", "optrace-status",
+        "optrace-freeze", "optrace-unfreeze", "optrace-depth",
+        "scrings-dump",
         # INFRA-3 record/replay introspection (record-replay feature).
         # `record-status` returns seed + virtual ticks + ordinal; safe to
         # query under any build (returns enabled:false when the feature

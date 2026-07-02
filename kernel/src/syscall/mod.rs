@@ -24,14 +24,22 @@ use spin::Mutex;
 /// Per-process syscall ring buffer (firefox-test diagnostic aid).  Active
 /// code is feature-gated inside; the module itself compiles out cleanly when
 /// the feature is off because nothing outside the module references it.
-#[cfg(feature = "firefox-test-core")]
+///
+/// Compiled under `test-mode` in addition to `firefox-test-core` so the
+/// in-kernel test suite (which boots `test-mode`) can exercise the ring's
+/// wake-source annotation and gap-end freeze-trigger plumbing directly.
+/// Under pure `test-mode` no PID is ever tracked (`enable_for` is only
+/// called on the firefox-test path), so the real module behaves exactly like
+/// the stub for production callers — `is_tracked` returns false, no ring is
+/// allocated — while remaining reachable from unit tests.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub mod ring;
 
-/// Stub `ring` module for builds without the firefox-test feature.  Provides
-/// the `is_tracked()` predicate so generic syscall-trace gates can compile
-/// uniformly; always returns false because no PIDs are tracked outside of
-/// the firefox-test diagnostic build.
-#[cfg(not(feature = "firefox-test-core"))]
+/// Stub `ring` module for builds without the firefox-test / test-mode
+/// feature.  Provides the `is_tracked()` predicate so generic syscall-trace
+/// gates can compile uniformly; always returns false because no PIDs are
+/// tracked outside of the firefox-test diagnostic build.
+#[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
 pub mod ring {
     #[inline]
     pub fn is_tracked(_pid: u64) -> bool { false }

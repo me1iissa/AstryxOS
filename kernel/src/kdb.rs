@@ -422,6 +422,23 @@ pub fn dispatch(req: &str, out: &mut String) {
         "futex-stats"           => op_futex_stats(out),
         #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
+        // optrace: W101 op-trace gap-end freeze trigger controls + on-demand
+        // non-destructive dump of a frozen per-pid syscall ring.  See
+        // syscall::ring::optrace.
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-arm"      => op_optrace_arm(req, out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-disarm"   => op_optrace_disarm(out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-status"   => op_optrace_status(out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-freeze"   => op_optrace_freeze(out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-unfreeze" => op_optrace_unfreeze(out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "optrace-depth"    => op_optrace_depth(req, out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "scrings-dump"     => op_scrings_dump(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
         // cond-autopsy: one-shot musl pthread_cond/mutex wake-target-vs-
         // wait-addr report.  Composes the live struct dump + parked waiters +
@@ -1366,6 +1383,110 @@ fn op_bell_stats(out: &mut String) {
         bell_wakes, resync_wakes, bell_ratio_permille
     );
 }
+// ── optrace: W101 op-trace gap-end freeze trigger ─────────────────────────────
+//
+// Arms/queries the freeze trigger and drives the on-demand non-destructive
+// frozen-ring dump.  All ops are additive JSON.  See syscall::ring::optrace.
+
+/// `optrace-arm` — arm the gap-end trigger.  Optional `quiet_ms` / `grace_ms`
+/// override the defaults (2000 / 500).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_arm(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let quiet_ms = extract_field(req, "quiet_ms").and_then(|s| parse_u64(&s)).unwrap_or(2000);
+    let grace_ms = extract_field(req, "grace_ms").and_then(|s| parse_u64(&s)).unwrap_or(500);
+    crate::syscall::ring::optrace::arm(quiet_ms, grace_ms);
+    let _ = write!(
+        out,
+        r#"{{"armed":true,"quiet_ms":{},"grace_ms":{}}}"#,
+        quiet_ms, grace_ms
+    );
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_disarm(out: &mut String) {
+    crate::syscall::ring::optrace::disarm();
+    out.push_str(r#"{"armed":false}"#);
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_freeze(out: &mut String) {
+    crate::syscall::ring::optrace::freeze_now();
+    let (_, _, _, _, freeze_at, frozen) = crate::syscall::ring::optrace::status();
+    use core::fmt::Write;
+    let _ = write!(out, r#"{{"frozen":{},"freeze_at_ns":{}}}"#, frozen, freeze_at);
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_unfreeze(out: &mut String) {
+    crate::syscall::ring::optrace::unfreeze();
+    out.push_str(r#"{"frozen":false,"freeze_at_ns":0}"#);
+}
+
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_status(out: &mut String) {
+    use core::fmt::Write;
+    let (armed, quiet_ns, grace_ns, last_send_ns, freeze_at_ns, frozen) =
+        crate::syscall::ring::optrace::status();
+    let _ = write!(
+        out,
+        r#"{{"armed":{},"quiet_ms":{},"grace_ms":{},"last_tcp_send_ns":{},"freeze_at_ns":{},"frozen":{},"default_depth":{},"rings":["#,
+        armed, quiet_ns / 1_000_000, grace_ns / 1_000_000,
+        last_send_ns, freeze_at_ns, frozen,
+        crate::syscall::ring::default_capacity()
+    );
+    for (i, (pid, cap, len)) in crate::syscall::ring::tracked_rings().iter().enumerate() {
+        if i > 0 { out.push(','); }
+        let _ = write!(out, r#"{{"pid":{},"cap":{},"len":{}}}"#, pid, cap, len);
+    }
+    out.push_str("]}");
+}
+
+/// `optrace-depth` — set per-pid ring depth for a capture.  With `pid`,
+/// resize (and clear) that pid's ring; without, set the default for new
+/// rings.  `depth` is required.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_optrace_depth(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let depth = match extract_field(req, "depth").and_then(|s| parse_u64(&s)) {
+        Some(d) if d >= 1 => d as usize,
+        _ => { out.push_str(r#"{"error":"missing or bad 'depth' (>=1)"}"#); return; }
+    };
+    match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(pid) if pid != 0 => {
+            let applied = crate::syscall::ring::resize_ring(pid, depth);
+            if applied == 0 {
+                let _ = write!(out, r#"{{"error":"pid {} not tracked"}}"#, pid);
+            } else {
+                let _ = write!(out, r#"{{"pid":{},"cap":{}}}"#, pid, applied);
+            }
+        }
+        _ => {
+            crate::syscall::ring::set_default_capacity(depth);
+            let _ = write!(out, r#"{{"default_depth":{}}}"#, depth);
+        }
+    }
+}
+
+/// `scrings-dump` — non-destructively emit the frozen ring(s) to serial so
+/// the harness `scrings` parser can ingest them.  With `pid`, just that pid;
+/// without, every tracked pid.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_scrings_dump(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(pid) if pid != 0 => {
+            crate::syscall::ring::dump_for_pid(pid);
+            let _ = write!(out, r#"{{"dumped":true,"pid":{}}}"#, pid);
+        }
+        _ => {
+            crate::syscall::ring::dump_all_tracked();
+            let n = crate::syscall::ring::tracked_rings().len();
+            let _ = write!(out, r#"{{"dumped":true,"pids":{}}}"#, n);
+        }
+    }
+}
+
 // ── compose-stats ─────────────────────────────────────────────────────────────
 //
 // Reports the rate-gated compositor's blit-vs-skip split: how many
