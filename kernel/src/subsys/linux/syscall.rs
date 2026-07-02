@@ -1156,6 +1156,32 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // [SC-RET] trace) rather than bypassing them.
     let ret: i64 = dispatch_body(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
+    // ── Verbose file-op / write-content / return trace (opt-in) ──────────────
+    // Behind `firefox-trace-verbose` (never in the default or fast profiles):
+    // completes the existing `[LINUX-SYS]` entry line with the decoded path +
+    // flags/mode + return for file ops ([FILEOP]), the payload of writes to the
+    // small diagnostic channels ([WR]), and a compact return-value line paired
+    // with `[LINUX-SYS]` ([SYSR]).  Together these let a gate that leaves no
+    // failing syscall — e.g. a userspace library returning NULL with zero
+    // syscalls — be localised precisely.
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
+    {
+        if crate::proc::current_pid_lockless() >= 1 {
+            trace_fileop(num, arg1, arg2, arg3, arg4, ret);
+            trace_write_content(num, arg1, arg2, arg3, ret);
+            static RETN: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let n = RETN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 10000 {
+                crate::serial_println!(
+                    "[SYSR] #{} pid={} tid={} nr={} a1={:#x} a2={:#x} a3={:#x} ret={}",
+                    n, crate::proc::current_pid_lockless(),
+                    crate::proc::current_tid(), num, arg1, arg2, arg3, ret,
+                );
+            }
+        }
+    }
+
     // ── Close out the ring entry with the syscall's return value ─────────────
     #[cfg(feature = "syscall-trace")]
     {
@@ -12223,4 +12249,115 @@ fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     }
 
     crate::serial_println!("{}", line);
+}
+
+// ── File-op decode trace (opt-in diagnostic) ──────────────────────────────
+// Emits ONE self-contained `[FILEOP]` line per path-bearing / directory
+// syscall AFTER the handler returns, so the pathname string, the mode/flags
+// arguments, and the observed return value all appear together.  This is the
+// detail the bare `[LINUX-SYS]` firehose (num + a1 only) lacks — it is what a
+// syscall-fidelity comparison against POSIX / the man-page contracts needs.
+// The x86_64 Linux ABI syscall numbers and their pathname-argument positions
+// are per the published `syscall(2)` / `syscalls(2)` tables.
+#[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
+fn trace_fileop(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, ret: i64) {
+    let (name, path_arg): (&str, Option<u64>) = match num {
+        2   => ("open",        Some(a1)),
+        257 => ("openat",      Some(a2)),
+        4   => ("stat",        Some(a1)),
+        6   => ("lstat",       Some(a1)),
+        5   => ("fstat",       None),
+        262 => ("newfstatat",  Some(a2)),
+        21  => ("access",      Some(a1)),
+        269 => ("faccessat",   Some(a2)),
+        439 => ("faccessat2",  Some(a2)),
+        89  => ("readlink",    Some(a1)),
+        267 => ("readlinkat",  Some(a2)),
+        83  => ("mkdir",       Some(a1)),
+        258 => ("mkdirat",     Some(a2)),
+        217 => ("getdents64",  None),
+        78  => ("getdents",    None),
+        332 => ("statx",       Some(a2)),
+        137 => ("statfs",      Some(a1)),
+        138 => ("fstatfs",     None),
+        79  => ("getcwd",      None),
+        80  => ("chdir",       Some(a1)),
+        161 => ("chroot",      Some(a1)),
+        _ => return,
+    };
+    let pid = crate::proc::current_pid_lockless();
+    let tid = crate::proc::current_tid();
+    match path_arg {
+        Some(p) => {
+            let bytes = read_cstring_from_user(p);
+            let s = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+            crate::serial_println!(
+                "[FILEOP] pid={} tid={} {} path=\"{}\" a1={:#x} a3={:#x} a4={:#x} ret={}",
+                pid, tid, name, s, a1, a3, a4, ret,
+            );
+        }
+        None => {
+            crate::serial_println!(
+                "[FILEOP] pid={} tid={} {} a1={:#x} a2={:#x} a3={:#x} ret={}",
+                pid, tid, name, a1, a2, a3, ret,
+            );
+        }
+    }
+}
+
+// ── write/writev content trace (opt-in diagnostic) ────────────────────────
+// Echoes the payload of write(2)/writev(2) to the three small diagnostic
+// channels — fd 1 (stdout), fd 2 (stderr), fd 3 (a diagnostic log a launcher
+// may point at, e.g. LD_DEBUG_OUTPUT per ld.so(8)).  Bounded and
+// control-char-sanitised so each payload stays on a single serial line;
+// surfaces upstream diagnostics (Xlib/GDK messages, the dynamic loader's
+// per-object narrative) right up to a failure that leaves no syscall trace.
+#[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
+fn trace_write_content(num: u64, a1: u64, a2: u64, a3: u64, ret: i64) {
+    let fd = a1 as i64;
+    if fd < 0 || fd > 3 || ret <= 0 { return; }
+    const CAP: usize = 240;
+    let mut out = alloc::vec::Vec::<u8>::with_capacity(CAP);
+    fn push(out: &mut alloc::vec::Vec<u8>, bytes: &[u8], cap: usize) {
+        for &b in bytes {
+            if out.len() >= cap { break; }
+            match b {
+                b'\n' => out.push(b'|'),
+                b'\t' => out.push(b' '),
+                0x20..=0x7e => out.push(b),
+                _ => out.push(b'.'),
+            }
+        }
+    }
+    if num == 1 {
+        let take = core::cmp::min(a3 as usize, CAP);
+        if let Some(buf) = unsafe { crate::syscall::user_slice_snapshot(a2, take) } {
+            push(&mut out, &buf, CAP);
+        }
+    } else if num == 20 {
+        // writev(2): each `struct iovec` is { void *base; size_t len } (16 B).
+        let iovcnt = core::cmp::min(a3 as usize, 8);
+        if let Some(iov) = unsafe { crate::syscall::user_slice_snapshot(a2, iovcnt.saturating_mul(16)) } {
+            for i in 0..iovcnt {
+                if out.len() >= CAP { break; }
+                let mut base_b = [0u8; 8];
+                let mut len_b = [0u8; 8];
+                base_b.copy_from_slice(&iov[i * 16..i * 16 + 8]);
+                len_b.copy_from_slice(&iov[i * 16 + 8..i * 16 + 16]);
+                let base = u64::from_le_bytes(base_b);
+                let len = u64::from_le_bytes(len_b) as usize;
+                let take = core::cmp::min(len, CAP - out.len());
+                if base != 0 && take > 0 {
+                    if let Some(seg) = unsafe { crate::syscall::user_slice_snapshot(base, take) } {
+                        push(&mut out, &seg, CAP);
+                    }
+                }
+            }
+        }
+    } else {
+        return;
+    }
+    let s = core::str::from_utf8(&out).unwrap_or("<non-utf8>");
+    crate::serial_println!("[WR] pid={} tid={} fd={} n={} {}",
+        crate::proc::current_pid_lockless(), crate::proc::current_tid(), fd, ret, s);
 }
