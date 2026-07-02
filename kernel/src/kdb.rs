@@ -369,6 +369,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc-tree"      => op_proc_tree(req, out),
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
+        // unix-table: live occupancy of the global AF_UNIX socket TABLE.
+        // A full table makes socket(AF_UNIX)/socketpair(2) return EMFILE,
+        // which surfaces to X clients (libxcb) as "cannot open display".
+        "unix-table"     => op_unix_table(out),
         "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
@@ -2451,6 +2455,72 @@ fn op_epoll_watch(req: &str, out: &mut String) {
 //
 // Output: { "pid": N | "all", "entries": [ { pid, fd, kind, socket_id,
 //   peer_socket_id, peer_pid, peer_fd, pipe_id, pipe_end, path } ] }
+
+/// unix-table — dump live occupancy of the global AF_UNIX socket TABLE.
+///
+/// Reports `occupied`/`capacity` plus a per-slot summary (state, kind, peer,
+/// and the bound name if any).  When `occupied == capacity` the table is full
+/// and any further `socket(AF_UNIX)`/`socketpair(2)` returns `EMFILE` — which
+/// an X client's libxcb reports as "cannot open display".  The per-slot view
+/// distinguishes the consumers (listening servers vs connected socketpair
+/// endpoints vs pathname binds) so an exhaustion can be attributed.
+fn op_unix_table(out: &mut String) {
+    use core::fmt::Write;
+    let snaps = crate::net::unix::snapshot_all();
+    let cap = crate::net::unix::capacity();
+    let hwm = crate::net::unix::high_water();
+    let _ = write!(out,
+        r#"{{"occupied":{},"capacity":{},"high_water":{},"full":{},"slots":["#,
+        snaps.len(), cap, hwm, snaps.len() >= cap);
+    let mut first = true;
+    for s in &snaps {
+        if !first { out.push(','); }
+        first = false;
+        let state = match s.state {
+            crate::net::unix::UnixState::Free      => "free",
+            crate::net::unix::UnixState::Unbound   => "unbound",
+            crate::net::unix::UnixState::Bound     => "bound",
+            crate::net::unix::UnixState::Listening => "listening",
+            crate::net::unix::UnixState::Connected => "connected",
+        };
+        let kind = match s.kind {
+            crate::net::unix::SockKind::Stream    => "stream",
+            crate::net::unix::SockKind::SeqPacket => "seqpacket",
+        };
+        out.push('{');
+        j_kv(out, "id", &alloc::format!("{}", s.id));
+        j_kv_str(out, "state", state);
+        j_kv_str(out, "kind", kind);
+        if s.peer_id == u64::MAX {
+            j_kv_str(out, "peer", "none");
+        } else {
+            j_kv(out, "peer", &alloc::format!("{}", s.peer_id));
+        }
+        // Render the bound name (if any).  A leading NUL marks the abstract
+        // namespace per unix(7); show it as "@rest" (the ss(8) convention).
+        if s.path_len > 0 {
+            let raw = &s.path[..s.path_len.min(s.path.len())];
+            let mut name = alloc::string::String::new();
+            if raw.first() == Some(&0) {
+                name.push('@');
+                for &b in &raw[1..] {
+                    if (0x20..0x7f).contains(&b) { name.push(b as char); }
+                    else { name.push('.'); }
+                }
+            } else {
+                for &b in raw {
+                    if (0x20..0x7f).contains(&b) { name.push(b as char); }
+                    else { name.push('.'); }
+                }
+            }
+            j_kv_str(out, "name", &name);
+        }
+        // trailing comma-free close for this slot: drop the last ','
+        if out.ends_with(',') { out.pop(); }
+        out.push('}');
+    }
+    out.push_str("]}");
+}
 
 fn op_fd_map(req: &str, out: &mut String) {
     use core::fmt::Write;

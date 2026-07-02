@@ -7177,6 +7177,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "coverage-flush", "proc-metrics",
               # socket-poll: per-AF_INET-socket poll-readiness divergence report
               # (sticky-POLLIN / spurious-EOF busy-poll localizer).
+              # unix-table: live AF_UNIX socket table occupancy (EMFILE localizer).
+              "unix-table",
               "socket-poll",
               "futex-stats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
@@ -13144,6 +13146,11 @@ def main():
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
+        # unix-table: live occupancy of the global AF_UNIX socket table
+        # (occupied/capacity + per-slot state/kind/peer/name). A full table
+        # makes socket(AF_UNIX)/socketpair(2) return EMFILE, which an X client
+        # reports as "cannot open display". See kdb::op_unix_table.
+        "unix-table",
         "epoll-watch",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "uread", "trace-status",

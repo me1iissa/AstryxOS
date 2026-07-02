@@ -808,6 +808,11 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_bind_connect() { passed += 1; }
 
+    // ── AF_UNIX abstract namespace + abstract→pathname fallback (libxcb) ───
+
+    total += 1;
+    if test_unix_abstract_and_fallback() { passed += 1; }
+
     // ── Test 55: /proc/self/maps content ─────────────────────────────────
 
     total += 1;
@@ -15803,6 +15808,120 @@ fn test_unix_bind_connect() -> bool {
     crate::syscall::dispatch_linux_kernel(3, accepted_fd as u64, 0, 0, 0, 0, 0);
 
     test_pass!("AF_UNIX bind/listen/connect/accept");
+    true
+}
+
+// ── AF_UNIX abstract namespace + libxcb-style abstract→pathname fallback ──────
+//
+// Locks in the exact AF_UNIX behaviour an X client relies on when opening the
+// display.  Per unix(7): a sockaddr_un whose sun_path begins with a NUL byte is
+// an *abstract* name whose length is taken from addrlen (not NUL-terminated).
+// libxcb's `_xcb_open` tries the abstract socket first, then falls back to the
+// pathname socket; that abstract-refused → pathname-success sequence is what a
+// working X connection performs, so it is guarded here.
+fn test_unix_abstract_and_fallback() -> bool {
+    test_header!("AF_UNIX abstract namespace + abstract→pathname fallback");
+    use crate::syscall::dispatch_linux_kernel as sc;
+
+    // Build a sockaddr_un for an ABSTRACT name.  addrlen is EXACT:
+    // 2 (sa_family) + 1 (leading NUL) + name.len().  A too-long addrlen would
+    // fold trailing NULs into the abstract name (they are significant), so the
+    // exact length matters — this is the subtlety abstract clients depend on.
+    fn abstract_addr(name: &[u8], buf: &mut [u8; 128]) -> u64 {
+        buf[0] = 1; buf[1] = 0;       // sa_family = AF_UNIX (LE)
+        buf[2] = 0;                   // sun_path[0] = NUL → abstract
+        buf[3..3 + name.len()].copy_from_slice(name);
+        (2 + 1 + name.len()) as u64   // addrlen
+    }
+
+    // ── Phase 1: abstract bind + listen + connect + accept roundtrip ─────────
+    let a_name: &[u8] = b"astryx-x-abs-rt";
+    let mut a_addr = [0u8; 128];
+    let a_len = abstract_addr(a_name, &mut a_addr);
+
+    let srv = sc(41, 1, 1, 0, 0, 0, 0);
+    if srv < 0 { test_fail!("unix_abs_socket", "socket() = {}", srv); return false; }
+    let r = sc(49 /*bind*/, srv as u64, a_addr.as_ptr() as u64, a_len, 0, 0, 0);
+    if r != 0 { test_fail!("unix_abs_bind", "bind(abstract) = {}", r); return false; }
+    if sc(50 /*listen*/, srv as u64, 5, 0, 0, 0, 0) != 0 {
+        test_fail!("unix_abs_listen", "listen() failed"); return false;
+    }
+    let cli = sc(41, 1, 1, 0, 0, 0, 0);
+    let r = sc(42 /*connect*/, cli as u64, a_addr.as_ptr() as u64, a_len, 0, 0, 0);
+    if r != 0 { test_fail!("unix_abs_connect", "connect(abstract) = {} (want 0)", r); return false; }
+    let acc = sc(43 /*accept*/, srv as u64, 0, 0, 0, 0, 0);
+    if acc < 0 { test_fail!("unix_abs_accept", "accept() = {}", acc); return false; }
+    let msg = b"abstract-ok";
+    if sc(1, cli as u64, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0) != msg.len() as i64 {
+        test_fail!("unix_abs_write", "write failed"); return false;
+    }
+    let mut rb = [0u8; 32];
+    let n = sc(0, acc as u64, rb.as_mut_ptr() as u64, rb.len() as u64, 0, 0, 0);
+    if n != msg.len() as i64 || &rb[..n as usize] != msg {
+        test_fail!("unix_abs_read", "read = {} / mismatch", n); return false;
+    }
+    test_println!("  abstract bind/connect/accept roundtrip ✓");
+    sc(3, srv as u64, 0, 0, 0, 0, 0);
+    sc(3, cli as u64, 0, 0, 0, 0, 0);
+    sc(3, acc as u64, 0, 0, 0, 0, 0);
+
+    // ── Phase 2: abstract-refused → pathname-fallback (the libxcb sequence) ───
+    // A connect to an UNBOUND abstract name must return ECONNREFUSED (-111),
+    // never ENOENT — an abstract name has no filesystem object (unix(7)).  The
+    // client then falls back to the pathname socket, which succeeds.
+    let mut miss_addr = [0u8; 128];
+    let miss_len = abstract_addr(b"astryx-x-absent", &mut miss_addr);
+    let c1 = sc(41, 1, 1, 0, 0, 0, 0);
+    let r = sc(42, c1 as u64, miss_addr.as_ptr() as u64, miss_len, 0, 0, 0);
+    if r != -111 {
+        test_fail!("unix_abs_refused", "connect(unbound abstract) = {} (want -111 ECONNREFUSED)", r);
+        return false;
+    }
+    test_println!("  connect(unbound abstract) → ECONNREFUSED ✓");
+
+    // pathname listener (the fallback target)
+    let psrv = sc(41, 1, 1, 0, 0, 0, 0);
+    let mut p_addr = [0u8; 128];
+    p_addr[0] = 1; p_addr[1] = 0;
+    let ppath = b"/tmp/astryx-x-fb.sock\0";
+    p_addr[2..2 + ppath.len()].copy_from_slice(ppath);
+    let p_len = (2 + ppath.len()) as u64;
+    if sc(49, psrv as u64, p_addr.as_ptr() as u64, p_len, 0, 0, 0) != 0 {
+        test_fail!("unix_fb_bind", "bind(pathname) failed"); return false;
+    }
+    if sc(50, psrv as u64, 5, 0, 0, 0, 0) != 0 {
+        test_fail!("unix_fb_listen", "listen() failed"); return false;
+    }
+    // A FRESH client connects to the pathname (as libxcb's _xcb_open_unix does).
+    let c2 = sc(41, 1, 1, 0, 0, 0, 0);
+    if sc(42, c2 as u64, p_addr.as_ptr() as u64, p_len, 0, 0, 0) != 0 {
+        test_fail!("unix_fb_connect", "pathname fallback connect failed"); return false;
+    }
+    if sc(43, psrv as u64, 0, 0, 0, 0, 0) < 0 {
+        test_fail!("unix_fb_accept", "accept() failed"); return false;
+    }
+    test_println!("  pathname fallback connect after abstract refusal ✓");
+
+    // ── Phase 3: same-fd reconnect after ECONNREFUSED (POSIX connect(2)) ──────
+    // A socket whose connect() failed with ECONNREFUSED is not poisoned and may
+    // be connected again (POSIX.1-2017 connect()).  c1 above already ate a -111
+    // on the abstract name; reconnect the SAME fd to the live pathname listener.
+    let r = sc(42, c1 as u64, p_addr.as_ptr() as u64, p_len, 0, 0, 0);
+    if r != 0 {
+        test_fail!("unix_reconnect_after_refused",
+                   "reconnect same fd after ECONNREFUSED = {} (want 0)", r);
+        return false;
+    }
+    if sc(43, psrv as u64, 0, 0, 0, 0, 0) < 0 {
+        test_fail!("unix_reconnect_accept", "accept() of reconnect failed"); return false;
+    }
+    test_println!("  same-fd reconnect after ECONNREFUSED ✓");
+
+    sc(3, c1 as u64, 0, 0, 0, 0, 0);
+    sc(3, c2 as u64, 0, 0, 0, 0, 0);
+    sc(3, psrv as u64, 0, 0, 0, 0, 0);
+
+    test_pass!("AF_UNIX abstract namespace + abstract→pathname fallback");
     true
 }
 
