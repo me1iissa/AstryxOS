@@ -439,6 +439,8 @@ pub fn dispatch(req: &str, out: &mut String) {
         "optrace-depth"    => op_optrace_depth(req, out),
         #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "scrings-dump"     => op_scrings_dump(req, out),
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        "scrings-page"     => op_scrings_page(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
         // cond-autopsy: one-shot musl pthread_cond/mutex wake-target-vs-
         // wait-addr report.  Composes the live struct dump + parked waiters +
@@ -1468,49 +1470,77 @@ fn op_optrace_depth(req: &str, out: &mut String) {
     }
 }
 
-/// `scrings-dump` — non-destructively emit the frozen ring(s) so the harness
-/// `scrings` parser can ingest them.  With `pid`, just that pid; without,
-/// every tracked pid.
+/// `scrings-dump` — non-destructively emit the frozen ring(s) to the COM1
+/// serial log so the harness `scrings` parser can ingest them.  With `pid`,
+/// just that pid; without, every tracked pid.
 ///
-/// Routes through the guest-RAM log ring by default (a single reservation +
-/// memcpy per line — no per-byte UART VM-exits), so dumping a deep ring does
-/// not monopolise the vCPU or wedge kdb during a live capture.  Retrieve the
-/// lines out of band with `qemu-harness.py log-ring flush` (re-emits to the
-/// serial log for `scrings`) or `log-ring drain` (JSON).  The log ring is
-/// bounded (`log_ring::CAP`, 4 MiB ≈ 20K lines): a larger dump keeps only the
-/// newest lines — the entries nearest the freeze, which is what the chain
-/// reconstruction needs.  Pass `com1` to force the complete-but-slow COM1
-/// path instead (use only when the vCPU is free).
+/// This is the SERIAL FALLBACK: it streams the whole ring over COM1 (~one
+/// VM-exit per byte on the 16550 THR — complete but slow, minutes for a deep
+/// ring), for use when the kdb channel is wedged.  The PREFERRED path for a
+/// live capture is `scrings-page` (below), which pages the ring straight back
+/// over kdb — fast, complete, and immune to the `[SC]` firehose that made the
+/// previous guest-RAM-log-ring route (PR #695) unusable under `syscall-trace`.
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_scrings_dump(req: &str, out: &mut String) {
     use core::fmt::Write;
-    let com1 = extract_field(req, "com1")
-        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false);
-    let route = if com1 {
-        crate::syscall::ring::DumpRoute::Com1
-    } else {
-        crate::syscall::ring::DumpRoute::LogRing
-    };
-    let route_name = if com1 { "com1" } else { "log-ring" };
     match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
         Some(pid) if pid != 0 => {
-            let entries = crate::syscall::ring::dump_for_pid(pid, route);
+            let entries = crate::syscall::ring::dump_for_pid(pid);
             let _ = write!(
                 out,
-                r#"{{"dumped":true,"pid":{},"entries":{},"route":"{}"}}"#,
-                pid, entries, route_name
+                r#"{{"dumped":true,"pid":{},"entries":{},"route":"com1"}}"#,
+                pid, entries
             );
         }
         _ => {
-            let pids = crate::syscall::ring::dump_all_tracked(route);
+            let pids = crate::syscall::ring::dump_all_tracked();
             let _ = write!(
-                out,
-                r#"{{"dumped":true,"pids":{},"route":"{}"}}"#,
-                pids, route_name
+                out, r#"{{"dumped":true,"pids":{},"route":"com1"}}"#, pids
             );
         }
     }
+}
+
+/// `scrings-page` — return a bounded WINDOW of `pid`'s frozen ring directly in
+/// the kdb response, for the fast harness dump path.  Request fields:
+///   `pid`   (required) — the process whose frozen ring to page;
+///   `from`  (default 0) — absolute chronological entry index to start at;
+///   `count` (default 4096) — max entries this page (also capped by a byte
+///           budget so the response stays under `MAX_RESP_BYTES`).
+///
+/// Response: `{"pid",​"from","emitted","next","total","eof","ns_now","lines"}`
+/// where `lines` is the JSON-escaped `[SC-RING]`(+PATH/BYTES) block for the
+/// window (no BEGIN/END frame — the host synthesises it once it has paged to
+/// `eof`).  The host loops `from = next` until `eof`, i.e. the same offset-
+/// cursor protocol the base64 PNG read (`read-png`) uses to stream a payload
+/// larger than one response.  Firehose-immune (no shared ring) and capacity-
+/// independent (each page is bounded), unlike the retired #695 log-ring route.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn op_scrings_page(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = extract_field(req, "pid").and_then(|s| parse_u64(&s)).unwrap_or(0);
+    let from = extract_field(req, "from").and_then(|s| parse_u64(&s)).unwrap_or(0) as usize;
+    let count = extract_field(req, "count").and_then(|s| parse_u64(&s))
+        .unwrap_or(4096).max(1) as usize;
+
+    // Keep the escaped `lines` block + JSON envelope under MAX_RESP_BYTES.
+    // 24 KiB of raw lines leaves comfortable room for escaping (`"`→`\"`,
+    // `\n`→`\\n`) plus the ~128-byte envelope inside the 32 KiB cap.
+    const PAGE_BYTE_BUDGET: usize = 24 * 1024;
+
+    let mut block = String::new();
+    let (emitted, total, ns_now) =
+        crate::syscall::ring::page_for_pid(pid, from, count, PAGE_BYTE_BUDGET, &mut block);
+    let next = from + emitted;
+    let eof = next >= total;
+
+    let _ = write!(
+        out,
+        r#"{{"pid":{},"from":{},"emitted":{},"next":{},"total":{},"eof":{},"ns_now":{},"lines":"#,
+        pid, from, emitted, next, total, eof, ns_now
+    );
+    j_str(out, &block);
+    out.push('}');
 }
 
 // ── compose-stats ─────────────────────────────────────────────────────────────
@@ -2694,6 +2724,11 @@ fn op_unix_table(out: &mut String) {
     out.push_str("]}");
 }
 
+/// Format an IPv4 address + port as `a.b.c.d:port` for the fd-map 4-tuple.
+fn fmt_ipv4_port(ip: [u8; 4], port: u16) -> alloc::string::String {
+    alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port)
+}
+
 fn op_fd_map(req: &str, out: &mut String) {
     use core::fmt::Write;
 
@@ -2804,28 +2839,64 @@ fn op_fd_map(req: &str, out: &mut String) {
                 j_kv_str(out, "kind", "socket");
                 j_kv(out, "socket_id", &alloc::format!("{}", snap.inode));
 
-                // Resolve peer socket id from the snapshot.
-                let peer_socket_id = sock_snaps.iter()
-                    .find(|s| s.id == snap.inode)
-                    .map(|s| s.peer_id)
-                    .unwrap_or(u64::MAX);
+                // Disambiguate AF_UNIX vs AF_INET by the fd flag captured at
+                // snapshot time (bit 23; same predicate `is_unix_socket_fd`
+                // uses) — the two socket tables have independent id spaces, so
+                // looking `snap.inode` up in the AF_UNIX table alone would
+                // mis-key an INET socket that happened to share the id.
+                let is_unix = snap.flags & crate::syscall::UNIX_SOCKET_FLAG != 0;
 
-                if peer_socket_id == u64::MAX {
-                    j_kv_str(out, "peer_socket_id", "none");
-                    j_kv_str(out, "peer_pid", "none");
-                    j_kv_str(out, "peer_fd",  "none");
-                } else {
-                    j_kv(out, "peer_socket_id", &alloc::format!("{}", peer_socket_id));
-                    match find_socket_owner(peer_socket_id) {
-                        Some((ppid, pfd)) => {
-                            j_kv(out, "peer_pid", &alloc::format!("{}", ppid));
-                            j_kv(out, "peer_fd",  &alloc::format!("{}", pfd));
+                if !is_unix {
+                    // AF_INET / AF_INET6: emit the IPv4 4-tuple + L4 proto so a
+                    // gap-ending send can be bound to its peer HOST.  The
+                    // AF_UNIX peer_socket_id resolution below never covers an
+                    // INET socket (getsockname(2)/getpeername(2)-shaped fields).
+                    match crate::net::socket::socket_inet_snapshot(snap.inode) {
+                        Some(t) => {
+                            j_kv_str(out, "af", "inet");
+                            j_kv_str(out, "l4", match t.socket_type {
+                                crate::net::socket::SocketType::Tcp => "tcp",
+                                crate::net::socket::SocketType::Udp => "udp",
+                            });
+                            j_kv_str(out, "local",  &fmt_ipv4_port(t.local_ip,  t.local_port));
+                            j_kv_str(out, "remote", &fmt_ipv4_port(t.remote_ip, t.remote_port));
+                            j_kv(out, "local_port",  &alloc::format!("{}", t.local_port));
+                            j_kv(out, "remote_port", &alloc::format!("{}", t.remote_port));
+                            j_kv_str(out, "bound",     if t.bound { "true" } else { "false" });
+                            j_kv_str(out, "connected", if t.connected { "true" } else { "false" });
                         }
                         None => {
-                            // Peer socket exists in TABLE but no process owns it yet
-                            // (e.g. created but not yet dup'd/installed in any FD table).
-                            j_kv_str(out, "peer_pid", "unowned");
-                            j_kv_str(out, "peer_fd",  "unowned");
+                            // Socket-flagged fd that is neither AF_UNIX-flagged
+                            // nor present in the INET table — report the
+                            // ambiguity rather than mislabel it as a UNIX peer.
+                            j_kv_str(out, "af", "unknown");
+                        }
+                    }
+                } else {
+                    j_kv_str(out, "af", "unix");
+                    // Resolve peer socket id from the snapshot.
+                    let peer_socket_id = sock_snaps.iter()
+                        .find(|s| s.id == snap.inode)
+                        .map(|s| s.peer_id)
+                        .unwrap_or(u64::MAX);
+
+                    if peer_socket_id == u64::MAX {
+                        j_kv_str(out, "peer_socket_id", "none");
+                        j_kv_str(out, "peer_pid", "none");
+                        j_kv_str(out, "peer_fd",  "none");
+                    } else {
+                        j_kv(out, "peer_socket_id", &alloc::format!("{}", peer_socket_id));
+                        match find_socket_owner(peer_socket_id) {
+                            Some((ppid, pfd)) => {
+                                j_kv(out, "peer_pid", &alloc::format!("{}", ppid));
+                                j_kv(out, "peer_fd",  &alloc::format!("{}", pfd));
+                            }
+                            None => {
+                                // Peer socket exists in TABLE but no process owns it yet
+                                // (e.g. created but not yet dup'd/installed in any FD table).
+                                j_kv_str(out, "peer_pid", "unowned");
+                                j_kv_str(out, "peer_fd",  "unowned");
+                            }
                         }
                     }
                 }

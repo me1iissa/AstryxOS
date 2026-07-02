@@ -1286,18 +1286,27 @@ def run_blk_trace_argv_check():
 
 def run_scrings_parse_check():
     """
-    Tier 1.5 host-only check: the `scrings` [SC-RING] parser + `scrings-dump`
-    argv shaping.  No QEMU (< 1s).
+    Tier 1.5 host-only check: the `scrings` [SC-RING] parser, the `scrings-dump`
+    / `scrings-page` argv shaping, AND the `scrings-pull` paged-reassembly loop.
+    No QEMU (< 1s).
 
-    Regression guard for the W101 op-trace parser bug (Phase A): the kernel
-    dumper emits `cr=<caller_rip>` between `rip=` and `a1=`, which the
-    historical `_SC_RING_LINE` regex did not account for, so it matched ZERO
-    entries from a real dump.  This check parses a synthetic block with the
-    real `cr=` field (+ additive ns/tid/wake and a kind=frozen BEGIN), asserts
-    the entries and every additive field land, and confirms a legacy cr-less
-    line still parses.
+    Two regressions are guarded:
+
+    1. The W101 op-trace PARSER bug (Phase A): the kernel dumper emits
+       `cr=<caller_rip>` between `rip=` and `a1=`, which the historical
+       `_SC_RING_LINE` regex did not account for, so it matched ZERO entries.
+
+    2. The FIREHOSE-IMMUNITY of the paged `scrings-pull` path (the task-#8
+       rework): the retired #695 log-ring route shared the 4 MiB firehose ring
+       and a live ~220K rec/s `[SC]` firehose evicted dump lines before drain.
+       The paged path reads the frozen ring straight over kdb in bounded
+       windows (no shared ring), so this test — feeding chunked `scrings-page`
+       responses through the real `_scrings_pull_one` reassembly loop and
+       asserting a complete multi-page dump — is the guard that WOULD have
+       caught the #695 defect (a shared-ring eviction cannot reassemble a
+       complete dump; direct paging always can).
     """
-    print("=== Tier 1.5: scrings [SC-RING] parser + scrings-dump argv (host-only) ===")
+    print("=== Tier 1.5: scrings parser + scrings-page paging (host-only) ===")
     print()
 
     import importlib.util
@@ -1348,20 +1357,73 @@ def run_scrings_parse_check():
                   and e2["ret"] == 64 and e2["a1"] == 0x35,
                   str({k: e2[k] for k in ("cr", "ns", "ret", "a1")}))
 
-    # scrings-dump argv: default (log-ring), com1, pid+com1 in either order.
-    check("scrings-dump default request shape",
+    # Request shaping: scrings-dump is now serial-fallback-only (pid, no route
+    # flag); scrings-page is the paged primitive (pid [from [count]]).
+    check("scrings-dump default (all pids) request shape",
           mod._kdb_build_request("scrings-dump", []) == {"op": "scrings-dump"},
           str(mod._kdb_build_request("scrings-dump", [])))
     check("scrings-dump pid=1 request shape",
           mod._kdb_build_request("scrings-dump", ["1"]) == {"op": "scrings-dump", "pid": "1"},
           str(mod._kdb_build_request("scrings-dump", ["1"])))
-    check("scrings-dump com1 flag request shape",
-          mod._kdb_build_request("scrings-dump", ["com1"]) == {"op": "scrings-dump", "com1": "1"},
-          str(mod._kdb_build_request("scrings-dump", ["com1"])))
-    r_both = mod._kdb_build_request("scrings-dump", ["1", "com1"])
-    check("scrings-dump pid+com1 (either order) request shape",
-          r_both == {"op": "scrings-dump", "pid": "1", "com1": "1"},
-          str(r_both))
+    check("scrings-page pid/from/count request shape",
+          mod._kdb_build_request("scrings-page", ["1", "4096", "256"])
+          == {"op": "scrings-page", "pid": "1", "from": "4096", "count": "256"},
+          str(mod._kdb_build_request("scrings-page", ["1", "4096", "256"])))
+
+    # Paged reassembly: synthesise an N-entry frozen ring, serve it as chunked
+    # `scrings-page` responses (honouring the kernel byte budget so it spans
+    # MANY pages), drive the real `_scrings_pull_one` loop, and assert the
+    # reassembled dump is complete + monotonic across page boundaries.
+    N = 5000
+    synth = []
+    for k in range(N):
+        e = {"t": 10 + k, "op": "futex/202", "rip": "0x7f00",
+             "cr": f"0x{0x401000 + k:x}", "a1": "0x1", "a2": "0x80", "a3": "0x2",
+             "a4": "0x0", "a5": "0x0", "a6": "0x0", "ret": -110,
+             "ns": 1000 + k, "tid": 7, "wake": "futex_timeout"}
+        synth.append(e)
+
+    PAGE_BUDGET = 24 * 1024  # mirrors the kernel op_scrings_page byte budget
+
+    def _entry_line(e, i):
+        return (f"[SC-RING] i={i:03} t={e['t']} {e['op']} rip={e['rip']} "
+                f"cr={e['cr']} a1={e['a1']} a2={e['a2']} a3={e['a3']} "
+                f"a4={e['a4']} a5={e['a5']} a6={e['a6']} ret={e['ret']} "
+                f"ns={e['ns']} tid={e['tid']} wake={e['wake']}\n")
+
+    def _fake_kdb(port, req, timeout=30.0, max_bytes=128 * 1024):
+        assert req["op"] == "scrings-page"
+        frm = int(req["from"]); count = int(req["count"])
+        out = []; nbytes = 0; emitted = 0
+        for j in range(frm, min(frm + count, N)):
+            if emitted > 0 and nbytes >= PAGE_BUDGET:
+                break
+            s = _entry_line(synth[j], j)
+            out.append(s); nbytes += len(s); emitted += 1
+        nxt = frm + emitted
+        resp = {"pid": 1, "from": frm, "emitted": emitted, "next": nxt,
+                "total": N, "eof": nxt >= N, "ns_now": 42, "lines": "".join(out)}
+        return (json.dumps(resp) + "\n").encode()
+
+    saved = mod._kdb_recv
+    try:
+        mod._kdb_recv = _fake_kdb
+        dump, pages, total = mod._scrings_pull_one(port=0, pid=1, timeout=5.0)
+    finally:
+        mod._kdb_recv = saved
+
+    got = len(dump["entries"]) if dump else 0
+    check("scrings-pull reassembles all entries across pages",
+          got == N, f"{got}/{N} entries in {pages} pages")
+    check("scrings-pull spans multiple pages (paging exercised)",
+          pages > 1, f"{pages} pages")
+    if dump and got == N:
+        idx_ok = all(dump["entries"][k]["i"] == k for k in range(N))
+        first, last = dump["entries"][0], dump["entries"][-1]
+        check("scrings-pull entry order monotonic + boundary fields intact",
+              idx_ok and first["cr"] == 0x401000 and first["ns"] == 1000
+              and last["cr"] == 0x401000 + (N - 1) and last["ns"] == 1000 + (N - 1),
+              f"idx_ok={idx_ok} first.cr={first['cr']:#x} last.cr={last['cr']:#x}")
     print()
 
 

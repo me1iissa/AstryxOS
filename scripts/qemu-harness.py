@@ -7316,18 +7316,25 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
             d["pid"] = str(int(rest[1]))
         return d
     if op == "scrings-dump":
-        # Non-destructively dump the frozen ring(s).  Routes through the
-        # guest-RAM log ring by default (retrieve via `log-ring flush|drain`);
-        # positional `com1` forces the complete-but-slow COM1 path.
-        # Optional positional `[pid]` (absent = every tracked pid).  `pid` and
-        # `com1` may appear in either order.
+        # Non-destructively emit the frozen ring(s) to the COM1 serial log
+        # (parse with `scrings`).  This is the SERIAL FALLBACK — complete but
+        # slow (per-byte UART); the fast path is `scrings-pull` (kdb-paged).
+        # Optional positional `[pid]` (absent = every tracked pid).
         d = {"op": op}
-        for tok in rest:
-            t = tok.strip().lower()
-            if t in ("com1", "--com1"):
-                d["com1"] = "1"
-            else:
-                d["pid"] = str(int(tok))
+        if rest:
+            d["pid"] = str(int(rest[0]))
+        return d
+    if op == "scrings-page":
+        # One bounded page of a pid's frozen ring, returned in the response.
+        # Positional: pid [from] [count].  Used by the `scrings-pull` wrapper's
+        # offset-cursor loop; rarely invoked by hand.
+        if not rest:
+            raise ValueError("scrings-page requires a pid")
+        d = {"op": op, "pid": str(int(rest[0]))}
+        if len(rest) > 1:
+            d["from"] = str(int(rest[1]))
+        if len(rest) > 2:
+            d["count"] = str(int(rest[2]))
         return d
     if op == "virtio-wait-mode":
         # Flip the wait strategy at runtime: adaptive (poll + peer-aware yield) |
@@ -7591,8 +7598,14 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     raise ValueError(f"unknown kdb op: {op}")
 
 
-def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
+def _kdb_recv(port: int, req: dict, timeout: float = 30.0,
+              max_bytes: int = 128 * 1024) -> bytes:
     """Send one JSON kdb request, return the raw response bytes.
+
+    `max_bytes` caps the client-side read (default 128 KiB — a runaway guard
+    for the common small ops).  Ops that legitimately return MiB-scale bodies
+    (e.g. `log-ring drain` of a multi-MiB ring) must raise it, or the read
+    truncates mid-response and json.loads fails.
 
     `timeout` is the OVERALL DEADLINE (not per-attempt).  The harness retries
     connect/send/read on `ConnectionRefused` / `socket.timeout` /
@@ -7633,7 +7646,7 @@ def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
                 if not chunk:
                     break
                 buf += chunk
-                if len(buf) > 128 * 1024:
+                if len(buf) > max_bytes:
                     break
             if buf.endswith(b"\n"):
                 return buf
@@ -7795,7 +7808,8 @@ def cmd_log_ring(args):
             sys.exit(1)
         timeout = float(getattr(args, "timeout", 30.0) or 30.0)
         try:
-            raw = _kdb_recv(port, {"op": op}, timeout=timeout)
+            raw = _kdb_recv(port, {"op": op}, timeout=timeout,
+                            max_bytes=64 * 1024 * 1024)
             resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
             _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
@@ -11058,6 +11072,117 @@ def cmd_scrings(args):
     _out({"dumps": dumps, "dump_count": len(dumps)})
 
 
+def _scrings_pull_one(port, pid, timeout):
+    """Page a single pid's frozen ring out over kdb (`scrings-page`), assemble
+    the `[SC-RING]` lines under a synthesised BEGIN/END frame, and parse it with
+    `_parse_ring_dump`.  Returns (dump_dict_or_None, pages, total).
+
+    This is the fast, complete, firehose-immune dump path — the offset-cursor
+    loop (`from = next` until `eof`) mirrors `cmd_kdb_read_png`.  Each page stays
+    under the kdb MAX_RESP_BYTES cap, so no single response is truncated and the
+    dump is capacity-independent (unlike the retired #695 guest-RAM-log-ring
+    route, which a live `syscall-trace` firehose evicted before drain).
+    """
+    blocks = []
+    frm = 0
+    total = 0
+    ns_now = 0
+    pages = 0
+    # Safety ceiling: every page emits >= 1 entry, so pages <= total; cap
+    # generously so a pathological loop still terminates.
+    max_pages = 200_000
+    while pages < max_pages:
+        req = {"op": "scrings-page", "pid": str(pid), "from": str(frm),
+               "count": "4096"}
+        # A page's `lines` block can approach MAX_RESP_BYTES (~32 KiB) plus the
+        # envelope; 1 MiB max_bytes is ample headroom for one response.
+        raw = _kdb_recv(port, req, timeout=timeout, max_bytes=1024 * 1024)
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+        if "error" in resp:
+            return (None, pages, total)
+        pages += 1
+        total = int(resp.get("total", 0))
+        if ns_now == 0:
+            ns_now = int(resp.get("ns_now", 0))
+        blocks.append(resp.get("lines", ""))
+        emitted = int(resp.get("emitted", 0))
+        frm = int(resp.get("next", frm + emitted))
+        if bool(resp.get("eof", False)) or emitted == 0:
+            break
+
+    if total == 0 and not any(blocks):
+        # No ring for this pid (or empty) — emit an empty-frame dump so the
+        # caller still sees the pid was queried.
+        assembled = (f"[SC-RING-BEGIN] pid={pid} exit_code=0 entries=0 "
+                     f"kind=frozen ns_now={ns_now}\n[SC-RING-END] pid={pid}\n")
+    else:
+        assembled = (
+            f"[SC-RING-BEGIN] pid={pid} exit_code=0 entries={total} "
+            f"kind=frozen ns_now={ns_now}\n"
+            + "".join(blocks)
+            + f"[SC-RING-END] pid={pid}\n"
+        )
+    dumps = list(_parse_ring_dump(assembled.splitlines()))
+    return (dumps[0] if dumps else None, pages, total)
+
+
+def cmd_scrings_pull(args):
+    """Fast, complete kdb-paged dump of one or all tracked frozen rings.
+
+    Unlike `scrings-dump` (which streams the ring to the COM1 serial log for
+    `scrings` to parse — complete but minutes-slow, and the retired #695
+    log-ring route which a live firehose evicted), `scrings-pull` pages the
+    frozen ring straight back over the kdb channel and returns the parsed dump
+    directly.  Firehose-immune and capacity-independent.  Requires the session
+    started with `--features kdb`.
+
+    Forms:
+      scrings-pull <sid> --pid N     one pid
+      scrings-pull <sid> --all       every tracked pid (default if no --pid)
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"ok": False, "error": "session was not started with --features kdb"})
+        sys.exit(1)
+    timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+
+    pid = getattr(args, "pid", None)
+    if pid is not None:
+        pids = [int(pid)]
+    else:
+        # --all (or default): enumerate tracked pids from optrace-status.
+        try:
+            raw = _kdb_recv(port, {"op": "optrace-status"}, timeout=timeout)
+            st = json.loads(raw.strip().decode("utf-8", errors="replace"))
+            pids = [int(r["pid"]) for r in st.get("rings", [])]
+        except (socket.timeout, ConnectionRefusedError, OSError,
+                json.JSONDecodeError, ValueError, KeyError) as e:
+            _out({"ok": False, "error": f"could not list tracked pids: {e}"})
+            sys.exit(1)
+        if not pids:
+            _out({"ok": True, "dumps": [], "dump_count": 0,
+                  "note": "no tracked rings"})
+            return
+
+    dumps = []
+    pages_total = 0
+    for p in pids:
+        try:
+            dump, pages, _total = _scrings_pull_one(port, p, timeout)
+        except (socket.timeout, ConnectionRefusedError, OSError,
+                json.JSONDecodeError, ValueError) as e:
+            _out({"ok": False, "error": f"scrings-page pid={p} failed: {e}",
+                  "dumps": dumps})
+            sys.exit(1)
+        pages_total += pages
+        if dump is not None:
+            dumps.append(dump)
+
+    _out({"ok": True, "dumps": dumps, "dump_count": len(dumps),
+          "pages_total": pages_total})
+
+
 # ── stack: parse exit-time userspace stack snapshots ─────────────────────────
 #
 # On non-zero exit the kernel (firefox-test feature) emits:
@@ -13381,11 +13506,14 @@ def main():
         # trigger; `optrace-status` reports state + per-pid ring depth;
         # `optrace-freeze`/`optrace-unfreeze` are the manual fallback;
         # `optrace-depth <depth> [pid]` sizes the capture ring;
-        # `scrings-dump [pid]` emits the frozen ring(s) for the `scrings`
-        # parser.  See syscall::ring::optrace + kdb::op_optrace_*.
+        # `scrings-dump [pid]` emits the frozen ring(s) to the serial log for
+        # the `scrings` parser (slow serial fallback); `scrings-page <pid>
+        # [from [count]]` returns one bounded page in the response (the fast
+        # `scrings-pull` subcommand's offset-cursor primitive).  See
+        # syscall::ring::optrace + kdb::op_optrace_*.
         "optrace-arm", "optrace-disarm", "optrace-status",
         "optrace-freeze", "optrace-unfreeze", "optrace-depth",
-        "scrings-dump",
+        "scrings-dump", "scrings-page",
         # INFRA-3 record/replay introspection (record-replay feature).
         # `record-status` returns seed + virtual ticks + ordinal; safe to
         # query under any build (returns enabled:false when the feature
@@ -13689,6 +13817,19 @@ def main():
                             help="Only return dumps for this PID")
     p_scrings.add_argument("--last", type=int, default=None,
                             help="Truncate each dump's entries[] to last N")
+
+    # scrings-pull — fast, complete kdb-paged dump (vs `scrings` which parses
+    # the serial log after a slow `scrings-dump`).  Firehose-immune.
+    p_scrings_pull = sub.add_parser(
+        "scrings-pull",
+        help="Page one/all frozen rings over kdb and return the parsed dump "
+             "(fast; needs --features kdb)"
+    )
+    p_scrings_pull.add_argument("sid")
+    p_scrings_pull.add_argument("--pid", type=int, default=None,
+                                help="Pull only this PID (default: all tracked)")
+    p_scrings_pull.add_argument("--timeout", type=float, default=30.0,
+                                help="Per-request kdb timeout in seconds (default 30)")
 
     # stack — parse [SC-RING-STACK] exit-time userspace stack snapshots.
     p_stack = sub.add_parser(
@@ -14206,6 +14347,7 @@ def main():
         "ff-progress": cmd_ff_progress,
         "health":      cmd_health,
         "scrings": cmd_scrings,
+        "scrings-pull": cmd_scrings_pull,
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,
         "parked-tids": cmd_parked_tids,
