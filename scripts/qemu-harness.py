@@ -7316,11 +7316,18 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
             d["pid"] = str(int(rest[1]))
         return d
     if op == "scrings-dump":
-        # Non-destructively dump the frozen ring(s) to serial for `scrings`.
-        # Optional positional `[pid]` (absent = every tracked pid).
+        # Non-destructively dump the frozen ring(s).  Routes through the
+        # guest-RAM log ring by default (retrieve via `log-ring flush|drain`);
+        # positional `com1` forces the complete-but-slow COM1 path.
+        # Optional positional `[pid]` (absent = every tracked pid).  `pid` and
+        # `com1` may appear in either order.
         d = {"op": op}
-        if rest:
-            d["pid"] = str(int(rest[0]))
+        for tok in rest:
+            t = tok.strip().lower()
+            if t in ("com1", "--com1"):
+                d["com1"] = "1"
+            else:
+                d["pid"] = str(int(tok))
         return d
     if op == "virtio-wait-mode":
         # Flip the wait strategy at runtime: adaptive (poll + peer-aware yield) |
@@ -10896,12 +10903,16 @@ def _scan_line(line_bytes: bytes, tests: list, libs_loaded: list,
 # `scrings-dump` op (W101 op-trace).  Format, from kernel/src/syscall/ring.rs:
 #
 #   [SC-RING-BEGIN] pid=<N> exit_code=<N> entries=<N> [kind=<exit|frozen> ns_now=<N>]
-#   [SC-RING] i=NNN t=<tick> <name>/<nr> rip=0x.. a1=0x.. a2=0x.. a3=0x.. \
+#   [SC-RING] i=NNN t=<tick> <name>/<nr> rip=0x.. cr=0x.. a1=0x.. a2=0x.. a3=0x.. \
 #             a4=0x.. a5=0x.. a6=0x.. ret=<i64> [ns=<N> tid=<N> wake=<label>]
 #   [SC-RING-PATH] i=NNN path="..."                    (for open/openat only)
 #   [SC-RING-BYTES] i=NNN len=<N> hex=<hex-ascii>      (for captured reads)
 #   [SC-RING-END] pid=<N>
 #
+# The `cr=` (caller_rip) field sits between `rip=` and `a1=`.  It has ALWAYS
+# been emitted by the kernel dumper, but the historical `_SC_RING_LINE` regex
+# omitted it and therefore matched zero entries; it is now an optional
+# capturing group (`cr`), back-compatible with any hypothetical cr-less line.
 # The `kind`/`ns_now` (BEGIN) and `ns`/`tid`/`wake` (per-entry) fields are
 # additive: they appear only on optrace-capable kernels and are parsed with
 # separate optional regexes so pre-optrace logs still parse.  `wake` is the
@@ -10920,11 +10931,15 @@ _SC_RING_BEGIN = re.compile(
 # exit-time dump from an on-demand frozen-ring dump; `ns_now=<n>` is the
 # monotonic-ns clock at dump time.  Absent on pre-optrace logs.
 _SC_RING_BEGIN_EXT = re.compile(r"kind=(\w+) ns_now=(\d+)")
+# Named groups so the additive `cr=` (caller_rip) group can slot in between
+# `rip=` and `a1=` without renumbering the rest.  `cr` is optional for
+# forward/back compatibility with any cr-less line.
 _SC_RING_LINE = re.compile(
-    r"\[SC-RING\] i=(\d+) t=(\d+) (\S+) rip=(0x[0-9a-fA-F]+) "
-    r"a1=(0x[0-9a-fA-F]+) a2=(0x[0-9a-fA-F]+) a3=(0x[0-9a-fA-F]+) "
-    r"a4=(0x[0-9a-fA-F]+) a5=(0x[0-9a-fA-F]+) a6=(0x[0-9a-fA-F]+) "
-    r"ret=(-?\d+)"
+    r"\[SC-RING\] i=(?P<i>\d+) t=(?P<t>\d+) (?P<name>\S+) rip=(?P<rip>0x[0-9a-fA-F]+)"
+    r"(?: cr=(?P<cr>0x[0-9a-fA-F]+))?"
+    r" a1=(?P<a1>0x[0-9a-fA-F]+) a2=(?P<a2>0x[0-9a-fA-F]+) a3=(?P<a3>0x[0-9a-fA-F]+)"
+    r" a4=(?P<a4>0x[0-9a-fA-F]+) a5=(?P<a5>0x[0-9a-fA-F]+) a6=(?P<a6>0x[0-9a-fA-F]+)"
+    r" ret=(?P<ret>-?\d+)"
 )
 # Additive per-entry tail (appended after ret=): monotonic-ns timestamp,
 # calling thread id, and the wake-source annotation.  Absent on pre-optrace
@@ -10964,17 +10979,19 @@ def _parse_ring_dump(lines):
         m = _SC_RING_LINE.search(ln)
         if m:
             e = {
-                "i":    int(m.group(1)),
-                "tick": int(m.group(2)),
-                "name": m.group(3),
-                "rip":  int(m.group(4), 16),
-                "a1":   int(m.group(5), 16),
-                "a2":   int(m.group(6), 16),
-                "a3":   int(m.group(7), 16),
-                "a4":   int(m.group(8), 16),
-                "a5":   int(m.group(9), 16),
-                "a6":   int(m.group(10), 16),
-                "ret":  int(m.group(11)),
+                "i":    int(m.group("i")),
+                "tick": int(m.group("t")),
+                "name": m.group("name"),
+                "rip":  int(m.group("rip"), 16),
+                # caller_rip — additive; None only on a (hypothetical) cr-less line.
+                "cr":   int(m.group("cr"), 16) if m.group("cr") else None,
+                "a1":   int(m.group("a1"), 16),
+                "a2":   int(m.group("a2"), 16),
+                "a3":   int(m.group("a3"), 16),
+                "a4":   int(m.group("a4"), 16),
+                "a5":   int(m.group("a5"), 16),
+                "a6":   int(m.group("a6"), 16),
+                "ret":  int(m.group("ret")),
                 # Additive optrace fields (None on pre-optrace logs).
                 "ns":   None,
                 "tid":  None,

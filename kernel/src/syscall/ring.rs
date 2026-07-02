@@ -618,6 +618,49 @@ fn nr_name(nr: u64) -> &'static str {
     }
 }
 
+/// Where a ring dump's `[SC-RING-*]` lines are routed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DumpRoute {
+    /// Classic COM1 `serial_println!` — every line pays ~one VM-exit per byte
+    /// on the 16550 THR (Intel SDM Vol. 3C §25.1.3).  Complete, but slow: a
+    /// deep frozen ring can monopolise the vCPU for minutes and wedge kdb.
+    /// Used by the crash-path exit dump (always reaches the log) and as the
+    /// `scrings-dump --com1` fallback.
+    Com1,
+    /// The near-zero-overhead guest-RAM log ring (`drivers::log_ring`): each
+    /// line is a single reservation + `memcpy`, no lock, no `outb`, no exit —
+    /// so a 10^5-entry dump completes in well under a second without starving
+    /// a live capture.  Drained out of band via `qemu-harness.py log-ring
+    /// drain|flush`.  Bounded to `log_ring::CAP` (4 MiB ≈ 20K lines): a dump
+    /// larger than that keeps only the NEWEST lines — which are the entries
+    /// nearest the freeze/gap-end, i.e. exactly the ones the W101 chain
+    /// reconstruction walks backwards from.
+    LogRing,
+}
+
+/// Format one already-composed line into the guest-RAM log ring, appending the
+/// `'\n'` terminator (matching the fast-path `log_fast` framing so a
+/// `log-ring flush` re-emits it as a proper serial line).  Mirrors
+/// `drivers::serial::log_fast`'s bounded-stack-buffer commit; no heap, no lock.
+fn record_line_to_ring(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    const CAP: usize = crate::drivers::log_ring::MAX_RECORD;
+    struct RingBuf { buf: [u8; CAP], len: usize }
+    impl core::fmt::Write for RingBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if self.len >= self.buf.len() { break; }
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+            Ok(())
+        }
+    }
+    let mut rb = RingBuf { buf: [0u8; CAP], len: 0 };
+    let _ = rb.write_fmt(format_args!("{}\n", args));
+    crate::drivers::log_ring::record(&rb.buf[..rb.len]);
+}
+
 /// Emit the entries of `ring` framed by `[SC-RING-BEGIN]`/`[SC-RING-END]`.
 ///
 /// The BEGIN line carries the legacy `pid`/`exit_code`/`entries` fields the
@@ -625,9 +668,23 @@ fn nr_name(nr: u64) -> &'static str {
 /// `ns_now=` tail fields (ignored by the anchored regex).  Each `[SC-RING]`
 /// line gains additive `ns=`/`tid=`/`wake=` fields, appended after `ret=` so
 /// older parsers keep matching.
-fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str) {
+///
+/// `route` selects COM1 (crash-path exit dump) vs the guest-RAM log ring
+/// (`scrings-dump`, so a live capture is not starved by per-byte UART I/O).
+fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str, route: DumpRoute) {
+    // Route one formatted line to the selected sink.  A `macro_rules!` (not a
+    // closure) so each call site can pass ordinary `format_args`-style tokens.
+    macro_rules! line {
+        ($($a:tt)*) => {
+            match route {
+                DumpRoute::Com1    => crate::serial_println!($($a)*),
+                DumpRoute::LogRing => record_line_to_ring(format_args!($($a)*)),
+            }
+        };
+    }
+
     let ns_now = crate::proc::vdso::monotonic_ns();
-    crate::serial_println!(
+    line!(
         "[SC-RING-BEGIN] pid={} exit_code={} entries={} kind={} ns_now={}",
         pid, exit_code, ring.len, kind, ns_now
     );
@@ -644,7 +701,7 @@ fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str) {
         // caller of libc's `syscall()` wrapper, which resolves directly to
         // a libxul / firefox-bin function name when the offset-from-base is
         // looked up in the Breakpad .sym symbol files.
-        crate::serial_println!(
+        line!(
             "[SC-RING] i={:03} t={} {} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ret={} ns={} tid={} wake={}",
             i, e.tick, name_field,
             e.rip, e.caller_rip,
@@ -652,7 +709,7 @@ fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str) {
             e.ns, e.tid, e.wake.as_str()
         );
         if !e.path.is_empty() {
-            crate::serial_println!("[SC-RING-PATH] i={:03} path={:?}", i, &e.path);
+            line!("[SC-RING-PATH] i={:03} path={:?}", i, &e.path);
         }
         if !e.read_bytes.is_empty() {
             // Hex-encode the bytes.  Keep everything on a single line — the
@@ -664,13 +721,11 @@ fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str) {
                 hex.push(HEX[hi as usize] as char);
                 hex.push(HEX[lo as usize] as char);
             }
-            crate::serial_println!(
-                "[SC-RING-BYTES] i={:03} len={} hex={}", i, e.read_bytes.len(), hex
-            );
+            line!("[SC-RING-BYTES] i={:03} len={} hex={}", i, e.read_bytes.len(), hex);
         }
     }
 
-    crate::serial_println!("[SC-RING-END] pid={}", pid);
+    line!("[SC-RING-END] pid={}", pid);
 }
 
 /// Dump the ring for `pid` to the serial console, framed by
@@ -682,12 +737,14 @@ pub fn dump_for_exit(pid: u64, exit_code: i64) {
     let Some(ring) = rings.remove(&pid) else {
         // No ring — nothing to dump.  Still emit the frame so the harness
         // can record that a non-zero exit happened but produced no trace.
+        // Exit dumps always go to COM1 so they survive a crash even if the
+        // log ring is never drained.
         crate::serial_println!(
             "[SC-RING-BEGIN] pid={} exit_code={} entries=0 kind=exit ns_now=0", pid, exit_code);
         crate::serial_println!("[SC-RING-END] pid={}", pid);
         return;
     };
-    emit_ring(pid, &ring, exit_code, "exit");
+    emit_ring(pid, &ring, exit_code, "exit", DumpRoute::Com1);
 }
 
 /// Non-destructively dump the (typically frozen) ring for `pid` on demand —
@@ -696,23 +753,34 @@ pub fn dump_for_exit(pid: u64, exit_code: i64) {
 /// framing so the existing `scrings` parser handles it unchanged; `kind=frozen`
 /// distinguishes it from an exit dump.  The ring is left in place so it can be
 /// re-dumped.
-pub fn dump_for_pid(pid: u64) {
+///
+/// `route` selects the sink: `LogRing` (default) keeps a live FF capture from
+/// being starved by per-byte UART I/O — the operator retrieves the lines via
+/// `qemu-harness.py log-ring drain|flush`; `Com1` is the complete-but-slow
+/// fallback for when the vCPU is free.  Returns the number of entries dumped.
+pub fn dump_for_pid(pid: u64, route: DumpRoute) -> usize {
     let rings = RINGS.lock();
     let Some(ring) = rings.get(&pid) else {
+        // Absent-ring frame always to COM1 (tiny, and confirms the op ran).
         crate::serial_println!(
             "[SC-RING-BEGIN] pid={} exit_code=0 entries=0 kind=frozen ns_now=0", pid);
         crate::serial_println!("[SC-RING-END] pid={}", pid);
-        return;
+        return 0;
     };
-    emit_ring(pid, ring, 0, "frozen");
+    let n = ring.len;
+    emit_ring(pid, ring, 0, "frozen", route);
+    n
 }
 
 /// Dump every tracked pid's ring on demand (frozen capture convenience).
-pub fn dump_all_tracked() {
+/// Returns the number of pids dumped.
+pub fn dump_all_tracked(route: DumpRoute) -> usize {
     let pids: Vec<u64> = TRACKED.lock().clone();
+    let n = pids.len();
     for pid in pids {
-        dump_for_pid(pid);
+        dump_for_pid(pid, route);
     }
+    n
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
