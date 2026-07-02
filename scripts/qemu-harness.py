@@ -11075,21 +11075,31 @@ def cmd_scrings(args):
 def _scrings_pull_one(port, pid, timeout):
     """Page a single pid's frozen ring out over kdb (`scrings-page`), assemble
     the `[SC-RING]` lines under a synthesised BEGIN/END frame, and parse it with
-    `_parse_ring_dump`.  Returns (dump_dict_or_None, pages, total).
+    `_parse_ring_dump`.
 
-    This is the fast, complete, firehose-immune dump path — the offset-cursor
-    loop (`from = next` until `eof`) mirrors `cmd_kdb_read_png`.  Each page stays
-    under the kdb MAX_RESP_BYTES cap, so no single response is truncated and the
-    dump is capacity-independent (unlike the retired #695 guest-RAM-log-ring
-    route, which a live `syscall-trace` firehose evicted before drain).
+    The offset-cursor loop (`from = next` until `eof`) mirrors
+    `cmd_kdb_read_png`.  Each page stays under the kdb MAX_RESP_BYTES cap, so no
+    single response is truncated and the dump is capacity-independent (unlike
+    the retired #695 guest-RAM-log-ring route, which a live `syscall-trace`
+    firehose evicted before drain).
+
+    Returns a dict so a partial pull is NEVER silently truncated:
+      {dump, pages, total, have, complete, resume_from, error}
+    `complete` is True only when the pull reached `eof` AND the parsed entry
+    count equals the kernel's reported `total`.  On any short pull (kdb error
+    mid-page, a stall, or the safety ceiling) `complete` is False, `error`
+    names the cause, and `resume_from` is the offset to restart from — the
+    caller must surface this loudly, not return a truncated set as if whole.
     """
     blocks = []
     frm = 0
     total = 0
     ns_now = 0
     pages = 0
+    complete = False
+    error = None
     # Safety ceiling: every page emits >= 1 entry, so pages <= total; cap
-    # generously so a pathological loop still terminates.
+    # generously so a pathological loop still terminates and reports partial.
     max_pages = 200_000
     while pages < max_pages:
         req = {"op": "scrings-page", "pid": str(pid), "from": str(frm),
@@ -11099,7 +11109,8 @@ def _scrings_pull_one(port, pid, timeout):
         raw = _kdb_recv(port, req, timeout=timeout, max_bytes=1024 * 1024)
         resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
         if "error" in resp:
-            return (None, pages, total)
+            error = f"scrings-page kdb error at from={frm}: {resp['error']}"
+            break
         pages += 1
         total = int(resp.get("total", 0))
         if ns_now == 0:
@@ -11107,23 +11118,34 @@ def _scrings_pull_one(port, pid, timeout):
         blocks.append(resp.get("lines", ""))
         emitted = int(resp.get("emitted", 0))
         frm = int(resp.get("next", frm + emitted))
-        if bool(resp.get("eof", False)) or emitted == 0:
+        if bool(resp.get("eof", False)):
+            complete = True
             break
-
-    if total == 0 and not any(blocks):
-        # No ring for this pid (or empty) — emit an empty-frame dump so the
-        # caller still sees the pid was queried.
-        assembled = (f"[SC-RING-BEGIN] pid={pid} exit_code=0 entries=0 "
-                     f"kind=frozen ns_now={ns_now}\n[SC-RING-END] pid={pid}\n")
+        if emitted == 0:
+            # Kernel made no progress before eof — a stall (page_for_pid should
+            # always emit >= 1 while entries remain).  Stop and report partial.
+            error = f"scrings-page stalled (emitted=0, not eof) at from={frm}"
+            break
     else:
-        assembled = (
-            f"[SC-RING-BEGIN] pid={pid} exit_code=0 entries={total} "
-            f"kind=frozen ns_now={ns_now}\n"
-            + "".join(blocks)
-            + f"[SC-RING-END] pid={pid}\n"
-        )
+        error = (f"scrings-page exceeded max_pages={max_pages} without eof "
+                 f"at from={frm}")
+
+    assembled = (
+        f"[SC-RING-BEGIN] pid={pid} exit_code=0 entries={total} "
+        f"kind=frozen ns_now={ns_now}\n"
+        + "".join(blocks)
+        + f"[SC-RING-END] pid={pid}\n"
+    )
     dumps = list(_parse_ring_dump(assembled.splitlines()))
-    return (dumps[0] if dumps else None, pages, total)
+    dump = dumps[0] if dumps else None
+    have = len(dump["entries"]) if dump else 0
+    # A clean eof still counts as incomplete if the parsed count disagrees with
+    # the kernel's total (a boundary bug would surface here, not silently).
+    if complete and have != total:
+        complete = False
+        error = f"reassembled {have} entries but kernel reported total={total}"
+    return {"dump": dump, "pages": pages, "total": total, "have": have,
+            "complete": complete, "resume_from": frm, "error": error}
 
 
 def cmd_scrings_pull(args):
@@ -11135,6 +11157,11 @@ def cmd_scrings_pull(args):
     frozen ring straight back over the kdb channel and returns the parsed dump
     directly.  Firehose-immune and capacity-independent.  Requires the session
     started with `--features kdb`.
+
+    A partial pull (kdb wedged mid-page, a stall, or the safety ceiling) is
+    reported LOUDLY: `all_complete=False`, a `partial_pids` list with each
+    pid's `have`/`total`/`resume_from`/`error`, a stderr warning, and a non-zero
+    exit — never a silently truncated dump masquerading as whole.
 
     Forms:
       scrings-pull <sid> --pid N     one pid
@@ -11162,25 +11189,41 @@ def cmd_scrings_pull(args):
             sys.exit(1)
         if not pids:
             _out({"ok": True, "dumps": [], "dump_count": 0,
-                  "note": "no tracked rings"})
+                  "all_complete": True, "note": "no tracked rings"})
             return
 
     dumps = []
+    partials = []
     pages_total = 0
     for p in pids:
         try:
-            dump, pages, _total = _scrings_pull_one(port, p, timeout)
+            r = _scrings_pull_one(port, p, timeout)
         except (socket.timeout, ConnectionRefusedError, OSError,
                 json.JSONDecodeError, ValueError) as e:
-            _out({"ok": False, "error": f"scrings-page pid={p} failed: {e}",
-                  "dumps": dumps})
-            sys.exit(1)
-        pages_total += pages
-        if dump is not None:
-            dumps.append(dump)
+            # Transport blew up entirely — surface it loudly with resume=0.
+            partials.append({"pid": p, "have": 0, "total": 0,
+                             "resume_from": 0, "error": f"transport: {e}"})
+            print(f"[scrings-pull] WARNING: pid {p} FAILED — {e}", file=sys.stderr)
+            continue
+        pages_total += r["pages"]
+        if r["dump"] is not None:
+            dumps.append(r["dump"])
+        if not r["complete"]:
+            partials.append({"pid": p, "have": r["have"], "total": r["total"],
+                             "resume_from": r["resume_from"], "error": r["error"]})
+            print(f"[scrings-pull] WARNING: pid {p} INCOMPLETE — "
+                  f"have {r['have']}/{r['total']} entries, "
+                  f"resume_from={r['resume_from']} ({r['error']})", file=sys.stderr)
 
-    _out({"ok": True, "dumps": dumps, "dump_count": len(dumps),
-          "pages_total": pages_total})
+    all_complete = not partials
+    out = {"ok": all_complete, "dumps": dumps, "dump_count": len(dumps),
+           "pages_total": pages_total, "all_complete": all_complete}
+    if partials:
+        out["partial_pids"] = partials
+    _out(out)
+    if not all_complete:
+        # Fail loudly: a truncated capture must not read as success.
+        sys.exit(2)
 
 
 # ── stack: parse exit-time userspace stack snapshots ─────────────────────────
