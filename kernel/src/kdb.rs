@@ -1523,10 +1523,15 @@ fn op_scrings_page(req: &str, out: &mut String) {
     let count = extract_field(req, "count").and_then(|s| parse_u64(&s))
         .unwrap_or(4096).max(1) as usize;
 
-    // Keep the escaped `lines` block + JSON envelope under MAX_RESP_BYTES.
-    // 24 KiB of raw lines leaves comfortable room for escaping (`"`→`\"`,
-    // `\n`→`\\n`) plus the ~128-byte envelope inside the 32 KiB cap.
-    const PAGE_BYTE_BUDGET: usize = 24 * 1024;
+    // Keep the JSON-escaped `lines` block + envelope PROVABLY under
+    // MAX_RESP_BYTES (kdb.rs hard-truncates a larger response, which would
+    // corrupt the page).  `j_str` expands each byte by at most 2× here: the
+    // block is printable ASCII plus `\n` line terminators, and any control
+    // byte in a path is already rendered as an ASCII backslash escape by the
+    // `{:?}` path formatter, so j_str never emits a 6-byte `\uXXXX`.  A 15 KiB
+    // raw budget therefore escapes to <= 30 KiB, which with the ~150-byte
+    // envelope stays inside the 32 KiB cap without any post-hoc drop/re-page.
+    const PAGE_BYTE_BUDGET: usize = 15 * 1024;
 
     let mut block = String::new();
     let (emitted, total, ns_now) =
