@@ -10025,11 +10025,13 @@ pub fn sys_futex_linux(
             // If we removed ourselves from the waiter list, the scheduler woke us = timeout.
             // If the list entry was already gone, FUTEX_WAKE removed us = success.
             //
-            // Op-trace wake-source annotation (diagnostic only; provably free
-            // when the ring feature is off): FutexTimeout vs FutexWake so an
+            // Op-trace wake-source annotation: FutexTimeout vs FutexWake so an
             // offline chain reconstruction can tell "gave up on a timeout"
-            // apart from "woken by a matching FUTEX_WAKE".
-            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+            // apart from "woken by a matching FUTEX_WAKE".  Gated on
+            // `syscall-trace` (the only profile whose ring reads it) so a bare
+            // `firefox-test-core` build stays byte-identical — same gating as
+            // the ring begin()/end() call sites.
+            #[cfg(feature = "syscall-trace")]
             crate::syscall::ring::note_wake_reason(if timed_out {
                 crate::syscall::ring::WakeReason::FutexTimeout
             } else {

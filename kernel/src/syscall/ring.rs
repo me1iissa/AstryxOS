@@ -78,6 +78,11 @@ pub enum WakeReason {
     /// The caller's own absolute deadline expired (poll/epoll timeout).
     Timeout      = 3,
     /// A signal delivery flipped us Ready (EINTR-shaped wake).
+    ///
+    /// Reserved: no producer yet — EINTR-shaped wakes currently surface as
+    /// `Bell`/`Resync`/`Timeout` (the underlying primitive's classification).
+    /// A dedicated producer can be wired if signal-interrupted parks need to
+    /// be distinguished in a future capture; the value is stable meanwhile.
     Signal       = 4,
     /// A matching FUTEX_WAKE removed us from the waiter list.
     FutexWake    = 5,
@@ -256,11 +261,19 @@ pub fn is_tracked(pid: u64) -> bool {
 // A blocking wait path (poll/epoll/select via `wait_poll_event`, or the
 // FUTEX_WAIT arm) records how it concluded here, AFTER its final `schedule()`
 // returns.  `begin()` resets the slot at syscall entry; `end()` folds it into
-// the entry.  Because no `schedule()` runs between a wait path's post-wake
-// note and `end()`, the calling thread stays on the same CPU across that
-// window, so a lock-free per-CPU slot is race-free for the reader.  Writes
-// from other threads while this thread is parked land on whichever CPU they
-// run on and are overwritten by this thread's own post-wake note on resume.
+// the entry.  For the wait paths themselves the annotation is exact: no
+// `schedule()` runs between a wait path's post-wake note and `end()`, so the
+// calling thread stays on the same CPU across that window and a lock-free
+// per-CPU slot is race-free for the reader.
+//
+// LIMITATION (mislabel-only, never unsafe): a *non-wait* syscall that happens
+// to reschedule mid-flight — e.g. a blocking demand-page fault or blk I/O
+// between `begin()` and `end()` — can, if a foreign thread runs a wait on the
+// same CPU meanwhile, read that foreign reason at `end()` and mislabel its own
+// entry.  This never corrupts state (the slot is a diagnostic u8); it only
+// misattributes the `wake` field on the occasional non-wait entry.  On SMP≥2
+// the same window also permits a cross-CPU mislabel; the W101 capture runs
+// `--smp 1`, where the wait paths' same-CPU invariant holds and this is moot.
 
 static WAKE_REASON: [AtomicU8; MAX_CPUS] =
     [const { AtomicU8::new(0) }; MAX_CPUS];

@@ -341,9 +341,11 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
         let pid = crate::proc::current_pid_lockless();
         crate::proc::proc_metrics::bump_net_write(pid, *n as u64);
         // Gap-end freeze trigger (W101 op-trace): a successful TCP data send
-        // is the observable "gap end".  Diagnostic only; disarmed by default,
-        // so this is a single atomic load off the fast path.
-        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+        // is the observable "gap end".  Disarmed by default, so this is a
+        // single atomic load off the fast path.  Gated on `syscall-trace`
+        // (the only profile whose ring is captured) so a bare
+        // `firefox-test-core` build stays byte-identical.
+        #[cfg(feature = "syscall-trace")]
         if matches!(socket_type, SocketType::Tcp) {
             crate::syscall::ring::optrace::note_tcp_send(pid);
         }

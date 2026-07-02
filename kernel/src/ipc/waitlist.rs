@@ -375,12 +375,17 @@ pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool
     } else {
         POLL_BELL_BELL_WAKES.fetch_add(1, Ordering::Relaxed);
     }
-    // Op-trace wake-source annotation (diagnostic only; provably free when the
-    // ring feature is off).  A bell ring drained us → readiness/data arrived;
-    // otherwise the scheduler tick woke us — attribute the caller's own
-    // deadline (Timeout) apart from the resync floor (Resync) so an offline
-    // chain reconstruction can tell "woken by data" from "gave up".
-    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    // Op-trace wake-source annotation.  Gated on `syscall-trace` — the only
+    // profile whose ring `begin()`/`end()` actually reads this slot — so a
+    // bare `firefox-test-core` build (the A/B baseline arm) pays nothing and
+    // stays byte-identical.  `syscall-trace` implies `firefox-test-core` via
+    // the feature bundles, so `ring`/`WakeReason` stay in scope (same gating
+    // as the ring `begin()`/`end()` call sites in the syscall dispatch).
+    // A bell ring drained us → readiness/data arrived; otherwise the
+    // scheduler tick woke us — attribute the caller's own deadline (Timeout)
+    // apart from the resync floor (Resync) so an offline chain reconstruction
+    // can tell "woken by data" from "gave up".
+    #[cfg(feature = "syscall-trace")]
     {
         use crate::syscall::ring::WakeReason;
         let r = if !still_parked {
