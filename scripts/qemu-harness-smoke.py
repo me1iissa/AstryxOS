@@ -1286,18 +1286,27 @@ def run_blk_trace_argv_check():
 
 def run_scrings_parse_check():
     """
-    Tier 1.5 host-only check: the `scrings` [SC-RING] parser + `scrings-dump`
-    argv shaping.  No QEMU (< 1s).
+    Tier 1.5 host-only check: the `scrings` [SC-RING] parser, the `scrings-dump`
+    / `scrings-page` argv shaping, AND the `scrings-pull` paged-reassembly loop.
+    No QEMU (< 1s).
 
-    Regression guard for the W101 op-trace parser bug (Phase A): the kernel
-    dumper emits `cr=<caller_rip>` between `rip=` and `a1=`, which the
-    historical `_SC_RING_LINE` regex did not account for, so it matched ZERO
-    entries from a real dump.  This check parses a synthetic block with the
-    real `cr=` field (+ additive ns/tid/wake and a kind=frozen BEGIN), asserts
-    the entries and every additive field land, and confirms a legacy cr-less
-    line still parses.
+    Two regressions are guarded:
+
+    1. The W101 op-trace PARSER bug (Phase A): the kernel dumper emits
+       `cr=<caller_rip>` between `rip=` and `a1=`, which the historical
+       `_SC_RING_LINE` regex did not account for, so it matched ZERO entries.
+
+    2. The FIREHOSE-IMMUNITY of the paged `scrings-pull` path (the task-#8
+       rework): the retired #695 log-ring route shared the 4 MiB firehose ring
+       and a live ~220K rec/s `[SC]` firehose evicted dump lines before drain.
+       The paged path reads the frozen ring straight over kdb in bounded
+       windows (no shared ring), so this test — feeding chunked `scrings-page`
+       responses through the real `_scrings_pull_one` reassembly loop and
+       asserting a complete multi-page dump — is the guard that WOULD have
+       caught the #695 defect (a shared-ring eviction cannot reassemble a
+       complete dump; direct paging always can).
     """
-    print("=== Tier 1.5: scrings [SC-RING] parser + scrings-dump argv (host-only) ===")
+    print("=== Tier 1.5: scrings parser + scrings-page paging (host-only) ===")
     print()
 
     import importlib.util
@@ -1348,20 +1357,95 @@ def run_scrings_parse_check():
                   and e2["ret"] == 64 and e2["a1"] == 0x35,
                   str({k: e2[k] for k in ("cr", "ns", "ret", "a1")}))
 
-    # scrings-dump argv: default (log-ring), com1, pid+com1 in either order.
-    check("scrings-dump default request shape",
+    # Request shaping: scrings-dump is now serial-fallback-only (pid, no route
+    # flag); scrings-page is the paged primitive (pid [from [count]]).
+    check("scrings-dump default (all pids) request shape",
           mod._kdb_build_request("scrings-dump", []) == {"op": "scrings-dump"},
           str(mod._kdb_build_request("scrings-dump", [])))
     check("scrings-dump pid=1 request shape",
           mod._kdb_build_request("scrings-dump", ["1"]) == {"op": "scrings-dump", "pid": "1"},
           str(mod._kdb_build_request("scrings-dump", ["1"])))
-    check("scrings-dump com1 flag request shape",
-          mod._kdb_build_request("scrings-dump", ["com1"]) == {"op": "scrings-dump", "com1": "1"},
-          str(mod._kdb_build_request("scrings-dump", ["com1"])))
-    r_both = mod._kdb_build_request("scrings-dump", ["1", "com1"])
-    check("scrings-dump pid+com1 (either order) request shape",
-          r_both == {"op": "scrings-dump", "pid": "1", "com1": "1"},
-          str(r_both))
+    check("scrings-page pid/from/count request shape",
+          mod._kdb_build_request("scrings-page", ["1", "4096", "256"])
+          == {"op": "scrings-page", "pid": "1", "from": "4096", "count": "256"},
+          str(mod._kdb_build_request("scrings-page", ["1", "4096", "256"])))
+
+    # Synthesise an N-entry frozen ring and a fake `scrings-page` server that
+    # honours the kernel byte budget (so a big ring spans many pages) and can
+    # inject a mid-pull kdb error to exercise the loud-partial path.
+    PAGE_BUDGET = 24 * 1024  # mirrors the kernel op_scrings_page byte budget
+
+    def _entry_line(k):
+        return (f"[SC-RING] i={k:03} t={10 + k} futex/202 rip=0x7f00 "
+                f"cr=0x{0x401000 + k:x} a1=0x1 a2=0x80 a3=0x2 "
+                f"a4=0x0 a5=0x0 a6=0x0 ret=-110 "
+                f"ns={1000 + k} tid=7 wake=futex_timeout\n")
+
+    def _make_server(total, fail_at_page=None):
+        """Return a fake `_kdb_recv` serving `total` entries; if `fail_at_page`
+        is set, the (0-based) page at that index returns a kdb error."""
+        state = {"page": 0}
+
+        def fake(port, req, timeout=30.0, max_bytes=128 * 1024):
+            assert req["op"] == "scrings-page"
+            if fail_at_page is not None and state["page"] == fail_at_page:
+                return (json.dumps({"error": "kdb wedged (injected)"}) + "\n").encode()
+            state["page"] += 1
+            frm = int(req["from"]); count = int(req["count"])
+            out = []; nbytes = 0; emitted = 0
+            for j in range(frm, min(frm + count, total)):
+                if emitted > 0 and nbytes >= PAGE_BUDGET:
+                    break
+                s = _entry_line(j)
+                out.append(s); nbytes += len(s); emitted += 1
+            nxt = frm + emitted
+            resp = {"pid": 1, "from": frm, "emitted": emitted, "next": nxt,
+                    "total": total, "eof": nxt >= total, "ns_now": 42,
+                    "lines": "".join(out)}
+            return (json.dumps(resp) + "\n").encode()
+        return fake
+
+    def _pull(total, fail_at_page=None):
+        saved = mod._kdb_recv
+        try:
+            mod._kdb_recv = _make_server(total, fail_at_page)
+            return mod._scrings_pull_one(port=0, pid=1, timeout=5.0)
+        finally:
+            mod._kdb_recv = saved
+
+    # (a) Paging to EOF across MANY pages — complete + monotonic + boundaries.
+    N = 5000
+    r = _pull(N)
+    got = r["have"]
+    check("scrings-pull reassembles all entries across pages",
+          got == N and r["complete"], f"{got}/{N}, complete={r['complete']}, {r['pages']} pages")
+    check("scrings-pull spans multiple pages (paging exercised)",
+          r["pages"] > 1, f"{r['pages']} pages")
+    if r["dump"] and got == N:
+        ents = r["dump"]["entries"]
+        idx_ok = all(ents[k]["i"] == k for k in range(N))
+        check("scrings-pull entry order monotonic + boundary fields intact",
+              idx_ok and ents[0]["cr"] == 0x401000 and ents[0]["ns"] == 1000
+              and ents[-1]["cr"] == 0x401000 + (N - 1) and ents[-1]["ns"] == 1000 + (N - 1),
+              f"idx_ok={idx_ok} first.cr={ents[0]['cr']:#x} last.cr={ents[-1]['cr']:#x}")
+
+    # (b) Short / final page: a tiny ring fits one page and reaches eof.
+    r1 = _pull(3)
+    check("scrings-pull short ring = single complete page",
+          r1["complete"] and r1["have"] == 3 and r1["pages"] == 1,
+          f"have={r1['have']} pages={r1['pages']} complete={r1['complete']}")
+
+    # (c) Resume-after-partial: kdb wedges at page 2 (0-based) — the pull must
+    # report INCOMPLETE with the correct resume offset and NOT masquerade the
+    # truncated set as whole.  This is the loud-partial guard the LEAD required.
+    rp = _pull(N, fail_at_page=2)
+    # 2 pages landed before the failure; resume_from = next cursor of page 2.
+    check("scrings-pull partial pull flagged INCOMPLETE (not silent)",
+          rp["complete"] is False and rp["error"] is not None,
+          f"complete={rp['complete']} error={rp['error']}")
+    check("scrings-pull partial reports resume_from = have (offset to restart)",
+          rp["resume_from"] == rp["have"] and 0 < rp["have"] < N,
+          f"resume_from={rp['resume_from']} have={rp['have']}")
     print()
 
 

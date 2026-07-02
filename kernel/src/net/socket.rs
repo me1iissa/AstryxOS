@@ -280,6 +280,47 @@ pub fn socket_peer_addr(id: u64) -> Option<(Ipv4Address, u16)> {
     Some((sock.remote_ip, sock.remote_port))
 }
 
+/// A read-only snapshot of a socket's IPv4 4-tuple + type/state, for the
+/// diagnostic fd-map (kdb `fd-map`).  Shape mirrors `getsockname(2)` +
+/// `getpeername(2)` (IEEE 1003.1): `local_*` is the bound source address
+/// (zeroed when unbound), `remote_*` the connected peer (zeroed when not
+/// connected).
+pub struct InetFdSnapshot {
+    pub socket_type: SocketType,
+    pub bound:       bool,
+    pub connected:   bool,
+    pub local_ip:    Ipv4Address,
+    pub local_port:  u16,
+    pub remote_ip:   Ipv4Address,
+    pub remote_port: u16,
+}
+
+/// Snapshot the IPv4 4-tuple + type/state for socket `id`, or `None` if no
+/// such socket exists in [`SOCKETS`] (e.g. the id belongs to the AF_UNIX
+/// table, not this INET table).  Read-only; the [`SOCKETS`] lock is held
+/// only to copy out the scalar fields, then released before the (TCP) local
+/// IP is resolved from the TCB — the same discipline as [`socket_local_addr`],
+/// so a diagnostic caller cannot deadlock against the net fast path.
+pub fn socket_inet_snapshot(id: u64) -> Option<InetFdSnapshot> {
+    let (socket_type, bound, connected, local_port, remote_ip, remote_port) = {
+        let sockets = SOCKETS.lock();
+        let s = sockets.iter().find(|s| s.id == id)?;
+        (s.socket_type, s.bound, s.connected, s.local_port, s.remote_ip, s.remote_port)
+    };
+    let local_ip = if bound {
+        match socket_type {
+            SocketType::Tcp => super::tcp::lookup_local_ip(local_port).unwrap_or([0; 4]),
+            SocketType::Udp => super::our_ip(),
+        }
+    } else {
+        [0; 4]
+    };
+    Some(InetFdSnapshot {
+        socket_type, bound, connected,
+        local_ip, local_port, remote_ip, remote_port,
+    })
+}
+
 /// Send data through a socket.
 pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
     let sockets = SOCKETS.lock();
