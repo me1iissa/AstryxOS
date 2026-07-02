@@ -3364,6 +3364,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let child_tidptr  = arg4; // r10 = child_tid
                 match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val, 0, 0) {
                     Some(tid) => {
+                        // Per-thread clone trace (fires once per pthread_create);
+                        // gate behind the full-trace profile so the lean
+                        // `firefox-test-core` perf boot pays nothing.
+                        #[cfg(feature = "firefox-test-trace")]
                         crate::serial_println!("[CLONE] Thread TID {} spawned in PID {}", tid, pid);
                         // CLONE-ARGS-DIAG: snapshot pthread args at clone time.
                         // Per upstream musl libc x86_64 __clone, before the
@@ -6639,7 +6643,13 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
         Ok(n) => {
             crate::mm::file_buf_witness::post_read(__fbw_snap, n as i64);
-            #[cfg(feature = "firefox-test-core")]
+            // `[FF/read-bytes]` synthetic-read capture: the path-lookup lock,
+            // per-read staging copy, snapshot alloc and the serial emit are all
+            // diagnostic (the functional read already completed above).  Gate
+            // the whole block behind the full-trace profile so the lean
+            // `firefox-test-core` perf/CI boot skips the per-read memcpy + the
+            // serial write it feeds.
+            #[cfg(feature = "firefox-test-trace")]
             {
                 // Look up the fd's open_path to decide whether to peek.  We
                 // do this AFTER the read so we see the actual returned bytes.

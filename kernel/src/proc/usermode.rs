@@ -64,6 +64,12 @@ pub fn create_user_thread(
         }
     }
 
+    // Per-thread clone-create trace: fires once per pthread_create, so it
+    // spikes during Firefox thread-churn phases.  Diagnostic only — gate it
+    // behind the full-trace profile so the lean `firefox-test-core` perf/CI
+    // boot stays quiet.  `[USER] Bootstrap` (per thread first-schedule) is
+    // deliberately kept on the lean profile as the harness CR3 fallback.
+    #[cfg(feature = "firefox-test-trace")]
     crate::serial_println!(
         "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x} RDX={:#x} R8={:#x} R9={:#x}",
         tid, pid, user_rip, user_rsp, tls, entry_rdx, entry_r8, parent_regs.r9
