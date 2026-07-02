@@ -1373,7 +1373,7 @@ def run_scrings_parse_check():
     # Synthesise an N-entry frozen ring and a fake `scrings-page` server that
     # honours the kernel byte budget (so a big ring spans many pages) and can
     # inject a mid-pull kdb error to exercise the loud-partial path.
-    PAGE_BUDGET = 24 * 1024  # mirrors the kernel op_scrings_page byte budget
+    PAGE_BUDGET = 15 * 1024  # mirrors the kernel op_scrings_page byte budget
 
     def _entry_line(k):
         return (f"[SC-RING] i={k:03} t={10 + k} futex/202 rip=0x7f00 "
