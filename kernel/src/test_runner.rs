@@ -1340,6 +1340,8 @@ pub fn run() -> ! {
         total += 1;
         if test_649_percpu_min_deadline_gate() { passed += 1; }
         total += 1;
+        if test_681_self_resume_clears_wait_stamp() { passed += 1; }
+        total += 1;
         if test_650_percpu_wake_target() { passed += 1; }
         total += 1;
         if test_652_percpu_audit_image_off_stack() { passed += 1; }
@@ -51320,6 +51322,109 @@ fn test_649_percpu_min_deadline_gate() -> bool {
     test_println!("  PerCpuRq::overdue(now) == per-candidate force gate \
 (max(wait_age-deadline)>=0) across A-empty/B-single/C-bsp-tight/D-mixed/E-late-tid0 \
 with full now-sweep — min_deadline refinement is force-decision-preserving GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 681: self-resume clears the run-queue wait stamp ──────────────────
+//
+// When the picker finds no OTHER Ready peer it returns to the current thread in
+// place (no context switch).  If the in-picker due-wake drain had flipped that
+// current thread from Blocked to Ready (its own sleep/timeout deadline elapsed
+// during the pass), the return IS a selection of the current thread to run —
+// so `resume_current_if_ready` must apply the same post-selection bookkeeping
+// the normal pick applies: promote it to `Running` and clear its
+// `ready_since_tick`.  Otherwise the thread keeps a `Ready` state and an
+// ancient wait stamp while it actually runs, and when it later yields to a
+// freshly-Ready peer it re-enters the ready set carrying that stale stamp — the
+// anti-starvation force-select backstop then rescues it on a wait age that was
+// never real (a spurious `[SCHED/STARVE] force-select`).
+//
+// The regression this guards: the pre-fix self-resume path left the thread
+// `Ready` with its stamp intact.  `ctx_rsp_valid` must NOT be touched (the
+// saved RSP stays stale until a real switch-out re-validates it — the invariant
+// the ctx_rsp_valid gate and the #672/#673 on-CPU interlock depend on).
+//
+// Cite: POSIX sched(7) SCHED_OTHER — every runnable thread must eventually get
+// the CPU, and a thread's fairness wait must reflect real run-queue wait time.
+fn test_681_self_resume_clears_wait_stamp() -> bool {
+    use crate::proc::{Thread, Tid, ThreadState, PRIORITY_NORMAL};
+    const NAME: &str = "[SCHED] self-resume promotes Ready→Running + clears wait stamp (Test 681)";
+    test_header!(NAME);
+
+    // A synthetic current thread with a chosen state + a stale wait stamp.
+    fn mk(tid: Tid, state: ThreadState, ready_since: u64, ctx_valid: bool) -> Thread {
+        let mut t = Thread::new_for_test(PRIORITY_NORMAL);
+        t.tid = tid;
+        t.state = state;
+        t.last_cpu = 0xFE; // sentinel: prove resume rewrites it to the picking CPU
+        t.ready_since_tick = ready_since;
+        t.ctx_rsp_valid = alloc::boxed::Box::new(
+            core::sync::atomic::AtomicBool::new(ctx_valid));
+        t
+    }
+
+    // Case A: a self-resuming Ready current with a stale stamp is promoted.
+    {
+        let mut threads = [mk(42, ThreadState::Ready, 1000, false)];
+        let observed = crate::sched::test_resume_current_if_ready(&mut threads, 42, 0);
+        let t = &threads[0];
+        if observed != Some(ThreadState::Ready) {
+            test_fail!(NAME, "A: observed state should be the pre-promotion Ready");
+            return false;
+        }
+        if t.state != ThreadState::Running {
+            test_fail!(NAME, "A: Ready current must be promoted to Running");
+            return false;
+        }
+        if t.ready_since_tick != 0 {
+            test_fail!(NAME, "A: stale wait stamp must be cleared on self-resume");
+            return false;
+        }
+        if t.last_cpu != 0 {
+            test_fail!(NAME, "A: last_cpu must be stamped to the picking CPU");
+            return false;
+        }
+        // ctx_rsp_valid must be left exactly as-is (still false here): the saved
+        // RSP is stale until a real switch-out re-validates it.
+        if t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Relaxed) {
+            test_fail!(NAME, "A: ctx_rsp_valid must NOT be touched by self-resume");
+            return false;
+        }
+    }
+
+    // Case B: an already-Running current is returned unchanged (no promotion,
+    // stamp and ctx_rsp_valid untouched — the common self-yield-with-no-peer).
+    {
+        let mut threads = [mk(43, ThreadState::Running, 0, true)];
+        let observed = crate::sched::test_resume_current_if_ready(&mut threads, 43, 0);
+        let t = &threads[0];
+        if observed != Some(ThreadState::Running)
+            || t.state != ThreadState::Running
+            || t.last_cpu != 0xFE
+        {
+            test_fail!(NAME, "B: Running current must be returned untouched");
+            return false;
+        }
+    }
+
+    // Case C: a Blocked/Sleeping current is NOT promoted (it goes on to HLT).
+    // A stale stamp on a non-Ready thread is the stamper's concern, not this
+    // path's — resume must leave state, stamp and last_cpu alone.
+    for st in [ThreadState::Blocked, ThreadState::Sleeping, ThreadState::Dead] {
+        let mut threads = [mk(44, st, 777, true)];
+        let observed = crate::sched::test_resume_current_if_ready(&mut threads, 44, 0);
+        let t = &threads[0];
+        if observed != Some(st) || t.state != st || t.ready_since_tick != 777
+            || t.last_cpu != 0xFE
+        {
+            test_fail!(NAME, "C: non-Ready current must be left untouched");
+            return false;
+        }
+    }
+
+    test_println!("  self-resume: Ready→Running + stamp cleared + last_cpu set; \
+Running/Blocked/Sleeping/Dead untouched; ctx_rsp_valid never mutated GREEN");
     test_pass!(NAME);
     true
 }
