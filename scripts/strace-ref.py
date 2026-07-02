@@ -71,9 +71,11 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -155,6 +157,122 @@ def prepare_rootfs_writable_dirs(rootfs: Path) -> None:
     """
     for d in ("home", "root", "run", "sys"):
         (rootfs / d).mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Xvfb / windowed-render helpers
+#
+# A headless `--screenshot` capture never opens an X display, so it exercises
+# a different top of the stack than a windowed browse (no GTK/GDK, no X11
+# present path).  For a wake-chain / IPDL reference that phase-corresponds to a
+# *windowed* run, the same musl firefox-esr binary is driven against a virtual
+# framebuffer (Xvfb) and a real toplevel is rendered.  These helpers manage the
+# Xvfb lifecycle and the small, public-documented environment that lets a
+# windowed musl Firefox open the display and software-render.
+#
+# References (public):
+# - Xvfb(1):        https://man.archlinux.org/man/Xvfb.1
+# - Mozilla env:    https://firefox-source-docs.mozilla.org/  (MOZ_* runtime vars)
+# - Mesa env vars:  https://docs.mesa3d.org/envvars.html  (LIBGL_*, GALLIUM_DRIVER)
+# - GdkPixbuf:      gdk-pixbuf-query-loaders(1) (GDK_PIXBUF_MODULE_FILE)
+# - fontconfig:     fonts-conf(5) (FONTCONFIG_FILE / FONTCONFIG_PATH)
+# ---------------------------------------------------------------------------
+
+X11_SOCK_DIR = "/tmp/.X11-unix"
+
+
+def pick_free_display(base: int = 90, span: int = 40) -> int:
+    """Return the first X display number in [base, base+span) whose unix
+    socket / lock file is free.  Uses the conventional /tmp/.X11-unix/X<n>
+    socket path and /tmp/.X<n>-lock lock file."""
+    for n in range(base, base + span):
+        if (not os.path.exists(f"{X11_SOCK_DIR}/X{n}")
+                and not os.path.exists(f"/tmp/.X{n}-lock")):
+            return n
+    raise RuntimeError(f"no free X display in :{base}..:{base + span}")
+
+
+def start_xvfb(display: int, screen: str) -> tuple[subprocess.Popen, str]:
+    """Start `Xvfb :<display>` and wait (up to ~10 s) for its socket.  Returns
+    (Popen, error).  On failure Popen is None."""
+    argv = ["Xvfb", f":{display}", "-ac", "-screen", "0", screen,
+            "-nolisten", "tcp"]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return None, "Xvfb not found on PATH (install the Xvfb package)"
+    sock = f"{X11_SOCK_DIR}/X{display}"
+    for _ in range(100):
+        if os.path.exists(sock):
+            return proc, ""
+        if proc.poll() is not None:
+            return None, (proc.stderr.read() if proc.stderr else
+                          f"Xvfb exited rc={proc.returncode}")
+        time.sleep(0.1)
+    proc.terminate()
+    return None, f"Xvfb socket {sock} did not appear within 10 s"
+
+
+def stop_xvfb(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def firefox_render_env() -> list[tuple[str, str]]:
+    """Public-documented environment that lets a windowed musl Firefox open an
+    X display and software-render (no GPU / no DRM render node present).  All
+    variables are documented by Mozilla / Mesa / GdkPixbuf / fontconfig / the
+    D-Bus spec — see the header comment above.  MOZ_HEADLESS is deliberately
+    absent (this is the windowed path)."""
+    return [
+        ("GDK_BACKEND", "x11"),
+        ("XDG_RUNTIME_DIR", "/tmp"),
+        ("XDG_CONFIG_HOME", "/tmp/.config"),
+        ("MOZ_DISABLE_CONTENT_SANDBOX", "1"),
+        ("MOZ_DISABLE_AUTO_SAFE_MODE", "1"),
+        ("MOZ_CRASHREPORTER_DISABLE", "1"),
+        ("MOZ_X11_EGL", "0"),
+        ("MOZ_ACCELERATED", "0"),
+        ("LIBGL_ALWAYS_SOFTWARE", "1"),
+        ("GALLIUM_DRIVER", "llvmpipe"),
+        ("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe"),
+        ("LIBGL_DRIVERS_PATH", "/usr/lib/dri:/usr/lib/xorg/modules/dri"),
+        ("GDK_PIXBUF_MODULE_FILE",
+         "/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"),
+        ("FONTCONFIG_FILE", "/etc/fonts/fonts.conf"),
+        ("FONTCONFIG_PATH", "/etc/fonts"),
+        # Point the D-Bus session address at a non-existent socket so Firefox
+        # does not fork/exec dbus-launch; it degrades gracefully to no bus.
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nodbus.sock"),
+    ]
+
+
+def take_screenshot(display: int, out_path: str, info: dict) -> None:
+    """Dump the Xvfb root window to `out_path` (xwd format) via xwd(1).  Records
+    the outcome into `info` (captured/size/error)."""
+    try:
+        r = subprocess.run(["xwd", "-root", "-display", f":{display}",
+                            "-out", out_path],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and os.path.exists(out_path):
+            info["captured"] = True
+            info["path"] = out_path
+            info["size_bytes"] = os.path.getsize(out_path)
+        else:
+            info["error"] = (r.stderr or f"xwd rc={r.returncode}").strip()
+    except FileNotFoundError:
+        info["error"] = "xwd not found on PATH"
+    except Exception as e:  # noqa: BLE001
+        info["error"] = str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +390,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     )
     out_trace.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build strace argv.  We use --absolute-timestamps for diffing.
+    # Build strace argv.
     strace_argv = ["strace"]
     if args.follow_forks:
         strace_argv.append("-f")
@@ -280,70 +398,140 @@ def cmd_capture(args: argparse.Namespace) -> int:
     syscalls = args.syscall_filter or "futex"
     strace_argv += ["-e", f"trace={syscalls}"]
     if args.timestamps:
-        # -ttt: epoch microseconds prefix, easy to parse / diff.
-        strace_argv += ["-ttt"]
+        # Timestamp prefix: -ttt = epoch microseconds (default, stable for
+        # cross-run diffing); -tt = wall-clock time-of-day with microseconds
+        # (human-readable, phase-alignment friendly).  strace(1) §-t/-tt/-ttt.
+        strace_argv.append("-tt" if args.time_mode == "walltime" else "-ttt")
+    if args.syscall_duration:
+        # -T: append the time spent inside each syscall — lets a reader tell a
+        # data-woken blocking op from one that dwelt to a timeout.  strace(1) §-T.
+        strace_argv.append("-T")
     if args.string_size:
         strace_argv += ["-s", str(args.string_size)]
     strace_argv += ["-o", str(out_trace)]
     strace_argv.append("--")
 
-    # bwrap argv — mirror the path layout AstryxOS uses.
-    bwrap_argv = [
-        "bwrap",
-        "--ro-bind", str(rootfs), "/",
-        "--proc", "/proc",
-        "--dev", "/dev",
-        "--ro-bind", "/sys", "/sys",
-        "--tmpfs", "/tmp",
-        "--tmpfs", "/var",
-        "--tmpfs", "/home",
-        "--tmpfs", "/root",
-        "--tmpfs", "/run",
-        "--setenv", "HOME", "/root",
-        "--setenv", "PATH", "/usr/lib/firefox-esr:/usr/bin:/bin",
-        "--setenv", "MOZ_HEADLESS", "1",
-        "--die-with-parent",
-    ]
-    # Optional extra env from caller
-    for kv in args.env or []:
-        if "=" not in kv:
-            die(f"--env entry must be KEY=VALUE: {kv!r}")
-            return 1
-        k, v = kv.split("=", 1)
-        bwrap_argv += ["--setenv", k, v]
-
-    # Inner argv — the firefox-esr launch.
-    inner = [f"/{FF_LAUNCHER_REL}"]
-    if args.binary_args:
-        # Tokenise via shlex to honour quoting.
-        import shlex as _shlex
-        inner += _shlex.split(args.binary_args)
-
-    argv = strace_argv + bwrap_argv + inner
-
-    # Popen + communicate(timeout=...) so we still capture stdout/stderr
-    # and the strace output file even if firefox-esr hangs past the
-    # wall-clock budget (we kill on timeout, then collect partial output).
-    started = time.time()
-    p = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        stdout, stderr = p.communicate(
-            timeout=args.timeout if args.timeout > 0 else None
-        )
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        p.kill()
+    # Optional Xvfb (windowed render) — bring up a virtual framebuffer the
+    # sandboxed Firefox can map a real toplevel onto.
+    xvfb_proc = None
+    display: int | None = None
+    if args.xvfb:
         try:
-            stdout, stderr = p.communicate(timeout=5)
+            display = args.display if args.display is not None else \
+                pick_free_display()
+        except RuntimeError as exc:
+            die(str(exc))
+            return 1
+        xvfb_proc, xerr = start_xvfb(display, args.xvfb_screen)
+        if xvfb_proc is None:
+            die("failed to start Xvfb", detail=xerr)
+            return 1
+
+    try:
+        # bwrap argv — reproduce the DT_RUNPATH layout of the Mozilla tree.
+        bwrap_argv = [
+            "bwrap",
+            "--ro-bind", str(rootfs), "/",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--ro-bind", "/sys", "/sys",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/var",
+            "--tmpfs", "/home",
+            "--tmpfs", "/root",
+            "--tmpfs", "/run",
+        ]
+        # Windowed render needs /dev/shm (X MIT-SHM / gecko shared memory) and
+        # the host X11 socket dir visible inside the (tmpfs) /tmp.  These binds
+        # come AFTER `--tmpfs /tmp` so they land inside the fresh tmpfs.
+        if args.xvfb:
+            bwrap_argv += ["--tmpfs", "/dev/shm"]
+            if os.path.isdir(X11_SOCK_DIR):
+                bwrap_argv += ["--bind", X11_SOCK_DIR, X11_SOCK_DIR]
+        # Host DNS/hosts for a network (http/https) load: the image's own
+        # resolv.conf points at a guest-only nameserver, dead on the host.
+        if args.bind_host_dns:
+            for hf in ("/etc/resolv.conf", "/etc/hosts"):
+                if os.path.exists(hf):
+                    bwrap_argv += ["--ro-bind", hf, hf]
+        # Read-write profile bind (seeded clean-load prefs) at the conventional
+        # --profile target, after the tmpfs so it is not masked.
+        if args.profile_dir:
+            prof = str(Path(args.profile_dir).resolve())
+            bwrap_argv += ["--bind", prof, "/tmp/ff-profile"]
+        # Base environment.
+        bwrap_argv += [
+            "--setenv", "HOME", "/root",
+            "--setenv", "PATH", "/usr/lib/firefox-esr:/usr/bin:/bin",
+            "--die-with-parent",
+        ]
+        if args.xvfb:
+            bwrap_argv += ["--setenv", "DISPLAY", f":{display}"]
+        else:
+            # Headless: keep libxul off the display-open path.  Mozilla docs:
+            # https://firefox-source-docs.mozilla.org/widget/headless.html
+            bwrap_argv += ["--setenv", "MOZ_HEADLESS", "1"]
+        if args.firefox_render_env:
+            for k, v in firefox_render_env():
+                bwrap_argv += ["--setenv", k, v]
+        # Caller-supplied env last so it overrides the render defaults.
+        for kv in args.env or []:
+            if "=" not in kv:
+                die(f"--env entry must be KEY=VALUE: {kv!r}")
+                return 1
+            k, v = kv.split("=", 1)
+            bwrap_argv += ["--setenv", k, v]
+
+        # Inner argv — the firefox-esr launch.
+        inner = [f"/{FF_LAUNCHER_REL}"]
+        if args.binary_args:
+            inner += shlex.split(args.binary_args)
+
+        argv = strace_argv + bwrap_argv + inner
+
+        # Schedule an in-flight screenshot (windowed mode only): a background
+        # timer dumps the Xvfb root at `--screenshot-after` s so the render is
+        # proven while Firefox is still alive.
+        shot_info: dict[str, Any] = {"requested": bool(args.screenshot)}
+        shot_timer = None
+        if args.screenshot and args.xvfb:
+            shot_timer = threading.Timer(
+                max(0.0, float(args.screenshot_after)),
+                take_screenshot, args=(display, args.screenshot, shot_info),
+            )
+            shot_timer.daemon = True
+            shot_timer.start()
+
+        # Popen + communicate(timeout=...) so we still collect the trace file
+        # even if firefox-esr runs past the wall-clock budget (kill on timeout).
+        started = time.time()
+        p = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, stderr = p.communicate(
+                timeout=args.timeout if args.timeout > 0 else None
+            )
+            timed_out = False
         except subprocess.TimeoutExpired:
-            stdout, stderr = "", ""
-        timed_out = True
-    elapsed = time.time() - started
+            # Belt-and-braces: if the scheduled screenshot never fired (short
+            # timeout), grab one now, before the kill tears the display down.
+            if args.screenshot and args.xvfb and not shot_info.get("captured"):
+                take_screenshot(display, args.screenshot, shot_info)
+            p.kill()
+            try:
+                stdout, stderr = p.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            timed_out = True
+        elapsed = time.time() - started
+        if shot_timer is not None:
+            shot_timer.cancel()
+    finally:
+        stop_xvfb(xvfb_proc)
 
     # Parse stats from the trace.
     stats = summarise_strace_trace(out_trace) if out_trace.exists() else {
@@ -363,10 +551,16 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "firefox_launcher": f"/{FF_LAUNCHER_REL}",
         "binary_args": args.binary_args,
         "syscall_filter": syscalls,
+        "time_mode": args.time_mode,
+        "syscall_duration": bool(args.syscall_duration),
+        "xvfb": bool(args.xvfb),
+        "display": (f":{display}" if display is not None else None),
+        "windowed_render_env": bool(args.firefox_render_env),
         "elapsed_s": round(elapsed, 3),
         "timed_out": timed_out,
         "captured_at": int(time.time()),
         "stats": stats,
+        "screenshot": shot_info,
         "stderr_tail": (stderr or "")[-2000:],
     }
     meta_path = out_trace.with_suffix(".meta.json")
@@ -381,6 +575,9 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "elapsed_s": round(elapsed, 3),
         "timed_out": timed_out,
         "syscall_filter": syscalls,
+        "xvfb": bool(args.xvfb),
+        "display": (f":{display}" if display is not None else None),
+        "screenshot": shot_info,
         "stats": stats,
     })
     return 0
@@ -879,7 +1076,43 @@ def make_parser() -> argparse.ArgumentParser:
                            help="strace -s argument (string truncation).")
     p_capture.add_argument("--env", action="append", default=[],
                            metavar="KEY=VALUE",
-                           help="Extra env vars for the binary (repeatable).")
+                           help="Extra env vars for the binary (repeatable). "
+                                "Applied last, so they override the windowed "
+                                "render defaults.")
+    p_capture.add_argument("--time-mode", choices=("epoch", "walltime"),
+                           default="epoch",
+                           help="Timestamp prefix: 'epoch' (-ttt, default) or "
+                                "'walltime' (-tt, time-of-day µs).")
+    p_capture.add_argument("--syscall-duration", action="store_true",
+                           help="Append per-syscall duration (strace -T).")
+    p_capture.add_argument("--xvfb", action="store_true",
+                           help="Run windowed against a managed Xvfb virtual "
+                                "display (omits MOZ_HEADLESS; binds the host "
+                                "X11 socket + /dev/shm into the sandbox).")
+    p_capture.add_argument("--display", type=int, default=None,
+                           help="Explicit X display number for --xvfb "
+                                "(default: first free in :90..:130).")
+    p_capture.add_argument("--xvfb-screen", default="1280x1024x24",
+                           help="Xvfb screen geometry WxHxDEPTH "
+                                "(default: 1280x1024x24).")
+    p_capture.add_argument("--firefox-render-env", action="store_true",
+                           help="Inject the public-documented windowed-render "
+                                "environment (GDK/Mesa-llvmpipe/fontconfig/"
+                                "GdkPixbuf/D-Bus) so a windowed musl Firefox "
+                                "opens the display and software-renders.")
+    p_capture.add_argument("--bind-host-dns", action="store_true",
+                           help="Bind the host /etc/resolv.conf + /etc/hosts "
+                                "into the sandbox (needed for a network URL; "
+                                "the image resolv.conf is guest-only).")
+    p_capture.add_argument("--profile-dir", default=None,
+                           help="Read-write bind this directory at "
+                                "/tmp/ff-profile (matches --profile).")
+    p_capture.add_argument("--screenshot", default=None,
+                           help="With --xvfb: dump the Xvfb root to this path "
+                                "(xwd format) mid-run as render proof.")
+    p_capture.add_argument("--screenshot-after", type=float, default=30.0,
+                           help="Seconds to wait before the --screenshot dump "
+                                "(default: 30).")
     p_capture.set_defaults(func=cmd_capture)
 
     # diff
