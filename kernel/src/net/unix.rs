@@ -19,6 +19,25 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use spin::Mutex;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// High-water mark of simultaneously-live (non-`Free`) slots in the global
+/// AF_UNIX socket TABLE.  Updated on every successful `create`/`accept`/
+/// `connect`-peer allocation.  Diagnostic-only (kdb `unix-table`): lets an
+/// investigator see the peak AF_UNIX pressure a workload generated, which is
+/// how a transient `MAX_UNIX_SOCKETS` exhaustion (→ EMFILE → "cannot open
+/// display" for X clients) is confirmed after the fact.
+static UNIX_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+/// Recompute live-slot occupancy under the already-held TABLE lock and fold it
+/// into [`UNIX_HIGH_WATER`].  Called at each allocation site.
+fn note_occupancy(t: &Table) {
+    let live = t.0.iter().filter(|s| s.state != UnixState::Free).count();
+    UNIX_HIGH_WATER.fetch_max(live, Ordering::Relaxed);
+}
+
+/// Peak number of simultaneously-live AF_UNIX slots observed since boot.
+pub fn high_water() -> usize { UNIX_HIGH_WATER.load(Ordering::Relaxed) }
 
 // ── Limits ───────────────────────────────────────────────────────────────────
 
@@ -303,6 +322,7 @@ fn is_abstract(name: &[u8]) -> bool {
 
 pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
     let mut t = TABLE.lock();
+    let mut allocated = u64::MAX;
     for (i, s) in t.0.iter_mut().enumerate() {
         if s.state == UnixState::Free {
             s.reset();
@@ -312,10 +332,12 @@ pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
             s.creator_pid = creds.pid;
             s.creator_uid = creds.uid;
             s.creator_gid = creds.gid;
-            return i as u64;
+            allocated = i as u64;
+            break;
         }
     }
-    u64::MAX
+    if allocated != u64::MAX { note_occupancy(&t); }
+    allocated
 }
 
 pub fn bind(id: u64, path: &[u8]) -> i64 {
@@ -455,6 +477,7 @@ pub fn connect(id: u64, path: &[u8], _client_creds: PeerCreds) -> i64 {
         srv.backlog[srv.backlog_len] = peer_id;
         srv.backlog_len += 1;
     }
+    note_occupancy(&t);
     // Drop the table lock before ringing — a `poll`/`epoll_wait`
     // caller blocked on the listener fd for `POLLIN` (the
     // connection-pending readiness signal per `accept(2)`) re-checks
@@ -519,6 +542,7 @@ pub fn socketpair(kind: SockKind, creds: PeerCreds) -> (u64, u64) {
     }
     t.0[a as usize].peer_id = b;
     t.0[b as usize].peer_id = a;
+    note_occupancy(&t);
     (a, b)
 }
 
@@ -1107,3 +1131,9 @@ pub fn snapshot_all() -> Vec<SocketSnap> {
     }
     out
 }
+
+/// Total number of slots in the global AF_UNIX socket table
+/// (`MAX_UNIX_SOCKETS`).  Exposed for the kdb `unix-table` diagnostic so a
+/// caller can report live occupancy against the hard cap (a full table makes
+/// `socket(AF_UNIX)`/`socketpair(2)` return `EMFILE`).
+pub fn capacity() -> usize { MAX_UNIX_SOCKETS }
