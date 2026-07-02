@@ -1518,6 +1518,19 @@ pub fn run() -> ! {
         if test_295b_proc_fd_sentinel_reopen_no_uaf() { passed += 1; }
     }
 
+    // ── Test 297: eventfd open-file-description refcount across fork/dup ───
+    // Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicate descriptors
+    // refer to the SAME open file description, and per close(2) the object
+    // is released only when the LAST reference is closed.  An eventfd
+    // inherited across fork is one shared counter with two references; the
+    // child's pre-execve close-on-exec scrub must NOT free the slot the
+    // parent still writes to.  Refs: close(2), fork(2), dup(2), eventfd(2).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_297_eventfd_ofd_refcount() { passed += 1; }
+    }
+
     // ── Test 629: compositor rate-gate + damage-driven recompose ───────────
     // The cooperative BSP poll loop calls the compositor at spin rate.  The
     // rate gate (`compose_due_decision`) must (a) cap repaints to the minimum
@@ -48197,6 +48210,320 @@ fn test_295_proc_fd_memfd_reopen() -> bool {
     crate::subsys::linux::syscall::sys_close_test(memfd as u64);
     test_pass!("/proc/self/fd/N reopen of an unlinked memfd succeeds + reads contents");
     true
+}
+
+// ── Test 297: eventfd open-file-description refcount across fork/dup ─────────
+//
+// Per POSIX.1-2017 §2.14, fork(2), and dup(2): duplicated file descriptors
+// refer to the SAME open file description; per close(2), "If fildes is the
+// last file descriptor referring to the open file description, the resources
+// associated with the open file description shall be released" — i.e. only
+// the LAST close frees the object.  An eventfd inherited across fork(2) is
+// one shared counter with two references: the child's pre-execve(2)
+// close-on-exec scrub (a plain close(2) loop) must NOT free the slot the
+// parent still writes to.  Without the refcount, the child's scrub freed the
+// parent's waker slot, the parent's next write(2) returned EBADF, and a later
+// eventfd2(2) recycled the slot under the stale id (CWE-416 class via reuse).
+//
+// Coverage drives the REAL inc/dec call sites end to end so a future
+// regression that drops a dec (re-introducing the LEAK direction) fails here,
+// not just by inspection: Part 2 the close(2)/dup(2) dispatch arms, Part 2b
+// the dup2(2) displaced-slot dec, Part 3 the scm_drop_fds SCM-drop dec, and
+// Part 4 fork_process (real fork inc) -> exit_group teardown (real exit dec).
+// Refs: close(2), fork(2), dup(2), eventfd(2), unix(7) SCM_RIGHTS.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_297_eventfd_ofd_refcount() -> bool {
+    test_header!("eventfd OFD refcount across fork/dup (Test 297)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    // Linux ABI for this process (eventfd/dup are Linux-personality calls).
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    // ── Part 1: module level — simulated fork inheritance ───────────────────
+    // create() takes the creating fd's reference; inc_ref() is exactly what
+    // `inc_eventfd_refs_for_fork` does for each inherited eventfd fd; the
+    // first close() models the child's CLOEXEC scrub.
+    {
+        use crate::ipc::eventfd;
+        let id = eventfd::create(0, 0);
+        if id == u64::MAX {
+            test_fail!("efd-refs", "create() returned no slot");
+            return false;
+        }
+        if eventfd::debug_ref_count(id) != 1 {
+            test_fail!("efd-refs", "refs after create = {} (want 1)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        eventfd::inc_ref(id); // fork: child inherits the fd
+        if eventfd::debug_ref_count(id) != 2 {
+            test_fail!("efd-refs", "refs after fork-inherit = {} (want 2)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        eventfd::close(id);   // child's CLOEXEC scrub close(2)
+        // THE regression: parent's write must still succeed (was Err(-9)
+        // EBADF — the child's close freed the shared slot).
+        match eventfd::write(id, 1) {
+            Ok(()) => test_println!("  parent write after child close -> Ok"),
+            Err(e) => {
+                test_fail!("efd-refs",
+                    "parent write after child close = {} (want Ok) — \
+                     child close freed the shared slot", e);
+                ok = false;
+            }
+        }
+        if !eventfd::is_readable(id) {
+            test_fail!("efd-refs", "slot not readable after parent write");
+            ok = false;
+        }
+        eventfd::close(id);   // parent's close — the LAST reference
+        if eventfd::write(id, 1) != Err(-9) {
+            test_fail!("efd-refs", "write after last close should be EBADF");
+            ok = false;
+        }
+        if eventfd::debug_ref_count(id) != 0 {
+            test_fail!("efd-refs", "refs after last close = {} (want 0)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        if ok {
+            test_println!("  simulated fork: 1->2->1->0 refs, free on last close");
+        }
+    }
+
+    // ── Part 1b: last-close frees; the freed slot is reusable ───────────────
+    // Documents the recycle the refcount protects: only after the LAST close
+    // is a slot available for reuse.  NOTE: eventfd ids are bare slot indices
+    // with no generation tag, so a genuinely-recycled slot cannot reject a
+    // stale id — Fix A's guarantee is that a premature free never happens, so
+    // no live holder is ever left holding an id whose slot got reused (a
+    // generation tag to reject truly-stale ids is a possible follow-up).
+    {
+        use crate::ipc::eventfd;
+        let a = eventfd::create(0, 0);
+        eventfd::close(a);                 // last ref -> freed
+        let b = eventfd::create(0, 0);     // may reuse slot `a`
+        if eventfd::debug_ref_count(b) != 1 {
+            test_fail!("efd-refs", "refs on recycled slot = {} (want 1)",
+                eventfd::debug_ref_count(b));
+            ok = false;
+        }
+        eventfd::close(b);
+    }
+
+    // ── Part 2: syscall level — dup(2) bumps, close(2) arm drops ────────────
+    {
+        const SYS_EVENTFD2: u64 = 290;
+        const SYS_DUP:      u64 = 32;
+        const SYS_CLOSE:    u64 = 3;
+        const SYS_WRITE:    u64 = 1;
+        const SYS_READ:     u64 = 0;
+
+        let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+        if efd < 0 {
+            test_fail!("efd-refs", "eventfd2 = {}", efd);
+            return false;
+        }
+        let id = crate::syscall::get_eventfd_id(pid, efd as usize);
+        let dupfd = dispatch(SYS_DUP, efd as u64, 0, 0, 0, 0, 0);
+        if dupfd < 0 {
+            test_fail!("efd-refs", "dup(eventfd) = {}", dupfd);
+            ok = false;
+        }
+        if crate::ipc::eventfd::debug_ref_count(id) != 2 {
+            test_fail!("efd-refs", "refs after dup = {} (want 2)",
+                crate::ipc::eventfd::debug_ref_count(id));
+            ok = false;
+        }
+        // Close the ORIGINAL fd through the real close(2) dispatch arm —
+        // the duplicate must keep the slot alive.
+        let r = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+        if r != 0 {
+            test_fail!("efd-refs", "close(efd) = {}", r);
+            ok = false;
+        }
+        let v: u64 = 7;
+        let w = dispatch(SYS_WRITE, dupfd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+        if w == 8 {
+            test_println!("  write via dup'd fd after close(original) -> 8");
+        } else {
+            test_fail!("efd-refs",
+                "write via dup'd fd after close(original) = {} (want 8)", w);
+            ok = false;
+        }
+        let mut rbuf = [0u8; 8];
+        let n = dispatch(SYS_READ, dupfd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if n != 8 || u64::from_le_bytes(rbuf) != 7 {
+            test_fail!("efd-refs", "read via dup'd fd = {} val={} (want 8/7)",
+                n, u64::from_le_bytes(rbuf));
+            ok = false;
+        }
+        let _ = dispatch(SYS_CLOSE, dupfd as u64, 0, 0, 0, 0, 0);
+        if crate::ipc::eventfd::debug_ref_count(id) != 0 {
+            test_fail!("efd-refs", "refs after closing both fds = {} (want 0)",
+                crate::ipc::eventfd::debug_ref_count(id));
+            ok = false;
+        }
+    }
+
+    // ── Part 2b: dup2(2) displaced-slot drop (real dispatch dec) ────────────
+    // dup2 onto an fd that already names a DIFFERENT eventfd must close the
+    // displaced eventfd (POSIX dup2(2): fildes2 "shall be closed first").
+    // Drives the sys_dup2 inc AND the displaced-slot dec through the real
+    // dispatch arm — a regression dropping either fails here.
+    {
+        const SYS_EVENTFD2: u64 = 290;
+        const SYS_DUP2:     u64 = 33;
+        const SYS_CLOSE:    u64 = 3;
+
+        let fd_a = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+        let fd_b = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+        if fd_a < 0 || fd_b < 0 {
+            test_fail!("efd-refs", "eventfd2 (dup2 subcase) a={} b={}", fd_a, fd_b);
+            return false;
+        }
+        let id_a = crate::syscall::get_eventfd_id(pid, fd_a as usize);
+        let id_b = crate::syscall::get_eventfd_id(pid, fd_b as usize);
+        // dup2(fd_a -> fd_b): fd_b's eventfd (id_b) is displaced+closed
+        // (refs 1->0, freed); id_a gains the duplicate (refs 1->2).
+        let r = dispatch(SYS_DUP2, fd_a as u64, fd_b as u64, 0, 0, 0, 0);
+        if r != fd_b {
+            test_fail!("efd-refs", "dup2 = {} (want {})", r, fd_b);
+            ok = false;
+        }
+        if crate::ipc::eventfd::debug_ref_count(id_b) != 0 {
+            test_fail!("efd-refs",
+                "refs on displaced eventfd = {} (want 0 — dup2 displaced-slot dec)",
+                crate::ipc::eventfd::debug_ref_count(id_b));
+            ok = false;
+        }
+        if crate::ipc::eventfd::debug_ref_count(id_a) != 2 {
+            test_fail!("efd-refs", "refs after dup2 = {} (want 2 — dup2 inc)",
+                crate::ipc::eventfd::debug_ref_count(id_a));
+            ok = false;
+        } else {
+            test_println!("  dup2 inc (1->2) + displaced-slot dec (1->0) via dispatch ✓");
+        }
+        // Both fd_a and fd_b now name id_a; close both to release it.
+        let _ = dispatch(SYS_CLOSE, fd_a as u64, 0, 0, 0, 0, 0);
+        let _ = dispatch(SYS_CLOSE, fd_b as u64, 0, 0, 0, 0, 0);
+    }
+
+    // ── Part 3: SCM_RIGHTS enqueue -> drop round trip (real scm_drop_fds) ───
+    // An eventfd passed via SCM_RIGHTS is inc_ref'd at enqueue; if the batch
+    // is never received, scm_drop_fds must balance it (unix(7) SCM_RIGHTS).
+    // Build the in-flight descriptor the enqueue path would create, inc_ref
+    // exactly as the enqueue does, then drive the REAL scm_drop_fds so a
+    // regression dropping its eventfd arm re-introduces the leak and fails
+    // here (not just by inspection).
+    {
+        use crate::ipc::eventfd;
+        let id = eventfd::create(0, 0);   // refs = 1 (the sender's fd)
+        if id == u64::MAX {
+            test_fail!("efd-refs", "create() (SCM subcase) returned no slot");
+            return false;
+        }
+        eventfd::inc_ref(id);             // SCM enqueue inc: refs = 2
+        let fd = crate::vfs::FileDescriptor {
+            mount_idx:  usize::MAX,
+            inode:      id,
+            offset:     0,
+            flags:      0x0001_0000,      // eventfd flag bit (see sys_eventfd_linux)
+            is_console: false,
+            cloexec:    false,
+            file_type:  crate::vfs::FileType::EventFd,
+            open_path:  alloc::string::String::new(),
+        };
+        crate::syscall::scm_drop_fds(alloc::vec![fd]); // real drop: refs 2->1
+        if eventfd::debug_ref_count(id) != 1 {
+            test_fail!("efd-refs",
+                "refs after scm_drop_fds = {} (want 1 — SCM-drop dec)",
+                eventfd::debug_ref_count(id));
+            ok = false;
+        } else {
+            test_println!("  SCM enqueue inc (1->2) + scm_drop_fds dec (2->1) ✓");
+        }
+        eventfd::close(id);               // release the create ref: 1 -> 0
+    }
+
+    // ── Part 4: fork(2) inherit -> child exit_group teardown (real decs) ────
+    // The leak direction the whole re-land exists to prevent: fork_process
+    // bumps the shared eventfd's ref via inc_eventfd_refs_for_fork, and the
+    // child's process-exit teardown drops it — so a regression that removes
+    // the exit-teardown dec (or the fork inc) fails HERE, not just by
+    // inspection.  `exit_group_pid` is the sanctioned out-of-band teardown
+    // entry for a synthetic target process (yield_self=false: the caller
+    // returns normally after driving the child's full teardown).
+    //
+    // NOTE: the execve(2) FD_CLOEXEC purge dec (a distinct call site) is not
+    // driven here — driving a real execve in-kernel replaces the address
+    // space and needs a target program — but it invokes the SAME
+    // `eventfd::close` refcounted dec proven by Parts 1/2/4, so a regression
+    // there would still surface a refcount imbalance under any CLOEXEC-eventfd
+    // workload.  Left to inspection + the exit/close coverage above.
+    {
+        const SYS_EVENTFD2: u64 = 290;
+        const SYS_CLOSE:    u64 = 3;
+
+        let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+        if efd < 0 {
+            test_fail!("efd-refs", "eventfd2 (fork subcase) = {}", efd);
+            return false;
+        }
+        let id = crate::syscall::get_eventfd_id(pid, efd as usize);
+        let ptid = crate::proc::current_tid();
+        match crate::proc::fork_process(pid, ptid, &crate::proc::ForkUserRegs::default()) {
+            Some((child_pid, _child_tid)) => {
+                // fork_process copies the fd table and inc_eventfd_refs_for_fork
+                // bumps the shared eventfd's ref: 1 -> 2.
+                if crate::ipc::eventfd::debug_ref_count(id) != 2 {
+                    test_fail!("efd-refs",
+                        "refs after fork = {} (want 2 — inc_eventfd_refs_for_fork)",
+                        crate::ipc::eventfd::debug_ref_count(id));
+                    ok = false;
+                }
+                // Child _exit(0): the real exit teardown loop drops the child's
+                // inherited eventfd ref: 2 -> 1 (the parent's fd still holds it).
+                crate::proc::exit_group_pid(child_pid, 0);
+                if crate::ipc::eventfd::debug_ref_count(id) != 1 {
+                    test_fail!("efd-refs",
+                        "refs after child exit = {} (want 1 — exit-teardown dec)",
+                        crate::ipc::eventfd::debug_ref_count(id));
+                    ok = false;
+                } else {
+                    test_println!(
+                        "  fork inherit (1->2) + child exit_group teardown (2->1) ✓");
+                }
+                // Reap the zombie child so it does not leak a table slot.
+                let _ = crate::proc::waitpid(pid, child_pid as i64);
+            }
+            None => {
+                test_println!(
+                    "  fork_process returned None — exit-teardown dec left to inspection");
+            }
+        }
+        // The parent's own close drops the last reference: 1 -> 0.
+        let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+        if crate::ipc::eventfd::debug_ref_count(id) != 0 {
+            test_fail!("efd-refs", "refs after parent close = {} (want 0)",
+                crate::ipc::eventfd::debug_ref_count(id));
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("eventfd OFD refcount across fork/dup (Test 297)");
+    }
+    ok
 }
 
 /// Test 295b — reopening /proc/self/fd/<N> for a SENTINEL fd (eventfd) must
