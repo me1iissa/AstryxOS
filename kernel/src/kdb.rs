@@ -1468,21 +1468,47 @@ fn op_optrace_depth(req: &str, out: &mut String) {
     }
 }
 
-/// `scrings-dump` — non-destructively emit the frozen ring(s) to serial so
-/// the harness `scrings` parser can ingest them.  With `pid`, just that pid;
-/// without, every tracked pid.
+/// `scrings-dump` — non-destructively emit the frozen ring(s) so the harness
+/// `scrings` parser can ingest them.  With `pid`, just that pid; without,
+/// every tracked pid.
+///
+/// Routes through the guest-RAM log ring by default (a single reservation +
+/// memcpy per line — no per-byte UART VM-exits), so dumping a deep ring does
+/// not monopolise the vCPU or wedge kdb during a live capture.  Retrieve the
+/// lines out of band with `qemu-harness.py log-ring flush` (re-emits to the
+/// serial log for `scrings`) or `log-ring drain` (JSON).  The log ring is
+/// bounded (`log_ring::CAP`, 4 MiB ≈ 20K lines): a larger dump keeps only the
+/// newest lines — the entries nearest the freeze, which is what the chain
+/// reconstruction needs.  Pass `com1` to force the complete-but-slow COM1
+/// path instead (use only when the vCPU is free).
 #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_scrings_dump(req: &str, out: &mut String) {
     use core::fmt::Write;
+    let com1 = extract_field(req, "com1")
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let route = if com1 {
+        crate::syscall::ring::DumpRoute::Com1
+    } else {
+        crate::syscall::ring::DumpRoute::LogRing
+    };
+    let route_name = if com1 { "com1" } else { "log-ring" };
     match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
         Some(pid) if pid != 0 => {
-            crate::syscall::ring::dump_for_pid(pid);
-            let _ = write!(out, r#"{{"dumped":true,"pid":{}}}"#, pid);
+            let entries = crate::syscall::ring::dump_for_pid(pid, route);
+            let _ = write!(
+                out,
+                r#"{{"dumped":true,"pid":{},"entries":{},"route":"{}"}}"#,
+                pid, entries, route_name
+            );
         }
         _ => {
-            crate::syscall::ring::dump_all_tracked();
-            let n = crate::syscall::ring::tracked_rings().len();
-            let _ = write!(out, r#"{{"dumped":true,"pids":{}}}"#, n);
+            let pids = crate::syscall::ring::dump_all_tracked(route);
+            let _ = write!(
+                out,
+                r#"{{"dumped":true,"pids":{},"route":"{}"}}"#,
+                pids, route_name
+            );
         }
     }
 }

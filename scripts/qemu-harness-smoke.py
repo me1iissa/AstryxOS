@@ -1284,6 +1284,87 @@ def run_blk_trace_argv_check():
     print()
 
 
+def run_scrings_parse_check():
+    """
+    Tier 1.5 host-only check: the `scrings` [SC-RING] parser + `scrings-dump`
+    argv shaping.  No QEMU (< 1s).
+
+    Regression guard for the W101 op-trace parser bug (Phase A): the kernel
+    dumper emits `cr=<caller_rip>` between `rip=` and `a1=`, which the
+    historical `_SC_RING_LINE` regex did not account for, so it matched ZERO
+    entries from a real dump.  This check parses a synthetic block with the
+    real `cr=` field (+ additive ns/tid/wake and a kind=frozen BEGIN), asserts
+    the entries and every additive field land, and confirms a legacy cr-less
+    line still parses.
+    """
+    print("=== Tier 1.5: scrings [SC-RING] parser + scrings-dump argv (host-only) ===")
+    print()
+
+    import importlib.util
+    h_path = Path(__file__).resolve().parent / "qemu-harness.py"
+    spec = importlib.util.spec_from_file_location("qemu_harness_smoke_scrings", h_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # A real optrace frozen-ring dump (cr= present, additive ns/tid/wake), plus
+    # one legacy cr-less line to confirm back-compat.
+    lines = [
+        "[SC-RING-BEGIN] pid=1 exit_code=0 entries=3 kind=frozen ns_now=123456789",
+        "[SC-RING] i=000 t=10 futex/202 rip=0x7f00 cr=0x401abc a1=0x1 a2=0x80 a3=0x2 "
+        "a4=0x0 a5=0x0 a6=0x0 ret=-110 ns=1000 tid=7 wake=futex_timeout",
+        "[SC-RING] i=001 t=11 poll/7 rip=0x7f10 cr=0x402def a1=0x5 a2=0x1 a3=0xffffffff "
+        "a4=0x0 a5=0x0 a6=0x0 ret=1 ns=2000 tid=7 wake=bell",
+        "[SC-RING-PATH] i=001 path=\"/etc/hosts\"",
+        # Legacy cr-less line (hypothetical old format) must still parse.
+        "[SC-RING] i=002 t=12 write/1 rip=0x7f20 a1=0x35 a2=0x9000 a3=0x40 "
+        "a4=0x0 a5=0x0 a6=0x0 ret=64",
+        "[SC-RING-END] pid=1",
+    ]
+    dumps = list(mod._parse_ring_dump(lines))
+    ok_block = len(dumps) == 1
+    check("scrings parser yields exactly one dump block", ok_block, f"{len(dumps)} blocks")
+    if ok_block:
+        d = dumps[0]
+        ents = d["entries"]
+        # THE regression: the cr= line used to match zero entries.
+        check("scrings parses SC-RING lines with cr= (was 0 entries)",
+              len(ents) == 3, f"{len(ents)} entries (want 3)")
+        check("scrings BEGIN kind/ns_now captured",
+              d.get("kind") == "frozen" and d.get("ns_now") == 123456789,
+              f"kind={d.get('kind')} ns_now={d.get('ns_now')}")
+        if len(ents) == 3:
+            e0, e1, e2 = ents
+            check("scrings entry[0] cr/ns/tid/wake captured",
+                  e0["cr"] == 0x401abc and e0["ns"] == 1000
+                  and e0["tid"] == 7 and e0["wake"] == "futex_timeout"
+                  and e0["ret"] == -110 and e0["a2"] == 0x80,
+                  str({k: e0[k] for k in ("cr", "ns", "tid", "wake", "ret", "a2")}))
+            check("scrings entry[1] path attached + wake=bell",
+                  e1["path"] == "/etc/hosts" and e1["wake"] == "bell"
+                  and e1["cr"] == 0x402def,
+                  str({k: e1[k] for k in ("path", "wake", "cr")}))
+            check("scrings legacy cr-less line parses (cr=None)",
+                  e2["cr"] is None and e2["ns"] is None
+                  and e2["ret"] == 64 and e2["a1"] == 0x35,
+                  str({k: e2[k] for k in ("cr", "ns", "ret", "a1")}))
+
+    # scrings-dump argv: default (log-ring), com1, pid+com1 in either order.
+    check("scrings-dump default request shape",
+          mod._kdb_build_request("scrings-dump", []) == {"op": "scrings-dump"},
+          str(mod._kdb_build_request("scrings-dump", [])))
+    check("scrings-dump pid=1 request shape",
+          mod._kdb_build_request("scrings-dump", ["1"]) == {"op": "scrings-dump", "pid": "1"},
+          str(mod._kdb_build_request("scrings-dump", ["1"])))
+    check("scrings-dump com1 flag request shape",
+          mod._kdb_build_request("scrings-dump", ["com1"]) == {"op": "scrings-dump", "com1": "1"},
+          str(mod._kdb_build_request("scrings-dump", ["com1"])))
+    r_both = mod._kdb_build_request("scrings-dump", ["1", "com1"])
+    check("scrings-dump pid+com1 (either order) request shape",
+          r_both == {"op": "scrings-dump", "pid": "1", "com1": "1"},
+          str(r_both))
+    print()
+
+
 def run_pcap_argv_check():
     """
     Tier 1.5 host-only check: `start --pcap` filter-dump composition +
@@ -1553,6 +1634,7 @@ def main():
     run_blk_trace_argv_check()
     run_livelock_reap_check()
     run_pcap_argv_check()
+    run_scrings_parse_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.
