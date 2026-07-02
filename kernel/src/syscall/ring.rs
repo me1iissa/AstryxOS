@@ -6,13 +6,21 @@
 //! lines; each entry is printed on a single `[SC-RING]` line.
 //!
 //! The ring is a purely diagnostic aid: the information it captures (syscall
-//! number, six argument registers, return value, user RIP, optional resolved
-//! path, optional first bytes returned from read) is what a userspace strace
-//! would observe.  For Firefox debugging this is the cheapest way to answer
-//! "what was the process looking at immediately before it decided to abort?"
+//! number, six argument registers, return value, user RIP, a TSC-derived
+//! monotonic-ns timestamp, the calling thread id, how any blocking wait
+//! concluded, and optional resolved path / first read bytes) is a superset of
+//! what a userspace strace would observe.  For Firefox debugging this is the
+//! cheapest way to answer "what was the process looking at — and what woke it
+//! — immediately before it acted?"
 //!
-//! Feature-gated: code is only compiled under `firefox-test` so the general
-//! syscall path remains untouched for production builds.
+//! The `optrace` submodule adds a kdb-armable gap-end freeze trigger so a
+//! single Wikipedia-load wake-chain transition can be captured and
+//! reconstructed offline (W101 op-trace, Phase 0).
+//!
+//! Feature-gated: compiled under `firefox-test-core` (the Firefox bring-up
+//! profile) and `test-mode` (so the in-kernel test suite can exercise the
+//! plumbing).  Nothing is ever auto-tracked under bare `test-mode`, so the
+//! general syscall path stays untouched for production builds.
 
 extern crate alloc;
 
@@ -20,16 +28,98 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Ring capacity per process (last N syscalls).
-pub const RING_CAP: usize = 256;
+use crate::arch::x86_64::apic::{cpu_index, MAX_CPUS};
+
+/// Default ring capacity per process (last N syscalls).
+///
+/// The gap-end freeze trigger (see `optrace` below) stops recording once the
+/// captured transition tail has settled, so the *live* requirement on this
+/// number is only "deep enough to span the gap-ending send through the grace
+/// window at storm rate".  The historical value was 256 (≈2 ms of storm) —
+/// far too shallow for a W101 op-trace capture where the post-gap burst runs
+/// at ~10^5 syscalls/s.  The default is bumped modestly (holds ~24 ms of
+/// storm) and the per-pid depth is raised to a capture depth via the kdb
+/// `optrace-depth` op right before arming, which bounds heap cost to just the
+/// two focus PIDs rather than every tracked process.  Each slot is a fixed
+/// ~104 B header plus (empty) `String`/`Vec` handles — see the PR notes for
+/// the memory model.
+pub const RING_CAP: usize = 4096;
+
+/// Runtime default capacity for newly-created rings.  Seeded from `RING_CAP`;
+/// raised via `set_default_capacity` (kdb `optrace-depth` with no pid).
+static RING_CAP_RUNTIME: AtomicUsize = AtomicUsize::new(RING_CAP);
 
 /// Max bytes of `open()`'d path stored per entry.
 pub const PATH_BYTES: usize = 128;
 
 /// Max bytes of `read()` content captured per entry.
 pub const READ_BYTES: usize = 256;
+
+/// How a blocking wait concluded, captured at syscall exit so an offline
+/// chain reconstruction can tell "woken by data/readiness" apart from "gave
+/// up on a timeout" — the one discrimination a userspace strace cannot make.
+///
+/// `NeverBlocked` is the default for every entry; a wait path overwrites the
+/// per-CPU slot (see [`note_wake_reason`]) *after* its final `schedule()`
+/// returns, and [`end`] folds the slot into the entry.  Values are stable
+/// (append-only) so the harness/JSON mapping never shifts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum WakeReason {
+    /// Syscall did not park (or is not a wait syscall) — data was immediate.
+    NeverBlocked = 0,
+    /// A poll-bell ring (an IPC/readiness writer) drained the waiter.
+    Bell         = 1,
+    /// The bounded resync-floor scheduler tick woke us (no bell fired).
+    Resync       = 2,
+    /// The caller's own absolute deadline expired (poll/epoll timeout).
+    Timeout      = 3,
+    /// A signal delivery flipped us Ready (EINTR-shaped wake).
+    ///
+    /// Reserved: no producer yet — EINTR-shaped wakes currently surface as
+    /// `Bell`/`Resync`/`Timeout` (the underlying primitive's classification).
+    /// A dedicated producer can be wired if signal-interrupted parks need to
+    /// be distinguished in a future capture; the value is stable meanwhile.
+    Signal       = 4,
+    /// A matching FUTEX_WAKE removed us from the waiter list.
+    FutexWake    = 5,
+    /// FUTEX_WAIT deadline expired (ETIMEDOUT).
+    FutexTimeout = 6,
+    /// Blocked, but the wait path could not cheaply attribute the wake.
+    Unknown      = 7,
+}
+
+impl WakeReason {
+    #[inline]
+    fn from_u8(v: u8) -> WakeReason {
+        match v {
+            1 => WakeReason::Bell,
+            2 => WakeReason::Resync,
+            3 => WakeReason::Timeout,
+            4 => WakeReason::Signal,
+            5 => WakeReason::FutexWake,
+            6 => WakeReason::FutexTimeout,
+            7 => WakeReason::Unknown,
+            _ => WakeReason::NeverBlocked,
+        }
+    }
+    /// Stable string label used by the serial dumper and the scrings JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WakeReason::NeverBlocked => "never_blocked",
+            WakeReason::Bell         => "bell",
+            WakeReason::Resync       => "resync",
+            WakeReason::Timeout      => "timeout",
+            WakeReason::Signal       => "signal",
+            WakeReason::FutexWake    => "futex_wake",
+            WakeReason::FutexTimeout => "futex_timeout",
+            WakeReason::Unknown      => "unknown",
+        }
+    }
+}
 
 /// One entry in the ring.
 #[derive(Clone)]
@@ -55,9 +145,21 @@ pub struct Entry {
     /// First PATH_BYTES of read content, if this entry is a read() that we
     /// captured.  Hex-escaped by the dumper; kept as raw bytes here.
     pub read_bytes: Vec<u8>,
-    /// Tick counter when the entry was committed — lets the dumper show the
-    /// approximate rate and interleaving.
+    /// Tick counter (10 ms `get_ticks`) when the entry was committed — lets
+    /// the dumper show the approximate rate and interleaving.
     pub tick: u64,
+    /// TSC-derived monotonic nanoseconds at syscall entry.  Unlike `tick`
+    /// (10 ms granularity, and frozen on a dead LAPIC timer under KVM — see
+    /// PR #692), this reads the vDSO calibration directly, so cross-process
+    /// op ordering at a gap transition is unambiguous even inside one tick.
+    pub ns: u64,
+    /// Calling thread id (per-CPU `current_tid`).  The ring is per-PID; this
+    /// records which thread issued the call so a chain reconstruction knows
+    /// which-thread-did-what across the process's threads.
+    pub tid: u64,
+    /// How the wait concluded, if this entry blocked.  `NeverBlocked` for the
+    /// common (non-parking) case.  See [`WakeReason`].
+    pub wake: WakeReason,
 }
 
 impl Entry {
@@ -68,15 +170,22 @@ impl Entry {
             path: String::new(),
             read_bytes: Vec::new(),
             tick: 0,
+            ns: 0,
+            tid: 0,
+            wake: WakeReason::NeverBlocked,
         }
     }
 }
 
 /// Per-process ring state.
+///
+/// `buf` is a runtime-sized boxed slice (was a const-generic array) so a
+/// focus PID's depth can be raised for a capture without recompiling — see
+/// [`optrace`] and the kdb `optrace-depth` op.  `cap()` is always `buf.len()`.
 pub struct Ring {
-    pub buf: Box<[Entry; RING_CAP]>,
+    pub buf: Box<[Entry]>,
     pub head: usize,   // index where the NEXT entry will be written
-    pub len:  usize,   // number of valid entries (<= RING_CAP)
+    pub len:  usize,   // number of valid entries (<= cap())
     /// Pending entry: we record at syscall-entry (nr/args/rip) and patch the
     /// return value at syscall-exit.  None when no entry is in-flight for
     /// this process on the current CPU.
@@ -84,30 +193,45 @@ pub struct Ring {
 }
 
 impl Ring {
+    fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(1);
+        // Box the slice directly to avoid stack-allocating a large array.
+        let mut v: Vec<Entry> = Vec::with_capacity(cap);
+        for _ in 0..cap { v.push(Entry::zero()); }
+        Ring { buf: v.into_boxed_slice(), head: 0, len: 0, pending_idx: None }
+    }
+
     fn new() -> Self {
-        // Box large arrays directly to avoid stack-allocation of ~128 KiB.
-        let mut v: Vec<Entry> = Vec::with_capacity(RING_CAP);
-        for _ in 0..RING_CAP { v.push(Entry::zero()); }
-        let boxed: Box<[Entry; RING_CAP]> = v.into_boxed_slice().try_into().ok()
-            .expect("RING_CAP-sized vec should convert to boxed array");
-        Ring { buf: boxed, head: 0, len: 0, pending_idx: None }
+        Ring::with_capacity(RING_CAP_RUNTIME.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    fn cap(&self) -> usize { self.buf.len() }
+
+    /// Re-allocate the ring to `cap` entries, discarding history.  Called
+    /// only from the kdb `optrace-depth` op before a capture, so clearing is
+    /// intentional (the capture happens after the resize).
+    fn resize(&mut self, cap: usize) {
+        *self = Ring::with_capacity(cap);
     }
 
     fn push_begin(&mut self, mut e: Entry) -> usize {
+        let cap = self.cap();
         let idx = self.head;
         // Drop old content at this slot to free its String/Vec allocations
         // before overwriting (avoids unbounded memory retention).
         self.buf[idx] = core::mem::replace(&mut e, Entry::zero());
-        self.head = (self.head + 1) % RING_CAP;
-        if self.len < RING_CAP { self.len += 1; }
+        self.head = (self.head + 1) % cap;
+        if self.len < cap { self.len += 1; }
         self.pending_idx = Some(idx);
         idx
     }
 
     fn iter_chronological(&self) -> impl Iterator<Item = &Entry> {
-        let start = if self.len < RING_CAP { 0 } else { self.head };
+        let cap = self.cap();
+        let start = if self.len < cap { 0 } else { self.head };
         let len = self.len;
-        (0..len).map(move |i| &self.buf[(start + i) % RING_CAP])
+        (0..len).map(move |i| &self.buf[(start + i) % cap])
     }
 }
 
@@ -132,6 +256,206 @@ pub fn is_tracked(pid: u64) -> bool {
     t.contains(&pid)
 }
 
+// ── Per-CPU wake-reason slot ────────────────────────────────────────────────
+//
+// A blocking wait path (poll/epoll/select via `wait_poll_event`, or the
+// FUTEX_WAIT arm) records how it concluded here, AFTER its final `schedule()`
+// returns.  `begin()` resets the slot at syscall entry; `end()` folds it into
+// the entry.  For the wait paths themselves the annotation is exact: no
+// `schedule()` runs between a wait path's post-wake note and `end()`, so the
+// calling thread stays on the same CPU across that window and a lock-free
+// per-CPU slot is race-free for the reader.
+//
+// LIMITATION (mislabel-only, never unsafe): a *non-wait* syscall that happens
+// to reschedule mid-flight — e.g. a blocking demand-page fault or blk I/O
+// between `begin()` and `end()` — can, if a foreign thread runs a wait on the
+// same CPU meanwhile, read that foreign reason at `end()` and mislabel its own
+// entry.  This never corrupts state (the slot is a diagnostic u8); it only
+// misattributes the `wake` field on the occasional non-wait entry.  On SMP≥2
+// the same window also permits a cross-CPU mislabel; the W101 capture runs
+// `--smp 1`, where the wait paths' same-CPU invariant holds and this is moot.
+
+static WAKE_REASON: [AtomicU8; MAX_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_CPUS];
+
+/// Record how the current syscall's blocking wait concluded.  Called by the
+/// wait paths (feature-gated at the call site) right after the wake.
+#[inline]
+pub fn note_wake_reason(r: WakeReason) {
+    WAKE_REASON[cpu_index()].store(r as u8, Ordering::Relaxed);
+}
+
+/// Reset this CPU's wake-reason slot to `NeverBlocked` (syscall entry).
+#[inline]
+fn clear_wake_reason() {
+    WAKE_REASON[cpu_index()].store(WakeReason::NeverBlocked as u8, Ordering::Relaxed);
+}
+
+/// Read (and reset) this CPU's wake-reason slot (syscall exit).
+#[inline]
+fn take_wake_reason() -> WakeReason {
+    let v = WAKE_REASON[cpu_index()]
+        .swap(WakeReason::NeverBlocked as u8, Ordering::Relaxed);
+    WakeReason::from_u8(v)
+}
+
+// ── Gap-end freeze trigger (W101 op-trace capture) ──────────────────────────
+//
+// Arm from kdb; then the FIRST TCP send from a tracked FF pid after a
+// configurable quiet interval sets a freeze deadline `now + grace`.  Once the
+// deadline passes, `begin()` becomes a no-op, so the gap-ending send AND its
+// immediate consequent chain are captured, then the post-gap storm cannot
+// overwrite them.  A single serial marker is emitted when the trigger fires
+// (one line per gap-end — not a hot path) so the harness can `wait` on it.
+//
+// All state is plain atomics; the only hot-path reader is `is_frozen_at`
+// (one relaxed load) from `begin()`.
+pub mod optrace {
+    use super::*;
+
+    /// Master arm flag.  When false, `note_tcp_send` is a single atomic load.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    /// Quiet threshold (ns) a TCP-send stream must be silent for before the
+    /// next send counts as a gap end.  Default 2000 ms.
+    static QUIET_NS: AtomicU64 = AtomicU64::new(2_000_000_000);
+    /// Grace window (ns) recorded after the trigger fires before the ring
+    /// freezes.  Default 500 ms.
+    static GRACE_NS: AtomicU64 = AtomicU64::new(500_000_000);
+    /// Monotonic ns of the last observed tracked-pid TCP send (0 = none yet).
+    static LAST_TCP_SEND_NS: AtomicU64 = AtomicU64::new(0);
+    /// Absolute monotonic ns at which the ring freezes (0 = not frozen /
+    /// not triggered).  Set once by the trigger or by a manual freeze.
+    static FREEZE_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm the trigger with the given quiet/grace thresholds (ms).  Resets
+    /// the last-send timestamp and any prior freeze deadline so a fresh gap
+    /// is captured.
+    pub fn arm(quiet_ms: u64, grace_ms: u64) {
+        QUIET_NS.store(quiet_ms.saturating_mul(1_000_000), Ordering::Relaxed);
+        GRACE_NS.store(grace_ms.saturating_mul(1_000_000), Ordering::Relaxed);
+        LAST_TCP_SEND_NS.store(0, Ordering::Relaxed);
+        FREEZE_AT_NS.store(0, Ordering::Relaxed);
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// Disarm the trigger.  Leaves any existing freeze deadline untouched
+    /// (use `unfreeze` to resume recording).
+    pub fn disarm() { ARMED.store(false, Ordering::Relaxed); }
+
+    /// Manually freeze the ring right now (`freeze_at = now`).
+    pub fn freeze_now() {
+        let now = crate::proc::vdso::monotonic_ns();
+        // A monotonic_ns() of 0 (pre-calibration) would never freeze; clamp
+        // to 1 so the gate (`now >= freeze_at`) engages immediately.
+        FREEZE_AT_NS.store(now.max(1), Ordering::Relaxed);
+    }
+
+    /// Clear any freeze deadline and resume recording.
+    pub fn unfreeze() { FREEZE_AT_NS.store(0, Ordering::Relaxed); }
+
+    /// Hot-path gate for `begin()`: has the freeze deadline passed?
+    #[inline]
+    pub fn is_frozen_at(now_ns: u64) -> bool {
+        let f = FREEZE_AT_NS.load(Ordering::Relaxed);
+        f != 0 && now_ns >= f
+    }
+
+    /// Snapshot: `(armed, quiet_ns, grace_ns, last_send_ns, freeze_at_ns,
+    /// frozen_now)`.  Used by the kdb `optrace-status` op.
+    pub fn status() -> (bool, u64, u64, u64, u64, bool) {
+        let now = crate::proc::vdso::monotonic_ns();
+        (
+            ARMED.load(Ordering::Relaxed),
+            QUIET_NS.load(Ordering::Relaxed),
+            GRACE_NS.load(Ordering::Relaxed),
+            LAST_TCP_SEND_NS.load(Ordering::Relaxed),
+            FREEZE_AT_NS.load(Ordering::Relaxed),
+            is_frozen_at(now),
+        )
+    }
+
+    /// Core trigger logic, parameterised on `now` for deterministic testing.
+    /// Returns `true` when this call fired the trigger.
+    pub fn tcp_send_at(pid: u64, now_ns: u64) -> bool {
+        if !ARMED.load(Ordering::Relaxed) { return false; }
+        if !is_tracked(pid) { return false; }
+        let last = LAST_TCP_SEND_NS.swap(now_ns, Ordering::Relaxed);
+        // Already triggered → don't re-fire (keeps the first gap end).
+        if FREEZE_AT_NS.load(Ordering::Relaxed) != 0 { return false; }
+        let quiet = QUIET_NS.load(Ordering::Relaxed);
+        if last == 0 || now_ns.saturating_sub(last) < quiet {
+            return false;
+        }
+        let grace = GRACE_NS.load(Ordering::Relaxed);
+        let freeze_at = now_ns.saturating_add(grace).max(1);
+        // CAS 0 → freeze_at so exactly one send wins the trigger.
+        if FREEZE_AT_NS
+            .compare_exchange(0, freeze_at, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            crate::serial_println!(
+                "[OPTRACE] gap-end trigger fired pid={} quiet_ms={} grace_ms={} \
+                 last_ns={} now_ns={} freeze_at_ns={}",
+                pid, quiet / 1_000_000, grace / 1_000_000, last, now_ns, freeze_at
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hook from the socket TCP-send path (feature-gated at the call site).
+    pub fn note_tcp_send(pid: u64) {
+        // Fast bail before reading the clock when disarmed.
+        if !ARMED.load(Ordering::Relaxed) { return; }
+        let now = crate::proc::vdso::monotonic_ns();
+        let _ = tcp_send_at(pid, now);
+    }
+}
+
+// ── Ring depth control (kdb `optrace-depth`) ────────────────────────────────
+
+/// Set the default capacity used for rings created from now on.  Does NOT
+/// resize existing rings (use `resize_ring` for a specific focus pid).
+pub fn set_default_capacity(cap: usize) {
+    RING_CAP_RUNTIME.store(cap.max(1), Ordering::Relaxed);
+}
+
+/// Read the current default capacity for new rings.
+pub fn default_capacity() -> usize {
+    RING_CAP_RUNTIME.load(Ordering::Relaxed)
+}
+
+/// Resize (and clear) the ring for `pid` to `cap` entries, creating it if the
+/// pid is tracked but has no ring yet.  Returns the resulting capacity, or 0
+/// if `pid` is not tracked.  Called from kdb before a capture, so discarding
+/// history is intentional.
+pub fn resize_ring(pid: u64, cap: usize) -> usize {
+    if !is_tracked(pid) { return 0; }
+    let cap = cap.max(1);
+    let mut rings = RINGS.lock();
+    let ring = rings.entry(pid).or_insert_with(|| Ring::with_capacity(cap));
+    ring.resize(cap);
+    ring.cap()
+}
+
+/// Current capacity of `pid`'s ring (0 if none).  Used by `optrace-status`.
+pub fn ring_capacity(pid: u64) -> usize {
+    RINGS.lock().get(&pid).map(|r| r.cap()).unwrap_or(0)
+}
+
+/// Snapshot of tracked pids and their ring depth/occupancy, for kdb status.
+pub fn tracked_rings() -> Vec<(u64, usize, usize)> {
+    let rings = RINGS.lock();
+    let t = TRACKED.lock();
+    t.iter()
+        .map(|&pid| {
+            let (cap, len) = rings.get(&pid).map(|r| (r.cap(), r.len)).unwrap_or((0, 0));
+            (pid, cap, len)
+        })
+        .collect()
+}
+
 /// Record syscall entry — stores (nr, args, rip, caller_rip) in a new ring
 /// slot and returns its index.  Caller passes the index back to `end()`
 /// together with the syscall's return value.
@@ -145,7 +469,19 @@ pub fn begin(
     rip: u64, caller_rip: u64,
 ) -> Option<usize> {
     if !is_tracked(pid) { return None; }
+    // TSC-derived monotonic ns; also drives the gap-end freeze gate so we
+    // read the clock exactly once per entry.
+    let ns = crate::proc::vdso::monotonic_ns();
+    // Gap-end freeze: once the trigger has fired and the grace window has
+    // elapsed, stop recording so the captured transition tail is not
+    // overwritten by the post-gap storm.  Pure instrumentation — no syscall
+    // behaviour changes, the call still runs; only the trace slot is skipped.
+    if optrace::is_frozen_at(ns) { return None; }
+    // Reset the per-CPU wake-reason slot for this syscall.  A blocking wait
+    // path overwrites it after its final schedule(); end() folds it in.
+    clear_wake_reason();
     let tick = crate::arch::x86_64::irq::get_ticks();
+    let tid = crate::proc::current_tid();
     let mut rings = RINGS.lock();
     let ring = rings.entry(pid).or_insert_with(Ring::new);
     let entry = Entry {
@@ -154,6 +490,9 @@ pub fn begin(
         path: String::new(),
         read_bytes: Vec::new(),
         tick,
+        ns,
+        tid,
+        wake: WakeReason::NeverBlocked,
     };
     Some(ring.push_begin(entry))
 }
@@ -186,13 +525,19 @@ pub fn set_read_bytes(pid: u64, idx: Option<usize>, data: &[u8]) {
     }
 }
 
-/// Patch the return value onto the entry previously created by `begin()`.
+/// Patch the return value (and the wake reason recorded by any blocking wait
+/// this syscall performed) onto the entry previously created by `begin()`.
 pub fn end(pid: u64, idx: Option<usize>, ret: i64) {
     let Some(idx) = idx else { return; };
+    // Read the per-CPU wake-reason slot BEFORE taking RINGS.  No schedule()
+    // runs between a wait path's post-wake note and here, so this CPU's slot
+    // still reflects THIS thread's wait outcome.
+    let wake = take_wake_reason();
     let mut rings = RINGS.lock();
     if let Some(ring) = rings.get_mut(&pid) {
         if let Some(slot) = ring.buf.get_mut(idx) {
             slot.ret = ret;
+            slot.wake = wake;
         }
         ring.pending_idx = None;
     }
@@ -273,23 +618,18 @@ fn nr_name(nr: u64) -> &'static str {
     }
 }
 
-/// Dump the ring for `pid` to the serial console, framed by
-/// `[SC-RING-BEGIN]` / `[SC-RING-END]`.  Called from `exit_group` when the
-/// exit code is non-zero.  Clears the ring afterwards so a crashed process
-/// doesn't leak its entries into a re-used PID.
-pub fn dump_for_exit(pid: u64, exit_code: i64) {
-    let mut rings = RINGS.lock();
-    let Some(ring) = rings.remove(&pid) else {
-        // No ring — nothing to dump.  Still emit the frame so the harness
-        // can record that a non-zero exit happened but produced no trace.
-        crate::serial_println!("[SC-RING-BEGIN] pid={} exit_code={} entries=0", pid, exit_code);
-        crate::serial_println!("[SC-RING-END] pid={}", pid);
-        return;
-    };
-
+/// Emit the entries of `ring` framed by `[SC-RING-BEGIN]`/`[SC-RING-END]`.
+///
+/// The BEGIN line carries the legacy `pid`/`exit_code`/`entries` fields the
+/// harness regex anchors on, plus additive `kind=` (exit|frozen) and
+/// `ns_now=` tail fields (ignored by the anchored regex).  Each `[SC-RING]`
+/// line gains additive `ns=`/`tid=`/`wake=` fields, appended after `ret=` so
+/// older parsers keep matching.
+fn emit_ring(pid: u64, ring: &Ring, exit_code: i64, kind: &str) {
+    let ns_now = crate::proc::vdso::monotonic_ns();
     crate::serial_println!(
-        "[SC-RING-BEGIN] pid={} exit_code={} entries={}",
-        pid, exit_code, ring.len
+        "[SC-RING-BEGIN] pid={} exit_code={} entries={} kind={} ns_now={}",
+        pid, exit_code, ring.len, kind, ns_now
     );
 
     for (i, e) in ring.iter_chronological().enumerate() {
@@ -305,10 +645,11 @@ pub fn dump_for_exit(pid: u64, exit_code: i64) {
         // a libxul / firefox-bin function name when the offset-from-base is
         // looked up in the Breakpad .sym symbol files.
         crate::serial_println!(
-            "[SC-RING] i={:03} t={} {} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ret={}",
+            "[SC-RING] i={:03} t={} {} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ret={} ns={} tid={} wake={}",
             i, e.tick, name_field,
             e.rip, e.caller_rip,
-            e.a1, e.a2, e.a3, e.a4, e.a5, e.a6, e.ret
+            e.a1, e.a2, e.a3, e.a4, e.a5, e.a6, e.ret,
+            e.ns, e.tid, e.wake.as_str()
         );
         if !e.path.is_empty() {
             crate::serial_println!("[SC-RING-PATH] i={:03} path={:?}", i, &e.path);
@@ -330,6 +671,48 @@ pub fn dump_for_exit(pid: u64, exit_code: i64) {
     }
 
     crate::serial_println!("[SC-RING-END] pid={}", pid);
+}
+
+/// Dump the ring for `pid` to the serial console, framed by
+/// `[SC-RING-BEGIN]` / `[SC-RING-END]`.  Called from `exit_group` when the
+/// exit code is non-zero.  Clears the ring afterwards so a crashed process
+/// doesn't leak its entries into a re-used PID.
+pub fn dump_for_exit(pid: u64, exit_code: i64) {
+    let mut rings = RINGS.lock();
+    let Some(ring) = rings.remove(&pid) else {
+        // No ring — nothing to dump.  Still emit the frame so the harness
+        // can record that a non-zero exit happened but produced no trace.
+        crate::serial_println!(
+            "[SC-RING-BEGIN] pid={} exit_code={} entries=0 kind=exit ns_now=0", pid, exit_code);
+        crate::serial_println!("[SC-RING-END] pid={}", pid);
+        return;
+    };
+    emit_ring(pid, &ring, exit_code, "exit");
+}
+
+/// Non-destructively dump the (typically frozen) ring for `pid` on demand —
+/// called from the kdb `scrings-dump` op during a live W101 capture, where
+/// the process is still running.  Reuses the `[SC-RING-BEGIN]`/`[SC-RING-END]`
+/// framing so the existing `scrings` parser handles it unchanged; `kind=frozen`
+/// distinguishes it from an exit dump.  The ring is left in place so it can be
+/// re-dumped.
+pub fn dump_for_pid(pid: u64) {
+    let rings = RINGS.lock();
+    let Some(ring) = rings.get(&pid) else {
+        crate::serial_println!(
+            "[SC-RING-BEGIN] pid={} exit_code=0 entries=0 kind=frozen ns_now=0", pid);
+        crate::serial_println!("[SC-RING-END] pid={}", pid);
+        return;
+    };
+    emit_ring(pid, ring, 0, "frozen");
+}
+
+/// Dump every tracked pid's ring on demand (frozen capture convenience).
+pub fn dump_all_tracked() {
+    let pids: Vec<u64> = TRACKED.lock().clone();
+    for pid in pids {
+        dump_for_pid(pid);
+    }
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -674,4 +1057,29 @@ pub fn dump_futex_wait_stack(tid: u64, pid: u64, uaddr: u64, cr3: u64,
         "[FUTEX_WAIT_STACK] tid={} pid={} uaddr={:#x} leaf={:#x}{}",
         tid, pid, uaddr, leaf_rip, suffix
     );
+}
+
+// ── Test accessors ──────────────────────────────────────────────────────────
+//
+// Read-only snapshots of ring internals for the in-kernel test suite
+// (`test_runner.rs`).  Compiled in every build the module is (so
+// `firefox-test-core` and `test-mode`); they take the same locks as the live
+// paths and never mutate state.
+
+/// Snapshot the most-recently committed entry for `pid`:
+/// `(nr, tid, ns, wake, ret)`.  `None` if the pid has no ring / no entries.
+pub fn snapshot_last(pid: u64) -> Option<(u64, u64, u64, WakeReason, i64)> {
+    let rings = RINGS.lock();
+    let ring = rings.get(&pid)?;
+    if ring.len == 0 { return None; }
+    let cap = ring.cap();
+    // head points at the NEXT write slot; the last written is one behind it.
+    let idx = (ring.head + cap - 1) % cap;
+    let e = &ring.buf[idx];
+    Some((e.nr, e.tid, e.ns, e.wake, e.ret))
+}
+
+/// Number of valid entries currently held for `pid` (0 if none).
+pub fn entry_count(pid: u64) -> usize {
+    RINGS.lock().get(&pid).map(|r| r.len).unwrap_or(0)
 }
