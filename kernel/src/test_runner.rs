@@ -1379,6 +1379,19 @@ pub fn run() -> ! {
         if test_659_kstack_drain_per_tick_throttle() { passed += 1; }
     }
 
+    // ── Test 688: kstack quiescence is immune to a frozen TICK_COUNT ──────
+    // Robustness guard for the dead-LAPIC-timer condition: when the LAPIC
+    // periodic timer stops delivering, the raw ISR-published `TICK_COUNT`
+    // freezes while wall time keeps moving.  Every time-dependent kernel
+    // decision must read the TSC-derived `get_ticks()` instead so it keeps
+    // advancing.  Verifies the kstack-quiescence tick gate (and its shared
+    // time source) still elapse with the raw counter pinned behind wall time.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_688_quiesce_immune_to_frozen_tick() { passed += 1; }
+    }
+
     {
         total += 1;
         if test_671_kstack_onstack_survey_gate() { passed += 1; }
@@ -48554,10 +48567,18 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_header!("sched: dead-kstack switch-generation quiescence gate (SMP #DB)");
 
     // Use a long-elapsed push_tick (0) so the wall-clock tick gate is always
-    // satisfied; this isolates the *generation* condition.  TICK_COUNT is well
-    // past the escape-valve margin by the time the test suite runs, so we
-    // pick a recent push_tick for the cases that must observe withholding.
-    let now = crate::arch::x86_64::irq::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    // satisfied; this isolates the *generation* condition.  The quiescence
+    // clock is well past the escape-valve margin by the time the suite runs, so
+    // we pick a recent push_tick for the cases that must observe withholding.
+    //
+    // Read `now` from the SAME source the gate reads (`entry_is_quiesced` calls
+    // `current_tick_for_quiesce()` = `get_ticks()`), NOT the raw `TICK_COUNT`.
+    // Under a dead LAPIC timer `get_ticks()` can lead the frozen raw counter by
+    // many ticks; a `recent = raw − 3` push_tick would then sit ≥16 ticks below
+    // the gate's `get_ticks()` view, spuriously flipping `escape_ok` true and
+    // failing the withholding cases (A, E) on a local KVM run. Same-clock keeps
+    // the `now − push_tick` delta honest regardless of timer liveness.
+    let now = crate::sched::test_current_tick_for_quiesce();
     let cpu0_gen = crate::sched::test_cpu_switch_gen(0);
 
     // Case A: gen NOT advanced (snapshot == live), recent push → WITHHELD.
@@ -48609,9 +48630,17 @@ fn test_294_kstack_switch_gen_gate() -> bool {
     test_println!("  D: gen-not-advanced + escape-margin → eligible via valve (ok)");
 
     // Case E: too-recent push → base tick gate not met → WITHHELD even with
-    // the unknown-CPU sentinel.  push_tick = now → only 0 ticks elapsed.
-    if crate::sched::test_entry_quiesced(now, 0, u64::MAX) && now != 0 {
-        // now != 0 guard: at the very first tick the saturating arithmetic
+    // the unknown-CPU sentinel.  RE-READ the quiescence clock here rather than
+    // reuse the top-of-test `now`: cases A-D each emit serial output, which
+    // burns several ticks of wall time under KVM PIO, so the shared snapshot is
+    // stale by the time this runs.  `entry_is_quiesced` reads its own
+    // `get_ticks()` internally; if push_tick lags that read by ≥2 ticks the
+    // "0-tick" entry looks old enough to pass the tick gate and the case
+    // spuriously fails.  A fresh read makes push_tick == the gate's `now`
+    // (within a few instructions ≪ 1 tick) → genuinely 0 ticks elapsed.
+    let now_fresh = crate::sched::test_current_tick_for_quiesce();
+    if crate::sched::test_entry_quiesced(now_fresh, 0, u64::MAX) && now_fresh != 0 {
+        // now_fresh != 0 guard: at the very first tick the saturating arithmetic
         // makes the 2-tick threshold equal to now, which is a benign edge.
         test_fail!("test294", "too-recent entry (0 ticks) was eligible — tick gate open");
         return false;
@@ -48717,6 +48746,105 @@ fn test_659_kstack_drain_per_tick_throttle() -> bool {
     test_println!("  E: stale entry (≥16t) eligible via escape valve → per-tick drain reclaims (ok)");
 
     test_pass!("per-tick drain throttle: once-per-tick + resumes each tick + reclamation intact");
+    true
+}
+
+// ── Test 688: kstack quiescence is immune to a frozen TICK_COUNT ──────────────
+//
+// Under a dead LAPIC periodic timer (e.g. a KVM vCPU whose LAPIC injection is
+// suppressed — Intel SDM Vol. 3A §11.5.4) the ISR that advances the raw
+// `TICK_COUNT` stops firing, so the raw counter FREEZES while wall time keeps
+// moving.  The invariant TSC (Intel SDM Vol. 3B §17.17, constant-rate TSC)
+// keeps advancing regardless, and `get_ticks()` returns `max(TICK_COUNT,
+// tsc_floor)` so it tracks wall time through a dead timer.
+//
+// Every time-dependent kernel decision must therefore read `get_ticks()` and
+// not the raw counter.  This regression pins that for the kstack-quiescence
+// machinery: with the raw counter forced far behind wall time, (a) the shared
+// quiescence source (`current_tick_for_quiesce`) must still report the TSC
+// floor, not the frozen raw value, and (b) the `entry_is_quiesced` tick gate
+// must still judge an old entry eligible.  Pre-fix (raw `TICK_COUNT` read) the
+// source would echo the frozen value, the tick gate would never elapse, and the
+// reaper would stall — a dead-timer robustness hole.
+//
+// SMP note: the assertions compare against an independently-computed TSC floor,
+// so this never FALSE-FAILS on SMP=2 — a sibling CPU's ISR monotone-CAS-healing
+// the raw counter back up only raises the raw value, which the TSC-floor bound
+// already dominates.  It does not guarantee the strongest DISCRIMINATION on
+// SMP=2 though: if a sibling heals `TICK_COUNT` inside the store→read window a
+// hypothetically-buggy raw read could be masked and still pass.  That is
+// acceptable — the whole-machine-frozen regime this fix targets is a single-core
+// phenomenon, so the decisive discrimination is on SMP=1.  The forced-behind
+// store is restored with a monotone `fetch_max`.
+#[cfg(feature = "test-mode")]
+fn test_688_quiesce_immune_to_frozen_tick() -> bool {
+    use core::sync::atomic::Ordering;
+    use crate::arch::x86_64::irq::{TICK_COUNT, TSC_AT_BOOT, TSC_PER_TICK, rdtsc, get_ticks};
+    test_header!("sched: kstack quiescence immune to a frozen TICK_COUNT (dead-LAPIC robustness)");
+
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        // Pre-calibration: no TSC epoch, `get_ticks()` legitimately falls back
+        // to the raw count.  Not the regime this test targets; treat as N/A.
+        test_println!("  (skipped: TSC not yet calibrated — immunity is post-calibration)");
+        test_pass!("quiesce frozen-tick immunity: N/A pre-calibration");
+        return true;
+    }
+
+    // Independent lower bound on the true wall-clock tick, computed straight
+    // from the TSC — never touches TICK_COUNT.
+    let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
+    let tsc_floor = rdtsc().wrapping_sub(tsc_at_boot) / tsc_per_tick;
+    if tsc_floor < 32 {
+        // Too early in boot to build an "old" push_tick below the escape valve.
+        test_println!("  (skipped: only {} ticks of uptime — need ≥32)", tsc_floor);
+        test_pass!("quiesce frozen-tick immunity: N/A this early in boot");
+        return true;
+    }
+
+    // Emulate the dead timer: pin the raw counter far behind wall time.
+    let saved = TICK_COUNT.load(Ordering::Relaxed);
+    const FROZEN: u64 = 1;
+    TICK_COUNT.store(FROZEN, Ordering::Relaxed);
+
+    // (a) The shared quiescence source must report the TSC floor, not `FROZEN`.
+    let q = crate::sched::test_current_tick_for_quiesce();
+    let g = get_ticks();
+
+    // (b) An entry pushed ~8 ticks ago (past the 2-tick quiesce window, well
+    // short of the 16-tick escape valve) must be eligible on the TICK GATE
+    // alone — `last_cpu_gen = u64::MAX` makes the generation gate vacuous, so
+    // only the tick gate can grant eligibility here.
+    let push_tick = tsc_floor.saturating_sub(8);
+    let eligible = crate::sched::test_entry_quiesced(push_tick, 0, u64::MAX);
+
+    // Restore before asserting (never lower the counter a sibling may have
+    // already advanced past `saved`).
+    TICK_COUNT.fetch_max(saved, Ordering::Relaxed);
+
+    if q < tsc_floor {
+        test_fail!("test688",
+            "quiescence source echoed the frozen counter (q={} < tsc_floor={}) — \
+             a dead LAPIC would freeze the reaper", q, tsc_floor);
+        return false;
+    }
+    if g < tsc_floor {
+        test_fail!("test688",
+            "get_ticks() regressed below the TSC floor (g={} < {})", g, tsc_floor);
+        return false;
+    }
+    test_println!("  A: raw TICK_COUNT pinned at {} → quiesce source={} get_ticks={} (≥ tsc_floor {}) (ok)",
+                  FROZEN, q, g, tsc_floor);
+
+    if !eligible {
+        test_fail!("test688",
+            "old entry (push_tick={}) not eligible with raw counter frozen — \
+             the tick gate stalled on a dead timer", push_tick);
+        return false;
+    }
+    test_println!("  B: old entry (push_tick={}, ~8t) eligible on the tick gate despite frozen raw (ok)", push_tick);
+
+    test_pass!("kstack quiescence tracks the TSC through a frozen TICK_COUNT (dead-LAPIC immune)");
     true
 }
 
