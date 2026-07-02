@@ -57,6 +57,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# BUILD_DIR is overridable via ASTRYXOS_BUILD_DIR so an isolated variant build
+# (create-data-disk.sh --build-dir) injects into the libxul.so staged under
+# that root instead of build/disk.
+BUILD_DIR="${ASTRYXOS_BUILD_DIR:-${ROOT_DIR}/build}"
 INJECT_SCRIPT="${ROOT_DIR}/scripts/inject-libxul-symtab.py"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -80,7 +84,7 @@ done
 
 # ── Mode-specific paths and URLs ─────────────────────────────────────────────
 if [ "${MODE}" = "glibc" ]; then
-    LIBXUL="${ROOT_DIR}/build/disk/opt/firefox/libxul.so"
+    LIBXUL="${BUILD_DIR}/disk/opt/firefox/libxul.so"
     SYM_DIR="${HOME}/.cache/astryxos-firefox/dbg-symbols"
     SYM_FILE="${SYM_DIR}/libxul.so.sym"
     SYM_COMPRESSED="${SYM_DIR}/libxul_sym_compressed.bin"
@@ -98,7 +102,7 @@ if [ "${MODE}" = "glibc" ]; then
     ZIP_DATA_BYTE_SIZE=135889978   # 129.6 MiB compressed
 else
     # --musl
-    LIBXUL="${ROOT_DIR}/build/disk/usr/lib/firefox-esr/libxul.so"
+    LIBXUL="${BUILD_DIR}/disk/usr/lib/firefox-esr/libxul.so"
     SYM_DIR="${HOME}/.cache/astryxos-firefox-musl/dbg-symbols"
     SYM_FILE="${SYM_DIR}/libxul.so.sym"
     SYM_GZ="${SYM_DIR}/libxul.so.sym.gz"

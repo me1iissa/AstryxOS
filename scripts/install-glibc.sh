@@ -14,7 +14,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build"
+# BUILD_DIR is overridable via ASTRYXOS_BUILD_DIR so an isolated variant build
+# (create-data-disk.sh --build-dir) stages into that root instead of build/.
+BUILD_DIR="${ASTRYXOS_BUILD_DIR:-${ROOT_DIR}/build}"
 DISK_LIB64="${BUILD_DIR}/disk/lib64"
 DISK_GNU="${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
 

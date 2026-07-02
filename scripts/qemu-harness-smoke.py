@@ -604,6 +604,95 @@ def run_staleness_check():
     print()
 
 
+def run_variant_data_img_check():
+    """
+    Tier 1.5 host-only check: exercise `_variant_data_img_candidate` directly to
+    confirm the `--firefox-variant glibc` prebuilt-image selection is correct
+    and NON-destructive.
+
+    A future refactor must not (a) auto-select a glibc image for the musl
+    default, (b) ignore an explicit --data-img, or (c) fail to pick up a present
+    build/data-glibc.img — each of those would silently break the glibc
+    'does the ~50x slowdown reproduce?' discriminator.  No QEMU launched.
+    """
+    print("=== Tier 1.5: --firefox-variant glibc image selection (host-only) ===")
+    print()
+    import importlib.util
+    import os
+    import tempfile
+    spec = importlib.util.spec_from_file_location("qh_smoke_variant", str(HARNESS))
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    fn = getattr(mod, "_variant_data_img_candidate", None)
+    check("variant-select fn importable", fn is not None, "")
+    if fn is None:
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        di = tdp / "data.img"
+        di.write_text("musl")
+        gi = tdp / "data-glibc.img"
+
+        # Make the check hermetic: repoint the canonical-build fallback at the
+        # sandbox so a real build/data-glibc.img on the host cannot leak into
+        # the "no image" cases.  Restored in the finally below.
+        _orig_canon = getattr(mod, "_CANONICAL_BUILD_DIR", None)
+        mod._CANONICAL_BUILD_DIR = tdp
+        try:
+            _run_variant_data_img_cases(fn, di, gi)
+        finally:
+            if _orig_canon is not None:
+                mod._CANONICAL_BUILD_DIR = _orig_canon
+
+    print()
+
+
+def _run_variant_data_img_cases(fn, di, gi):
+    """Hermetic assertion body for run_variant_data_img_check (sandbox paths)."""
+    import os
+    import tempfile
+    # Case A: musl (default) never auto-selects a variant image.
+    check("musl → None", fn(di, "musl", None) is None)
+
+    # Case B: glibc requested but no prebuilt image → None (legacy re-stage).
+    check("glibc, no image → None", fn(di, "glibc", None) is None)
+
+    # Case C: glibc requested + sibling data-glibc.img present → selected.
+    gi.write_text("glibc")
+    r = fn(di, "glibc", None)
+    check("glibc + sibling image → selected", r == gi, str(r))
+
+    # Case D: an explicit --data-img always wins (helper stays out of it).
+    check("explicit --data-img → None",
+          fn(di, "glibc", "/some/explicit.img") is None)
+
+    # Case E: $ASTRYX_GLIBC_DATA_IMG env escape hatch honoured when it exists.
+    with tempfile.NamedTemporaryFile(suffix=".img") as envimg:
+        os.environ["ASTRYX_GLIBC_DATA_IMG"] = envimg.name
+        try:
+            r = fn(di, "glibc", None)
+            check("env override → selected", str(r) == envimg.name, str(r))
+        finally:
+            os.environ.pop("ASTRYX_GLIBC_DATA_IMG", None)
+
+    # Case F: a non-existent env override falls through to the sibling image.
+    os.environ["ASTRYX_GLIBC_DATA_IMG"] = "/nonexistent/data-glibc.img"
+    try:
+        r = fn(di, "glibc", None)
+        check("missing env override → sibling fallback", r == gi, str(r))
+    finally:
+        os.environ.pop("ASTRYX_GLIBC_DATA_IMG", None)
+
+
 def run_allowlist_check():
     """
     Tier 1.5 host-only check: exercise `allowlist` subcommands directly.
@@ -1454,6 +1543,7 @@ def main():
     # the corresponding silent-wedge guards (W7 staleness; ci/allow-fail
     # registry) against future refactors of qemu-harness.py.
     run_staleness_check()
+    run_variant_data_img_check()
     run_allowlist_check()
     run_snapgate_argv_check()
     run_read_ff_png_check()
