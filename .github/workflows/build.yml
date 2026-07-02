@@ -68,6 +68,82 @@ jobs:
       - name: check fault-immunity tokens (ke::bugcheck + no_alloc_fmt)
         run: bash scripts/check_fault_immune.sh
 
+  feature-combo-check:
+    # Compile-check (cargo check level — no codegen/link, NO QEMU boot) the
+    # firefox-test* kernel feature combinations that the plain `cargo-check` job
+    # never exercises.  `cargo-check` only checks astryx-kernel with DEFAULT
+    # features, so every path behind `firefox-test-core` / `firefox-test-trace`
+    # / `firefox-trace-verbose` / `syscall-trace` / `kdb` (and the diagnostic
+    # emitters those pull in) ships compile-UNVERIFIED: a feature-gated syntax
+    # or type error stays invisible until someone builds that exact flag set by
+    # hand.  Each matrix leg is one `cargo check --features <combo>` against the
+    # bare-metal kernel target — fast, and a HARD gate (compile checks have no
+    # flake surface, unlike the QEMU kernel-smoke job).
+    #
+    # Failure mode this prevents: feature-gated code (e.g. an opt-in trace
+    # emitter, or a firefox-test-core/-trace profile-split move) that compiles
+    # under `default`/`test-mode` but fails under a `firefox-test*` combo,
+    # landing green and only breaking when an agent boots that flag set.
+    #
+    # `fail-fast: false` so one broken combo reports without cancelling the
+    # others (you want to see every failing combo, not just the first).
+    name: feature-combo check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kdb
+            features: kdb
+          - name: ff-core-kdb
+            features: firefox-test-core,kdb
+          - name: ff-trace-kdb
+            features: firefox-test-trace,kdb
+          - name: ff-core-verbose-kdb
+            features: firefox-test-core,firefox-trace-verbose,kdb
+          - name: ff-bundle
+            features: firefox-test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust nightly (matching rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-uefi, x86_64-unknown-none
+
+      # One shared cache across the legs: the expensive artefact is the built
+      # `core`/`alloc` sysroot (-Zbuild-std) + the registry, which is identical
+      # for every combo — only the single astryx-kernel crate re-checks per
+      # combo (cheap, no codegen).  Legs race to save the same key; a duplicate
+      # save is a harmless no-op.  Falls back to the cargo-check cache so a first
+      # run still restores a warm build-std.
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: feature-combo-${{ runner.os }}-${{ hashFiles('Cargo.lock','kernel/x86_64-astryx.json') }}
+          restore-keys: |
+            feature-combo-${{ runner.os }}-
+            cargo-check-${{ runner.os }}-
+
+      # Same bare-metal invocation as the `cargo-check` job (the kernel is
+      # no_std + a custom JSON target and needs -Zbuild-std; checking it against
+      # the host target trips a duplicate panic_impl), plus the combo under test.
+      - name: cargo check (astryx-kernel, --features ${{ matrix.features }})
+        run: >
+          cargo +nightly check -p astryx-kernel
+          --target kernel/x86_64-astryx.json
+          --features ${{ matrix.features }}
+          -Zbuild-std=core,alloc
+          -Zbuild-std-features=compiler-builtins-mem
+          -Zjson-target-spec
+
   tooling-smoke:
     # Host-only smoke tests for the dev-dashboard tooling (no kernel build, no
     # QEMU boot — pure Python against synthetic + real serial-log fixtures, <10s
