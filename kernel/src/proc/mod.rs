@@ -2433,11 +2433,27 @@ fn free_user_page_tables(cr3: u64) {
 /// killing the test runner thread itself.
 pub fn exit_group(exit_code: i64) {
     let tid = recover_current_tid();
+    // Resolve the pid inside a SHORT `THREAD_TABLE` critical section and copy
+    // it out, so the guard is released before any scheduling decision.  The
+    // `None` arm below reaches `schedule()`, whose dead-thread reap prologue
+    // re-acquires `THREAD_TABLE` unconditionally; entering `schedule()` while
+    // this guard were still live would re-enter a non-reentrant spinlock and
+    // wedge this CPU spinning on a lock it already holds (a lock the guard's
+    // `Drop` can no longer release, since `Drop` runs only after `schedule()`
+    // returns — which it never will).  Dropping the guard before the branch
+    // keeps the whole scheduling path lock-free.
     let pid = {
         let threads = THREAD_TABLE.lock();
-        match threads.iter().find(|t| t.tid == tid) {
-            Some(t) => t.pid,
-            None => { crate::sched::schedule(); return; }
+        threads.iter().find(|t| t.tid == tid).map(|t| t.pid)
+    };
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            // This thread is no longer recorded in `THREAD_TABLE` — a sibling's
+            // group teardown already reaped it while it was mid-exit.  There is
+            // nothing left to tear down; yield permanently with no lock held.
+            crate::sched::schedule();
+            return;
         }
     };
 
