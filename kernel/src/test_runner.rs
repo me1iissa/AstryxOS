@@ -690,6 +690,15 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_self_cwd_readlink() { passed += 1; }
 
+    // W215 write-protect trap — huge-page-split neighbour safety.  Placed
+    // BEFORE Test 40 (Desktop Launch) per the note above, so the load-bearing
+    // direct-map-split invariant is verified even if Desktop Launch panics.
+    #[cfg(feature = "w215-wptrap")]
+    {
+        total += 1;
+        if test_w215_wptrap_split_neighbour_safe() { passed += 1; }
+    }
+
     // ── Test 40: Desktop Launch with Timeout ────────────────────────────
 
     total += 1;
@@ -1591,16 +1600,6 @@ pub fn run() -> ! {
         if test_640_frame_recycle_zeroing_invariant() { passed += 1; }
         total += 1;
         if test_643_bucket_a_classifier_content_aware() { passed += 1; }
-    }
-
-    // W215 write-protect trap — the load-bearing correctness property is that
-    // protecting one direct-map frame splits the covering 2 MiB huge page
-    // without corrupting its neighbours.  Gated on `w215-wptrap` (the module
-    // is compiled only in that profile).
-    #[cfg(feature = "w215-wptrap")]
-    {
-        total += 1;
-        if test_w215_wptrap_split_neighbour_safe() { passed += 1; }
     }
 
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
