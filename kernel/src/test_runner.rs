@@ -296,6 +296,14 @@ pub fn run() -> ! {
     total += 1;
     if test_proc_metrics_self() { passed += 1; }
 
+    // ── Test 700: proc_metrics periodic ISR emit is allocation-free ──────
+    // emit_periodic runs from the timer ISR; a heap allocation there can
+    // corrupt a live block header under SMP=2 (the format!/String/Vec path).
+    // Assert the monotonic heap-alloc counter does not advance across a direct
+    // emit_periodic call (interrupts masked).
+    total += 1;
+    if test_700_proc_metrics_emit_no_alloc() { passed += 1; }
+
     // ── Test 0c: virtio-serial / /dev/vport0p0 (Phase QGA-1) ─────────────
     #[cfg(feature = "qga")]
     {
@@ -39197,6 +39205,30 @@ fn test_proc_metrics_self() -> bool {
         true
     } else {
         test_fail!("proc_metrics self-test", "category bucketing or snapshot mismatch");
+        false
+    }
+}
+
+// ── Test 700: proc_metrics periodic ISR emit is allocation-free ─────────────
+//
+// The `[PROC-METRICS]` periodic dump runs from the timer ISR
+// (`maybe_emit_periodic` → `emit_periodic`).  It formerly built a `Vec` of
+// process names, a per-process `String`, and a `format!` stuck-syscall tag —
+// three heap allocations from interrupt context.  Under SMP=2 heavy load an
+// allocation whose bytes land in a live block header corrupted the heap (the
+// canary panic whose overwrite content decoded to proc-metrics format data).
+// The fix renders names + the stuck tag into fixed stack buffers and iterates
+// the slot table directly, so the path is alloc-free.  This asserts it: the
+// monotonic heap-alloc counter must not advance across a direct `emit_periodic`
+// call (implementation masks interrupts so the timer ISR cannot perturb it).
+fn test_700_proc_metrics_emit_no_alloc() -> bool {
+    test_header!("proc_metrics periodic ISR emit is allocation-free");
+    if crate::proc::proc_metrics::emit_no_alloc_selftest() {
+        test_pass!("proc_metrics emit alloc-free");
+        true
+    } else {
+        test_fail!("proc_metrics/emit",
+                   "emit_periodic allocated from the ISR path (heap-alloc counter advanced)");
         false
     }
 }
