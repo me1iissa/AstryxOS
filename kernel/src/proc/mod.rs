@@ -1410,40 +1410,83 @@ pub fn is_tid_on_stack_any_cpu(tid: Tid) -> bool {
     false
 }
 
-/// On-CPU dispatch interlock: returns `true` if `tid` is still live — currently
-/// dispatched (`PER_CPU_CURRENT_TID`) **or** physically executing on its kernel
-/// stack (`PER_CPU_ONSTACK_TID`) — on any logical CPU OTHER than `self_cpu`.
+/// On-CPU dispatch interlock, classifier form.
 ///
 /// A thread that is still live on another CPU must never be dispatched/resumed
 /// here: it owns a single kernel stack, and running it on two CPUs at once lets
 /// each tear the other's saved `switch_context` frame in place (the SMP
-/// kernel-stack double-dispatch corruption).  This is the realisation, at our
-/// cooperative pick site, of the standard SMP wakeup interlock — a task carries
-/// an "on-CPU" marker held across the context switch, and a remote runqueue must
-/// not re-place the task until that marker clears.  Both signals are published
-/// with `Release` (`set_current_tid` / `set_onstack_tid`); the `Acquire` loads
-/// here pair with them so observing a CPU as no longer running/holding `tid` also
-/// observes that CPU's final stack writes for `tid` as retired.
+/// kernel-stack double-dispatch corruption, #655).  This is the realisation, at
+/// our cooperative pick site, of the standard SMP wakeup interlock — a task
+/// carries an "on-CPU" marker held across the context switch, and a remote
+/// runqueue must not re-place the task until that marker clears.  Both signals
+/// are published with `Release` (`set_current_tid` / `set_onstack_tid`); the
+/// `Acquire` loads here pair with them so observing a CPU as no longer
+/// running/holding `tid` also observes that CPU's final stack writes for `tid`
+/// as retired.  `self_cpu` is excluded so a thread legitimately re-selected on
+/// the very CPU it last ran on (the common no-migration case) is never
+/// spuriously deferred.
 ///
-/// `self_cpu` is excluded so a thread legitimately re-selected on the very CPU
-/// it last ran on (the common no-migration case) is never spuriously deferred.
-pub fn is_tid_live_on_other_cpu(tid: Tid, self_cpu: usize) -> bool {
+/// This enum classifies WHY a thread is live on another CPU.
+/// The interlock DECISION (defer or not) is the same for both live kinds — a
+/// thread live on another CPU must never be dispatched here.  The distinction
+/// exists only so diagnostics can separate the high-volume, expected
+/// steady-state refusal from the rare event the interlock was actually built to
+/// catch:
+///
+///   * [`Current`](Self::Current) — the thread is the CURRENT thread on another
+///     CPU (running there, or that CPU is idle-halting *on the thread's kernel
+///     stack* — no context switch leaves that stack, so `PER_CPU_CURRENT_TID`
+///     legitimately still names it).  Declining to also dispatch it here is
+///     ordinary "don't run one thread on two CPUs" and recurs at up to millions
+///     of refusals per second when one CPU is saturated and a peer repeatedly
+///     probes it for stealable work.  It is NOT the double-dispatch race.
+///
+///   * [`OnStack`](Self::OnStack) — the thread is no longer named current on any
+///     CPU, but a CPU is still physically on its kernel stack through the
+///     `switch_context_asm` epilogue (`PER_CPU_ONSTACK_TID`).  Dispatching it
+///     here would resume it onto the very stack that CPU is still unwinding and
+///     tear its saved switch frame in place.  This is precisely the switch-OUT
+///     double-dispatch window the interlock exists to close.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OtherCpuLiveness {
+    /// Not current and not on-stack on any CPU other than `self_cpu`.
+    None,
+    /// Named current on another CPU (running or idle-on-its-stack there).
+    Current,
+    /// Off-current everywhere, but a CPU is still on its kernel stack.
+    OnStack,
+}
+
+/// Classify why `tid` is live on a CPU other than `self_cpu` (see
+/// [`OtherCpuLiveness`]).  `Current` takes precedence over `OnStack`: a thread
+/// named current somewhere is actively live regardless of any on-stack slot.
+/// `tid == 0` (the idle/bootstrap sentinel) and a uniprocessor (`self_cpu` the
+/// only CPU) both classify as [`OtherCpuLiveness::None`], so SMP=1 is inert.
+/// Each slot is read `Acquire` to pair with the `Release` publish in
+/// `set_current_tid` / `set_onstack_tid`.
+pub fn other_cpu_liveness(tid: Tid, self_cpu: usize) -> OtherCpuLiveness {
     if tid == 0 {
-        return false;
+        return OtherCpuLiveness::None;
     }
     let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
         .min(crate::arch::x86_64::apic::MAX_CPUS);
+    let mut on_stack = false;
     for cpu in 0..ncpus {
         if cpu == self_cpu {
             continue;
         }
-        if PER_CPU_CURRENT_TID[cpu].load(Ordering::Acquire) == tid
-            || PER_CPU_ONSTACK_TID[cpu].load(Ordering::Acquire) == tid
-        {
-            return true;
+        if PER_CPU_CURRENT_TID[cpu].load(Ordering::Acquire) == tid {
+            return OtherCpuLiveness::Current;
+        }
+        if PER_CPU_ONSTACK_TID[cpu].load(Ordering::Acquire) == tid {
+            on_stack = true;
         }
     }
-    false
+    if on_stack {
+        OtherCpuLiveness::OnStack
+    } else {
+        OtherCpuLiveness::None
+    }
 }
 
 /// Read the currently running PID for an arbitrary CPU index.  See
