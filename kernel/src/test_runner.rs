@@ -1593,6 +1593,16 @@ pub fn run() -> ! {
         if test_643_bucket_a_classifier_content_aware() { passed += 1; }
     }
 
+    // W215 write-protect trap — the load-bearing correctness property is that
+    // protecting one direct-map frame splits the covering 2 MiB huge page
+    // without corrupting its neighbours.  Gated on `w215-wptrap` (the module
+    // is compiled only in that profile).
+    #[cfg(feature = "w215-wptrap")]
+    {
+        total += 1;
+        if test_w215_wptrap_split_neighbour_safe() { passed += 1; }
+    }
+
     // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
     // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
     // drivers::serial (the fast-path routing + COM1 fallback).  One test
@@ -57949,6 +57959,65 @@ fn test_640_frame_recycle_zeroing_invariant() -> bool {
     crate::mm::pmm::free_page(clean);
     test_pass!(NAME);
     true
+}
+
+/// W215 write-protect trap — huge-page-split neighbour safety.
+///
+/// The trap makes one page-cache code frame read-only on its higher-half
+/// direct-map alias.  That requires splitting the 2 MiB huge page the frame
+/// lives in into 4 KiB entries.  The load-bearing correctness property — and
+/// the whole reason this diagnostic is safe to run against a live direct map —
+/// is that the split preserves every OTHER sub-page's mapping and writability;
+/// only the single target PTE loses its writable bit.  This test drives the
+/// real `vmm::map_page` protect/restore primitive on a scratch frame and its
+/// neighbour and pins that invariant.
+///
+/// Cite: Intel SDM Vol. 3A §4.6 (R/W access-right bit), §4.10.4 (INVLPG).
+#[cfg(feature = "w215-wptrap")]
+fn test_w215_wptrap_split_neighbour_safe() -> bool {
+    const NAME: &str = "W215 wptrap huge-page-split neighbour safety";
+    test_header!(NAME);
+
+    // A scratch frame we own, plus its neighbour, so the assertions do not
+    // depend on any other tenant of the covering 2 MiB huge page.  Allocate
+    // the neighbour too so nothing else can claim it mid-test.
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!(NAME, "alloc_page returned None"); return false; }
+    };
+    let neigh = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!(NAME, "alloc_page (neighbour) returned None"); crate::mm::pmm::free_page(phys); return false; }
+    };
+
+    // Run the protect / verify-neighbour / restore cycle on `phys`.  Note the
+    // selftest checks `phys`'s own `+4 KiB` neighbour, which is a distinct
+    // frame within the same map; `neigh` above merely keeps the allocator from
+    // handing that region to another test concurrently.
+    let (protected_ro_ok, neighbour_safe, restored_ok) =
+        crate::mm::w215_wptrap::selftest(phys);
+
+    let mut ok = true;
+    if !protected_ro_ok {
+        test_fail!(NAME, "target frame was not present+read-only after protect");
+        ok = false;
+    }
+    if !neighbour_safe {
+        test_fail!(NAME, "neighbour lost its mapping/writability after the huge-page split");
+        ok = false;
+    }
+    if !restored_ok {
+        test_fail!(NAME, "target frame was not restored to present+writable after disarm");
+        ok = false;
+    }
+
+    crate::mm::pmm::free_page(phys);
+    crate::mm::pmm::free_page(neigh);
+
+    if ok {
+        test_pass!(NAME);
+    }
+    ok
 }
 
 /// Test 643 — [FAULT/CACHE-KEY] bucket-A classifier is content/CR2-aware.

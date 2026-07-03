@@ -26,6 +26,12 @@ pub mod file_buf_witness;
 pub mod w215_crc;
 #[cfg(feature = "firefox-test-core")]
 pub mod w215_diag;
+// W215 write-protect page-fault trap: names the in-place clobber writer by
+// trapping the store to a verified cluster code page.  Gated behind its own
+// feature (implies `w215-diag`) so default and plain-diag builds are
+// unaffected.  See `w215_wptrap.rs`.
+#[cfg(feature = "w215-wptrap")]
+pub mod w215_wptrap;
 // PSE 2026-05-20: `[VMA-DUMP]` on fatal user-mode exceptions.  Used by
 // `vma-dump-on-gp` to anchor PIE-ASLR bases at the moment a process is
 // torn down.  See `vma_dump.rs` for line format and emission cap.

@@ -1444,6 +1444,28 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
         }
     }
 
+    // === W215 write-protect trap (w215-wptrap diagnostic) ===
+    //
+    // A supervisor write (U=0, W=1) to a *present* page (P=1) that lands on the
+    // higher-half direct map is a protection violation.  If the target frame is
+    // one this diagnostic write-protected — a verified cluster code page — the
+    // interrupted instruction is the in-place W215 clobber writer.  The
+    // faulting linear address IS the direct-map alias, so the physical frame is
+    // simply `CR2 - PHYS_OFF` (no page walk).  Freeze here for a GDB autopsy.
+    // Checked before the demand-paging path so we do not treat the WP fault as
+    // a recoverable demand fault.  Per Intel SDM Vol. 3A §4.6 (R/W bit).
+    #[cfg(feature = "w215-wptrap")]
+    {
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+        if is_present && is_write && !_is_user && faulting_addr >= PHYS_OFF {
+            let phys = (faulting_addr - PHYS_OFF) & !0xFFFu64;
+            if crate::mm::w215_wptrap::is_protected(phys) {
+                // Does not return — bugchecks to freeze the machine.
+                crate::mm::w215_wptrap::report_and_freeze(phys, faulting_addr, frame);
+            }
+        }
+    }
+
     // Lockless PID lookup: the page-fault handler runs in interrupt context
     // (IF=0 on entry via the interrupt gate).  A kernel-mode #PF can fire
     // while a syscall on the same CPU already holds THREAD_TABLE — taking
@@ -2715,6 +2737,19 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 #[cfg(feature = "w215-diag")]
                 if is_shared && is_writable_vma {
                     crate::mm::w215_crc::mark_writable_shared(phys);
+                }
+
+                // W215 write-protect trap: arm a read-only trap on this frame's
+                // higher-half direct-map alias so the next in-place kernel write
+                // to it is caught red-handed.  Only for read-only (code) cluster
+                // pages — a legitimately-writable MAP_SHARED page mutates in
+                // place by contract (POSIX mmap(2)) and must never be armed.
+                // Reaching here means `insert_with_expected` verified the frame
+                // content against the source bytes, so we protect a known-good
+                // page.  `arm` itself filters to the cluster phys window.
+                #[cfg(feature = "w215-wptrap")]
+                if !is_writable_vma {
+                    crate::mm::w215_wptrap::arm(phys, inode, foff);
                 }
 
                 // W215 diagnostic Arm-2: my own pre-insert witness is now

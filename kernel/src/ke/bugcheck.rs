@@ -100,6 +100,17 @@ pub const BUGCHECK_W215_INSERT_WRONG_CONTENT: u32 = 0xDEAD_0008;
 /// (P3/P4 give the at-failure occupancy without re-locking the allocator).
 /// See the Rust `core::alloc::{GlobalAlloc, Layout}` allocation-error contract.
 pub const BUGCHECK_HEAP_EXHAUSTED: u32 = 0xDEAD_0009;
+/// AstryxOS (W215 write-protect trap, `w215-wptrap` diagnostic): a supervisor
+/// write faulted on a verified page-cache code frame that this diagnostic had
+/// made read-only on its higher-half direct-map alias.  A verified code page
+/// has no legitimate kernel writer for the rest of its cache residency, so the
+/// interrupted instruction is the in-place W215 clobber writer.  The machine is
+/// frozen here so the store can be autopsied under GDB.  P1 = writer RIP,
+/// P2 = CR2 (faulting direct-map alias), P3 = protected phys, P4 = refcount at
+/// fault.  Per Intel SDM Vol. 3A §4.6 (R/W access-right violation).  Gated on
+/// `w215-wptrap` so non-diagnostic builds remain byte-identical.
+#[cfg(feature = "w215-wptrap")]
+pub const BUGCHECK_W215_WP_TRAP: u32 = 0xDEAD_000A;
 
 /// Human-readable bug-check name, returned as a `&'static str` from a
 /// match against rodata literals.  This MUST NOT allocate — the
@@ -119,6 +130,8 @@ pub fn bugcheck_name(code: u32) -> &'static str {
         BUGCHECK_KERNEL_GPF          => "KERNEL_GPF",
         BUGCHECK_W215_INSERT_WRONG_CONTENT => "W215_INSERT_WRONG_CONTENT",
         BUGCHECK_HEAP_EXHAUSTED      => "HEAP_EXHAUSTED",
+        #[cfg(feature = "w215-wptrap")]
+        BUGCHECK_W215_WP_TRAP        => "W215_WP_TRAP",
         _                            => "UNKNOWN_BUGCHECK",
     }
 }

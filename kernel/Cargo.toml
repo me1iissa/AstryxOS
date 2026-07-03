@@ -339,6 +339,15 @@ native-core-tests = []
 # preserving on-demand investigative access.  Implies `firefox-test`
 # because the diagnostic shares the firefox-test cache instrumentation.
 w215-diag = ["firefox-test"]
+# W215 write-protect #PF trap.  Arms a read-only mapping on the higher-half
+# direct-map alias of a verified cluster code page at cache insert; the next
+# supervisor write to it raises a protection-violation #PF that the page-fault
+# handler recognises and freezes on (naming the in-place clobber writer's RIP).
+# Implies `w215-diag` (shares the cluster-key / phys-window definitions and the
+# firefox-test cache instrumentation).  Diagnostic-only; default and plain
+# `w215-diag` builds are byte-identical (the module and all call sites are
+# gated on this feature).
+w215-wptrap = ["w215-diag"]
 # #582 torn-saved-RFLAGS-slot writer probe.  Arms a DR0 8-byte data-write
 # watch on context-switch victims' saved-RFLAGS slots
 # (`Thread::context.rsp + 0`) and classifies the writer of any store to

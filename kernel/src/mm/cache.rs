@@ -487,6 +487,13 @@ pub fn insert_with_expected(
     }
 
     if let Some(old_phys) = evicted_zero_rc {
+        // W215 write-protect trap: the evicted frame has reached rc==0 and is
+        // about to be recycled.  If this diagnostic had write-protected it,
+        // restore write access first so the recycled frame is not left
+        // read-only for its next tenant.  Runs with no lock held (the cache
+        // lock was released above).
+        #[cfg(feature = "w215-wptrap")]
+        crate::mm::w215_wptrap::disarm(old_phys);
         // Defer PMM release through the quarantine to ensure any stale
         // TLB entry on a sibling CPU is retired before the frame is
         // recycled.  See module-level doc for the quiescent-state
