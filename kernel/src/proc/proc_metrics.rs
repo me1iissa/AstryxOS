@@ -398,26 +398,22 @@ pub fn maybe_emit_periodic(tick: u64) {
     emit_periodic(tick);
 }
 
-/// Emit one `[PROC-METRICS]` block to the serial console.  Skipped if
+/// Emit one `[PROC-METRICS]` block to the serial console.  Skipped per-PID if
 /// `PROCESS_TABLE` is contended — the next interval will retry.
+///
+/// ALLOCATION-FREE by construction.  This runs from the timer ISR (via
+/// [`maybe_emit_periodic`]); a heap allocation here would take the global
+/// allocator lock from interrupt context, and any allocation whose bytes land
+/// in a live block header corrupts the heap.  Names and the stuck-syscall tag
+/// are rendered into fixed stack buffers, the slot table is iterated directly
+/// (no `live_pids()` `Vec`), and `serial_println!` formats straight to the UART
+/// — nothing on this path calls the allocator.
 fn emit_periodic(tick: u64) {
-    use alloc::format;
-    // Resolve process names without blocking; if PROCESS_TABLE is held by
-    // a long syscall (mmap/fork), the next 5 s window will re-attempt and
-    // we lose only one sample.  Cosmetic.
-    let names: alloc::vec::Vec<(Pid, alloc::string::String)> =
-        match crate::proc::PROCESS_TABLE.try_lock() {
-            Some(g) => g.iter().map(|p| {
-                let end = p.name.iter().position(|&b| b == 0)
-                    .unwrap_or(p.name.len());
-                let name = alloc::string::String::from_utf8_lossy(
-                    &p.name[..end]).into_owned();
-                (p.pid, name)
-            }).collect(),
-            None => alloc::vec::Vec::new(),
-        };
+    use crate::util::no_alloc_fmt::ArrayWriter;
 
-    for pid in live_pids() {
+    for idx in 0..METRICS_TABLE_SIZE {
+        if !REGISTERED[idx].load(Ordering::Acquire) { continue; }
+        let pid = idx as Pid;
         let Some(s) = snapshot(pid) else { continue };
         // Skip PID 0 (idle) and pids that have no recorded activity at all —
         // they pollute the dump with empty lines.
@@ -426,21 +422,42 @@ fn emit_periodic(tick: u64) {
             && s.disk_w_bytes == 0 && s.net_r_bytes == 0 && s.net_w_bytes == 0
         { continue; }
 
-        let name = names.iter().find(|(p, _)| *p == pid)
-            .map(|(_, n)| n.as_str()).unwrap_or("?");
-
-        // Stuck-syscall tag.  Only meaningful when last_sc_nr is non-negative
-        // (i.e. the process is currently inside the kernel).
-        let stuck = if s.last_sc_nr >= 0 {
-            let delta = tick.saturating_sub(s.last_sc_tick);
-            if delta >= STUCK_TICKS {
-                format!(" STUCK_IN_NR={}@{}t", s.last_sc_nr, delta)
-            } else {
-                format!(" cur_nr={}@{}t", s.last_sc_nr, delta)
+        // Resolve the process name into a fixed stack buffer.  A brief
+        // `try_lock` copies the NUL-terminated name bytes without holding
+        // PROCESS_TABLE across the (slow) serial write and without a heap
+        // String; if the table is contended we emit "?" (cosmetic — the next
+        // 5 s window re-attempts).
+        let mut namebuf = [0u8; 64];
+        let mut nlen = 0usize;
+        if let Some(g) = crate::proc::PROCESS_TABLE.try_lock() {
+            if let Some(p) = g.iter().find(|p| p.pid == pid) {
+                let end = p.name.iter().position(|&b| b == 0)
+                    .unwrap_or(p.name.len())
+                    .min(namebuf.len());
+                namebuf[..end].copy_from_slice(&p.name[..end]);
+                nlen = end;
             }
+        }
+        let name = if nlen > 0 {
+            core::str::from_utf8(&namebuf[..nlen]).unwrap_or("?")
         } else {
-            alloc::string::String::new()
+            "?"
         };
+
+        // Stuck-syscall tag rendered into a fixed stack buffer (no `format!`).
+        // Only meaningful when last_sc_nr is non-negative (process currently
+        // inside the kernel); `last_sc_nr >= 0` makes the `as u64` cast exact.
+        let mut tagbuf = [0u8; 48];
+        let mut tagw = ArrayWriter::new(&mut tagbuf);
+        if s.last_sc_nr >= 0 {
+            let delta = tick.saturating_sub(s.last_sc_tick);
+            tagw.push_str(if delta >= STUCK_TICKS { " STUCK_IN_NR=" } else { " cur_nr=" });
+            tagw.push_dec_u64(s.last_sc_nr as u64);
+            tagw.push_byte(b'@');
+            tagw.push_dec_u64(delta);
+            tagw.push_byte(b't');
+        }
+        let stuck = core::str::from_utf8(tagw.as_bytes()).unwrap_or("");
 
         crate::serial_println!(
             "[PROC-METRICS] tick={} pid={} name={} sc={} (vm={} file={} net={} sync={} proc={} sig={} other={}) pf={} disk=R{}/W{} rreq={} net=R{}/W{}{}",
@@ -501,4 +518,45 @@ pub fn run_self_test() -> bool {
     let ok4 = snapshot(METRICS_TABLE_SIZE as Pid + 100).is_none();
 
     ok && ok2 && ok3 && ok4
+}
+
+/// Test-only: assert the periodic ISR emit path allocates ZERO heap blocks.
+///
+/// `emit_periodic` runs from the timer ISR (via [`maybe_emit_periodic`]).  A
+/// heap allocation there takes the global allocator lock from interrupt context
+/// and — observed under SMP=2 heavy load — corrupted a live block header (the
+/// former `format!`/`String`/`Vec` emit path).  This registers a PID with
+/// activity and a stuck-syscall tag (the exact `STUCK_IN_NR=` render that used
+/// to `format!`), then measures the monotonic heap-alloc counter across a direct
+/// `emit_periodic` call with interrupts masked (so the timer ISR cannot fire on
+/// this core and perturb the count; the AP idles without allocating).  Returns
+/// `true` iff the counter did not advance — i.e. the emit path is alloc-free.
+#[cfg(feature = "test-mode")]
+pub fn emit_no_alloc_selftest() -> bool {
+    let pid: Pid = 201;
+    register(pid);
+    bump_page_fault(pid);        // activity so the pid isn't skipped
+    enter_syscall(pid, 202, 5);  // last_sc_nr=202, last_sc_tick=5
+
+    let prior_flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq", "pop {f}", "cli",
+            f = out(reg) prior_flags,
+            options(nomem, preserves_flags),
+        );
+    }
+
+    let (alloc_before, ..) = crate::perf::heap_alloc_stats();
+    // Large tick so (tick - last_sc_tick) >= STUCK_TICKS → exercises the
+    // STUCK_IN_NR tag render (the former `format!` path).
+    emit_periodic(5 + STUCK_TICKS + 10);
+    let (alloc_after, ..) = crate::perf::heap_alloc_stats();
+
+    if prior_flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+    }
+
+    unregister(pid);
+    alloc_after == alloc_before
 }
