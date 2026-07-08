@@ -102,17 +102,38 @@ pub fn note_switch_completed() {
     crate::proc::set_onstack_tid(crate::proc::current_tid());
 }
 
-/// On-CPU dispatch-interlock counter: number of times a candidate was DEFERRED
-/// from dispatch/work-steal because it was still live (current or on-stack) on
-/// another CPU.  A non-zero value proves the #655 double-dispatch race was
-/// occurring and is now being caught.  Read via [`double_dispatch_defers`].
+/// On-CPU dispatch-interlock counter: number of times a candidate was deferred
+/// from dispatch/work-steal because a CPU was still physically on its kernel
+/// stack through the `switch_context_asm` epilogue — the genuine switch-OUT
+/// double-dispatch window (`OtherCpuLiveness::OnStack`).  A non-zero value proves
+/// the #655 double-dispatch race was occurring and is now being caught.  The
+/// high-volume benign case (the candidate is simply another CPU's *current*
+/// thread) is tallied separately in [`BENIGN_CURRENT_DEFERS`] so it never drowns
+/// this signal.  Read via [`double_dispatch_defers`].
 static DOUBLE_DISPATCH_DEFERS: AtomicU64 = AtomicU64::new(0);
+
+/// Benign on-CPU-interlock refusals: the candidate was the CURRENT thread on
+/// another CPU (running there, or that CPU idle-halting on its stack).  Declining
+/// to also dispatch it is ordinary "don't run one thread on two CPUs" and can
+/// recur at millions of refusals per second when one CPU is saturated (e.g. a
+/// content futex storm) and a peer's `try_steal_to` repeatedly probes it for
+/// stealable work — so this is counted without a per-event serial line.  Kept
+/// separate from [`DOUBLE_DISPATCH_DEFERS`] so the genuine switch-OUT signal is
+/// not buried.  Diagnostic only; does not affect scheduling.
+static BENIGN_CURRENT_DEFERS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the on-CPU dispatch-interlock defer counter (see
 /// [`DOUBLE_DISPATCH_DEFERS`]).
 #[inline]
 pub fn double_dispatch_defers() -> u64 {
     DOUBLE_DISPATCH_DEFERS.load(Ordering::Relaxed)
+}
+
+/// Read the benign steady-state interlock-refusal counter (see
+/// [`BENIGN_CURRENT_DEFERS`]).
+#[inline]
+pub fn benign_current_defers() -> u64 {
+    BENIGN_CURRENT_DEFERS.load(Ordering::Relaxed)
 }
 
 /// The on-CPU dispatch interlock, applied at every dispatch/resume/work-steal
@@ -129,18 +150,33 @@ pub fn double_dispatch_defers() -> u64 {
 /// executions tore its single kernel stack's saved switch frame in place.
 #[inline]
 pub(crate) fn defer_if_live_on_other_cpu(tid: proc::Tid, self_cpu: usize) -> bool {
-    if proc::is_tid_live_on_other_cpu(tid, self_cpu) {
-        let n = DOUBLE_DISPATCH_DEFERS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 16 || n % 4096 == 0 {
-            crate::serial_println!(
-                "[SCHED/INTERLOCK] deferred dispatch of tid={} on cpu={} \
-                 (still live on another CPU) total_defers={}",
-                tid, self_cpu, n,
-            );
+    match proc::other_cpu_liveness(tid, self_cpu) {
+        // Not live elsewhere — dispatch is safe.
+        proc::OtherCpuLiveness::None => false,
+        // Benign steady-state refusal: `tid` is another CPU's current thread.
+        // Correct to defer, but expected and extremely high-volume (a saturated
+        // peer probed for work), so tally it separately and do NOT emit a serial
+        // line — otherwise this drowns the genuine switch-OUT signal below (a
+        // single wedged workload once emitted ~15M of these lines).
+        proc::OtherCpuLiveness::Current => {
+            BENIGN_CURRENT_DEFERS.fetch_add(1, Ordering::Relaxed);
+            true
         }
-        true
-    } else {
-        false
+        // The genuine #655 double-dispatch window: `tid` is off-current
+        // everywhere but a CPU is still on its kernel stack through the switch
+        // epilogue.  This is the event the interlock exists to catch — count and
+        // (rate-limited) log it so the signal stays visible.
+        proc::OtherCpuLiveness::OnStack => {
+            let n = DOUBLE_DISPATCH_DEFERS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 16 || n % 4096 == 0 {
+                crate::serial_println!(
+                    "[SCHED/INTERLOCK] deferred dispatch of tid={} on cpu={} \
+                     (on-stack mid-switch on another CPU) total_defers={}",
+                    tid, self_cpu, n,
+                );
+            }
+            true
+        }
     }
 }
 

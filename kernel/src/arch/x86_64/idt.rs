@@ -1558,6 +1558,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             let old_phys = pte & 0x000F_FFFF_FFFF_F000;
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            // Release PROCESS_TABLE before the cross-CPU shootdown.  The
+            // shootdown IPI needs every target CPU to run its handler to ACK,
+            // but any peer CPU that is itself in `handle_page_fault` spins on
+            // PROCESS_TABLE with interrupts disabled (#PF is an interrupt
+            // gate).  While we hold this lock that target can never take the
+            // IPI, so we spin the full 10M-iter ACK bound — a lock-vs-IPI
+            // cross-CPU deadlock that stalls every concurrent fault and shows
+            // up as the residual `[TLB/TIMEOUT]` stream on SMP.  The PTE write
+            // above is already published and nothing below reads the process
+            // table; the shootdown takes only the Copy `cr3`/`page_addr` — so
+            // drop the lock first, exactly as the file-backed demand path below
+            // already does before its VFS work.  (Intel SDM Vol. 3A §10.6.1:
+            // IPI delivery to a CPU that cannot service it is the sender's
+            // responsibility; here we remove the reason it cannot service.)
+            drop(procs);
             crate::mm::tlb::shootdown_page(cr3, page_addr);
             // NOTE: this does not set the PTE dirty bit nor mark the backing
             // page-cache frame dirty.  Inert today (VFS writeback is not yet
@@ -1627,6 +1642,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                     }
                     // else: unrelated bump — proceed; the CAS guards the install.
                 }
+                // Release PROCESS_TABLE before the CAS-install + cross-CPU
+                // shootdown below (same lock-vs-IPI deadlock as the MAP_SHARED
+                // arm above).  All uses of `vm_space` — including the gen-abort
+                // re-check — are complete; the install is a self-guarding CAS
+                // (`map_page_in_cow_if_unchanged`) and the refcount ops carry
+                // their own locking, so none of this needs the process table.
+                drop(procs);
                 // The private copy (new_phys) takes sole ownership; mark it
                 // before publishing so a concurrent faulter that observes the
                 // installed PTE never sees a 0-refcount frame.
@@ -1676,6 +1698,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             // entry-point for the whole CoW arm.
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            // Release PROCESS_TABLE before the shootdown (lock-vs-IPI deadlock;
+            // see the MAP_SHARED arm above).
+            drop(procs);
             crate::mm::tlb::shootdown_page(cr3, page_addr);
             return true;
         }
@@ -1722,6 +1747,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             // first ifetch.
             let new_pte = pte & !crate::mm::vmm::PAGE_NO_EXECUTE;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            // Release PROCESS_TABLE before the shootdown (lock-vs-IPI deadlock;
+            // see the MAP_SHARED arm above).  `vma` is not read past its
+            // PROT_EXEC test in the guard, so the borrow is already released.
+            drop(procs);
             crate::mm::tlb::shootdown_page(cr3, page_addr);
             return true;
         }

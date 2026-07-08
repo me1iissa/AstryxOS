@@ -2102,12 +2102,22 @@ fn op_cpu_state(out: &mut String) {
     // (H2: a monopolising in-kernel path).  `force_total` is the cumulative
     // anti-starvation force-select count.  `gate_skips` (feature `sched-gate-
     // stats`) is the population of Ready threads skipped by each candidate gate.
+    // `benign_current_defers` / `double_dispatch_defers` are the #673 on-CPU
+    // interlock split (see `sched::defer_if_live_on_other_cpu`): the former
+    // counts refusals because a candidate is another CPU's *current* thread
+    // (benign steady-state), the latter the genuine switch-OUT on-stack window.
+    // At an interlock livelock a reader can tell which condition is firing —
+    // a climbing `benign_current` with a flat `double_dispatch` means a peer
+    // CPU is wedged holding the candidate as current (downstream), whereas a
+    // climbing `double_dispatch` is a genuine on-stack-flag-stuck interlock bug.
     let _ = write!(
         out,
-        r#","sched":{{"maintain_passes":{},"ctx_switches":{},"force_total":{}"#,
+        r#","sched":{{"maintain_passes":{},"ctx_switches":{},"force_total":{},"benign_current_defers":{},"double_dispatch_defers":{}"#,
         crate::sched::percpu::maintain_passes(),
         crate::perf::context_switches(),
         crate::sched::starve_force_count(),
+        crate::sched::benign_current_defers(),
+        crate::sched::double_dispatch_defers(),
     );
     #[cfg(feature = "sched-gate-stats")]
     {
