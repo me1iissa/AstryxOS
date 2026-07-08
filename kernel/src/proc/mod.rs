@@ -2179,6 +2179,75 @@ pub fn free_process_memory(pid: Pid) {
     use crate::mm::{refcount, pmm, vmm};
     use crate::mm::vma::VmBacking;
 
+    // ── Cross-CPU CR3 drain wait ────────────────────────────────────────────
+    // `exit_group` force-marks every sibling thread `Dead` up front, but a
+    // sibling can still be physically executing on another CPU with this
+    // address space's CR3 loaded (in user mode, or stalled mid-`#PF`).  Freeing
+    // its page tables out from under it is a use-after-free: its next PTE walk
+    // or its `SYSRETQ` back to user mode lands on freed — possibly reallocated —
+    // frames (Intel SDM Vol. 3A §4.10).  `exit_thread`'s `all_dead` call site
+    // (unlike `exit_group_inner`'s) had no cross-CPU guard, so a sibling exiting
+    // on one CPU could free while another sibling was still on-CPU faulting.
+    // (Widened, not introduced, by PR #703's fault-path `drop(PROCESS_TABLE)`.)
+    //
+    // Wait — synchronously, here, so the free stays unconditional and no
+    // deferral/retry machinery is needed — for the address space to drain off
+    // every OTHER CPU before removing the `VmSpace`.  A `Dead` thread is
+    // unschedulable and drops its CR3 at its next preemption (bounded by one
+    // scheduler quantum), so this resolves quickly.  The wait is read BEFORE the
+    // `vm_space.take()` below so a sibling faulting during the wait still finds
+    // its `VmSpace` (returns `Some`) and resolves the fault normally rather than
+    // taking a spurious SIGSEGV.  It runs in the IF=1 exit context with NO lock
+    // held: the not-yet-`Dead` caller (both call sites mark the caller `Dead`
+    // only just before `schedule()`, after this returns) is preemptible and
+    // resumes the wait after any preemption, and each sibling drains via its own
+    // CPU's timer, independent of this one.  `CR3_DRAIN_SPIN_BOUND` is a safety
+    // valve against a sibling that legitimately holds the CR3 for a long
+    // kernel excursion (this kernel does not preempt Ring 0, so a `Dead`
+    // sibling finishing a slow I/O-backed `#PF` keeps its CR3 until it reaches
+    // its own reschedule point) or is pathologically wedged — on expiry we log
+    // and proceed to free, no worse than the pre-fix unconditional free.  The
+    // bound is deliberately large (its wall-clock cost is on the order of
+    // seconds of `PAUSE`, not milliseconds) so it never fires for a legitimate
+    // in-flight fault.
+    //
+    // Only wait when this process actually OWNS the address space it is about
+    // to free.  A `CLONE_VM`/vfork child that shares the parent's CR3 records
+    // that CR3 in `proc.cr3` but has `vm_space == None` (nothing to free); its
+    // CR3 is legitimately live on other CPUs for as long as the *parent* has
+    // running threads, so waiting on it would spin to the full bound on a
+    // routine (posix_spawn / failed-exec `_exit`) exit for no benefit.  Gate on
+    // `vm_space.is_some()`, and also exclude the kernel CR3 (a kernel-only
+    // process records it; it is loaded everywhere and, again, has nothing to
+    // free).
+    const CR3_DRAIN_SPIN_BOUND: u64 = 100_000_000;
+    let (drain_cr3, owns_vm_space) = {
+        let procs = PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => (p.cr3, p.vm_space.is_some()),
+            None => (0, false),
+        }
+    };
+    if owns_vm_space
+        && drain_cr3 != 0
+        && drain_cr3 != crate::mm::vmm::get_kernel_cr3()
+    {
+        let mut spins: u64 = 0;
+        while crate::mm::tlb::cr3_active_on_other_cpu(drain_cr3)
+            && spins < CR3_DRAIN_SPIN_BOUND
+        {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        if spins >= CR3_DRAIN_SPIN_BOUND {
+            crate::serial_println!(
+                "[PROC] WARN free_process_memory(pid={}) proceeding with CR3 {:#x} \
+                 still active on another CPU after {} spins (wedged sibling?)",
+                pid, drain_cr3, spins,
+            );
+        }
+    }
+
     // Take the VmSpace out of the Process.  Setting cr3=0 prevents the scheduler
     // from accidentally switching to the freed PML4.
     let vm_space = {
