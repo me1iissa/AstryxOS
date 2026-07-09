@@ -2519,6 +2519,17 @@ pub fn run() -> ! {
         if test_227_sigreturn_frame_base_ptr_validation() { passed += 1; }
     }
 
+    // ── Test 249: SignalFrame preserves the caller-saved argument registers ─
+    // Regression guard for the x86-64 signal-return ABI fix: a returning
+    // handler must restore rdi/rsi/rdx/r8/r9/r10 (psABI §3.2.3), so the
+    // SignalFrame must carry them and sys_sigreturn must write them to the
+    // exact syscall_entry frame slots the SYSRETQ epilogue pops.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_249_signalframe_caller_saved_roundtrip() { passed += 1; }
+    }
+
     // ── Test 228: auto-reap doubly-orphaned zombie children on parent exit ─
     // Verifies that exit_group_inner sweeps any Zombie child of the dying
     // process from PROCESS_TABLE in-line (rather than leaving it to leak
@@ -9155,11 +9166,11 @@ fn test_signal_subsystem() -> bool {
     // 5. Signal frame size sanity
     test_println!("  Testing SignalFrame layout...");
     let frame_size = core::mem::size_of::<crate::signal::SignalFrame>();
-    if frame_size != 112 {
-        test_fail!("Signal subsystem", "SignalFrame size = {} (expected 112)", frame_size);
+    if frame_size != 160 {
+        test_fail!("Signal subsystem", "SignalFrame size = {} (expected 160)", frame_size);
         return false;
     }
-    test_println!("  SignalFrame size = {} bytes (14 × 8) ✓", frame_size);
+    test_println!("  SignalFrame size = {} bytes (20 × 8) ✓", frame_size);
 
     // 6. Trampoline virtual address constant
     if crate::signal::TRAMPOLINE_VADDR != 0x0000_7FFF_FFFF_F000 {
@@ -22720,13 +22731,13 @@ fn test_sigsegv_handler() -> bool {
         }
     }
 
-    // 3. SignalFrame size is 112 bytes (static assert in signal.rs already
+    // 3. SignalFrame size is 160 bytes (static assert in signal.rs already
     //    catches this at compile time, but let's print it for the log)
     {
         let sz = core::mem::size_of::<crate::signal::SignalFrame>();
-        test_println!("  SignalFrame size = {} bytes (expected 112) {}", sz,
-            if sz == 112 { "✓" } else { "FAIL" });
-        if sz != 112 { ok = false; }
+        test_println!("  SignalFrame size = {} bytes (expected 160) {}", sz,
+            if sz == 160 { "✓" } else { "FAIL" });
+        if sz != 160 { ok = false; }
     }
 
     // 4. TRAMPOLINE_VADDR is accessible (non-zero constant)
@@ -46854,6 +46865,85 @@ fn test_227_sigreturn_frame_base_ptr_validation() -> bool {
         return false;
     }
     test_pass!("validate_user_ptr rejects kernel-VA frame_base for SignalFrame size");
+    true
+}
+
+/// Test 249 — SignalFrame carries and round-trips the caller-saved argument
+/// registers (rdi/rsi/rdx/r8/r9/r10).
+///
+/// A signal is asynchronous: it can interrupt user code at any instruction,
+/// where the caller-saved argument registers may hold live values (a `this`
+/// pointer, a memcpy dest/src/count).  The x86-64 System V psABI §3.2.3
+/// signal-return contract requires the FULL interrupted register set be
+/// restored on handler return — unlike a *syscall* boundary, where the ABI
+/// permits clobbering these six.  Before the fix, `struct SignalFrame`
+/// structurally lacked these fields, so a returning handler resumed with
+/// garbage in them → deref-garbage SIGSEGV or a store through a stale
+/// destination pointer (silent cross-allocator memory corruption).
+///
+/// This guards the two invariants the fix depends on:
+///   1. SignalFrame is 160 bytes and each of the six fields is independently
+///      addressable (a reorder/removal that aliased two slots would fail the
+///      round-trip).
+///   2. `restorer` remains at offset 0 — the handler's `ret` pops it, and
+///      `sys_sigreturn` locates the frame at `user_rsp - 8`.
+///
+/// Cite: x86-64 System V psABI §3.2.3 (signal frames); sigreturn(2).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_249_signalframe_caller_saved_roundtrip() -> bool {
+    test_header!("SignalFrame preserves caller-saved arg regs (rdi/rsi/rdx/r8/r9/r10)");
+    use crate::signal::SignalFrame;
+
+    // Invariant 1a: size is exactly 20 × 8 = 160 bytes.
+    let sz = core::mem::size_of::<SignalFrame>();
+    if sz != 160 {
+        test_fail!("SignalFrame caller-saved", "size = {} (expected 160)", sz);
+        return false;
+    }
+
+    // Invariant 1b: each of the six caller-saved fields is independently
+    // addressable — write a unique sentinel to each, then read all back.  A
+    // struct-field reorder that overlapped two slots (or a lost field) would
+    // read back a wrong / aliased value.
+    let mut f: SignalFrame = unsafe { core::mem::zeroed() };
+    f.saved_rdi = 0x1111_1111_1111_1111;
+    f.saved_rsi = 0x2222_2222_2222_2222;
+    f.saved_rdx = 0x3333_3333_3333_3333;
+    f.saved_r8  = 0x4444_4444_4444_4444;
+    f.saved_r9  = 0x5555_5555_5555_5555;
+    f.saved_r10 = 0x6666_6666_6666_6666;
+    // Neighbouring fields must be untouched by the six writes above.
+    f.saved_rax = 0x7777_7777_7777_7777;
+    f._pad      = 0x8888_8888_8888_8888;
+
+    let ok = f.saved_rdi == 0x1111_1111_1111_1111
+        &&  f.saved_rsi == 0x2222_2222_2222_2222
+        &&  f.saved_rdx == 0x3333_3333_3333_3333
+        &&  f.saved_r8  == 0x4444_4444_4444_4444
+        &&  f.saved_r9  == 0x5555_5555_5555_5555
+        &&  f.saved_r10 == 0x6666_6666_6666_6666
+        &&  f.saved_rax == 0x7777_7777_7777_7777
+        &&  f._pad      == 0x8888_8888_8888_8888;
+    if !ok {
+        test_fail!("SignalFrame caller-saved", "field round-trip aliased/lost a slot");
+        return false;
+    }
+
+    // Invariant 2: `restorer` is the first field (offset 0).  sys_sigreturn
+    // and the handler-return `ret` both depend on this.
+    let base = &f as *const SignalFrame as usize;
+    let restorer_addr = &f.restorer as *const u64 as usize;
+    if restorer_addr != base {
+        test_fail!("SignalFrame caller-saved",
+            "restorer not at offset 0 (off={})", restorer_addr - base);
+        return false;
+    }
+
+    // Structural note (checked by construction, documented here): sys_sigreturn
+    // writes the six regs to ksp-{80,88,96,104,112,120}, contiguous with the
+    // existing ksp-{8..72} callee-saved slots — 15 slots (8..120 step 8) that
+    // exactly match syscall_entry's 15 register pushes.
+    test_pass!("SignalFrame carries + round-trips all six caller-saved arg regs");
     true
 }
 
