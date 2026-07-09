@@ -4900,7 +4900,8 @@ pub(crate) fn sys_sigreturn() -> i64 {
     let frame_ptr = frame_base as *const crate::signal::SignalFrame;
 
     let (sig_num, saved_mask, saved_rsp, saved_r15, saved_r14, saved_r13,
-         saved_r12, saved_rbx, saved_rbp, saved_r11, saved_rcx, saved_rax);
+         saved_r12, saved_rbx, saved_rbp, saved_r11, saved_rcx, saved_rax,
+         saved_rdi, saved_rsi, saved_rdx, saved_r8, saved_r9, saved_r10);
     // SMAP bracket — frame_base has already been range-validated by
     // validate_user_ptr above so the UserGuard is safe to lift AC.
     unsafe {
@@ -4917,6 +4918,15 @@ pub(crate) fn sys_sigreturn() -> i64 {
         saved_r11 = (*frame_ptr).saved_r11;
         saved_rcx = (*frame_ptr).saved_rcx;
         saved_rax = (*frame_ptr).saved_rax;
+        // Caller-saved args — restored to the syscall_entry frame below so
+        // the SYSRETQ epilogue reinstates the FULL interrupted register set
+        // (x86-64 System V psABI §3.2.3 signal-return contract).
+        saved_rdi = (*frame_ptr).saved_rdi;
+        saved_rsi = (*frame_ptr).saved_rsi;
+        saved_rdx = (*frame_ptr).saved_rdx;
+        saved_r8  = (*frame_ptr).saved_r8;
+        saved_r9  = (*frame_ptr).saved_r9;
+        saved_r10 = (*frame_ptr).saved_r10;
     }
 
     crate::serial_println!(
@@ -4938,17 +4948,23 @@ pub(crate) fn sys_sigreturn() -> i64 {
     }
 
     // Write the original registers back onto the kernel stack frame.
-    // The kernel stack frame layout (from syscall_entry) relative to
-    // the per-CPU kernel_rsp:
-    //   ksp - 8  = user RSP
-    //   ksp - 16 = RCX (user RIP)
-    //   ksp - 24 = R11 (user RFLAGS)
-    //   ksp - 32 = RBP
-    //   ksp - 40 = RBX
-    //   ksp - 48 = R12
-    //   ksp - 56 = R13
-    //   ksp - 64 = R14
-    //   ksp - 72 = R15
+    // The kernel stack frame layout (from syscall_entry's 15 pushes)
+    // relative to the per-CPU kernel_rsp:
+    //   ksp -   8 = user RSP
+    //   ksp -  16 = RCX (user RIP)
+    //   ksp -  24 = R11 (user RFLAGS)
+    //   ksp -  32 = RBP
+    //   ksp -  40 = RBX
+    //   ksp -  48 = R12
+    //   ksp -  56 = R13
+    //   ksp -  64 = R14
+    //   ksp -  72 = R15
+    //   ksp -  80 = R10   ┐ caller-saved argument registers — restored so
+    //   ksp -  88 = R9    │ the SYSRETQ epilogue reinstates the FULL
+    //   ksp -  96 = R8    │ interrupted register set (psABI §3.2.3).  These
+    //   ksp - 104 = RDX   │ slots are the last six syscall_entry pushes
+    //   ksp - 112 = RSI   │ (rdi lowest); the epilogue pops them in Step 4b.
+    //   ksp - 120 = RDI   ┘
     let ksp = unsafe { PER_CPU_SYSCALL[cpu_index()].kernel_rsp };
     // Sanitise RFLAGS before restoring it as the user's EFLAGS via SYSRETQ.
     // The signal frame is user-controlled memory; a crafted handler can
@@ -4975,6 +4991,13 @@ pub(crate) fn sys_sigreturn() -> i64 {
         *((ksp - 56) as *mut u64) = saved_r13;
         *((ksp - 64) as *mut u64) = saved_r14;
         *((ksp - 72) as *mut u64) = saved_r15;
+        // Caller-saved argument registers (see layout comment above).
+        *((ksp -  80) as *mut u64) = saved_r10;
+        *((ksp -  88) as *mut u64) = saved_r9;
+        *((ksp -  96) as *mut u64) = saved_r8;
+        *((ksp - 104) as *mut u64) = saved_rdx;
+        *((ksp - 112) as *mut u64) = saved_rsi;
+        *((ksp - 120) as *mut u64) = saved_rdi;
     }
 
     // Return original RAX — dispatch() returns this, the asm puts it
