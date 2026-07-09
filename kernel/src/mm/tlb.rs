@@ -452,6 +452,15 @@ pub fn cr3_active_on_other_cpu(cr3: u64) -> bool {
     (snapshot_active_mask(cr3) & !self_mask) != 0
 }
 
+/// Public snapshot of the per-CPU active-CPU bitmask for `cr3` (bit `n` set ⇒
+/// CPU `n` is bookkept as currently running on `cr3`).  Returns 0 for an
+/// untracked `cr3`.  Intended for diagnostics that need to name *which* CPUs a
+/// teardown is waiting on — e.g. the `free_process_memory` CR3-drain warning —
+/// rather than just the boolean any-other-CPU predicate above.
+pub fn active_cpu_mask(cr3: u64) -> u64 {
+    snapshot_active_mask(cr3)
+}
+
 /// Local `invlpg` over `[va_lo, va_hi)`.  Used by both the sender and
 /// the IPI handler.
 #[inline]
