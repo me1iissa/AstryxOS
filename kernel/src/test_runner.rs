@@ -211,6 +211,13 @@ pub fn run() -> ! {
     total += 1;
     if test_smp_online_count_matches_started_flags() { passed += 1; }
 
+    // ── Test R0d: XSAVE/AVX enabled + YMM state survives a context switch ─────
+    // Pure kernel state (no userspace/data.img dependency).  Guards the
+    // XSAVE/AVX enablement: FXSAVE dropped the AVX YMM upper 128 bits across
+    // every context switch; XSAVE/XRSTOR must round-trip the full YMM.
+    total += 1;
+    if test_xsave_avx_ymm_roundtrip() { passed += 1; }
+
     // ── Test 0-heap: Heap free-list validation + canaries — healthy churn ─
     // Runs FIRST (before any test that could itself perturb the heap) so it
     // is a clean no-false-positive assertion for the hardened allocator: the
@@ -34029,6 +34036,73 @@ fn test_pfh_install_arm_anti_alias_backout() -> bool {
 /// When launched under `-smp 2` (the harness default) AP 1 sets its online
 /// flag during boot, so the recomputed count is 2 and the present string is
 /// `"0-1\n"` — exactly the regression this guards against.
+/// XSAVE/AVX enablement: the full 256-bit YMM0 must survive a save/restore
+/// round-trip (FXSAVE preserved only the low 128 bits, corrupting AVX state
+/// across context switches).  Skipped as a vacuous pass on a CPU without AVX,
+/// where the FXSAVE fallback is correct.  Intel SDM Vol. 1 §13.
+fn test_xsave_avx_ymm_roundtrip() -> bool {
+    test_header!("XSAVE/AVX enabled + YMM state round-trips");
+
+    if !crate::arch::x86_64::XSAVE_AVX_ENABLED
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        // No AVX on this CPU (e.g. a TCG run): the FXSAVE path is correct and
+        // there is no YMM upper-half to preserve.  Pass vacuously.
+        crate::serial_println!(
+            "[TEST] XSAVE/AVX not enabled on this CPU — FXSAVE fallback, YMM check skipped");
+        test_pass!("XSAVE/AVX");
+        return true;
+    }
+
+    // 256-bit sentinel, distinct across all four 64-bit lanes so a partial
+    // (XMM-only) save that drops the upper 128 bits is detected.
+    let sentinel: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+    ];
+    let mut readback: [u8; 32] = [0u8; 32];
+    // 64-byte-aligned XSAVE area (FpuState is `#[repr(align(64))]`).
+    let mut area = alloc::boxed::Box::new(crate::proc::FpuState::new_zeroed());
+
+    // Disable interrupts so no real context switch (which also touches YMM0)
+    // interleaves and masks a broken save/restore; run the whole
+    // load→save→clobber→restore→read as one asm block.
+    let rflags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags)); }
+    let if_was_set = rflags & (1 << 9) != 0;
+    crate::hal::disable_interrupts();
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{sent}]",   // ymm0 = sentinel (all 256 bits)
+            "xsave [{area}]",            // save x87|SSE|AVX (eax/edx = mask)
+            "vpxor ymm0, ymm0, ymm0",    // clobber ymm0 = 0
+            "xrstor [{area}]",           // restore ymm0 from the saved area
+            "vmovdqu [{out}], ymm0",     // out = restored ymm0
+            sent = in(reg) sentinel.as_ptr(),
+            area = in(reg) area.data.as_mut_ptr(),
+            out  = in(reg) readback.as_mut_ptr(),
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            out("xmm0") _,
+            options(nostack),
+        );
+    }
+    if if_was_set { crate::hal::enable_interrupts(); }
+
+    if readback != sentinel {
+        test_fail!(
+            "XSAVE/AVX",
+            "YMM0 not preserved across xsave/xrstor: got {:02x?} want {:02x?}",
+            readback, sentinel
+        );
+        return false;
+    }
+    test_pass!("XSAVE/AVX");
+    true
+}
+
 fn test_smp_online_count_matches_started_flags() -> bool {
     test_header!("SMP online-count reflects every onlined AP");
 

@@ -48,6 +48,127 @@ pub fn enable_sse() {
         // Clear EM (bit 2), set MP (bit 1)
         let cr0 = (cr0 & !(1u64 << 2)) | (1u64 << 1);
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+
+        // ── XSAVE + AVX enablement ─────────────────────────────────────────
+        // The legacy FXSAVE/FXRSTOR above save only x87 + SSE (XMM0-15); they
+        // do NOT preserve the upper 128 bits of the AVX YMM registers.  With
+        // AVX advertised (host-passthrough CPUID) but XSAVE/XCR0 left disabled,
+        // a userspace IFUNC resolver that selects an AVX code path on the CPUID
+        // bit alone executes a VEX-encoded instruction and takes #UD.  Enable
+        // OSXSAVE + XCR0(x87|SSE|AVX) so AVX is usable and its state is carried
+        // across context switches by XSAVE/XRSTOR (see `fpu_save`/`fpu_restore`).
+        //
+        // Runs on every CPU (BSP via `init`, each AP via `ap_rust_entry`);
+        // CR4 and XCR0 are per-logical-processor and do not propagate.
+        //
+        // Intel SDM Vol. 1 §13.2-13.3 (XSAVE/XCR0), Vol. 3A §2.6 (OSXSAVE).
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        let have_xsave = leaf1.ecx & (1 << 26) != 0;
+        let have_avx = leaf1.ecx & (1 << 28) != 0;
+        if have_xsave && have_avx {
+            // CR4.OSXSAVE (bit 18): enables XGETBV/XSETBV/XSAVE/XRSTOR and
+            // makes CPUID.1:ECX.OSXSAVE (bit 27) report OS support, so
+            // userspace feature detection selects AVX paths correctly.
+            let cr4b: u64;
+            core::arch::asm!("mov {}, cr4", out(reg) cr4b, options(nomem, nostack));
+            core::arch::asm!(
+                "mov cr4, {}",
+                in(reg) cr4b | (1u64 << 18),
+                options(nostack),
+            );
+            // XSETBV XCR0 = x87 | SSE | AVX.  ECX=0 selects XCR0; the value is
+            // in EDX:EAX.  x87 (bit 0) is mandatory and SSE (bit 1) must be set
+            // whenever AVX (bit 2) is (Intel SDM Vol. 1 §13.3).
+            let xcr0: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") xcr0 as u32,
+                in("edx") (xcr0 >> 32) as u32,
+                options(nomem, nostack, preserves_flags),
+            );
+            // CPUID.(EAX=0DH,ECX=0):EBX = the XSAVE-area size for the state set
+            // now enabled in XCR0.  A per-thread `FpuState` smaller than this
+            // would let XSAVE write past the allocation — fail loudly at boot
+            // rather than corrupt memory later.
+            let d0 = core::arch::x86_64::__cpuid_count(0x0D, 0);
+            assert!(
+                (d0.ebx as usize) <= XSAVE_AREA_SIZE,
+                "XSAVE area {} exceeds FpuState {} (enable AVX-512? resize XSAVE_AREA_SIZE)",
+                d0.ebx, XSAVE_AREA_SIZE,
+            );
+            XSAVE_AVX_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// `true` once XSAVE + AVX have been enabled (CR4.OSXSAVE + XCR0) on the boot
+/// path.  When `false` the FPU context-switch path falls back to FXSAVE/FXRSTOR
+/// (legacy x87+SSE only), e.g. on a CPU that does not advertise XSAVE/AVX.
+pub static XSAVE_AVX_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Size in bytes of the per-thread `FpuState` XSAVE area.  Must be a multiple
+/// of 64 and >= CPUID.(EAX=0DH,ECX=0):EBX for the enabled XCR0 set
+/// (x87|SSE|AVX = 832 bytes); 1 KiB leaves headroom and is asserted against
+/// CPUID at boot.  FXSAVE (the non-AVX fallback) uses only the first 512 bytes.
+/// Intel SDM Vol. 1 §13.4 (XSAVE area layout).
+pub const XSAVE_AREA_SIZE: usize = 1024;
+
+const XCR0_X87: u64 = 1 << 0;
+const XCR0_SSE: u64 = 1 << 1;
+const XCR0_AVX: u64 = 1 << 2;
+
+/// Save the current FPU/SSE/AVX register state into `area` (>= `XSAVE_AREA_SIZE`
+/// bytes, 64-byte aligned).  Uses XSAVE (x87+SSE+AVX) when AVX is enabled,
+/// otherwise FXSAVE (x87+SSE only).
+///
+/// # Safety
+/// `area` must point to a writable, 64-byte-aligned buffer of at least
+/// `XSAVE_AREA_SIZE` bytes.  Intel SDM Vol. 1 §13.7 (XSAVE) / §10.5 (FXSAVE).
+#[inline]
+pub unsafe fn fpu_save(area: *mut u8) {
+    if XSAVE_AVX_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        // EDX:EAX = requested-feature bitmap; all-ones saves every component
+        // enabled in XCR0 (the AND with XCR0 restricts it to x87|SSE|AVX).
+        core::arch::asm!(
+            "xsave [{}]",
+            in(reg) area,
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            options(nostack, preserves_flags),
+        );
+    } else {
+        core::arch::asm!(
+            "fxsave [{}]",
+            in(reg) area,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Restore FPU/SSE/AVX register state saved by [`fpu_save`] from `area`.
+///
+/// # Safety
+/// `area` must point to a readable, 64-byte-aligned XSAVE/FXSAVE image of at
+/// least `XSAVE_AREA_SIZE` bytes produced by [`fpu_save`] (or a zeroed area,
+/// which XRSTOR interprets as the initial state).  Intel SDM Vol. 1 §13.8.
+#[inline]
+pub unsafe fn fpu_restore(area: *const u8) {
+    if XSAVE_AVX_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        core::arch::asm!(
+            "xrstor [{}]",
+            in(reg) area,
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            options(nostack, preserves_flags),
+        );
+    } else {
+        core::arch::asm!(
+            "fxrstor [{}]",
+            in(reg) area,
+            options(nostack, preserves_flags),
+        );
     }
 }
 
