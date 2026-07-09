@@ -2201,15 +2201,21 @@ pub fn free_process_memory(pid: Pid) {
     // held: the not-yet-`Dead` caller (both call sites mark the caller `Dead`
     // only just before `schedule()`, after this returns) is preemptible and
     // resumes the wait after any preemption, and each sibling drains via its own
-    // CPU's timer, independent of this one.  `CR3_DRAIN_SPIN_BOUND` is a safety
-    // valve against a sibling that legitimately holds the CR3 for a long
-    // kernel excursion (this kernel does not preempt Ring 0, so a `Dead`
-    // sibling finishing a slow I/O-backed `#PF` keeps its CR3 until it reaches
-    // its own reschedule point) or is pathologically wedged — on expiry we log
-    // and proceed to free, no worse than the pre-fix unconditional free.  The
-    // bound is deliberately large (its wall-clock cost is on the order of
-    // seconds of `PAUSE`, not milliseconds) so it never fires for a legitimate
-    // in-flight fault.
+    // CPU's timer, independent of this one.  The wait is bounded by wall-clock
+    // TICKS, not a raw spin count: the sibling drains when its CPU takes a timer
+    // tick and reschedules off the now-`Dead` thread (~1-2 ticks), and a
+    // spin-count bound is unreliable — `PAUSE` latency varies by orders of
+    // magnitude across host / KVM / TCG, so a fixed count is either a
+    // multi-second stall or (as observed under KVM) expires before even one
+    // tick, abandoning the wait prematurely and proceeding with the CR3 still
+    // live.  `get_ticks()` is TSC-derived (Intel SDM Vol. 3B §17.17,
+    // constant-rate TSC), so it advances even if this CPU's LAPIC timer is dead
+    // and the loop is guaranteed to terminate.  `CR3_DRAIN_MAX_TICKS` is a
+    // safety valve against a sibling that legitimately holds the CR3 for a long
+    // kernel excursion (this kernel does not preempt Ring 0, so a `Dead` sibling
+    // finishing a slow I/O-backed `#PF` keeps its CR3 until it reaches its own
+    // reschedule point) or is pathologically wedged — on expiry we log and
+    // proceed to free, no worse than the pre-fix unconditional free.
     //
     // Only wait when this process actually OWNS the address space it is about
     // to free.  A `CLONE_VM`/vfork child that shares the parent's CR3 records
@@ -2220,7 +2226,7 @@ pub fn free_process_memory(pid: Pid) {
     // `vm_space.is_some()`, and also exclude the kernel CR3 (a kernel-only
     // process records it; it is loaded everywhere and, again, has nothing to
     // free).
-    const CR3_DRAIN_SPIN_BOUND: u64 = 100_000_000;
+    const CR3_DRAIN_MAX_TICKS: u64 = 30; // ~300 ms at 100 Hz — a few ticks + slow-I/O margin
     let (drain_cr3, owns_vm_space) = {
         let procs = PROCESS_TABLE.lock();
         match procs.iter().find(|p| p.pid == pid) {
@@ -2232,18 +2238,27 @@ pub fn free_process_memory(pid: Pid) {
         && drain_cr3 != 0
         && drain_cr3 != crate::mm::vmm::get_kernel_cr3()
     {
-        let mut spins: u64 = 0;
-        while crate::mm::tlb::cr3_active_on_other_cpu(drain_cr3)
-            && spins < CR3_DRAIN_SPIN_BOUND
-        {
+        let start_tick = crate::arch::x86_64::irq::get_ticks();
+        let mut timed_out = false;
+        let mut i: u32 = 0;
+        while crate::mm::tlb::cr3_active_on_other_cpu(drain_cr3) {
             core::hint::spin_loop();
-            spins += 1;
+            // Sample the (rdtsc-backed) clock only every ~1024 spins so the
+            // inner wait stays a tight `PAUSE` loop.
+            i = i.wrapping_add(1);
+            if i & 0x3FF == 0
+                && crate::arch::x86_64::irq::get_ticks().wrapping_sub(start_tick)
+                    >= CR3_DRAIN_MAX_TICKS
+            {
+                timed_out = true;
+                break;
+            }
         }
-        if spins >= CR3_DRAIN_SPIN_BOUND {
+        if timed_out {
             crate::serial_println!(
                 "[PROC] WARN free_process_memory(pid={}) proceeding with CR3 {:#x} \
-                 still active on another CPU after {} spins (wedged sibling?)",
-                pid, drain_cr3, spins,
+                 still active on another CPU after {} ticks (wedged sibling?)",
+                pid, drain_cr3, CR3_DRAIN_MAX_TICKS,
             );
         }
     }
