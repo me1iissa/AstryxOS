@@ -6180,6 +6180,201 @@ def cmd_regs(args):
     _out({"ok": True, "regs": regs})
 
 
+def cmd_vcpu_cr3(args):
+    """Dump every vCPU's REAL hardware CR3 register via QMP `info registers -a`.
+
+    The GDB general register set does not include control registers, so
+    `dual-regs` cannot answer "which address space is CPU N actually on?".
+    QEMU's HMP `info registers -a` prints per-CPU `CR3=<phys>` — the hardware
+    ground truth.  Used to settle the CR3-drain-WARN A-vs-B question: at the
+    WARN, compare the exiting proc's `drain_cr3` against each *other* vCPU's
+    real CR3.  If some other vCPU's real CR3 == drain_cr3, a sibling genuinely
+    holds it (Hypothesis A); if no vCPU's real CR3 == drain_cr3 while the
+    drain-wait spun, the CR3_ACTIVE_CPUS mask over-counted (Hypothesis B).
+
+    Pure read via the QMP monitor; no guest mutation.
+    """
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock", "")
+    if not qmp_sock:
+        _err("session has no qmp_sock")
+    reply = _hmp(qmp_sock, "info registers -a")
+    txt = reply.get("return", "") if isinstance(reply, dict) else ""
+    if not txt:
+        _err(f"empty info-registers reply: {reply!r}")
+    # Parse `CPU#N` headers and the following `CR3=<hex>` for each.
+    cpus = []
+    cur = None
+    for line in txt.splitlines():
+        m = re.search(r"CPU#(\d+)", line)
+        if m:
+            if cur is not None:
+                cpus.append(cur)
+            cur = {"cpu": int(m.group(1)), "cr3": None,
+                   "rip": None, "cs": None, "ring": None}
+            continue
+        if cur is None:
+            continue
+        mcr3 = re.search(r"CR3=([0-9a-fA-F]+)", line)
+        if mcr3:
+            cur["cr3"] = "0x" + mcr3.group(1).lstrip("0").rjust(1, "0")
+        mrip = re.search(r"RIP=([0-9a-fA-F]+)", line)
+        if mrip:
+            cur["rip"] = "0x" + mrip.group(1)
+        mcs = re.search(r"\bCS =([0-9a-fA-F]+)", line)
+        if mcs:
+            cs = int(mcs.group(1), 16)
+            cur["cs"] = hex(cs)
+            cur["ring"] = cs & 0x3
+    if cur is not None:
+        cpus.append(cur)
+    _out({"ok": True, "n_cpus": len(cpus), "cpus": cpus, "raw": txt})
+
+
+def cmd_cr3_drain_catch(args):
+    """Catch the CR3-drain WARN under GDB and settle Hypothesis A vs B.
+
+    Requires a throwaway diagnostic build whose WARN path calls the
+    `cr3_drain_warn_trap(drain_cr3)` no-op (drain_cr3 → RDI at the symbol).
+    Arms a hardware breakpoint on that symbol, resumes, blocks until hit,
+    then — while ALL vCPUs are frozen atomically — reads:
+      * the caller CPU's RDI  = drain_cr3 (the exiting proc's address space)
+      * every vCPU's GPRs (RIP/CS/ring) via the GDB stub
+      * every vCPU's REAL hardware CR3 via QMP `info registers -a`
+    and computes the verdict: if any OTHER vCPU's real CR3 == drain_cr3 a
+    sibling genuinely holds it (A); if none does while the drain-wait spun,
+    the CR3_ACTIVE_CPUS mask over-counted (B).
+    """
+    import fcntl
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    qmp_sock = sess["qmp_sock"]
+
+    addr = None
+    override = getattr(args, "addr", None)
+    if override:
+        addr = int(override, 0)
+    else:
+        addr, _ = _autopsy_resolve_break_target("cr3_drain_warn_trap")
+        if addr is None:
+            # Local (module-private) Rust symbol — grep the mangled name via nm.
+            import subprocess
+            kbin = sess.get("session_kernel_path") or \
+                "target/x86_64-astryx/release/astryx-kernel"
+            elf = "target/x86_64-astryx/release/astryx-kernel"
+            try:
+                out = subprocess.check_output(["nm", elf], text=True)
+                for ln in out.splitlines():
+                    if "cr3_drain_warn_trap" in ln:
+                        addr = int(ln.split()[0], 16)
+                        break
+            except Exception as e:
+                _err(f"nm resolve failed: {e}")
+    if addr is None:
+        _err("Could not resolve cr3_drain_warn_trap (throwaway diag build?)")
+
+    lock_path = HARNESS_DIR / f"{args.sid}.gdb.lock"
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fd.close()
+        _err(f"GDB stub for sid {args.sid} is busy — retry once the holder exits.")
+
+    timeout_ms = max(1000, int(getattr(args, "timeout_ms", 120000)))
+    deadline = time.time() + timeout_ms / 1000.0
+    _qmp_command(qmp_sock, "stop", connect_timeout=3.0)
+
+    gdb = GdbClient("127.0.0.1", port)
+    result = None
+    try:
+        if not gdb.connect():
+            _qmp_command(qmp_sock, "cont", connect_timeout=3.0)
+            _err(f"Cannot connect to GDB stub on port {port}")
+        if not gdb.set_hbreak(addr):
+            _err(f"Could not arm hw breakpoint at {hex(addr)}")
+
+        _qmp_command(qmp_sock, "cont", connect_timeout=2.0)
+        gdb.cont_no_wait()
+        remaining = deadline - time.time()
+        stop = gdb.wait_for_stop(remaining) if remaining > 0 else None
+        if stop is None:
+            result = {"ok": True, "hit": False, "reason": "timeout waiting for WARN",
+                      "trap_addr": hex(addr)}
+        else:
+            # Frozen. Enumerate every vCPU: GPRs via GDB, CR3 via QMP.
+            cpus = []
+            tids = gdb.list_threads() or [1]
+            caller = None
+            for tid in tids:
+                gdb.select_thread(tid)
+                r = gdb.read_regs()
+                rip = int(r.get("rip", "0x0"), 16)
+                cs = int(r.get("cs", "0x0"), 16)
+                rdi = int(r.get("rdi", "0x0"), 16)
+                sym = _autopsy_resolve_kernel_rip(rip)
+                entry = {"gdb_tid": tid, "rip": hex(rip), "sym": sym,
+                         "cs": hex(cs), "ring": cs & 0x3, "rdi": hex(rdi),
+                         "rsp": r.get("rsp"), "rbp": r.get("rbp")}
+                if rip == addr:
+                    caller = entry
+                cpus.append(entry)
+            # Per-vCPU real CR3 from QMP (VM is frozen → stable).
+            reply = _hmp(qmp_sock, "info registers -a")
+            txt = reply.get("return", "") if isinstance(reply, dict) else ""
+            qmp_cr3 = []
+            cur = None
+            for line in txt.splitlines():
+                m = re.search(r"CPU#(\d+)", line)
+                if m:
+                    if cur is not None:
+                        qmp_cr3.append(cur)
+                    cur = {"cpu": int(m.group(1)), "cr3": None, "rip": None}
+                    continue
+                if cur is None:
+                    continue
+                mc = re.search(r"CR3=([0-9a-fA-F]+)", line)
+                if mc:
+                    cur["cr3"] = "0x" + mc.group(1).lstrip("0").rjust(1, "0")
+                mr = re.search(r"RIP=([0-9a-fA-F]+)", line)
+                if mr:
+                    cur["rip"] = "0x" + mr.group(1)
+            if cur is not None:
+                qmp_cr3.append(cur)
+
+            drain_cr3 = caller["rdi"] if caller else None
+            # Verdict: does any CPU other than the caller hold drain_cr3?
+            verdict = None
+            holder_cpus = []
+            if drain_cr3 is not None:
+                dc = int(drain_cr3, 16)
+                caller_rip = caller["rip"] if caller else None
+                for q in qmp_cr3:
+                    # Identify the caller CPU by matching its RIP to the trap.
+                    is_caller = (q.get("rip") == caller_rip)
+                    if q.get("cr3") and int(q["cr3"], 16) == dc and not is_caller:
+                        holder_cpus.append(q["cpu"])
+                verdict = "A (genuine sibling holds drain_cr3)" if holder_cpus \
+                    else "B (mask over-count: NO CPU holds drain_cr3)"
+            result = {"ok": True, "hit": True, "trap_addr": hex(addr),
+                      "drain_cr3": drain_cr3, "verdict": verdict,
+                      "holder_cpus": holder_cpus,
+                      "caller": caller, "cpus": cpus, "qmp_cr3": qmp_cr3,
+                      "qmp_raw": txt}
+    finally:
+        try:
+            gdb.del_bp(addr)
+        except Exception:
+            pass
+        gdb.close()
+        _qmp_command(qmp_sock, "cont", connect_timeout=3.0)  # keep boot alive
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_fd.close()
+    _out(result)
+
+
 def cmd_dual_regs(args):
     """Enumerate every QEMU vCPU thread, read RIP/CS/RSP/RBP for each, and
     symbolize the kernel-space RIP.
@@ -13356,6 +13551,21 @@ def main():
         help="[Tier2] Read RIP/CS/RSP/RBP for every vCPU and symbolize the kernel RIP")
     p_dual_regs.add_argument("sid")
 
+    # vcpu-cr3 — read every vCPU's REAL hardware CR3 via QMP info-registers
+    p_vcpu_cr3 = sub.add_parser(
+        "vcpu-cr3",
+        help="[Tier2] Dump every vCPU's real hardware CR3 (QMP info registers -a)")
+    p_vcpu_cr3.add_argument("sid")
+
+    # cr3-drain-catch — catch the CR3-drain WARN and settle A vs B
+    p_cr3_catch = sub.add_parser(
+        "cr3-drain-catch",
+        help="[Tier2] Catch cr3_drain_warn_trap; read drain_cr3 + per-vCPU real CR3; verdict A/B")
+    p_cr3_catch.add_argument("sid")
+    p_cr3_catch.add_argument("--timeout-ms", type=int, default=120000)
+    p_cr3_catch.add_argument("--addr", default=None,
+                             help="Override trap address (hex) if symbol lookup fails")
+
     # mem
     p_mem = sub.add_parser("mem", help="[Tier2] Read guest memory via GDB stub")
     p_mem.add_argument("sid")
@@ -14356,6 +14566,8 @@ def main():
         # Tier 2
         "regs":   cmd_regs,
         "dual-regs": cmd_dual_regs,
+        "vcpu-cr3": cmd_vcpu_cr3,
+        "cr3-drain-catch": cmd_cr3_drain_catch,
         "mem":    cmd_mem,
         "sym":    cmd_sym,
         "bp":     cmd_bp,
