@@ -148,7 +148,7 @@ const _SIGNAL_FRAME_SIZE_CHECK: () = {
 /// non-user, or read-only.  Returning `true` is a single-point-in-time
 /// snapshot; once SMAP is lifted (`stac`) and the writes begin, another
 /// CPU can still flip the PTE (e.g. mprotect, ptrace, ksm).  That race
-/// is small (the entire frame is ≤ 664 bytes / one page touched) and
+/// is small (the entire frame is ≤ 712 bytes / one page touched) and
 /// the worst case is the same kernel-mode #PF this function was added
 /// to prevent — so the caller MUST still treat a faulting store as
 /// fatal-to-the-process (not fatal-to-the-kernel).  Achieving the
@@ -196,7 +196,7 @@ pub(crate) fn is_user_writable_range(cr3: u64, base: u64, len: u64) -> bool {
     use crate::mm::vmm::{lookup_pte_in, virt_to_phys_in,
                           PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
     // Iterate every page covered by [base, base+len).  Loop bound is
-    // ceil((base & 0xfff) + len, 4096) — at most 2 pages for the 664-
+    // ceil((base & 0xfff) + len, 4096) — at most 2 pages for the 712-
     // byte SA_SIGINFO frame, but we keep the loop general so the same
     // helper can be reused (e.g. by sigaltstack-aware paths later).
     let end = match base.checked_add(len) {
@@ -873,7 +873,7 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             // The syscall-entry path runs with AC=0, so this bracket is
             // required for every store via `sig_frame_ptr` / `ucontext_ptr`
             // / `siginfo_ptr` below.  Pointer math is bounded by `total`
-            // (≤ 664) starting at the user-supplied `saved_rsp`.
+            // (≤ 712) starting at the user-supplied `saved_rsp`.
             let _smap_g = unsafe { UserGuard::new() };
             unsafe {
                 (*sig_frame_ptr).restorer   = restorer_addr;
@@ -1107,9 +1107,9 @@ pub unsafe fn deliver_fault_signal_from_isr(
     // (int signo, siginfo_t *info, ucontext_t *uctx) in (RDI, RSI, RDX).
     let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 160
     let total = if want_siginfo {
-        sigframe_size + UCONTEXT_SIZE + 128u64  // 112 + 424 + 128 = 664
+        sigframe_size + UCONTEXT_SIZE + 128u64  // 160 + 424 + 128 = 712
     } else {
-        sigframe_size + 128u64                  // 112 + 128 = 240 (legacy)
+        sigframe_size + 128u64                  // 160 + 128 = 288 (legacy)
     };
 
     // 16-align the allocation base, then subtract 8 for "just-called" ABI.
@@ -1136,7 +1136,7 @@ pub unsafe fn deliver_fault_signal_from_isr(
     // the process via exit_thread instead.
     //
     // We walk every page in [new_rsp, new_rsp + total) (≤ 2 pages for the
-    // 664-byte SA_SIGINFO frame), not just `new_rsp`, because the frame can
+    // 712-byte SA_SIGINFO frame), not just `new_rsp`, because the frame can
     // straddle a page boundary when the user stack ends near one and the
     // tail page is mapped but read-only / non-user.
     //

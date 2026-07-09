@@ -46939,10 +46939,16 @@ fn test_249_signalframe_caller_saved_roundtrip() -> bool {
         return false;
     }
 
-    // Structural note (checked by construction, documented here): sys_sigreturn
-    // writes the six regs to ksp-{80,88,96,104,112,120}, contiguous with the
-    // existing ksp-{8..72} callee-saved slots — 15 slots (8..120 step 8) that
-    // exactly match syscall_entry's 15 register pushes.
+    // Structural note: the register→kernel-slot mapping itself cannot be
+    // exercised here without userspace execution (a real signal delivery +
+    // handler-return round-trip), so it is verified by the asm layout instead:
+    // sys_sigreturn writes the six regs to ksp-{80,88,96,104,112,120}, which
+    // are — in reverse push order — the last six of syscall_entry's 15 register
+    // pushes (rdi lowest at ksp-120 … r10 at ksp-80), contiguous with the
+    // existing ksp-{8..72} callee-saved slots. If syscall_entry's push order
+    // ever changes, these offsets (and this cross-reference) must change with
+    // it. See `syscall_entry` in kernel/src/syscall/mod.rs (Step 2 pushes) and
+    // its Step 4b/Step 7 pop epilogue.
     test_pass!("SignalFrame carries + round-trips all six caller-saved arg regs");
     true
 }
