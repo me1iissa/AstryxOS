@@ -1193,7 +1193,8 @@ irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
 /// context switch happens at the next `sched::check_reschedule()` (syscall/IRQ
 /// return), exactly as a timer-tick preemption does.  Because it is
 /// lock-free it cannot interact with the TLB-shootdown IPI's ACK spin: there is
-/// no shared lock to contend and the EOI is unconditional.
+/// no shared lock to contend and the EOI takes no lock (it is issued whenever
+/// the LAPIC is enabled, which it always is for a CPU servicing this IPI).
 extern "C" fn resched_interrupt() {
     crate::sched::note_resched_ipi();
     crate::sched::set_need_reschedule_local();
