@@ -2268,6 +2268,12 @@ pub fn free_process_memory(pid: Pid) {
             // per-CPU current-TID slots) or non-blocking (`THREAD_TABLE`
             // try-lock, skipped on contention) — this exit path runs with
             // IF=1 but must never allocate, block, or escalate to a panic.
+            //
+            // `others` is re-sampled here (a separate read from the
+            // `cr3_active_on_other_cpu` predicate that drove the timeout), so if
+            // the sibling drains in the sub-microsecond window between the two
+            // it may read 0 with no per-CPU sub-lines — a near-miss, not a
+            // contradiction of the headline.
             let self_bit = 1u64 << (crate::arch::x86_64::apic::cpu_index() as u64);
             let others = crate::mm::tlb::active_cpu_mask(drain_cr3) & !self_bit;
             crate::serial_println!(
@@ -2283,6 +2289,16 @@ pub fn free_process_memory(pid: Pid) {
                     continue;
                 }
                 let other_tid = current_tid_on_cpu(cpu);
+                if other_tid == 0 {
+                    // Idle sentinel: the CPU drained to the per-CPU idle thread
+                    // between the timeout decision and this snapshot — a benign
+                    // near-miss, distinct from a lookup failure below.
+                    crate::serial_println!(
+                        "[PROC]   cpu={} still on CR3 {:#x} now idle (drained after the deadline)",
+                        cpu, drain_cr3,
+                    );
+                    continue;
+                }
                 // Non-blocking pid resolution: never panic or spin in the WARN
                 // path.  `?`-less try-lock so a contended THREAD_TABLE just
                 // yields an unknown pid rather than stalling teardown.
