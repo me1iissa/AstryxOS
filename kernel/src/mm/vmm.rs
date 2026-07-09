@@ -564,6 +564,34 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // `None` arm is a no-op (no concurrent fork to serialise against).
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags)
+}
+
+/// `#PF`-fast-path variant of [`map_page_in`] — identical semantics, used by
+/// the single install site inside `handle_page_fault` that runs with IF=0
+/// (the `PAGE_NO_CACHE` MMIO-mapping arm).  Acquires `mm_sem` via
+/// [`crate::mm::vma::mm_sem_read_draining`] instead of a plain blocking
+/// `RwLock::read()` — see that function's docs for the mm_sem/shootdown
+/// reentrancy deadlock this avoids.  Every other `map_page_in` call site
+/// (ELF/PE loading, fork, `vdso`/`usermode` bring-up, `sysv_shm`, the signal
+/// trampoline) runs with interrupts enabled and stays on the plain
+/// `map_page_in` above.
+///
+/// # Safety
+/// `pml4_phys` must point to a valid PML4 page table.
+pub fn map_page_in_fault_path(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_read_draining(s));
+    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags)
+}
+
+/// Shared body of [`map_page_in`] / [`map_page_in_fault_path`] — everything
+/// after the `mm_sem` acquisition, which the two wrappers perform differently.
+/// Takes `VMM_LOCK` itself, preserving the `mm_sem` (outer) → `VMM_LOCK`
+/// (inner) ordering documented on `VmSpace::mm_sem`.
+fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -653,8 +681,16 @@ pub fn map_page_in_if_absent(
     phys_addr: u64,
     flags: u64,
 ) -> bool {
+    // mm_sem/shootdown reentrancy: every caller of this function is inside
+    // `handle_page_fault` (IF=0), so the plain `RwLock::read()` used elsewhere
+    // in this file risks the mm_sem-vs-shootdown-ACK deadlock documented on
+    // `mm::vma::mm_sem_read_draining` — use the draining acquire
+    // unconditionally here rather than forking a `_fault_path` sibling, since
+    // there is no non-fault-path caller to keep on the plain acquire.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
-    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    let _mm_read = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_read_draining(s));
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -738,8 +774,15 @@ pub fn map_page_in_cow_if_unchanged(
     flags: u64,
     expected_phys: u64,
 ) -> bool {
+    // mm_sem/shootdown reentrancy: the sole caller of this function is the
+    // write-fault CoW arm inside `handle_page_fault` (IF=0) — see
+    // `mm::vma::mm_sem_read_draining` for the deadlock this closes.  No
+    // non-fault-path caller exists, so the draining acquire is used
+    // unconditionally rather than forking a sibling function.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
-    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    let _mm_read = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_read_draining(s));
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -1001,7 +1044,27 @@ pub fn read_pte(pml4_phys: u64, virt_addr: u64) -> u64 {
 pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    write_pte_impl(pml4_phys, virt_addr, pte)
+}
 
+/// `#PF`-fast-path variant of [`write_pte`] — identical semantics, used by the
+/// flag-rewrite call sites inside `handle_page_fault` (IF=0).  Acquires
+/// `mm_sem` via [`crate::mm::vma::mm_sem_read_draining`] instead of a plain
+/// blocking `RwLock::read()` — see that function's docs for the mm_sem/
+/// shootdown reentrancy deadlock this avoids.  The `ptrace` POKETEXT/POKEDATA
+/// path and the other IF=1 `write_pte` callers run with interrupts enabled and
+/// stay on the plain `write_pte` above.
+pub fn write_pte_fault_path(pml4_phys: u64, virt_addr: u64, pte: u64) {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_read_draining(s));
+    write_pte_impl(pml4_phys, virt_addr, pte)
+}
+
+/// Shared body of [`write_pte`] / [`write_pte_fault_path`] — everything after
+/// the `mm_sem` acquisition, which the two wrappers perform differently.
+fn write_pte_impl(pml4_phys: u64, virt_addr: u64, pte: u64) {
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;

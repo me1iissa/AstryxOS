@@ -2356,6 +2356,15 @@ pub fn run() -> ! {
     total += 1;
     if test_699_tlb_shootdown_ack_spin_reentrancy() { passed += 1; }
 
+    // ── Test 706: #PF-fast-path draining lock acquires (mm_sem + PROCESS_TABLE) ──
+    // Reader-side reentrancy fix for the mm_sem / PROCESS_TABLE lock-vs-shootdown
+    // deadlock class (follow-up to PR #703): a contended #PF-fast-path acquire
+    // services its own incoming shootdown slot instead of blocking IF=0.  This
+    // guards the three primitives' mechanics (fast-path returns a real guard,
+    // inert drain, W216 read-excludes-write preserved).
+    total += 1;
+    if test_706_pf_fastpath_draining_acquire() { passed += 1; }
+
     // ── Test 651: per-CPU LAPIC-timer liveness decision state machine ──
     // The hardware-free core of the SMP dead-CPU-timer self-heal: ISR-advance
     // recovery, tolerance window, sticky-dead, bounded futile re-arm cap.
@@ -45057,6 +45066,65 @@ fn test_699_tlb_shootdown_ack_spin_reentrancy() -> bool {
     }
 
     test_pass!("TLB shootdown ACK-spin reentrancy (mutual-livelock break)");
+    true
+}
+
+// ── Test 706: #PF-fast-path draining lock acquires (mm_sem + PROCESS_TABLE) ──
+//
+// The reader-side reentrancy fix for the lock-vs-shootdown deadlock class that
+// PR #703 opened (mm_sem/PROCESS_TABLE held across a shootdown by a teardown/
+// fork writer vs. an IF=0 #PF peer spinning on the same lock).  A live trigger
+// needs a genuine SMP timing race (writer + IF=0 faulter on the same CR3), so
+// this is a mechanical regression guard for the three primitives rather than a
+// deadlock reproducer: it proves the uncontended fast path returns a REAL
+// guard, the drain call is safe + inert when no shootdown is pending, and the
+// W216 read-excludes-write invariant the draining acquire must preserve holds.
+fn test_706_pf_fastpath_draining_acquire() -> bool {
+    test_header!("#PF-fast-path draining lock acquires (mm_sem + PROCESS_TABLE)");
+    use spin::RwLock;
+
+    // (1) drain_incoming_shootdown_if_smp() must be safe and inert to call
+    //     while holding no lock (the exact context the draining spin uses it
+    //     in).  On the single-CPU test runner SMP_ACTIVE is false, so it is a
+    //     single relaxed load and never touches a shootdown slot; idempotent.
+    crate::mm::tlb::drain_incoming_shootdown_if_smp();
+    crate::mm::tlb::drain_incoming_shootdown_if_smp();
+
+    // (2) mm_sem_read_draining() fast path returns a genuine read guard on an
+    //     uncontended sem, preserving W216: while the read guard is held a
+    //     writer is EXCLUDED but a second reader is ADMITTED (shared read).
+    let sem = RwLock::new(());
+    {
+        let g = crate::mm::vma::mm_sem_read_draining(&sem);
+        if sem.try_write().is_some() {
+            test_fail!("pf/drain", "mm_sem read guard did not exclude a writer");
+            return false;
+        }
+        if sem.try_read().is_none() {
+            test_fail!("pf/drain", "mm_sem read guard wrongly excluded a second reader");
+            return false;
+        }
+        drop(g);
+    }
+    // Guard really released: a writer is now admitted.
+    if sem.try_write().is_none() {
+        test_fail!("pf/drain", "writer still excluded after mm_sem read guard dropped");
+        return false;
+    }
+
+    // (3) lock_process_table_draining() acquires PROCESS_TABLE via its fast
+    //     path and releases on drop — a plain lock must then succeed (the
+    //     draining acquire must not leave the lock wedged).
+    {
+        let procs = crate::proc::lock_process_table_draining();
+        let _ = procs.len(); // guard is usable
+    }
+    if crate::proc::PROCESS_TABLE.try_lock().is_none() {
+        test_fail!("pf/drain", "PROCESS_TABLE still held after draining guard dropped");
+        return false;
+    }
+
+    test_pass!("#PF-fast-path draining lock acquires (mm_sem + PROCESS_TABLE)");
     true
 }
 

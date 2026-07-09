@@ -557,6 +557,62 @@ pub static PROCESS_TABLE: Mutex<Vec<Process>> = Mutex::new(Vec::new());
 /// Thread table.
 pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 
+/// Acquire `PROCESS_TABLE` from a `#PF` handler running with interrupts
+/// disabled, servicing this CPU's own incoming TLB-shootdown slot on every
+/// contended spin iteration instead of blocking outright.
+///
+/// # The `PROCESS_TABLE`/shootdown reentrancy deadlock this closes
+///
+/// `VmSpace::clone_for_fork` runs from the fork(2) path with `PROCESS_TABLE`
+/// held (the caller borrows the parent `Process` out of the table across the
+/// whole clone) and issues a `mm::tlb::shootdown_full_user` for the parent's
+/// CR3 to evict the sibling CPUs' now-stale writable CoW translations.  A
+/// sibling thread of the forking process taking a `#PF` on another CPU enters
+/// `handle_page_fault` on an interrupt gate (IF=0 for the handler's duration;
+/// Intel SDM Vol. 3A §6.8.1/§6.12.1) and acquires `PROCESS_TABLE` to look up
+/// its faulting VMA.  If it spins on a plain `PROCESS_TABLE.lock()` while the
+/// forking CPU holds the lock across its shootdown, and that shootdown is
+/// simultaneously spinning on the ACK from this exact CPU, both sides
+/// deadlock: the forking CPU never gets its ACK (IF=0 leaves the shootdown IPI
+/// pending in this CPU's LAPIC IRR until it returns from the fault and
+/// re-enables interrupts — Intel SDM Vol. 3A §10.6.1), and this CPU never
+/// acquires `PROCESS_TABLE` (the forking CPU never reaches the point where it
+/// drops it).  This is the same deadlock CLASS PR #703 fixed for the
+/// write-fault-path shootdown vs. `PROCESS_TABLE`; PR #703 dropped
+/// `PROCESS_TABLE` before *its own* shootdowns, but `clone_for_fork` is a
+/// separate holder PR #703 did not touch, and it cannot drop the lock without
+/// releasing the borrow of the parent `Process` mid-clone.
+///
+/// Unlike the write-fault path, `PROCESS_TABLE` here is not protecting the
+/// page-table copy — `clone_for_fork` holds `mm_sem.write()` for that exclusion
+/// (the mmap-lock analogue), and `PROCESS_TABLE` is held only incidentally, to
+/// keep the parent-`Process` borrow alive.  So the reader side can safely
+/// service its own shootdown while it waits: draining evicts this CPU's stale
+/// TLB (exactly the shootdown's intent) and violates no invariant `PROCESS_TABLE`
+/// guards.  The mutual exclusion is preserved exactly — this CPU still cannot
+/// proceed until the writer drops the lock.
+///
+/// # Scope
+///
+/// Used ONLY by the `handle_page_fault` acquisitions, which run with IF=0.
+/// Every other `PROCESS_TABLE.lock()` site runs with interrupts enabled, where
+/// a plain blocking acquire cannot produce this deadlock: the shootdown IPI is
+/// still serviceable by the ordinary ISR while that CPU spins.  The common
+/// (uncontended) case is `try_lock()` succeeding immediately — identical cost
+/// to a plain `lock()`; only on contention does the drain loop run.
+pub fn lock_process_table_draining() -> spin::MutexGuard<'static, Vec<Process>> {
+    if let Some(guard) = PROCESS_TABLE.try_lock() {
+        return guard;
+    }
+    loop {
+        crate::mm::tlb::drain_incoming_shootdown_if_smp();
+        if let Some(guard) = PROCESS_TABLE.try_lock() {
+            return guard;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Bounded-spin acquire of `THREAD_TABLE` with a loud panic on exhaustion.
 ///
 /// Used (under `firefox-test`) at hot read-only call sites that previously
