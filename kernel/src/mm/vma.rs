@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::{Mutex, RwLock, RwLockReadGuard};
 
 /// VMA protection flags (mmap-compatible).
 pub type VmProt = u32;
@@ -452,6 +452,93 @@ pub fn mm_sem_for_cr3(cr3: u64) -> Option<Arc<RwLock<()>>> {
     }
     let reg = MM_REGISTRY.lock();
     reg.get(&cr3).cloned()
+}
+
+/// Acquire `sem.read()` for a `#PF`-fast-path caller, servicing this CPU's
+/// own incoming TLB-shootdown slot on every contended spin iteration instead
+/// of blocking outright.
+///
+/// # The `mm_sem`/shootdown reentrancy deadlock this closes
+///
+/// `free_process_memory`, `free_vm_space`, and `clone_for_fork` hold
+/// `mm_sem.write()` across a `mm::tlb::shootdown_*` call.  That ordering is
+/// load-bearing per the W216 exclusion invariant documented on
+/// [`VmSpace::mm_sem`] above — no concurrent faulter may install a mapping
+/// while teardown/fork is walking page tables and returning frames to the
+/// PMM — so, unlike the `PROCESS_TABLE`-vs-shootdown deadlock fixed by
+/// dropping `PROCESS_TABLE` before its shootdown (PR #703), `mm_sem.write()`
+/// cannot simply be released before the shootdown here.  The writer must keep
+/// the lock.
+///
+/// A `#PF` is delivered on an interrupt gate (IF=0 for the duration of the
+/// handler; Intel SDM Vol. 3A §6.8.1/§6.12.1), so a peer CPU concurrently
+/// installing a PTE via `map_page_in_if_absent`, `map_page_in_cow_if_unchanged`,
+/// or the fault-path callers of `map_page_in` / `write_pte` takes `mm_sem`
+/// in read mode with interrupts disabled.  If that reader spins on a plain
+/// `RwLock::read()` because a writer already holds `mm_sem.write()`, and the
+/// writer's own `shootdown_full_user` / `shootdown_range` call is
+/// simultaneously spinning on the ACK from that exact reader CPU, the two
+/// sides deadlock: the writer never receives its ACK, because IF=0 leaves the
+/// shootdown IPI vector pending in the reader CPU's LAPIC IRR (unserviceable
+/// until the reader returns from the page-fault handler and re-enables
+/// interrupts, per Intel SDM Vol. 3A §10.6.1), and the reader never acquires
+/// `mm_sem`, because the writer never reaches the point where it drops it.
+/// This is the same deadlock CLASS fixed for `PROCESS_TABLE` vs. the
+/// write-fault-path shootdown — a lock held across a TLB shootdown whose
+/// target is itself blocked acquiring that lock — applied to `mm_sem`.
+///
+/// # The fix
+///
+/// Mirrors the reentrancy already used to break the analogous livelock
+/// between two shootdown *initiators* (the ACK-spin in
+/// `mm::tlb::shootdown_range_inner`, which services incoming shootdowns on
+/// every iteration): instead of blocking, a contended reader here services
+/// its OWN incoming shootdown slot via
+/// [`crate::mm::tlb::drain_incoming_shootdown_if_smp`] on every iteration.
+/// That routine is lock-free and EOI-free, so it is safe to call with
+/// interrupts disabled while `mm_sem` / `VMM_LOCK` are NOT held by this CPU
+/// (they are not: this CPU is still spinning to acquire `mm_sem`, and
+/// `VMM_LOCK` is taken only after `mm_sem`).  The W216 mutual exclusion is
+/// preserved exactly — the reader still cannot proceed until the writer is
+/// done — this only stops the reader from presenting as IF=0 dead weight to
+/// the writer's shootdown while it waits.
+///
+/// # Cost
+///
+/// The common case (a live fault racing a teardown/fork writer is rare) is
+/// `try_read()` succeeding immediately — identical cost to a plain
+/// `RwLock::read()`.  Only on contention does the loop run, and each iteration
+/// costs one relaxed atomic load (`drain_incoming_shootdown_if_smp`'s
+/// `SMP_ACTIVE` check) plus, only when SMP is active AND a shootdown is
+/// actually incoming, one lock-free compare-exchange + `invlpg`.  On SMP=1 the
+/// drain is a single relaxed load per iteration and never sends or receives an
+/// IPI.
+///
+/// # Scope — why this is not just `RwLock::read()` everywhere
+///
+/// This wrapper is used ONLY by the acquisitions that can run with IF=0:
+/// `map_page_in_if_absent`, `map_page_in_cow_if_unchanged`, and the
+/// `_fault_path` wrappers of `map_page_in` / `write_pte` (see
+/// `kernel/src/mm/vmm.rs`).  Every other `mm_sem_for_cr3(...).read()` site —
+/// ELF/PE loading, the non-fault-path `map_page_in` / `write_pte` callers
+/// (`sysv_shm`, `signal.rs`'s trampoline setup, `ptrace` POKETEXT/POKEDATA,
+/// process/PE bring-up, the `vdso`/`usermode` setup helpers,
+/// `unmap_and_free_range_in`'s own inner read acquisition) — runs with
+/// interrupts enabled, where a plain blocking `RwLock::read()` cannot produce
+/// this deadlock: the shootdown IPI targeting that CPU is still serviceable by
+/// the ordinary ISR while it spins.  Leaving those on the plain acquire keeps
+/// this change scoped to the actual IF=0 hazard.
+pub(crate) fn mm_sem_read_draining(sem: &RwLock<()>) -> RwLockReadGuard<'_, ()> {
+    if let Some(guard) = sem.try_read() {
+        return guard;
+    }
+    loop {
+        crate::mm::tlb::drain_incoming_shootdown_if_smp();
+        if let Some(guard) = sem.try_read() {
+            return guard;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 // ============================================================================

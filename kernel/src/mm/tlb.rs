@@ -1095,6 +1095,38 @@ fn service_incoming_shootdown_and_drain(cpu: usize) {
     drain_pending_force_flush(cpu);
 }
 
+/// Service this CPU's own incoming shootdown slot if SMP is active; a no-op
+/// on a single-CPU boot.
+///
+/// Exposes [`service_incoming_shootdown_and_drain`] outside this module for
+/// the lock-vs-IPI reentrancy fix on the `#PF` fast path: a page-fault handler
+/// that spins (with interrupts disabled) to acquire a lock — `mm_sem` in read
+/// mode (`crate::mm::vma::mm_sem_read_draining`) or `PROCESS_TABLE`
+/// (`crate::proc::lock_process_table_draining`) — held by a peer CPU that is
+/// simultaneously waiting on a TLB-shootdown ACK from *this* CPU would deadlock
+/// (this CPU cannot ACK the shootdown IPI while it is IF-masked, and the peer
+/// cannot release the lock until its shootdown completes). Draining our own
+/// incoming shootdown slot on every spin iteration lets the peer's ACK from
+/// this CPU complete even while this CPU is blocked acquiring the lock. This is
+/// the same deadlock CLASS the `PROCESS_TABLE`-vs-write-fault-path shootdown
+/// fix (PR #703) addressed, applied to a lock the writer legitimately holds
+/// across its shootdown.
+///
+/// Checking `SMP_ACTIVE` first means a single-CPU boot pays exactly one
+/// relaxed atomic load per contended spin iteration and never reaches
+/// `apic::cpu_index()` (an `RDTSCP`) or touches a shootdown slot — inert on
+/// SMP=1, matching the same guard `shootdown_range` uses before doing any
+/// cross-CPU work.  The routine is lock-free and EOI-free (a compare-exchange
+/// on this CPU's own slot, an `invlpg` if the target CR3 matches, and a
+/// force-flush drain), so it is safe to call with interrupts disabled while
+/// holding no lock this CPU is still trying to acquire.
+#[inline]
+pub(crate) fn drain_incoming_shootdown_if_smp() {
+    if SMP_ACTIVE.load(Ordering::Acquire) {
+        service_incoming_shootdown_and_drain(apic::cpu_index());
+    }
+}
+
 /// IPI handler.  Invoked from [`crate::arch::x86_64::idt`] when the LAPIC
 /// delivers a [`TLB_SHOOTDOWN_VECTOR`] interrupt to this CPU.
 ///

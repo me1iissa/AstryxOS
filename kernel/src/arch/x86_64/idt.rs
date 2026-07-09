@@ -1461,7 +1461,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
     // For vfork children (sharing parent's CR3), also check the parent's VmSpace
     // if the child's own VmSpace doesn't have a matching VMA.
     let (parent_pid_for_fallback, own_cr3) = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
+        // IF=0 fault-entry acquire: drain incoming shootdowns while spinning so
+        // a peer `clone_for_fork` holding PROCESS_TABLE across its CoW shootdown
+        // cannot deadlock against us (see `proc::lock_process_table_draining`).
+        let procs = crate::proc::lock_process_table_draining();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
             None => return false,
@@ -1473,7 +1476,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
     // Try own process first; if it has no VMA for this address, try the parent.
     // This handles vfork children that share the parent's page tables.
     let target_pid = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
+        // IF=0 fault-entry acquire — drain incoming shootdowns while spinning
+        // (see the acquire above and `proc::lock_process_table_draining`).
+        let procs = crate::proc::lock_process_table_draining();
         let has_vma = procs.iter().find(|p| p.pid == pid)
             .and_then(|p| p.vm_space.as_ref())
             .and_then(|vs| vs.find_vma(faulting_addr))
@@ -1494,7 +1499,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
         }
     };
 
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    // IF=0 fault-entry acquire — drain incoming shootdowns while spinning
+    // (see the two acquires above and `proc::lock_process_table_draining`).
+    let mut procs = crate::proc::lock_process_table_draining();
     let proc = match procs.iter_mut().find(|p| p.pid == target_pid) {
         Some(p) => p,
         None => return false,
@@ -1557,7 +1564,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             let pte = crate::mm::vmm::read_pte(cr3, page_addr);
             let old_phys = pte & 0x000F_FFFF_FFFF_F000;
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
-            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::vmm::write_pte_fault_path(cr3, page_addr, new_pte);
             // Release PROCESS_TABLE before the cross-CPU shootdown.  The
             // shootdown IPI needs every target CPU to run its handler to ACK,
             // but any peer CPU that is itself in `handle_page_fault` spins on
@@ -1697,7 +1704,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             // pays for itself by keeping the source readable as a single
             // entry-point for the whole CoW arm.
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
-            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::vmm::write_pte_fault_path(cr3, page_addr, new_pte);
             // Release PROCESS_TABLE before the shootdown (lock-vs-IPI deadlock;
             // see the MAP_SHARED arm above).
             drop(procs);
@@ -1746,7 +1753,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             // an NX-marked TLB entry for the same page and #PF on the
             // first ifetch.
             let new_pte = pte & !crate::mm::vmm::PAGE_NO_EXECUTE;
-            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::vmm::write_pte_fault_path(cr3, page_addr, new_pte);
             // Release PROCESS_TABLE before the shootdown (lock-vs-IPI deadlock;
             // see the MAP_SHARED arm above).  `vma` is not read past its
             // PROT_EXEC test in the guard, so the borrow is already released.
@@ -3535,7 +3542,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 // Identity-map device memory (no allocation needed)
                 let offset = page_addr - vma.base;
                 let phys = phys_base + offset;
-                crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags | crate::mm::vmm::PAGE_NO_CACHE);
+                crate::mm::vmm::map_page_in_fault_path(cr3, page_addr, phys, page_flags | crate::mm::vmm::PAGE_NO_CACHE);
                 crate::mm::vmm::invlpg(page_addr);
                 return true;
             }
