@@ -925,6 +925,17 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
     // target is its pin, handled by `desired_slot`/`target_cpu_for` directly.
     // The load read uses the guards already held (re-locking `RQS` here would
     // deadlock the leaf spinlock), so the spread sees this pass's live counts.
+    //
+    // Bitmask of CPUs that gained a freshly-enqueued thread on a REMOTE
+    // runqueue this pass and should be poked with a reschedule IPI (Perf P2
+    // phase 3c).  Collected under the locks but the IPIs are fired AFTER the
+    // guards drop, so no IPI is sent from inside the locked window.  `here` is
+    // this CPU; a bit is set only for a CPU != here, so on SMP=1 the mask stays
+    // empty (the wake edge requires `ncpus > 1` to even reassign a target, and
+    // the only enqueue CPU is 0 == here).
+    let here = crate::arch::x86_64::apic::cpu_index();
+    let mut resched_mask: u32 = 0;
+
     for t in threads.iter_mut() {
         // Wake-edge target assignment (before computing `want`, which reads
         // `last_cpu`).  Only on the None→runnable transition, only for unpinned
@@ -959,6 +970,17 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
         let want = desired_slot(t);
         if have == want {
             continue;
+        }
+        // A None→Some transition that lands on a REMOTE CPU is a cross-CPU
+        // wakeup: flag that CPU for a reschedule poke.  (have==None means the
+        // thread was not previously enqueued — i.e. it just woke; a Some→Some
+        // re-placement is a migration handled elsewhere, not a wake.)
+        if have.is_none() {
+            if let Some((ncpu, _)) = want {
+                if (ncpu as usize) != here && (ncpu as usize) < 32 {
+                    resched_mask |= 1u32 << (ncpu as u32);
+                }
+            }
         }
         // Remove from the old bucket (if any) — using the level it was enqueued
         // AT, not its (possibly changed) live priority.
@@ -1083,5 +1105,21 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
         }
     }
 
-    // Guards drop here in declaration order, releasing every runqueue lock.
+    // Release every runqueue lock BEFORE issuing any reschedule IPI, so no IPI
+    // is sent from inside the locked window (the handler is lock-free, but
+    // keeping the send out of the critical section bounds the lock-hold time).
+    drop(guards);
+
+    // ── Reschedule IPIs for cross-CPU wakeups (Perf P2 phase 3c) ─────────────
+    // Poke each remote CPU that gained a freshly-enqueued thread this pass so it
+    // reschedules at its next return-to-context check instead of waiting out a
+    // timer tick.  `resched_cpu` sets the target's NEED_RESCHEDULE flag and
+    // sends the fire-and-forget 0xF2 IPI; it takes no lock.  On SMP=1 the mask
+    // is always empty, so this loop is a no-op and behaviour is unchanged.
+    let mut m = resched_mask;
+    while m != 0 {
+        let cpu = m.trailing_zeros() as usize;
+        super::resched_cpu(cpu);
+        m &= m - 1;
+    }
 }

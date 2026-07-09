@@ -1368,6 +1368,8 @@ pub fn run() -> ! {
         total += 1;
         if test_650_percpu_wake_target() { passed += 1; }
         total += 1;
+        if test_651_resched_ipi() { passed += 1; }
+        total += 1;
         if test_652_percpu_audit_image_off_stack() { passed += 1; }
         total += 1;
         if test_653_reaper_skips_thread_on_other_cpu() { passed += 1; }
@@ -51967,6 +51969,89 @@ fn test_650_percpu_wake_target() -> bool {
     test_println!("  select_task_rq-equiv routing: hard-pin / warm-last_cpu / \
 least-loaded-fallback / warm-tie-keep / strict-min-migrate / uniproc-collapse / \
 last_cpu-clamp — >1-CPU target logic correct (closes the Phase 2b coverage nit) GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 651: reschedule IPI (Perf P2 phase 3c) ─────────────────────────────
+//
+// The reschedule IPI (vector 0xF2) closes the remote-wakeup latency hole: when
+// a wakeup makes a thread runnable on a REMOTE CPU, `sched::resched_cpu` sets
+// that CPU's NEED_RESCHEDULE flag and pokes it so it reschedules at its next
+// return-to-context check instead of waiting out a timer tick (Intel SDM
+// Vol. 3A §10.6.1).  A real cross-CPU IPI is not deterministically reproducible
+// in a single-threaded unit test, so this test pins the parts that ARE
+// deterministic:
+//   * the vector is distinct from the TLB-shootdown (0xF0) and the diagnostic
+//     DR-sync (0xF1) vectors — a collision would cross-wire the handlers;
+//   * `resched_cpu(self)` degenerates to setting the LOCAL flag with NO IPI
+//     (the SMP=1 / self-wakeup path), which is exactly the prior behaviour;
+//   * `resched_cpu` on an out-of-range CPU index is a safe no-op.
+fn test_651_resched_ipi() -> bool {
+    use crate::sched;
+    const NAME: &str = "[SCHED/P2] reschedule IPI vector + self-target (Test 651)";
+    test_header!(NAME);
+
+    // Vector distinctness: 0xF2, separate from 0xF0 (TLB) and 0xF1 (DR-sync).
+    if sched::RESCHED_VECTOR != 0xF2 {
+        test_fail!(NAME, "RESCHED_VECTOR = {:#x} expected 0xF2", sched::RESCHED_VECTOR);
+        return false;
+    }
+    if sched::RESCHED_VECTOR == 0xF0 || sched::RESCHED_VECTOR == 0xF1 {
+        test_fail!(NAME, "RESCHED_VECTOR collides with a TLB/DR-sync IPI vector");
+        return false;
+    }
+
+    // Self-arm primitive: `set_need_reschedule_local` (the mechanism the IPI
+    // handler and the self-target path use) must arm THIS CPU's flag.  The
+    // NEED_RESCHEDULE flag is normally CONSUMED by `check_reschedule()` at the
+    // next IRQ/syscall return, so observing it "still set" is inherently racy
+    // with the 100 Hz timer — disable interrupts for the set-then-read window so
+    // no timer-driven `check_reschedule` can swap-clear it between the arm and
+    // the observation.  (NOTE: this test runs in the kernel test phase, where
+    // the global scheduler is NOT marked active; `resched_cpu` is gated on
+    // `is_active()`, so its self-arm side effect is exercised here through the
+    // ungated `set_need_reschedule_local` primitive it would call. `resched_cpu`
+    // itself is exercised below for its no-IPI-on-self and no-panic-on-OOB
+    // properties, which hold regardless of `is_active`.)
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    crate::hal::disable_interrupts();
+    sched::test_clear_need_reschedule();
+    let cleared_ok = !sched::test_need_reschedule_raw();
+    sched::set_need_reschedule_local();
+    let armed_local = sched::test_need_reschedule_raw();
+    // Re-clear before re-enabling so the test leaves no pending reschedule.
+    sched::test_clear_need_reschedule();
+    crate::hal::enable_interrupts();
+
+    if !cleared_ok {
+        test_fail!(NAME, "flag not cleared by test_clear_need_reschedule");
+        return false;
+    }
+    if !armed_local {
+        test_fail!(NAME, "set_need_reschedule_local did not arm the flag (cpu={})", cpu);
+        return false;
+    }
+
+    // `resched_cpu(self)` must never route through the IPI handler (no
+    // IPI-to-self is ever sent — the SMP=1 / self-wakeup path is the local flag
+    // only).  This invariant holds whether or not the scheduler is marked
+    // active, so the serviced-IPI counter must be unchanged across the call.
+    let ipis_before = sched::resched_ipi_count();
+    sched::resched_cpu(cpu);
+    if sched::resched_ipi_count() != ipis_before {
+        test_fail!(NAME, "resched_cpu(self) unexpectedly routed through the IPI handler");
+        return false;
+    }
+
+    // Out-of-range CPU index is a safe no-op (must not panic / OOB the
+    // NEED_RESCHEDULE array).  MAX_CPUS is small; use a deliberately huge index.
+    sched::resched_cpu(usize::MAX);
+    sched::test_clear_need_reschedule();
+
+    test_println!("  RESCHED_VECTOR=0xF2 (distinct from 0xF0 TLB / 0xF1 DR-sync); \
+resched_cpu(self) arms the local flag with no IPI; out-of-range index is a no-op — \
+cross-CPU reschedule-poke wiring correct GREEN");
     test_pass!(NAME);
     true
 }

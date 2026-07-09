@@ -419,8 +419,8 @@ pub fn percpu_timer_rearm_count() -> u64 {
 }
 
 /// IPI vector for the cross-CPU timer-wake poke (see `timer_wake_interrupt`).
-/// 0xF0 = TLB shootdown, 0xF1 = W215 DR-sync, 0xF2 reserved for the reschedule
-/// IPI (Perf P2 phase 3c), 0xF3 = timer-wake.  A distinct vector per IPI class
+/// 0xF0 = TLB shootdown, 0xF1 = W215 DR-sync, 0xF2 = reschedule IPI
+/// (Perf P2 phase 3c), 0xF3 = timer-wake.  A distinct vector per IPI class
 /// keeps each handler body independent (Intel SDM Vol. 3A §10.6.1).
 pub const TIMER_WAKE_VECTOR: u8 = 0xF3;
 
@@ -1180,8 +1180,26 @@ irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
 irq_stub!(irq_timer_wake_handler, timer_wake_interrupt);
+irq_stub!(irq_resched_handler, resched_interrupt);
 #[cfg(feature = "w215-diag")]
 irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
+
+/// Reschedule IPI body (vector 0xF2, Perf P2 phase 3c).
+///
+/// A remote CPU made a thread runnable on THIS CPU and poked it via
+/// `sched::resched_cpu` → `apic::send_ipi_noblock`.  The handler does the
+/// minimum possible work: set this CPU's `NEED_RESCHEDULE` flag and EOI.  It
+/// takes NO lock and runs NO scheduler logic in interrupt context — the actual
+/// context switch happens at the next `sched::check_reschedule()` (syscall/IRQ
+/// return), exactly as a timer-tick preemption does.  Because it is
+/// lock-free it cannot interact with the TLB-shootdown IPI's ACK spin: there is
+/// no shared lock to contend and the EOI takes no lock (it is issued whenever
+/// the LAPIC is enabled, which it always is for a CPU servicing this IPI).
+extern "C" fn resched_interrupt() {
+    crate::sched::note_resched_ipi();
+    crate::sched::set_need_reschedule_local();
+    if super::apic::is_enabled() { super::apic::lapic_eoi(); }
+}
 
 /// Cross-CPU timer-wake IPI body (vector 0xF3).
 ///

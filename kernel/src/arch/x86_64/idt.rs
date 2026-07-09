@@ -189,13 +189,26 @@ pub fn init() {
             #[cfg(feature = "w215-diag")]
             IDT[0xF1].set_handler(fix(super::irq::irq_w215_dr_sync_handler as *const () as u64), kernel_cs, 0, 0);
 
+            // Reschedule IPI (vector 0xF2, Perf P2 phase 3c).  Distinct from the
+            // TLB shootdown (0xF0), the diagnostic DR-sync IPI (0xF1, only
+            // assigned under `w215-diag` but whose vector is avoided
+            // unconditionally so the two can never collide in any build), and
+            // the cross-CPU timer-wake poke (0xF3).  Sent by
+            // `sched::resched_cpu` when a wakeup makes a thread runnable on a
+            // REMOTE CPU; the handler only sets that CPU's NEED_RESCHEDULE flag
+            // and EOIs, so the target reschedules at its next return-to-context
+            // check instead of waiting out a timer tick.  Always wired (no
+            // feature gate) — the reschedule IPI is core SMP behaviour.  See
+            // `sched::RESCHED_VECTOR` and Intel SDM Vol. 3A §10.6.1.
+            IDT[0xF2].set_handler(fix(super::irq::irq_resched_handler as *const () as u64), kernel_cs, 0, 0);
+
             // Cross-CPU timer-wake IPI (vector 0xF3).  A CPU whose LAPIC timer
             // is delivering sends this to a sibling whose timer ISR went stale
             // (its LAPIC periodic timer wedged — Intel SDM Vol. 3A §11.5.4) so
             // the sibling cannot sleep through a dead timer.  Production SMP
             // self-heal (not diagnostic), so it is always wired.  Vector 0xF2 is
-            // reserved for the reschedule IPI (Perf P2 phase 3c); this poke uses
-            // 0xF3 so the two cross-CPU paths stay independent.  The handler
+            // the reschedule IPI (Perf P2 phase 3c, wired just above); this poke
+            // uses 0xF3 so the two cross-CPU paths stay independent.  The handler
             // records the poke, drives a scheduler tick and EOIs; the wake is
             // effected by the interrupt itself resuming the target from `hlt`.
             IDT[0xF3].set_handler(fix(super::irq::irq_timer_wake_handler as *const () as u64), kernel_cs, 0, 0);
