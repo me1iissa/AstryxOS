@@ -436,6 +436,22 @@ fn snapshot_active_mask(cr3: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// Returns true if `cr3` is currently loaded on any CPU **other than** the
+/// caller's.  Used by process teardown to wait for an address space to drain
+/// off every other CPU before freeing its page tables: a sibling thread —
+/// force-marked `Dead` by `exit_group` but still physically executing on
+/// another CPU (e.g. in user mode, or mid-`#PF`) — still has that CR3 loaded,
+/// and freeing the tables under it is a use-after-free (its next PTE walk or
+/// `SYSRETQ` lands on freed frames; Intel SDM Vol. 3A §4.10).  The caller's own
+/// CPU is excluded so a teardown thread never waits on itself.
+///
+/// Acquires only the leaf `CR3_ACTIVE_CPUS` lock — the caller MUST NOT hold any
+/// other lock (e.g. `PROCESS_TABLE`) across this, per the module lock order.
+pub fn cr3_active_on_other_cpu(cr3: u64) -> bool {
+    let self_mask = 1u64 << (apic::cpu_index() as u64);
+    (snapshot_active_mask(cr3) & !self_mask) != 0
+}
+
 /// Local `invlpg` over `[va_lo, va_hi)`.  Used by both the sender and
 /// the IPI handler.
 #[inline]
