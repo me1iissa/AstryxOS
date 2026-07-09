@@ -2865,49 +2865,27 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // user VA.  Per Intel SDM Vol. 3A §4.10, CR3-referenced PML4 entries
     // must remain valid while any logical processor has the CR3 loaded.
     //
-    // Guard: if any sibling is still Running, defer the PMM teardown.
-    // The sibling's own syscall dispatch tail (dispatch() in
-    // subsys/linux/syscall.rs) checks for Dead state on return and calls
-    // exit_thread(), which checks all_dead and performs the PMM teardown
-    // as the final owner.  This keeps the common single-thread path fast
-    // (no sibling → free immediately) while making the multi-thread path
-    // safe (CLONE_THREAD: wait for Running siblings to drain off-CPU).
+    // Free the process's user address space.
     //
-    // Contention note: THREAD_TABLE is a spin::Mutex.  This lock
-    // acquisition is on the exit path — interrupts are enabled and the
-    // calling CPU is about to schedule away, so contention with a
-    // concurrent timer ISR or AP scheduler is bounded to a short
-    // critical section (one iter + state compare).  If SMP thread counts
-    // grow large enough that the linear scan becomes a latency concern,
-    // consider an atomic per-process Running-thread counter as a fast
-    // pre-check before taking the lock.
+    // `free_process_memory` now self-protects against the cross-CPU teardown
+    // race this site used to guard by hand: before freeing, it waits for the
+    // address space to drain off every other CPU (its CR3 drain-wait), so a
+    // sibling force-marked `Dead` up front but still physically executing on
+    // another CPU cannot have its page tables freed out from under it — its
+    // next PTE walk / `SYSRETQ` would otherwise land on freed frames (Intel SDM
+    // Vol. 3A §4.10).
     //
-    // CROSS-CPU detection: the `state == Running` test that used to live here
-    // was defeated by this function's own earlier pass, which forced every
-    // sibling to `Dead` (so none read as Running and the guard always fell
-    // through to an immediate free).  A sibling marked Dead can still be
-    // physically executing on another CPU mid-syscall; freeing the user page
-    // tables out from under it lets its SYSRETQ land on a now-unmapped user VA
-    // (Intel SDM Vol. 3A §4.10).  Detect "still on a CPU" via the per-CPU
-    // current-PID slots — the address-space analogue of the reaper's
-    // `is_tid_current_on_any_cpu` kstack guard.
-    let any_sibling_on_cpu = {
-        let calling_cpu_tid = current_tid();
-        let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
-            .min(crate::arch::x86_64::apic::MAX_CPUS);
-        (0..ncpus).any(|c| {
-            let ctid = current_tid_on_cpu(c);
-            current_pid_on_cpu(c) == pid
-                && ctid != 0
-                // Exclude the exit_group caller itself (it is mid-teardown on
-                // its own stack; it frees the rest after it yields).
-                && !(calling_tid != 0 && ctid == calling_tid)
-                && ctid != calling_cpu_tid
-        })
-    };
-    if !any_sibling_on_cpu {
-        free_process_memory(pid);
-    }
+    // The former `any_sibling_on_cpu` pre-check (a `current_pid_on_cpu` scan)
+    // is therefore redundant — and it was worse than redundant: when a sibling
+    // WAS on-CPU it *skipped* `free_process_memory` entirely rather than
+    // deferring it, and nothing ever retried (the last sibling's own
+    // `exit_thread` is the only other caller, and a sibling whose remaining
+    // on-CPU execution is pure user-mode code never re-reaches it).  The
+    // address space then leaked: the orphan-reap sweep / `waitpid` later drops
+    // the still-`Some` `VmSpace`, whose `Drop` frees no page-table frames.
+    // Calling unconditionally — and letting the drain-wait handle the on-CPU
+    // sibling — closes that pre-existing leak.
+    free_process_memory(pid);
 
     // Vfork isolated-stack cleanup: same rationale as exit_thread (see
     // there for the longer comment).  We harvest the field from the
