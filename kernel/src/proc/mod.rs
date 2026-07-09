@@ -2255,11 +2255,54 @@ pub fn free_process_memory(pid: Pid) {
             }
         }
         if timed_out {
+            // Enrich the warning with the identity of every CPU still bookkept
+            // on `drain_cr3` (excluding self) and what it is running.  A live
+            // GDB/QMP autopsy proved this warning is a true positive: the
+            // masked CPU's real hardware CR3 equals `drain_cr3` because a
+            // sibling thread of this same process is genuinely still executing
+            // in non-preemptible Ring 0 on the shared address space.  Printing
+            // `cpu=N running pid=X tid=Y (same_proc=…)` lets a future occurrence
+            // be triaged from the log line alone: `same_proc=true` is the
+            // expected slow-sibling drain; a foreign pid would flag a genuine
+            // anomaly worth investigating.  All reads here are lock-free (the
+            // per-CPU current-TID slots) or non-blocking (`THREAD_TABLE`
+            // try-lock, skipped on contention) — this exit path runs with
+            // IF=1 but must never allocate, block, or escalate to a panic.
+            let self_bit = 1u64 << (crate::arch::x86_64::apic::cpu_index() as u64);
+            let others = crate::mm::tlb::active_cpu_mask(drain_cr3) & !self_bit;
             crate::serial_println!(
                 "[PROC] WARN free_process_memory(pid={}) proceeding with CR3 {:#x} \
-                 still active on another CPU after {} ticks (wedged sibling?)",
-                pid, drain_cr3, CR3_DRAIN_MAX_TICKS,
+                 still active on another CPU after {} ticks (wedged sibling?); \
+                 active_other_mask={:#x}",
+                pid, drain_cr3, CR3_DRAIN_MAX_TICKS, others,
             );
+            let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+                .min(crate::arch::x86_64::apic::MAX_CPUS);
+            for cpu in 0..ncpus {
+                if others & (1u64 << (cpu as u64)) == 0 {
+                    continue;
+                }
+                let other_tid = current_tid_on_cpu(cpu);
+                // Non-blocking pid resolution: never panic or spin in the WARN
+                // path.  `?`-less try-lock so a contended THREAD_TABLE just
+                // yields an unknown pid rather than stalling teardown.
+                let other_pid = THREAD_TABLE
+                    .try_lock()
+                    .and_then(|threads| {
+                        threads.iter().find(|t| t.tid == other_tid).map(|t| t.pid)
+                    });
+                match other_pid {
+                    Some(op) => crate::serial_println!(
+                        "[PROC]   cpu={} still on CR3 {:#x} running pid={} tid={} (same_proc={})",
+                        cpu, drain_cr3, op, other_tid, op == pid,
+                    ),
+                    None => crate::serial_println!(
+                        "[PROC]   cpu={} still on CR3 {:#x} running tid={} (pid unresolved: \
+                         THREAD_TABLE contended or tid absent)",
+                        cpu, drain_cr3, other_tid,
+                    ),
+                }
+            }
         }
     }
 
