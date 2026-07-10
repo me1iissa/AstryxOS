@@ -197,8 +197,22 @@ pub unsafe fn fpu_restore(area: *const u8) {
 /// `user_va` is otherwise untrusted.  Intel SDM Vol. 1 §13.8 (XRSTOR + its
 /// `#GP` conditions), §10.5.1.1 (MXCSR reserved bits).
 pub unsafe fn fpu_restore_from_user(user_va: u64) -> bool {
-    // XRSTOR/FXRSTOR require a 64-byte-aligned operand; reject null too.
-    if user_va == 0 || (user_va & 0x3F) != 0 {
+    // Reject any non-user address BEFORE walking the page tables.  This is
+    // essential, not cosmetic: `virt_to_phys_in` below confirms only a PTE's
+    // PRESENT bit, NOT its US (user/supervisor) bit, and the kernel half + the
+    // direct map are present in every process CR3 (shared PML4[256..512]).
+    // Without this gate a ring-3 process could set `fpstate` to a 64-aligned
+    // KERNEL VA; we would copy 1 KiB of kernel memory into `kbuf` and XRSTOR it
+    // into the caller's XMM/YMM — kernel-memory disclosure (and, via PHYS_OFF,
+    // effectively arbitrary-physical read).  `validate_user_ptr` requires the
+    // whole `[user_va, user_va+len)` range to lie below USER_VA_LIMIT
+    // (0x0000_8000_0000_0000) with no wrap, excluding the kernel half + direct
+    // map, and rejects null.
+    if !crate::syscall::validate_user_ptr(user_va, XSAVE_AREA_SIZE) {
+        return false;
+    }
+    // XRSTOR/FXRSTOR require a 64-byte-aligned operand.
+    if (user_va & 0x3F) != 0 {
         return false;
     }
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
@@ -228,8 +242,13 @@ pub unsafe fn fpu_restore_from_user(user_va: u64) -> bool {
     }
 
     let base = kbuf.0.as_ptr();
-    // MXCSR (legacy region offset 24): reserved bits 16..31 must be clear or
-    // XRSTOR/FXRSTOR `#GP` (Intel SDM Vol. 1 §10.5.1.1).
+    // MXCSR (legacy region offset 24): reserved bits 31..16 must be clear or
+    // XRSTOR/FXRSTOR `#GP` (Intel SDM Vol. 1 §10.5.1.1).  NB: strictly, a set
+    // bit in 15..0 that is not in the CPU's MXCSR_MASK also `#GP`s; that cannot
+    // occur on the AVX/XSAVE target this path runs on (MXCSR_MASK covers 15..0
+    // on every SSE2+ CPU), so we validate only the architected reserved region.
+    // A fully-CPU-general check would AND against the boot-snapshotted
+    // MXCSR_MASK (FXSAVE+28) — a hardening follow-up, not reachable here.
     let mxcsr = core::ptr::read_unaligned(base.add(24) as *const u32);
     if (mxcsr & 0xFFFF_0000) != 0 {
         return false;
