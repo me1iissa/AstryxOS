@@ -4902,6 +4902,7 @@ pub(crate) fn sys_sigreturn() -> i64 {
     let (sig_num, saved_mask, saved_rsp, saved_r15, saved_r14, saved_r13,
          saved_r12, saved_rbx, saved_rbp, saved_r11, saved_rcx, saved_rax,
          saved_rdi, saved_rsi, saved_rdx, saved_r8, saved_r9, saved_r10);
+    let fpstate: u64;
     // SMAP bracket — frame_base has already been range-validated by
     // validate_user_ptr above so the UserGuard is safe to lift AC.
     unsafe {
@@ -4927,6 +4928,23 @@ pub(crate) fn sys_sigreturn() -> i64 {
         saved_r8  = (*frame_ptr).saved_r8;
         saved_r9  = (*frame_ptr).saved_r9;
         saved_r10 = (*frame_ptr).saved_r10;
+        fpstate   = (*frame_ptr).fpstate;
+    }
+
+    // Restore the interrupted FPU/SSE/AVX register file that signal delivery
+    // saved via `fpu_save` (XRSTOR/FXRSTOR).  Skip if the handler cleared it
+    // (fpstate == 0) or the pointer is not a 64-byte-aligned, readable user
+    // range of the full save area — a corrupt/hostile frame must not #GP the
+    // kernel via a malformed XSAVE image.  (Fault-fixup on XRSTOR itself is a
+    // hardening follow-up; a normal frame is one we wrote and is well-formed.)
+    if fpstate != 0
+        && (fpstate & 0x3F) == 0
+        && validate_user_ptr(fpstate, crate::arch::x86_64::XSAVE_AREA_SIZE)
+    {
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            crate::arch::x86_64::fpu_restore(fpstate as *const u8);
+        }
     }
 
     crate::serial_println!(
