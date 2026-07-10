@@ -46988,7 +46988,7 @@ fn test_249_signalframe_caller_saved_roundtrip() -> bool {
     f.saved_r10 = 0x6666_6666_6666_6666;
     // Neighbouring fields must be untouched by the six writes above.
     f.saved_rax = 0x7777_7777_7777_7777;
-    f._pad      = 0x8888_8888_8888_8888;
+    f.fpstate   = 0x8888_8888_8888_8888;
 
     let ok = f.saved_rdi == 0x1111_1111_1111_1111
         &&  f.saved_rsi == 0x2222_2222_2222_2222
@@ -46997,7 +46997,7 @@ fn test_249_signalframe_caller_saved_roundtrip() -> bool {
         &&  f.saved_r9  == 0x5555_5555_5555_5555
         &&  f.saved_r10 == 0x6666_6666_6666_6666
         &&  f.saved_rax == 0x7777_7777_7777_7777
-        &&  f._pad      == 0x8888_8888_8888_8888;
+        &&  f.fpstate   == 0x8888_8888_8888_8888;
     if !ok {
         test_fail!("SignalFrame caller-saved", "field round-trip aliased/lost a slot");
         return false;
