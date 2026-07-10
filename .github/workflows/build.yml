@@ -422,10 +422,10 @@ jobs:
       # is being developed. SMP=2 coverage is preserved by the separate,
       # non-blocking `kernel-smoke-smp2` job below.
       #
-      # TODO(revert): once the W215 root fix lands and SMP=2 test-mode boots
-      # clean, DROP the `ASTRYX_SMP: "1"` env here AND delete the
-      # `kernel-smoke-smp2` job. Tracked in the "kernel-smoke SMP=2 W215
-      # content-corruption flake (AVX-amplified)" issue. This masks a KNOWN,
+      # TODO(revert) #714: once the W215 root fix lands and SMP=2 test-mode
+      # boots clean, DROP the `ASTRYX_SMP: "1"` env here AND delete the
+      # `kernel-smoke-smp2` job. Tracked in issue #714 ("kernel-smoke SMP=2
+      # W215 content-corruption flake (AVX-amplified)"). This masks a KNOWN,
       # actively-fixed bug — it is not a silent quality drop.
       # Bounded retry (belt-and-suspenders on top of the SMP=1 pin). SMP=1
       # is the primary lever, but the underlying W215 corruption is flaky by
@@ -503,7 +503,7 @@ jobs:
   #   * `continue-on-error: true` — a failure is reported but never fails the run.
   # It is expected to stay RED until the W215 content-corruption root fix lands;
   # when it flips GREEN that is the signal the required job can be un-pinned and
-  # THIS job deleted (same "kernel-smoke SMP=2 W215 flake" tracking issue).
+  # THIS job deleted (tracked in issue #714).
   #
   # To avoid burning ~15+ min of TCG runner time on a known-red boot for every
   # PR (including trivial docs PRs), this job runs only on pushes to master and
@@ -511,7 +511,7 @@ jobs:
   # can trigger it via workflow_dispatch, or (preferred) verify at SMP=2 locally
   # through scripts/qemu-harness.py.
   #
-  # TODO(revert): DELETE this entire job once SMP=2 test-mode boots clean.
+  # TODO(revert) #714: DELETE this entire job once SMP=2 test-mode boots clean.
   kernel-smoke-smp2:
     name: kernel smoke SMP=2 (non-blocking, W215-expected-red)
     runs-on: ubuntu-latest
