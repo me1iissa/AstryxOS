@@ -132,7 +132,15 @@ pub struct SignalFrame {
     pub saved_r8:  u64,
     pub saved_r9:  u64,
     pub saved_r10: u64,
-    pub _pad: u64,          // padding to 20 × 8 = 160 bytes (16-aligned)
+    // User-VA of the interrupted thread's saved FPU/SSE/AVX state (a 64-byte
+    // aligned XSAVE/FXSAVE area reserved just above this frame on the user
+    // stack), or 0 if no FPU state was saved.  A signal can interrupt user
+    // code mid-SIMD (glibc/musl use AVX pervasively — memcpy/memset/strlen),
+    // and the handler + sigreturn would otherwise clobber the interrupted
+    // YMM/XMM/x87 state.  The x86-64 psABI signal-return contract requires the
+    // full FPU register file be restored on handler return, the same as the
+    // GPRs above.  Restored via XRSTOR/FXRSTOR in `sys_sigreturn`.
+    pub fpstate: u64,       // keeps the struct at 20 × 8 = 160 bytes (16-aligned)
 }
 
 const _SIGNAL_FRAME_SIZE_CHECK: () = {
@@ -816,15 +824,27 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             // For classic handlers (no SA_SIGINFO):
             //   new_rsp + 0 .. +160 : SignalFrame only (as before)
             let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 160
-            let total = if want_siginfo {
+            let payload = if want_siginfo {
                 sigframe_size + UCONTEXT_SIZE + 128u64  // 160 + 424 + 128 = 712
             } else {
                 sigframe_size
             };
 
-            // 16-align the allocation base, then subtract 8 for "just-called" ABI.
-            let base    = (saved_rsp.wrapping_sub(total)) & !0xFu64;
+            // Reserve a 64-byte-aligned FPU (XSAVE/FXSAVE) save area at the top
+            // of the frame (just below the interrupted RSP); the signal payload
+            // sits below it.  XSAVE requires 64-byte operand alignment (Intel
+            // SDM Vol. 1 §13.7).  `fpu_save` writes ≤ XSAVE_AREA_SIZE bytes here.
+            let fpstate_size = crate::arch::x86_64::XSAVE_AREA_SIZE as u64;
+            let fpstate_va   = saved_rsp.wrapping_sub(fpstate_size) & !0x3Fu64;
+
+            // 16-align the payload base below the FPU area, then subtract 8 for
+            // the "just-called" ABI (handler sees RSP % 16 == 8).
+            let base    = fpstate_va.wrapping_sub(payload) & !0xFu64;
             let new_rsp = base.wrapping_sub(8);
+            // Whole reservation spans [new_rsp, saved_rsp): payload + alignment
+            // slack + the FPU area — the pre-flight writable check + probe below
+            // must cover all of it.
+            let total = saved_rsp.wrapping_sub(new_rsp);
 
             let sig_frame_ptr  = new_rsp as *mut SignalFrame;
             let ucontext_ptr   = (new_rsp + sigframe_size) as *mut UContext;
@@ -896,7 +916,12 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 (*sig_frame_ptr).saved_r8   = saved_r8;
                 (*sig_frame_ptr).saved_r9   = saved_r9;
                 (*sig_frame_ptr).saved_r10  = saved_r10;
-                (*sig_frame_ptr)._pad       = 0;
+                // Save the interrupted FPU/SSE/AVX register file into the
+                // reserved 64-aligned area and record its VA; sys_sigreturn
+                // XRSTORs it.  Runs under the active SMAP UserGuard (AC=1) so
+                // the supervisor XSAVE store to the user page is permitted.
+                (*sig_frame_ptr).fpstate    = fpstate_va;
+                crate::arch::x86_64::fpu_save(fpstate_va as *mut u8);
             }
 
             if want_siginfo {
@@ -1106,15 +1131,24 @@ pub unsafe fn deliver_fault_signal_from_isr(
     // Per POSIX.1-2017 sigaction(2): SA_SIGINFO handlers receive
     // (int signo, siginfo_t *info, ucontext_t *uctx) in (RDI, RSI, RDX).
     let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 160
-    let total = if want_siginfo {
+    let payload = if want_siginfo {
         sigframe_size + UCONTEXT_SIZE + 128u64  // 160 + 424 + 128 = 712
     } else {
         sigframe_size + 128u64                  // 160 + 128 = 288 (legacy)
     };
 
-    // 16-align the allocation base, then subtract 8 for "just-called" ABI.
-    let base    = (user_rsp.wrapping_sub(total)) & !0xFu64;
+    // Reserve a 64-byte-aligned FPU (XSAVE/FXSAVE) save area at the top of the
+    // frame (just below the interrupted RSP); the signal payload sits below it.
+    // XSAVE requires 64-byte operand alignment (Intel SDM Vol. 1 §13.7).
+    let fpstate_size = crate::arch::x86_64::XSAVE_AREA_SIZE as u64;
+    let fpstate_va   = user_rsp.wrapping_sub(fpstate_size) & !0x3Fu64;
+
+    // 16-align the payload base below the FPU area, then subtract 8 for the
+    // "just-called" ABI.
+    let base    = fpstate_va.wrapping_sub(payload) & !0xFu64;
     let new_rsp = base.wrapping_sub(8);
+    // Whole reservation spans [new_rsp, user_rsp): payload + slack + FPU area.
+    let total = user_rsp.wrapping_sub(new_rsp);
 
     let sig_frame_ptr = new_rsp as *mut SignalFrame;
     let ucontext_ptr  = (new_rsp + sigframe_size) as *mut UContext;
@@ -1215,7 +1249,11 @@ pub unsafe fn deliver_fault_signal_from_isr(
     (*sig_frame_ptr).saved_r8    = isr_r8;
     (*sig_frame_ptr).saved_r9    = isr_r9;
     (*sig_frame_ptr).saved_r10   = isr_r10;
-    (*sig_frame_ptr)._pad        = 0;
+    // Save the interrupted FPU/SSE/AVX register file into the reserved
+    // 64-aligned area (under the active SMAP UserGuard) and record its VA;
+    // sys_sigreturn XRSTORs it — the FPU analogue of the GPR save above.
+    (*sig_frame_ptr).fpstate     = fpstate_va;
+    crate::arch::x86_64::fpu_save(fpstate_va as *mut u8);
 
     // ── Write ucontext_t (SA_SIGINFO handlers only) ───────────────────────────
     // Per x86_64 System V psABI §3.4 and POSIX.1-2017 sigaction(2):

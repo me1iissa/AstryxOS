@@ -412,15 +412,20 @@ pub fn apply_wake_boost(t: &mut Thread) {
     t.priority = (t.priority + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX);
 }
 
-/// 512-byte FXSAVE area, 16-byte aligned.
-#[repr(C, align(16))]
+/// Per-thread FPU/SSE/AVX save area for XSAVE/XRSTOR.  64-byte aligned as
+/// required by XSAVE (Intel SDM Vol. 1 §13.7); sized to `XSAVE_AREA_SIZE` and
+/// verified >= the CPUID.0DH area size at boot.  On a CPU without AVX the FPU
+/// path falls back to FXSAVE/FXRSTOR, which use only the first 512 bytes.  A
+/// freshly zeroed area is a valid initial state for both XRSTOR (header
+/// XSTATE_BV=0 → init all components) and FXRSTOR.
+#[repr(C, align(64))]
 pub struct FpuState {
-    pub data: [u8; 512],
+    pub data: [u8; crate::arch::x86_64::XSAVE_AREA_SIZE],
 }
 
 impl FpuState {
     pub fn new_zeroed() -> Self {
-        Self { data: [0u8; 512] }
+        Self { data: [0u8; crate::arch::x86_64::XSAVE_AREA_SIZE] }
     }
 }
 

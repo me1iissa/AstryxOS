@@ -2911,13 +2911,10 @@ was_emergency_4k={}",
                 cur.fpu_state = Some(alloc::boxed::Box::new(proc::FpuState::new_zeroed()));
             }
             if let Some(ref mut fpu) = cur.fpu_state {
-                unsafe {
-                    core::arch::asm!(
-                        "fxsave [{}]",
-                        in(reg) fpu.data.as_mut_ptr(),
-                        options(nostack, preserves_flags),
-                    );
-                }
+                // XSAVE (x87+SSE+AVX) when AVX is enabled, else FXSAVE.  The
+                // legacy path saved only x87+SSE, silently dropping the AVX
+                // YMM upper halves across every switch.
+                unsafe { crate::arch::x86_64::fpu_save(fpu.data.as_mut_ptr()); }
             }
             (
                 &mut cur.context.rsp as *mut u64,
@@ -3091,13 +3088,7 @@ was_emergency_4k={}",
         let threads = THREAD_TABLE.lock();
         if let Some(cur) = threads.iter().find(|t| t.tid == current_tid_now) {
             if let Some(ref fpu) = cur.fpu_state {
-                unsafe {
-                    core::arch::asm!(
-                        "fxrstor [{}]",
-                        in(reg) fpu.data.as_ptr(),
-                        options(nostack, preserves_flags),
-                    );
-                }
+                unsafe { crate::arch::x86_64::fpu_restore(fpu.data.as_ptr()); }
             }
         }
     }
