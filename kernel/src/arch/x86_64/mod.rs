@@ -172,6 +172,93 @@ pub unsafe fn fpu_restore(area: *const u8) {
     }
 }
 
+/// Restore FPU/SSE/AVX state from a **user-supplied** XSAVE image (the
+/// `sigreturn` path) without ever letting XRSTOR/FXRSTOR fault in kernel mode.
+///
+/// XRSTOR executed at CPL0 on a user-controlled image is a ring-3 → ring-0
+/// crash primitive: a malformed header raises `#GP` and an unmapped page raises
+/// `#PF`, both *in the kernel*, which has no CPL0 fault-recovery path (see
+/// `idt.rs`: only CPL3 faults kill the process).  Rather than XRSTOR the user
+/// bytes in place, copy the image into a kernel buffer through the
+/// presence-confirming direct map (translate each page via `virt_to_phys_in`
+/// and read through `PHYS_OFF` — the same fault-immune idiom the ssp/canary
+/// diagnostics use, never touching an unmapped user page), validate the XSAVE
+/// header + MXCSR so XRSTOR cannot `#GP`, then restore from the stable,
+/// always-mapped kernel buffer.  This also removes the TOCTOU a
+/// validate-then-XRSTOR-in-place scheme would carry (a sibling thread unmapping
+/// the page between the check and the XRSTOR).
+///
+/// Returns `true` if the state was restored, `false` if the image was rejected
+/// (null/misaligned, unmapped, or malformed); on reject the caller leaves the
+/// current FPU state untouched.
+///
+/// # Safety
+/// Reads guest memory of the current address space via the kernel direct map;
+/// `user_va` is otherwise untrusted.  Intel SDM Vol. 1 §13.8 (XRSTOR + its
+/// `#GP` conditions), §10.5.1.1 (MXCSR reserved bits).
+pub unsafe fn fpu_restore_from_user(user_va: u64) -> bool {
+    // XRSTOR/FXRSTOR require a 64-byte-aligned operand; reject null too.
+    if user_va == 0 || (user_va & 0x3F) != 0 {
+        return false;
+    }
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    #[repr(C, align(64))]
+    struct Scratch([u8; XSAVE_AREA_SIZE]);
+    let mut kbuf = Scratch([0u8; XSAVE_AREA_SIZE]);
+
+    // Copy the whole reserved area from user memory via the fault-immune direct
+    // map: an unmapped user page yields a clean reject, not a kernel `#PF`.
+    let cr3 = crate::mm::vmm::get_cr3();
+    let mut done = 0usize;
+    while done < XSAVE_AREA_SIZE {
+        let va = user_va.wrapping_add(done as u64);
+        let page = va & !0xFFFu64;
+        let phys = match crate::mm::vmm::virt_to_phys_in(cr3, page) {
+            Some(p) => p,
+            None => return false,
+        };
+        let off = (va & 0xFFF) as usize;
+        let n = core::cmp::min(0x1000 - off, XSAVE_AREA_SIZE - done);
+        core::ptr::copy_nonoverlapping(
+            (PHYS_OFF + phys + off as u64) as *const u8,
+            kbuf.0.as_mut_ptr().add(done),
+            n,
+        );
+        done += n;
+    }
+
+    let base = kbuf.0.as_ptr();
+    // MXCSR (legacy region offset 24): reserved bits 16..31 must be clear or
+    // XRSTOR/FXRSTOR `#GP` (Intel SDM Vol. 1 §10.5.1.1).
+    let mxcsr = core::ptr::read_unaligned(base.add(24) as *const u32);
+    if (mxcsr & 0xFFFF_0000) != 0 {
+        return false;
+    }
+    if XSAVE_AVX_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        // XSAVE header (standard, non-compacted form): XSTATE_BV must be a
+        // subset of XCR0, XCOMP_BV must be 0, and the reserved header bytes
+        // [528, 576) must be 0 — any violation `#GP`s XRSTOR (SDM Vol. 1 §13.8).
+        let xstate_bv = core::ptr::read_unaligned(base.add(512) as *const u64);
+        let xcomp_bv  = core::ptr::read_unaligned(base.add(520) as *const u64);
+        let xcr0 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
+        if (xstate_bv & !xcr0) != 0 || xcomp_bv != 0 {
+            return false;
+        }
+        let mut i = 528usize;
+        while i < 576 {
+            if *base.add(i) != 0 {
+                return false;
+            }
+            i += 1;
+        }
+    }
+
+    // Restore from the validated, always-mapped kernel buffer: cannot `#PF`
+    // (kernel memory) and cannot `#GP` (header + MXCSR validated).
+    fpu_restore(base);
+    true
+}
+
 /// Enable hardware-enforced kernel/user separation features in CR4.
 ///
 /// Currently enables CR4.SMEP (bit 20) — Supervisor Mode Execution

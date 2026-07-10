@@ -4932,19 +4932,15 @@ pub(crate) fn sys_sigreturn() -> i64 {
     }
 
     // Restore the interrupted FPU/SSE/AVX register file that signal delivery
-    // saved via `fpu_save` (XRSTOR/FXRSTOR).  Skip if the handler cleared it
-    // (fpstate == 0) or the pointer is not a 64-byte-aligned, readable user
-    // range of the full save area — a corrupt/hostile frame must not #GP the
-    // kernel via a malformed XSAVE image.  (Fault-fixup on XRSTOR itself is a
-    // hardening follow-up; a normal frame is one we wrote and is well-formed.)
-    if fpstate != 0
-        && (fpstate & 0x3F) == 0
-        && validate_user_ptr(fpstate, crate::arch::x86_64::XSAVE_AREA_SIZE)
-    {
-        unsafe {
-            let _g = crate::arch::x86_64::smap::UserGuard::new();
-            crate::arch::x86_64::fpu_restore(fpstate as *const u8);
-        }
+    // saved via `fpu_save`.  `fpstate` is on the user stack and therefore
+    // attacker-controllable: `fpu_restore_from_user` copies the image into a
+    // kernel buffer through the fault-immune direct map and validates the XSAVE
+    // header + MXCSR before XRSTOR, so neither an unmapped page (#PF) nor a
+    // malformed header (#GP) can fault the kernel — XRSTOR at CPL0 has no
+    // fault-recovery path.  A rejected image leaves the current FPU untouched
+    // (skip on fpstate == 0: the handler saved none).
+    if fpstate != 0 {
+        unsafe { crate::arch::x86_64::fpu_restore_from_user(fpstate); }
     }
 
     crate::serial_println!(
