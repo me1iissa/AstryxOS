@@ -952,6 +952,22 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         crate::ke::gp_trap_diag::dump_for_kernel_trap(
             14, frame.rip, frame.rsp, error_code,
         );
+        // W215 task#23: classify the frame backing the faulting kernel RIP and
+        // the `cr2` data page before we bugcheck. The Ring-3 `#PF` path already
+        // does this (`emit_fault_phys_for_fatal` above); this extends the same
+        // `[FAULT/PHYS]` / `[W215/VERDICT]` coverage to a kernel-mode `#PF`
+        // (`cr2` here can point at a corrupted-but-live kernel structure). The
+        // callee is non-blocking (see `emit_fault_phys_for_kernel_fatal`).
+        #[cfg(feature = "firefox-test-core")]
+        {
+            let cr3_now: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
+                    options(nomem, nostack, preserves_flags));
+            }
+            let pid = crate::proc::current_pid_lockless();
+            crate::signal::emit_fault_phys_for_kernel_fatal(pid, frame.rip, cr2, cr3_now);
+        }
         crate::ke::bugcheck::ke_bugcheck(
             crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
             cr2,             // P1: fault address
@@ -1316,6 +1332,24 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     crate::ke::gp_trap_diag::dump_for_kernel_trap(
         vector, frame.rip, frame.rsp, error_code,
     );
+    // W215 task#23: classify the frame backing the faulting kernel RIP before
+    // we bugcheck, extending the Ring-3 `emit_fault_phys_for_fatal` coverage to
+    // kernel-mode fatal exceptions (#DF/#GP/#UD/…). `cr2` is meaningless for
+    // non-#PF vectors (Intel SDM Vol. 3A §6.15), so pass 0 — the RIP-page
+    // verdict is what applies here. NOTE: for a `#DF` (vector 8) the corruptor
+    // is a pointer-slot writer, not a content frame, so the verdict classifies
+    // the (valid) code page only; naming that writer needs a hardware
+    // watchpoint, not this classifier. Callee is non-blocking.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let cr3_now: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
+                options(nomem, nostack, preserves_flags));
+        }
+        let pid = crate::proc::current_pid_lockless();
+        crate::signal::emit_fault_phys_for_kernel_fatal(pid, frame.rip, 0, cr3_now);
+    }
     crate::ke::bugcheck::ke_bugcheck(
         bugcode,
         vector as u64,      // P1: exception vector

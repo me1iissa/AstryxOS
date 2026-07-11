@@ -725,10 +725,32 @@ pub fn counts() -> [(&'static str, u64); 10] {
 // dispositive evidence.
 
 /// Direct-mapped free-shadow size.  64 Ki entries covers `64 Ki × 4 KiB =
-/// 256 MiB` of physical address space without hash collisions; with the
-/// `pfn % FREE_SHADOW_SIZE` direct addressing, frames spaced by a multiple
-/// of 256 MiB will alias.  In a 4 GiB physical RAM configuration the
-/// collision rate is ≤ 16-to-1 — adequate for a diagnostic.
+/// 256 MiB` of physical address space without collisions; with `pfn %
+/// FREE_SHADOW_SIZE` direct addressing, frames spaced by a multiple of 256 MiB
+/// alias into the same slot.
+///
+/// ## Why NOT widened to cover the whole guest (W215 task#23, 2026-07-10)
+///
+/// The obvious fix for the displacement-blind `hit=0` was to grow the table to
+/// 2^19 (2 GiB coverage).  That is **infeasible in BSS**: the bootloader writes
+/// the handoff `BootInfo` at a fixed `BOOT_INFO_PHYS_BASE` = 16 MiB
+/// (`shared/src/lib.rs`), and the kernel image (loaded at 1 MiB, `.bss`
+/// included) must end below it or `_start`'s BSS-zeroing clobbers the handoff
+/// page (the exact hazard `w215_crc.rs` documents).  A 2^19 pair of shadows is
+/// +22 MiB of BSS and overruns 16 MiB.
+///
+/// Instead the displacement-blindness is removed *per pfn* at read time, with
+/// no size change: [`free_shadow_slot_state`] reports whether the faulting
+/// frame's slot holds an EXACT record for that pfn (reliable hit), is EMPTY
+/// (`phys == 0` — reliably "no free recorded for this pfn", since a free of
+/// this pfn OR any aliasing pfn would have written it), or is ALIASED (holds a
+/// *different* pfn — this pfn's record was displaced, so the verdict is
+/// inconclusive for this fault and the operator waits for another).  Frees are
+/// far rarer than allocs over a boot, so a code-page frame (which is demand-
+/// faulted and never freed for the process lifetime) reads EMPTY reliably —
+/// the common, decisive case.  Per Intel SDM Vol. 3A §4.10.5 the most-recent
+/// free of a frame is the upstream of a use-after-recycle; naming it (or
+/// proving it never happened) per-pfn is the dispositive evidence.
 const FREE_SHADOW_SIZE: usize = 65536;
 
 #[repr(C)]
@@ -837,6 +859,47 @@ pub fn dump_free_shadow_for_phys(phys: u64) {
                 phys, recorded, displaced,
             );
         }
+    }
+}
+
+/// Per-pfn trust state of a direct-addressed shadow slot.  This is what makes
+/// a `hit=0` lookup interpretable despite the table aliasing 4-to-1 on a 1 GiB
+/// guest: the *specific* faulting pfn either owns its slot, has a provably
+/// untouched slot, or has been displaced by an aliasing pfn (in which case the
+/// lookup for THIS pfn is inconclusive and must not be read as "never freed").
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum SlotState {
+    /// Slot holds a record for exactly this pfn — the (tick, rip) is reliable.
+    Exact,
+    /// Slot was never written (`phys == 0`).  Because a free/alloc of this pfn
+    /// OR of any pfn aliasing to this slot would have stamped `phys`, an empty
+    /// slot reliably proves this pfn's event never occurred.
+    Empty,
+    /// Slot holds a *different* pfn — this pfn's record (if any) was displaced.
+    /// The lookup is inconclusive for this pfn.
+    Aliased,
+}
+
+impl SlotState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotState::Exact => "EXACT",
+            SlotState::Empty => "EMPTY",
+            SlotState::Aliased => "ALIASED",
+        }
+    }
+}
+
+/// Classify the FREE-shadow slot occupancy for `phys` (see [`SlotState`]).
+pub fn free_shadow_slot_state(phys: u64) -> SlotState {
+    if phys == 0 {
+        return SlotState::Aliased; // phys=0 is never a real frame; treat as noise
+    }
+    let slot = free_shadow_slot(phys);
+    match slot.phys.load(Ordering::Relaxed) {
+        0 => SlotState::Empty,
+        p if p == phys => SlotState::Exact,
+        _ => SlotState::Aliased,
     }
 }
 
@@ -1241,12 +1304,112 @@ pub fn dump_alloc_shadow_for_phys(phys: u64) {
     }
 }
 
+/// Classify the ALLOC-shadow slot occupancy for `phys` (see [`SlotState`]).
+pub fn alloc_shadow_slot_state(phys: u64) -> SlotState {
+    if phys == 0 {
+        return SlotState::Aliased;
+    }
+    let slot = alloc_shadow_slot(phys);
+    match slot.phys.load(Ordering::Relaxed) {
+        0 => SlotState::Empty,
+        p if p == phys => SlotState::Exact,
+        _ => SlotState::Aliased,
+    }
+}
+
 /// Read alloc-shadow counters for kdb introspection.
 pub fn alloc_shadow_recorded_count() -> u64 {
     ALLOC_SHADOW_RECORDED.load(Ordering::Relaxed)
 }
 pub fn alloc_shadow_displaced_count() -> u64 {
     ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
+}
+
+// ── [W215/VERDICT] combined free→recycle vs in-place-mutation classifier ─────
+//
+// The single disambiguator the W215 saga hinged on but never ran reliably.
+// Given the physical frame that a fault resolved to (either the instruction
+// page `rip_phys` or the data page `cr2`→phys), read the *per-pfn trust state*
+// of the FREE/ALLOC shadow slots (see [`SlotState`] — this is what makes the
+// verdict reliable despite the 256 MiB-aliasing table, without the +22 MiB BSS
+// that whole-guest coverage would need and that would clobber the 16 MiB
+// BootInfo handoff) plus the live refcount / pte_share, and emit a one-line
+// verdict:
+//
+//   * `INPLACE_NEVERFREED` — FREE slot EMPTY (reliable): this frame was never
+//                   freed since boot, so it cannot be a use-after-recycle — a
+//                   wrong writer mutated a live, legitimately-owned frame in
+//                   place.  The writer must then be caught with a hardware
+//                   watchpoint on this frame's VA (classification, not writer
+//                   RIP, is the output — that is what ends the two-camp
+//                   ambiguity).  `alloc` names the owner-of-record if EXACT.
+//   * `RECYCLE_DANGLING`  — FREE slot EXACT and `refcount == 0`: the frame was
+//                   freed and is currently unowned, yet the victim still maps
+//                   it ⇒ genuine dangling recycle.  `free.rip` names the
+//                   `pmm::free_page` caller that released it under the mapping.
+//   * `INPLACE_REALLOC`   — FREE slot EXACT but `refcount >= 1`: a free is
+//                   recorded but the frame is live again (re-allocated after
+//                   that free) ⇒ the recorded free is prior-life history; the
+//                   current corruption is in-place on the live allocation.
+//   * `INDETERMINATE_FREE_ALIASED` — FREE slot holds a different pfn (this
+//                   pfn's record was displaced by an aliasing pfn) ⇒ the FREE
+//                   verdict is inconclusive for this fault; wait for another.
+//
+// Per Intel SDM Vol. 3A §4.10.5 the most-recent free of a frame is the
+// upstream of any use-after-recycle; proving per-pfn that it either happened
+// (EXACT) or provably did not (EMPTY) is the dispositive evidence.  The line
+// is grep-stable:
+//   [W215/VERDICT] phys=<p> class=<...> free=(state,tick,rip) \
+//     alloc=(state,tick,rip) rc=<n> sc=<n>
+pub fn dump_w215_verdict_for_phys(phys: u64) {
+    if phys == 0 {
+        return;
+    }
+    let free_state = free_shadow_slot_state(phys);
+    let alloc_state = alloc_shadow_slot_state(phys);
+    let free = free_shadow_lookup(phys); // Option<(tick, rip)>, valid iff Exact
+    let alloc = alloc_shadow_lookup(phys);
+    let rc = crate::mm::refcount::page_ref_count(phys);
+    let sc = crate::mm::refcount::pte_share_count(phys);
+
+    // Classification anchored on the FREE-shadow *per-pfn* trust state plus the
+    // live refcount.  The FREE side is the load-bearing signal: allocs are far
+    // more frequent than frees, so the ALLOC slot is usually aliased, but the
+    // FREE slot for a rarely-freed code/data frame is reliably readable.
+    //
+    //   * free EMPTY (reliable)          → this frame was NEVER freed since
+    //                                        boot ⇒ it cannot be a recycle ⇒
+    //                                        IN-PLACE mutation of a live frame.
+    //   * free EXACT + refcount == 0     → freed AND currently unowned yet the
+    //                                        victim still maps it ⇒ genuine
+    //                                        dangling RECYCLE; `freer_rip` names
+    //                                        the releaser.
+    //   * free EXACT + refcount >= 1     → a free is recorded but the frame is
+    //                                        live again (re-allocated after that
+    //                                        free) ⇒ the recorded free is prior-
+    //                                        life history; the current corruption
+    //                                        is IN-PLACE on the live allocation.
+    //   * free ALIASED                   → this pfn's free record was displaced
+    //                                        by an aliasing pfn ⇒ INDETERMINATE
+    //                                        for this fault; wait for another.
+    let class = match free_state {
+        SlotState::Empty => "INPLACE_NEVERFREED",
+        SlotState::Exact if rc == 0 => "RECYCLE_DANGLING",
+        SlotState::Exact => "INPLACE_REALLOC",
+        SlotState::Aliased => "INDETERMINATE_FREE_ALIASED",
+    };
+
+    let (ftick, frip) = free.unwrap_or((0, 0));
+    let (atick, arip) = alloc.unwrap_or((0, 0));
+    crate::serial_println!(
+        "[W215/VERDICT] phys={:#x} class={} \
+         free=(state={},tick={},rip={:#x}) \
+         alloc=(state={},tick={},rip={:#x}) rc={} sc={}",
+        phys, class,
+        free_state.as_str(), ftick, frip,
+        alloc_state.as_str(), atick, arip,
+        rc, sc,
+    );
 }
 
 // ── FONT-RECYCLE catch (Wikipedia re/fonts blob slice-panic) ────────────────
