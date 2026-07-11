@@ -1840,58 +1840,6 @@ pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
     emit_fault_phys_diagnostic(pid, user_rip, Some(cr2), cr3, &snap);
 }
 
-/// Kernel-mode fatal-fault variant of [`emit_fault_phys_for_fatal`].
-///
-/// Called from the kernel-mode fault paths in `arch/x86_64/idt.rs` immediately
-/// before `ke_bugcheck` (the Ring-3 sites above are unreachable for a fault
-/// taken at CPL 0 — Intel SDM Vol. 3A §6.15). It emits the same
-/// `[FAULT/PHYS]` / `[W215/VERDICT]` classification for kernel faults that the
-/// Ring-3 path already emits for user faults.
-///
-/// **Must not block.** The interrupted kernel code may be holding
-/// `PROCESS_TABLE`, so a blocking `.lock()` here would hang the faulting CPU
-/// before the bugcheck banner is printed. We therefore take the VMA snapshot
-/// with `try_lock()` and fall back to an empty snapshot on contention. The
-/// `[W215/VERDICT]` classification lives in `emit_fault_phys_diagnostic`, which
-/// is itself lock-free / ISR-safe, so the verdict is emitted regardless; only
-/// the `vma_offset` enrichment is skipped when the table is busy.
-///
-/// **Coverage boundary.** This classifies the physical frame backing the
-/// faulting RIP and, for a #PF, the `cr2` data page. It is meaningful for the
-/// kernel-CONTENT-corruption face — e.g. a kernel `#PF` whose `cr2` resolves to
-/// a corrupted-but-live kernel structure, where the verdict names that frame's
-/// free/recycle history. It does **not** name the corruptor of the
-/// pointer-slot face (a `#DF` from a saved stack pointer whose high dword was
-/// zeroed): there the faulting RIP is valid code and `cr2` is the truncated
-/// pointer's target, neither of which is the corrupted slot. That face needs a
-/// hardware watchpoint on the pointer slot, not a free/alloc-shadow classifier.
-#[cfg(feature = "firefox-test-core")]
-pub fn emit_fault_phys_for_kernel_fatal(pid: u64, rip: u64, cr2: u64, cr3: u64) {
-    // Non-blocking snapshot: enrich with `vma_offset` when the table is free,
-    // otherwise proceed with an empty snapshot (NO_VMA) — never block a fatal
-    // path. Mirrors the parent-VmSpace fallback in `emit_fault_phys_for_fatal`.
-    let snap = match crate::proc::PROCESS_TABLE.try_lock() {
-        Some(procs) => {
-            let child = procs.iter().find(|p| p.pid == pid);
-            if let Some(space) = child.and_then(|p| p.vm_space.as_ref()) {
-                signal_vma_snapshot(Some(space), rip, cr2)
-            } else if let Some(c) = child {
-                let parent_pid = c.parent_pid;
-                let cr3_child = c.cr3;
-                let parent_space = procs
-                    .iter()
-                    .find(|p| p.pid == parent_pid && p.cr3 == cr3_child && cr3_child != 0)
-                    .and_then(|p| p.vm_space.as_ref());
-                signal_vma_snapshot(parent_space, rip, cr2)
-            } else {
-                signal_vma_snapshot(None, rip, cr2)
-            }
-        }
-        None => signal_vma_snapshot(None, rip, cr2),
-    };
-    emit_fault_phys_diagnostic(pid, rip, Some(cr2), cr3, &snap);
-}
-
 /// Emit `[FAULT/PHYS]` and `[FAULT/RIP-CONTENT]` diagnostic lines.
 ///
 /// `[FAULT/PHYS]` exposes the physical frame backing the user RIP page so

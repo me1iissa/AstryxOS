@@ -707,6 +707,21 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                         }
                     }
                 }
+                // W215 task#23: this SMAP-triage bugcheck (supervisor access to
+                // a present user-mapped page) intercepts exactly the user-half
+                // CR2 class the classifier can resolve — e.g. a truncated
+                // kernel pointer (high dword zeroed) landing on a live user
+                // page. Classify it before the banner, via the same lock-free
+                // emit as the other kernel-fatal sites.
+                #[cfg(feature = "firefox-test-core")]
+                {
+                    let cr3_now: u64;
+                    unsafe {
+                        core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
+                            options(nomem, nostack, preserves_flags));
+                    }
+                    crate::mm::w215_diag::emit_kernel_fatal_verdict(14, frame.rip, cr2, cr3_now);
+                }
                 crate::ke::bugcheck::ke_bugcheck(
                     crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
                     cr2,
@@ -952,12 +967,13 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         crate::ke::gp_trap_diag::dump_for_kernel_trap(
             14, frame.rip, frame.rsp, error_code,
         );
-        // W215 task#23: classify the frame backing the faulting kernel RIP and
-        // the `cr2` data page before we bugcheck. The Ring-3 `#PF` path already
-        // does this (`emit_fault_phys_for_fatal` above); this extends the same
-        // `[FAULT/PHYS]` / `[W215/VERDICT]` coverage to a kernel-mode `#PF`
-        // (`cr2` here can point at a corrupted-but-live kernel structure). The
-        // callee is non-blocking (see `emit_fault_phys_for_kernel_fatal`).
+        // W215 task#23: classify the RIP page and the `cr2` data page before we
+        // bugcheck, extending the Ring-3 `[W215/VERDICT]` coverage to a
+        // kernel-mode `#PF` (a `cr2` pointing at a corrupted-but-live kernel
+        // structure gets a real in-place-vs-recycle verdict). The emit is
+        // lock-free / no-alloc / no-`PROCESS_TABLE` and bounds its page walk
+        // against the direct map, so it can never hang or nested-fault before
+        // the bugcheck banner (see `w215_diag::emit_kernel_fatal_verdict`).
         #[cfg(feature = "firefox-test-core")]
         {
             let cr3_now: u64;
@@ -965,8 +981,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
                     options(nomem, nostack, preserves_flags));
             }
-            let pid = crate::proc::current_pid_lockless();
-            crate::signal::emit_fault_phys_for_kernel_fatal(pid, frame.rip, cr2, cr3_now);
+            crate::mm::w215_diag::emit_kernel_fatal_verdict(14, frame.rip, cr2, cr3_now);
         }
         crate::ke::bugcheck::ke_bugcheck(
             crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
@@ -1332,14 +1347,16 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     crate::ke::gp_trap_diag::dump_for_kernel_trap(
         vector, frame.rip, frame.rsp, error_code,
     );
-    // W215 task#23: classify the frame backing the faulting kernel RIP before
-    // we bugcheck, extending the Ring-3 `emit_fault_phys_for_fatal` coverage to
-    // kernel-mode fatal exceptions (#DF/#GP/#UD/…). `cr2` is meaningless for
-    // non-#PF vectors (Intel SDM Vol. 3A §6.15), so pass 0 — the RIP-page
-    // verdict is what applies here. NOTE: for a `#DF` (vector 8) the corruptor
-    // is a pointer-slot writer, not a content frame, so the verdict classifies
-    // the (valid) code page only; naming that writer needs a hardware
-    // watchpoint, not this classifier. Callee is non-blocking.
+    // W215 task#23: classify the RIP page before we bugcheck, extending the
+    // Ring-3 `[W215/VERDICT]` coverage to kernel-mode fatal exceptions
+    // (#DF/#GP/#UD/…). `cr2` is meaningless for non-#PF vectors (Intel SDM
+    // Vol. 3A §6.15), so pass 0 — the emit records an explicit "no CR2 data
+    // datum" breadcrumb rather than a silent nothing, and classifies the RIP
+    // page. NOTE: for a `#DF` (vector 8) the corruptor is a pointer-slot
+    // writer, not a content frame, so the RIP-page verdict names the (valid)
+    // code page only; naming that writer needs a hardware watchpoint. The emit
+    // is lock-free / no-alloc and bounds its walk (see
+    // `w215_diag::emit_kernel_fatal_verdict`).
     #[cfg(feature = "firefox-test-core")]
     {
         let cr3_now: u64;
@@ -1347,8 +1364,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
                 options(nomem, nostack, preserves_flags));
         }
-        let pid = crate::proc::current_pid_lockless();
-        crate::signal::emit_fault_phys_for_kernel_fatal(pid, frame.rip, 0, cr3_now);
+        crate::mm::w215_diag::emit_kernel_fatal_verdict(vector, frame.rip, 0, cr3_now);
     }
     crate::ke::bugcheck::ke_bugcheck(
         bugcode,
