@@ -725,10 +725,32 @@ pub fn counts() -> [(&'static str, u64); 10] {
 // dispositive evidence.
 
 /// Direct-mapped free-shadow size.  64 Ki entries covers `64 Ki × 4 KiB =
-/// 256 MiB` of physical address space without hash collisions; with the
-/// `pfn % FREE_SHADOW_SIZE` direct addressing, frames spaced by a multiple
-/// of 256 MiB will alias.  In a 4 GiB physical RAM configuration the
-/// collision rate is ≤ 16-to-1 — adequate for a diagnostic.
+/// 256 MiB` of physical address space without collisions; with `pfn %
+/// FREE_SHADOW_SIZE` direct addressing, frames spaced by a multiple of 256 MiB
+/// alias into the same slot.
+///
+/// ## Why NOT widened to cover the whole guest (W215 task#23, 2026-07-10)
+///
+/// The obvious fix for the displacement-blind `hit=0` was to grow the table to
+/// 2^19 (2 GiB coverage).  That is **infeasible in BSS**: the bootloader writes
+/// the handoff `BootInfo` at a fixed `BOOT_INFO_PHYS_BASE` = 16 MiB
+/// (`shared/src/lib.rs`), and the kernel image (loaded at 1 MiB, `.bss`
+/// included) must end below it or `_start`'s BSS-zeroing clobbers the handoff
+/// page (the exact hazard `w215_crc.rs` documents).  A 2^19 pair of shadows is
+/// +22 MiB of BSS and overruns 16 MiB.
+///
+/// Instead the displacement-blindness is removed *per pfn* at read time, with
+/// no size change: [`free_shadow_slot_state`] reports whether the faulting
+/// frame's slot holds an EXACT record for that pfn (reliable hit), is EMPTY
+/// (`phys == 0` — reliably "no free recorded for this pfn", since a free of
+/// this pfn OR any aliasing pfn would have written it), or is ALIASED (holds a
+/// *different* pfn — this pfn's record was displaced, so the verdict is
+/// inconclusive for this fault and the operator waits for another).  Frees are
+/// far rarer than allocs over a boot, so a code-page frame (which is demand-
+/// faulted and never freed for the process lifetime) reads EMPTY reliably —
+/// the common, decisive case.  The most-recent free of a frame is the upstream
+/// of a use-after-recycle (an allocator-lifecycle invariant); naming it (or
+/// proving it never happened) per-pfn is the dispositive evidence.
 const FREE_SHADOW_SIZE: usize = 65536;
 
 #[repr(C)]
@@ -837,6 +859,47 @@ pub fn dump_free_shadow_for_phys(phys: u64) {
                 phys, recorded, displaced,
             );
         }
+    }
+}
+
+/// Per-pfn trust state of a direct-addressed shadow slot.  This is what makes
+/// a `hit=0` lookup interpretable despite the table aliasing 4-to-1 on a 1 GiB
+/// guest: the *specific* faulting pfn either owns its slot, has a provably
+/// untouched slot, or has been displaced by an aliasing pfn (in which case the
+/// lookup for THIS pfn is inconclusive and must not be read as "never freed").
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum SlotState {
+    /// Slot holds a record for exactly this pfn — the (tick, rip) is reliable.
+    Exact,
+    /// Slot was never written (`phys == 0`).  Because a free/alloc of this pfn
+    /// OR of any pfn aliasing to this slot would have stamped `phys`, an empty
+    /// slot reliably proves this pfn's event never occurred.
+    Empty,
+    /// Slot holds a *different* pfn — this pfn's record (if any) was displaced.
+    /// The lookup is inconclusive for this pfn.
+    Aliased,
+}
+
+impl SlotState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotState::Exact => "EXACT",
+            SlotState::Empty => "EMPTY",
+            SlotState::Aliased => "ALIASED",
+        }
+    }
+}
+
+/// Classify the FREE-shadow slot occupancy for `phys` (see [`SlotState`]).
+pub fn free_shadow_slot_state(phys: u64) -> SlotState {
+    if phys == 0 {
+        return SlotState::Aliased; // phys=0 is never a real frame; treat as noise
+    }
+    let slot = free_shadow_slot(phys);
+    match slot.phys.load(Ordering::Relaxed) {
+        0 => SlotState::Empty,
+        p if p == phys => SlotState::Exact,
+        _ => SlotState::Aliased,
     }
 }
 
@@ -1241,12 +1304,324 @@ pub fn dump_alloc_shadow_for_phys(phys: u64) {
     }
 }
 
+/// Classify the ALLOC-shadow slot occupancy for `phys` (see [`SlotState`]).
+pub fn alloc_shadow_slot_state(phys: u64) -> SlotState {
+    if phys == 0 {
+        return SlotState::Aliased;
+    }
+    let slot = alloc_shadow_slot(phys);
+    match slot.phys.load(Ordering::Relaxed) {
+        0 => SlotState::Empty,
+        p if p == phys => SlotState::Exact,
+        _ => SlotState::Aliased,
+    }
+}
+
 /// Read alloc-shadow counters for kdb introspection.
 pub fn alloc_shadow_recorded_count() -> u64 {
     ALLOC_SHADOW_RECORDED.load(Ordering::Relaxed)
 }
 pub fn alloc_shadow_displaced_count() -> u64 {
     ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
+}
+
+// ── [W215/VERDICT] combined free→recycle vs in-place-mutation classifier ─────
+//
+// The single disambiguator the W215 saga hinged on but never ran reliably.
+// Given the physical frame that a fault resolved to (either the instruction
+// page `rip_phys` or the data page `cr2`→phys), read the *per-pfn trust state*
+// of the FREE/ALLOC shadow slots (see [`SlotState`] — this is what makes the
+// verdict reliable despite the 256 MiB-aliasing table, without the +22 MiB BSS
+// that whole-guest coverage would need and that would clobber the 16 MiB
+// BootInfo handoff) plus the live refcount / pte_share, and emit a one-line
+// verdict:
+//
+//   * `INPLACE_NEVERFREED` — FREE slot EMPTY (reliable): this frame was never
+//                   freed since boot, so it cannot be a use-after-recycle — a
+//                   wrong writer mutated a live, legitimately-owned frame in
+//                   place.  The writer must then be caught with a hardware
+//                   watchpoint on this frame's VA (classification, not writer
+//                   RIP, is the output — that is what ends the two-camp
+//                   ambiguity).  `alloc` names the owner-of-record if EXACT.
+//   * `RECYCLE_DANGLING`  — FREE slot EXACT and `refcount == 0`: the frame was
+//                   freed and is currently unowned, yet the victim still maps
+//                   it ⇒ genuine dangling recycle.  `free.rip` names the
+//                   `pmm::free_page` caller that released it under the mapping.
+//   * `INPLACE_REALLOC`   — FREE slot EXACT but `refcount >= 1`: a free is
+//                   recorded but the frame is live again (re-allocated after
+//                   that free) ⇒ the recorded free is prior-life history; the
+//                   current corruption is in-place on the live allocation.
+//   * `INDETERMINATE_FREE_ALIASED` — FREE slot holds a different pfn (this
+//                   pfn's record was displaced by an aliasing pfn) ⇒ the FREE
+//                   verdict is inconclusive for this fault; wait for another.
+//
+// The most-recent free of a frame is the upstream of any use-after-recycle
+// (an allocator-lifecycle invariant — software-level, not an architectural
+// statement); proving per-pfn that it either happened (EXACT) or provably did
+// not (EMPTY) is the dispositive evidence.  The line is grep-stable:
+//   [W215/VERDICT] phys=<p> class=<...> free=(state,tick,rip) \
+//     alloc=(state,tick,rip) rc=<n> sc=<n>
+
+/// One classified verdict for a physical frame.  Produced by [`classify_phys`]
+/// from a single snapshot of each shadow slot so the emitted line is always
+/// internally consistent (no `state=EXACT` paired with a null tuple, or the
+/// inverse, even if an aliasing free displaces the slot concurrently).
+struct W215Verdict {
+    class: &'static str,
+    free_state: SlotState,
+    free_tick: u64,
+    free_rip: u64,
+    alloc_state: SlotState,
+    alloc_tick: u64,
+    alloc_rip: u64,
+    rc: u16,
+    sc: u16,
+}
+
+/// Snapshot one direct-addressed shadow slot for `phys`.  `sp` is the caller's
+/// SINGLE load of `slot.phys`; the (tick, rip) tuple is only read — and only
+/// trusted — when that one read is EXACT, so state and tuple can never
+/// disagree within a line.
+#[inline]
+fn snapshot_slot(sp: u64, tick: &AtomicU64, rip: &AtomicU64, phys: u64) -> (SlotState, u64, u64) {
+    if sp == 0 {
+        (SlotState::Empty, 0, 0)
+    } else if sp == phys {
+        (
+            SlotState::Exact,
+            tick.load(Ordering::Relaxed),
+            rip.load(Ordering::Relaxed),
+        )
+    } else {
+        (SlotState::Aliased, 0, 0)
+    }
+}
+
+/// Single-snapshot classification of `phys` over the FREE/ALLOC shadows plus
+/// the live refcount.  Lock-free / no-alloc (atomics + masked indexing only),
+/// so it is safe to call from an ISR or a fatal fault path.  The FREE side is
+/// the load-bearing signal: allocs are far more frequent than frees, so the
+/// ALLOC slot is usually aliased, but the FREE slot for a rarely-freed
+/// code/data frame is reliably readable.
+///
+///   * free EMPTY (reliable)      → NEVER freed since boot ⇒ cannot be a
+///                                   recycle ⇒ IN-PLACE mutation of a live frame.
+///   * free EXACT + refcount == 0 → freed AND currently unowned yet the victim
+///                                   still maps it ⇒ dangling RECYCLE; the free
+///                                   rip names the `pmm::free_page` releaser.
+///   * free EXACT + refcount >= 1 → a free is recorded but the frame is live
+///                                   again (re-alloc'd after that free) ⇒ the
+///                                   recorded free is prior-life history; the
+///                                   current corruption is IN-PLACE.
+///   * free ALIASED               → this pfn's free record was displaced by an
+///                                   aliasing pfn ⇒ INDETERMINATE for this fault.
+fn classify_phys(phys: u64) -> W215Verdict {
+    let fslot = free_shadow_slot(phys);
+    let (free_state, free_tick, free_rip) =
+        snapshot_slot(fslot.phys.load(Ordering::Relaxed), &fslot.tick, &fslot.caller_rip, phys);
+    let aslot = alloc_shadow_slot(phys);
+    let (alloc_state, alloc_tick, alloc_rip) =
+        snapshot_slot(aslot.phys.load(Ordering::Relaxed), &aslot.tick, &aslot.caller_rip, phys);
+    let rc = crate::mm::refcount::page_ref_count(phys);
+    let sc = crate::mm::refcount::pte_share_count(phys);
+    let class = match free_state {
+        SlotState::Empty => "INPLACE_NEVERFREED",
+        SlotState::Exact if rc == 0 => "RECYCLE_DANGLING",
+        SlotState::Exact => "INPLACE_REALLOC",
+        SlotState::Aliased => "INDETERMINATE_FREE_ALIASED",
+    };
+    W215Verdict {
+        class,
+        free_state,
+        free_tick,
+        free_rip,
+        alloc_state,
+        alloc_tick,
+        alloc_rip,
+        rc,
+        sc,
+    }
+}
+
+/// Ring-3 verdict emit (user SIGSEGV / user fatal exception path).  Uses the
+/// normal `serial_println!` path — safe here because the interrupted context
+/// is CPL 3 and holds no kernel locks.  For CPL-0 fatal faults use
+/// [`emit_kernel_fatal_verdict`], which is lock-free / no-alloc.
+pub fn dump_w215_verdict_for_phys(phys: u64) {
+    if phys == 0 {
+        return;
+    }
+    let v = classify_phys(phys);
+    crate::serial_println!(
+        "[W215/VERDICT] phys={:#x} class={} \
+         free=(state={},tick={},rip={:#x}) \
+         alloc=(state={},tick={},rip={:#x}) rc={} sc={}",
+        phys, v.class,
+        v.free_state.as_str(), v.free_tick, v.free_rip,
+        v.alloc_state.as_str(), v.alloc_tick, v.alloc_rip,
+        v.rc, v.sc,
+    );
+}
+
+// ── Kernel-mode fatal-fault verdict emit (lock-free, no-alloc) ───────────────
+//
+// The Ring-3 verdict path (`signal::emit_fault_phys_diagnostic`) is UNSAFE to
+// reuse from a CPL-0 fatal path: it heap-allocates the VMA snapshot (a #PF
+// taken inside the allocator would self-deadlock on the non-reentrant heap
+// spinlock), iterates a possibly-scribbled `VmSpace.areas` Vec, and prints
+// every line through the blocking `SERIAL` mutex that `ke_bugcheck`
+// deliberately bypasses — any of which can wedge or nested-fault BEFORE the
+// bugcheck banner, exactly on the corruption class this instrument targets.
+//
+// This purpose-built emitter mirrors `ke_bugcheck`'s fault-immune discipline:
+// no heap, no `PROCESS_TABLE`, no `SERIAL` — every byte goes through the
+// lock-free bugcheck serial writer — and the page walk is bounded against the
+// direct-map extent so a corrupt paging structure can never make us deref an
+// unmapped direct-map address.  Because the direct map covers the kernel half
+// in every CR3, this DOES resolve+classify a kernel-half RIP page and a
+// kernel-half CR2 data page, which the user-half-guarded Ring-3 path could not.
+
+/// 4 GiB direct-map extent (matches `pmm::MAX_PAGES * PAGE_SIZE`); a physical
+/// address at or above this is not reachable through `PHYS_OFF + phys`, so we
+/// must never dereference a paging-structure frame beyond it.
+const KFATAL_DIRECT_MAP_MAX: u64 = 1u64 << 32;
+
+/// Direct-map-bounded 4-level translation for the fatal path.  Validates every
+/// table frame against [`KFATAL_DIRECT_MAP_MAX`] before dereferencing it, and
+/// returns `None` on any non-present level or out-of-range/garbage table frame.
+/// Lock-free, no alloc.  Cite: Intel SDM Vol. 3A §4.5 (4-level paging); a fault
+/// handler that inspects paging structures must not itself fault on them.
+fn kfatal_walk_to_phys(cr3: u64, va: u64) -> Option<u64> {
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PRESENT: u64 = 1 << 0;
+    const HUGE: u64 = 1 << 7;
+    // Read entry `idx` from a page-aligned table frame, refusing any frame
+    // outside the direct map so `PHYS_OFF + frame` can never fault.  A
+    // page-aligned frame `< 4 GiB` plus a `< 4 KiB` intra-frame offset stays
+    // inside the direct map, so the bound is exact.  Self-contained (references
+    // only module-scope / own consts) so it is a valid nested item.
+    fn read_entry(table_phys: u64, idx: usize) -> Option<u64> {
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+        if table_phys >= KFATAL_DIRECT_MAP_MAX {
+            return None;
+        }
+        let p = (PHYS_OFF + table_phys) as *const u64;
+        Some(unsafe { core::ptr::read_volatile(p.add(idx)) })
+    }
+    let pml4e = read_entry(cr3 & ADDR_MASK, ((va >> 39) & 0x1FF) as usize)?;
+    if pml4e & PRESENT == 0 {
+        return None;
+    }
+    let pdpte = read_entry(pml4e & ADDR_MASK, ((va >> 30) & 0x1FF) as usize)?;
+    if pdpte & PRESENT == 0 {
+        return None;
+    }
+    if pdpte & HUGE != 0 {
+        return Some((pdpte & 0x000F_FFFF_C000_0000) | (va & 0x3FFF_FFFF));
+    }
+    let pde = read_entry(pdpte & ADDR_MASK, ((va >> 21) & 0x1FF) as usize)?;
+    if pde & PRESENT == 0 {
+        return None;
+    }
+    if pde & HUGE != 0 {
+        return Some((pde & 0x000F_FFFF_FFE0_0000) | (va & 0x1F_FFFF));
+    }
+    let pte = read_entry(pde & ADDR_MASK, ((va >> 12) & 0x1FF) as usize)?;
+    if pte & PRESENT == 0 {
+        return None;
+    }
+    Some((pte & ADDR_MASK) | (va & 0xFFF))
+}
+
+/// Resolve+classify one faulting VA (`which` = "rip" or "cr2") for the
+/// kernel-fatal path and emit the grep-stable `[W215/VERDICT]` line via the
+/// lock-free bugcheck writer.  Unresolvable/out-of-range VAs emit an explicit
+/// breadcrumb, never a silent nothing.
+fn emit_kfatal_for_va(which: &'static str, cr3: u64, va: u64) {
+    use crate::util::no_alloc_fmt::{bugcheck_serial_write_bytes, ArrayWriter};
+    let mut buf = [0u8; 384];
+    let mut w = ArrayWriter::new(&mut buf);
+    match kfatal_walk_to_phys(cr3, va) {
+        None => {
+            w.push_str("[W215/KFATAL] src=");
+            w.push_str(which);
+            w.push_str(" va=");
+            w.push_hex_u64(va);
+            w.push_str(" phys=UNRESOLVABLE\n");
+        }
+        Some(p) => {
+            let phys = p & !0xFFF; // classify the page frame
+            let v = classify_phys(phys);
+            w.push_str("[W215/KFATAL] src=");
+            w.push_str(which);
+            w.push_str(" va=");
+            w.push_hex_u64(va);
+            w.push_byte(b'\n');
+            w.push_str("[W215/VERDICT] phys=");
+            w.push_hex_u64(phys);
+            w.push_str(" class=");
+            w.push_str(v.class);
+            w.push_str(" free=(state=");
+            w.push_str(v.free_state.as_str());
+            w.push_str(",tick=");
+            w.push_dec_u64(v.free_tick);
+            w.push_str(",rip=");
+            w.push_hex_u64(v.free_rip);
+            w.push_str(") alloc=(state=");
+            w.push_str(v.alloc_state.as_str());
+            w.push_str(",tick=");
+            w.push_dec_u64(v.alloc_tick);
+            w.push_str(",rip=");
+            w.push_hex_u64(v.alloc_rip);
+            w.push_str(") rc=");
+            w.push_dec_u64(v.rc as u64);
+            w.push_str(" sc=");
+            w.push_dec_u64(v.sc as u64);
+            w.push_byte(b'\n');
+        }
+    }
+    bugcheck_serial_write_bytes(w.as_bytes());
+}
+
+/// Lock-free, no-alloc kernel-mode fatal verdict emit.  Called from the CPL-0
+/// exception paths in `arch/x86_64/idt.rs` immediately BEFORE `ke_bugcheck`.
+/// Emits an identity breadcrumb first (so the fault is on serial no matter what
+/// follows), then a `[W215/VERDICT]` for the RIP page and — for a `#PF` — the
+/// CR2 data page.  Every byte uses the same lock-free path as the bugcheck
+/// banner.  `vector` is the trap vector; `cr2` MUST be 0 for non-`#PF` vectors.
+pub fn emit_kernel_fatal_verdict(vector: u64, rip: u64, cr2: u64, cr3: u64) {
+    use crate::util::no_alloc_fmt::{bugcheck_serial_write_bytes, ArrayWriter};
+    // Breadcrumb FIRST via the fault-immune writer — survives even if a sibling
+    // CPU is wedged holding SERIAL or the emit below nested-faults.
+    let mut buf = [0u8; 160];
+    let mut w = ArrayWriter::new(&mut buf);
+    w.push_str("\n[W215/KFATAL] vector=");
+    w.push_dec_u64(vector);
+    w.push_str(" rip=");
+    w.push_hex_u64(rip);
+    w.push_str(" cr2=");
+    w.push_hex_u64(cr2);
+    w.push_str(" cr3=");
+    w.push_hex_u64(cr3);
+    w.push_byte(b'\n');
+    bugcheck_serial_write_bytes(w.as_bytes());
+
+    // RIP page — always present (it was executing).
+    emit_kfatal_for_va("rip", cr3, rip);
+
+    // Data page — only `#PF` (vector 14) carries a meaningful CR2.  For other
+    // vectors emit an explicit breadcrumb so an absent verdict is never
+    // misread as "shadow empty" (it means "no classifiable datum").
+    if vector == 14 && cr2 != 0 {
+        emit_kfatal_for_va("cr2", cr3, cr2);
+    } else {
+        let mut b2 = [0u8; 96];
+        let mut w2 = ArrayWriter::new(&mut b2);
+        w2.push_str("[W215/KFATAL] no CR2 data datum (vector=");
+        w2.push_dec_u64(vector);
+        w2.push_str(")\n");
+        bugcheck_serial_write_bytes(w2.as_bytes());
+    }
 }
 
 // ── FONT-RECYCLE catch (Wikipedia re/fonts blob slice-panic) ────────────────

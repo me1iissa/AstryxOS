@@ -1939,6 +1939,13 @@ pub(crate) fn emit_fault_phys_diagnostic(
     #[cfg(feature = "firefox-test-core")]
     if let Some(rp) = rip_phys {
         crate::mm::w215_diag::dump_free_shadow_for_phys(rp);
+        // W215 task#23: also dump the ALLOC side and the combined
+        // free→recycle-vs-in-place verdict for the instruction page.  For a
+        // "code page served with garbage/ASCII bytes → #PF/#UD/#GP" fault the
+        // corrupt content lives in rip_phys itself, so this is the primary
+        // classification site.
+        crate::mm::w215_diag::dump_alloc_shadow_for_phys(rp);
+        crate::mm::w215_diag::dump_w215_verdict_for_phys(rp);
     }
 
     // ── [D13/CR2-PROV] phys-shadow lookup on the DATA fault address ─────────
@@ -1975,6 +1982,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
                     );
                     crate::mm::w215_diag::dump_free_shadow_for_phys(data_phys);
                     crate::mm::w215_diag::dump_alloc_shadow_for_phys(data_phys);
+                    crate::mm::w215_diag::dump_w215_verdict_for_phys(data_phys);
                     crate::mm::w215_diag::dump_prov_for_phys(data_phys);
                     // GATE-A (2026-05-30) — if the faulting data address is in
                     // the main-stack TOP window (the argv/envp/auxv block,
