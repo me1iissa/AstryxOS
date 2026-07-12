@@ -124,6 +124,30 @@ pub(crate) fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     }
 }
 
+/// User-buffer gate for syscall arms that in-kernel test dispatch legitimately
+/// drives with KERNEL-RESIDENT buffers (e.g. a stack buffer on the test-runner
+/// thread's now-higher-half kstack).  Equivalent to [`validate_user_ptr`]
+/// EXCEPT it also honours the per-CPU kernel-dispatch bypass.
+///
+/// Shape is load-bearing: `user_ptr_check_bypassed() || validate_user_ptr(p,n)`.
+/// The bypass short-circuits ONLY under a [`KernelDispatchGuard`] — set solely
+/// by the in-kernel test harness (`test-mode`-gated `test_runner`), never by
+/// real user SYSCALL traffic (asm entry) and never in `firefox-test-core` (which
+/// does not compile `test_runner`).  In production `user_ptr_check_bypassed()`
+/// is compile-time `false`, so this reduces to a plain `validate_user_ptr` call
+/// (dead-code-eliminated) and non-bypass / production behaviour is preserved BY
+/// CONSTRUCTION.
+///
+/// Opt-in policy (grep this name to see every opt-in site): use ONLY on arms
+/// whose in-kernel test expects SUCCESS with a trusted harness buffer.  Arms
+/// whose test expects a kernel-VA pointer to be REJECTED (the CWE-822 canaries,
+/// e.g. sysinfo(2)/getrusage(2)) MUST keep calling [`validate_user_ptr`] so the
+/// rejection stays provable.
+#[inline]
+pub(crate) fn validate_user_or_kdispatch_ptr(ptr: u64, len: usize) -> bool {
+    user_ptr_check_bypassed() || validate_user_ptr(ptr, len)
+}
+
 /// Snapshot a user buffer into a kernel-resident `Vec<u8>` under one
 /// SMAP bracket.
 ///
@@ -202,6 +226,21 @@ pub(crate) unsafe fn user_read_u32(addr: u64) -> Option<u32> {
     Some(core::ptr::read_volatile(addr as *const u32))
 }
 
+/// [`user_read_u32`] variant that honours the kernel-dispatch bypass, for
+/// syscall arms that in-kernel test dispatch legitimately drives with a
+/// kernel-resident futex word (e.g. FUTEX_CMP_REQUEUE's `*uaddr` comparison
+/// read on a test-runner stack word).  See [`validate_user_or_kdispatch_ptr`]:
+/// the bypass is test-only, production-DCE'd, and never set for real user
+/// SYSCALL traffic, so in production/firefox-test this is byte-identical to
+/// [`user_read_u32`].
+#[inline]
+pub(crate) unsafe fn user_read_u32_or_kdispatch(addr: u64) -> Option<u32> {
+    if !validate_user_or_kdispatch_ptr(addr, 4) { return None; }
+    if addr % 4 != 0 { return None; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
+    Some(core::ptr::read_volatile(addr as *const u32))
+}
+
 /// Write a u32 to a validated user address in the CURRENT address space.
 /// Returns `true` on success, `false` on a bad / non-canonical / kernel-half
 /// or misaligned address (caller should surface EFAULT).
@@ -217,6 +256,22 @@ pub(crate) unsafe fn user_read_u32(addr: u64) -> Option<u32> {
 #[inline]
 pub(crate) unsafe fn user_write_u32(addr: u64, val: u32) -> bool {
     if !validate_user_ptr(addr, 4) { return false; }
+    if addr % 4 != 0 { return false; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
+    core::ptr::write_volatile(addr as *mut u32, val);
+    true
+}
+
+/// [`user_write_u32`] variant that honours the kernel-dispatch bypass, for
+/// syscall arms that in-kernel test dispatch legitimately drives with a
+/// kernel-resident futex word (e.g. FUTEX_WAKE_OP's atomic modify of `*uaddr2`
+/// on a test-runner stack word).  See [`validate_user_or_kdispatch_ptr`]: the
+/// bypass is test-only, production-DCE'd, and never set for real user SYSCALL
+/// traffic, so in production/firefox-test this is byte-identical to
+/// [`user_write_u32`].
+#[inline]
+pub(crate) unsafe fn user_write_u32_or_kdispatch(addr: u64, val: u32) -> bool {
+    if !validate_user_or_kdispatch_ptr(addr, 4) { return false; }
     if addr % 4 != 0 { return false; } // alignment check
     let _g = crate::arch::x86_64::smap::UserGuard::new();
     core::ptr::write_volatile(addr as *mut u32, val);
@@ -254,6 +309,24 @@ pub(crate) unsafe fn user_read_u64(addr: u64) -> Option<u64> {
 #[inline]
 pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
     if !validate_user_ptr(addr, 16) { return None; }
+    if addr % 8 != 0 { return None; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
+    let p = addr as *const u64;
+    let tv_sec  = core::ptr::read_volatile(p);
+    let tv_nsec = core::ptr::read_volatile(p.add(1));
+    Some((tv_sec, tv_nsec))
+}
+
+/// [`user_read_timespec`] variant that honours the kernel-dispatch bypass, for
+/// syscall arms that in-kernel test dispatch legitimately drives with a
+/// kernel-resident `struct timespec` (e.g. FUTEX_WAIT_BITSET's timeout on a
+/// test-runner stack `[u64; 2]`).  See [`validate_user_or_kdispatch_ptr`]: the
+/// bypass is test-only, production-DCE'd, and never set for real user SYSCALL
+/// traffic, so in production/firefox-test this is byte-identical to
+/// [`user_read_timespec`].
+#[inline]
+pub(crate) unsafe fn user_read_timespec_or_kdispatch(addr: u64) -> Option<(u64, u64)> {
+    if !validate_user_or_kdispatch_ptr(addr, 16) { return None; }
     if addr % 8 != 0 { return None; } // alignment check
     let _g = crate::arch::x86_64::smap::UserGuard::new();
     let p = addr as *const u64;
@@ -5066,7 +5139,7 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, flags: u32) -> i64 {
     // contents are attacker-influenceable via repeated calls — CWE-119
     // (Improper Restriction of Operations within the Bounds of a Memory
     // Buffer); see also CWE-823 (Use of Out-of-range Pointer Offset).
-    if !validate_user_ptr(buf as u64, count) {
+    if !validate_user_or_kdispatch_ptr(buf as u64, count) {
         return -14; // EFAULT
     }
 

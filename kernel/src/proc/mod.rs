@@ -862,6 +862,14 @@ static PER_CPU_ONSTACK_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
 /// while we audit stack-hungry code paths for optimization.
 const KERNEL_STACK_PAGES: usize = 64;
 const KERNEL_STACK_SIZE: u64 = (KERNEL_STACK_PAGES * 4096) as u64;
+/// TID 0 (BSP idle/reactor) runs kernel_main's tail — the test suite / desktop
+/// path — on its own kstack after the pivot off the UEFI bootstrap stack (see
+/// `main.rs`).  That call depth exceeds the steady reactor loop, and the
+/// bootstrap stack it replaces was ~528 KiB, so size the idle stack to 512 KiB
+/// (128 pages) to avoid a headroom regression; the stack canary is the loud
+/// backstop if it is ever exceeded.
+const IDLE_STACK_PAGES: usize = 128;
+const IDLE_STACK_SIZE: u64 = (IDLE_STACK_PAGES * 4096) as u64;
 /// Public alias for sched dead-stack cache to compare page counts.
 pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
 
@@ -1095,6 +1103,32 @@ pub fn write_stack_canary(stack_base: u64) {
     }
 }
 
+/// Base (overflow-guard end) of TID 0's higher-half idle kstack, published by
+/// `init()` for [`verify_idle_stack_canary`].
+static IDLE_STACK_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Verify TID 0's idle-kstack overflow-guard canary is intact.  Called from
+/// `main.rs::kernel_main_run` before the BSP enters the deep suite / desktop
+/// path on the pivoted idle stack: a corrupt canary means the boot-phase call
+/// depth overran the stack (bugcheck loudly rather than corrupt silently).
+pub fn verify_idle_stack_canary() {
+    let base = IDLE_STACK_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return; // not yet initialised (should not happen post-init)
+    }
+    let got = read_stack_canary(base);
+    if got != STACK_END_MAGIC {
+        crate::ke::bugcheck::ke_bugcheck(
+            crate::ke::bugcheck::BUGCHECK_BAD_KERNEL_RSP,
+            base,
+            got,
+            STACK_END_MAGIC,
+            0,
+        );
+    }
+}
+
 /// Check the stack canary. Returns true if intact, false if corrupted.
 #[inline]
 pub fn check_stack_canary(stack_base: u64) -> bool {
@@ -1240,15 +1274,16 @@ fn default_rlimits() -> [u64; 16] {
 /// the bootstrap stack becomes unmapped — any stack access causes a double
 /// fault.  By giving TID 0 a higher-half kernel stack (PML4[256-511], shared
 /// with all user page tables), this crash is prevented.
-pub fn init() {
+pub fn init() -> u64 {
     // Allocate a proper higher-half kernel stack for TID 0 (BSP idle thread).
     // This replaces the UEFI bootstrap stack (which is identity-mapped only)
     // with a stack that survives CR3 switches to user page tables.
-    let idle_phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)
+    let idle_phys_stack = crate::mm::pmm::alloc_pages(IDLE_STACK_PAGES)
         .expect("Failed to allocate BSP idle kernel stack");
     let idle_stack_base = KERNEL_VIRT_OFFSET + idle_phys_stack;
-    let idle_stack_top = idle_stack_base + KERNEL_STACK_SIZE;
+    let idle_stack_top = idle_stack_base + IDLE_STACK_SIZE;
     write_stack_canary(idle_stack_base);
+    IDLE_STACK_BASE.store(idle_stack_base, Ordering::Release);
 
     // Create the idle process (PID 0) and its main thread (TID 0).
     let idle_proc = Process {
@@ -1302,7 +1337,7 @@ pub fn init() {
             ..CpuContext::default()
         }),
         kernel_stack_base: idle_stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: IDLE_STACK_SIZE,
         wake_tick: u64::MAX,
         name: {
             let mut name = [0u8; 32];
@@ -1348,16 +1383,24 @@ pub fn init() {
         idle_stack_base, idle_stack_top
     );
 
-    // NOTE: We do NOT switch the BSP stack here.  The UEFI bootstrap stack
-    // remains active for kernel_main.  schedule()'s Phase 1 CR3 switch to
-    // kernel_cr3 ensures the identity map stays active for the bootstrap
-    // stack during context switches.  TID 0's kernel_stack_base/size are
-    // used for TSS.RSP[0] and per_cpu.kernel_rsp by the scheduler.
+    // The BSP is pivoted OFF the UEFI bootstrap stack onto `idle_stack_top`
+    // by `main.rs` (right before it runs kernel_main's tail — the test suite /
+    // desktop path — where the first user CR3 comes into existence).  The
+    // identity-mapped bootstrap stack is only safe while the kernel CR3 is
+    // active; a user CR3 (or a shootdown/CoW that write-protects the shared
+    // low-VA PTE) leaves it unusable, which was the SMP=2 double-fault.  This
+    // higher-half kstack lives in the shared kernel half (PML4[256-511]) and is
+    // present+writable under every CR3 (Intel SDM Vol. 3A §4.5).  TID 0's
+    // kernel_stack_base/size (above) are also used for TSS.RSP[0] and
+    // per_cpu.kernel_rsp by the scheduler.  Return the top for the pivot.
 
     // Initialise the global vDSO + vvar pages.  Must run after PMM and
     // refcount, before any user process is loaded — see
     // `kernel/src/proc/vdso.rs` and vdso(7).
     vdso::init();
+
+    // Top of the higher-half idle kstack — `main.rs` pivots the BSP onto it.
+    idle_stack_top
 }
 
 use crate::arch::x86_64::apic::cpu_index;

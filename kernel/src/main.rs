@@ -171,17 +171,18 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Phase 5: Process manager and scheduler
     serial_println!("[Aether] Phase 5: Process & scheduler init...");
-    let _idle_stack_top = proc::init();
+    let idle_stack_top = proc::init();
     sched::init();
     serial_println!("[Aether] Phase 5: Process & scheduler OK");
 
-    // NOTE: We do NOT switch the BSP stack here.  The UEFI bootstrap stack
-    // remains active for kernel_main.  It is in the identity-mapped region
-    // (PML4[0]) which would become unmapped if schedule() switched CR3 to a
-    // user page table.  The fix is in schedule(): the Phase 1 CR3 switch to
-    // kernel_cr3 before switch_context ensures the identity map stays active
-    // for the bootstrap stack.  TID 0's higher-half kernel_stack_base/size
-    // are still used for TSS.RSP[0] and per_cpu.kernel_rsp by the scheduler.
+    // NOTE: the BSP keeps running on the UEFI bootstrap stack through the
+    // remaining boot phases (5b-7), which create no user address space, so the
+    // identity-mapped (PML4[0]) bootstrap stack is still safe.  `proc::init`
+    // returned the top of TID 0's higher-half idle kstack (`idle_stack_top`);
+    // the BSP is pivoted onto it below, immediately before the user-proc-launch
+    // branch — see the pivot site for the full rationale.  TID 0's higher-half
+    // kernel_stack_base/size are also used for TSS.RSP[0] and per_cpu.kernel_rsp
+    // by the scheduler.
 
     // Phase 5b: APIC and SMP
     serial_println!("[Aether] Phase 5b: APIC init...");
@@ -358,6 +359,136 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     kprintln!("[Aether] Dropping to kernel shell...");
     kprintln!("");
 
+    // W215 SMP=2 #DF fix: pivot the BSP off the identity-mapped UEFI bootstrap
+    // stack onto TID 0's higher-half idle kstack before running kernel_main's
+    // tail (the test suite / desktop path) — where the first user CR3 comes
+    // into existence.  A user CR3 (or a shootdown/CoW that write-protects the
+    // shared low-VA PTE) makes the bootstrap stack unusable, which was the
+    // double-fault.  The idle kstack lives in the shared kernel half
+    // (PML4[256-511]) and is present+writable under every CR3 (Intel SDM
+    // Vol. 3A §4.5).  IF=0 fresh-frame trampoline: no stale low-VA pointer
+    // survives onto the new stack.
+    //
+    // Enforced invariant: the pivot must precede the first user CR3; the
+    // bootstrap stack below this point is identity-mapped only.  Everything the
+    // BSP runs before this pivot (phases 5b-7) creates no user address space,
+    // so the bootstrap stack is still safe here.  Assert that no user address
+    // space exists yet (one-shot at boot), so a future boot-phase reorder that
+    // launches a user process earlier trips this loudly instead of silently
+    // reopening the hole.
+    let user_as = crate::mm::vma::user_address_spaces_created();
+    assert!(
+        user_as == 0,
+        "BSP stack-pivot must precede the first user CR3, but {} user address space(s) already exist",
+        user_as
+    );
+    pivot_to_stack_run(idle_stack_top, kernel_main_run);
+}
+
+/// Kernel panic handler.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Try to print to serial port
+    serial_println!("\n!!! KERNEL PANIC !!!");
+    serial_println!("{}", info);
+
+    // Also try framebuffer console
+    kprintln!("\n!!! KERNEL PANIC !!!");
+    kprintln!("{}", info);
+
+    // Halt the CPU
+    loop {
+        unsafe {
+            core::arch::asm!("cli; hlt");
+        }
+    }
+}
+
+/// Kernel print macros.
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {
+        $crate::drivers::console::_kprint(format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! kprintln {
+    () => ($crate::kprint!("\n"));
+    ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)))
+}
+
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => {
+        $crate::drivers::serial::_serial_print(format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! serial_println {
+    () => ($crate::serial_print!("\n"));
+    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)))
+}
+
+/// High-volume ("fast path") log line.
+///
+/// Routes through the near-zero-overhead guest-RAM log ring
+/// ([`crate::drivers::log_ring`]) instead of the per-byte COM1 16550 PIO path,
+/// when the ring sink is enabled (the default).  Use this — not
+/// `serial_println!` — for the firehose trace families (e.g. the `[SC]`
+/// syscall trace) so a Firefox boot does not pay tens of millions of VM-exits
+/// shipping the log out one `outb` at a time.  When the ring is disabled the
+/// macro falls back to the classic COM1 path so no output is ever lost.
+///
+/// Always appends a trailing newline so each record is a self-contained line in
+/// the drained output.
+#[macro_export]
+macro_rules! serial_fast_println {
+    () => ($crate::drivers::serial::log_fast(format_args!("\n")));
+    ($($arg:tt)*) => (
+        $crate::drivers::serial::log_fast(format_args!("{}\n", format_args!($($arg)*)))
+    )
+}
+
+
+// IF=0 fresh-frame stack-pivot trampoline (global_asm, like switch_context_asm):
+// load `new_rsp` (rdi) and call `cont` (rsi) on it.  `cont` diverges.  A fresh
+// call frame is established on the new stack so no stale low-VA pointer from the
+// bootstrap stack survives.  Cite: Intel SDM Vol. 3A §4.5 (PML4 sharing).
+core::arch::global_asm!(
+    ".global pivot_to_stack_run",
+    ".type pivot_to_stack_run, @function",
+    "pivot_to_stack_run:",
+    "cli",
+    "mov rsp, rdi",
+    "xor ebp, ebp",
+    "call rsi",
+    "ud2",
+    ".size pivot_to_stack_run, . - pivot_to_stack_run",
+);
+extern "C" {
+    fn pivot_to_stack_run(new_rsp: u64, cont: unsafe extern "C" fn() -> !) -> !;
+}
+
+/// kernel_main's tail (test suite / desktop path), run on TID 0's higher-half
+/// idle kstack after the pivot in `_start`.  Diverges (never returns).
+unsafe extern "C" fn kernel_main_run() -> ! {
+    // Req: verify the idle-stack overflow-guard canary survived before the deep
+    // suite/desktop path (loud bugcheck on overflow, not silent corruption).
+    crate::proc::verify_idle_stack_canary();
+    // One-shot confirmation that the BSP is now on the higher-half idle kstack
+    // (RSP >= 0xFFFF_8000_..) rather than the low identity bootstrap stack — the
+    // whole point of the pivot; a low RSP here would mean the pivot failed.
+    {
+        let rsp: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp,
+            options(nomem, nostack, preserves_flags));
+        serial_println!(
+            "[W215/PIVOT] BSP running kernel_main tail on higher-half idle kstack: rsp={:#x} (bootstrap-stack #DF closed)",
+            rsp
+        );
+    }
     // In test mode, run the automated test suite instead of the shell.
     // In normal mode, launch the interactive Orbit shell.
     #[cfg(feature = "test-mode")]
@@ -2108,70 +2239,4 @@ user_pref("security.sandbox.content.level", 0);
         shell::launch()
         } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test-core", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test")))]
     }
-}
-
-/// Kernel panic handler.
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Try to print to serial port
-    serial_println!("\n!!! KERNEL PANIC !!!");
-    serial_println!("{}", info);
-
-    // Also try framebuffer console
-    kprintln!("\n!!! KERNEL PANIC !!!");
-    kprintln!("{}", info);
-
-    // Halt the CPU
-    loop {
-        unsafe {
-            core::arch::asm!("cli; hlt");
-        }
-    }
-}
-
-/// Kernel print macros.
-#[macro_export]
-macro_rules! kprint {
-    ($($arg:tt)*) => {
-        $crate::drivers::console::_kprint(format_args!($($arg)*))
-    };
-}
-
-#[macro_export]
-macro_rules! kprintln {
-    () => ($crate::kprint!("\n"));
-    ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)))
-}
-
-#[macro_export]
-macro_rules! serial_print {
-    ($($arg:tt)*) => {
-        $crate::drivers::serial::_serial_print(format_args!($($arg)*))
-    };
-}
-
-#[macro_export]
-macro_rules! serial_println {
-    () => ($crate::serial_print!("\n"));
-    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)))
-}
-
-/// High-volume ("fast path") log line.
-///
-/// Routes through the near-zero-overhead guest-RAM log ring
-/// ([`crate::drivers::log_ring`]) instead of the per-byte COM1 16550 PIO path,
-/// when the ring sink is enabled (the default).  Use this — not
-/// `serial_println!` — for the firehose trace families (e.g. the `[SC]`
-/// syscall trace) so a Firefox boot does not pay tens of millions of VM-exits
-/// shipping the log out one `outb` at a time.  When the ring is disabled the
-/// macro falls back to the classic COM1 path so no output is ever lost.
-///
-/// Always appends a trailing newline so each record is a self-contained line in
-/// the drained output.
-#[macro_export]
-macro_rules! serial_fast_println {
-    () => ($crate::drivers::serial::log_fast(format_args!("\n")));
-    ($($arg:tt)*) => (
-        $crate::drivers::serial::log_fast(format_args!("{}\n", format_args!($($arg)*)))
-    )
 }
