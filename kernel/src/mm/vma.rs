@@ -608,6 +608,22 @@ pub fn make_generation_for_test() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
 
+/// Count of fresh user address spaces minted via [`VmSpace::new_user`].
+///
+/// `new_user()` is the genesis of every user process: a `clone_for_fork`
+/// child necessarily descends from a `new_user()`'d ancestor, so a zero here
+/// means no user address space (and therefore no user CR3) exists at all.
+/// The BSP stack-pivot in `main.rs` asserts this is still zero at pivot time —
+/// see [`user_address_spaces_created`].
+static USER_ADDRESS_SPACES_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of user address spaces minted via [`VmSpace::new_user`] so far.
+/// Used by the BSP stack-pivot to enforce "the pivot precedes the first user
+/// CR3" as a runtime invariant rather than a verified-today fact.
+pub fn user_address_spaces_created() -> u64 {
+    USER_ADDRESS_SPACES_CREATED.load(Ordering::Acquire)
+}
+
 impl VmSpace {
     /// Create a new empty address space for a kernel process (shares kernel CR3).
     pub fn new_kernel() -> Self {
@@ -738,6 +754,11 @@ impl VmSpace {
         register_mm_sem(new_pml4, mm_sem.clone());
         let generation = Arc::new(AtomicU64::new(0));
         register_mm_generation(new_pml4, generation.clone());
+        // Record that a user address space (and thus a user CR3) now exists.
+        // The BSP stack-pivot in `main.rs` asserts this is zero before it runs,
+        // so a boot-phase reorder that spawns a user process before the pivot
+        // trips loudly instead of silently reopening the bootstrap-stack hole.
+        USER_ADDRESS_SPACES_CREATED.fetch_add(1, Ordering::Release);
         Some(Self {
             cr3: new_pml4,
             areas: Vec::new(),

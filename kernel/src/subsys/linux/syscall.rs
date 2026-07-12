@@ -2254,7 +2254,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // any field. The msghdr layout (x86_64 Linux ABI) is 56 bytes
             // ending at msg_flags (offset 48–52); ctrl writes touch up to
             // ctrl_ptr + ctrl_len which is validated separately below.
-            if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
+            if !crate::syscall::validate_user_or_kdispatch_ptr(arg2, 56) { return -14; }
             // SMAP bracket the msghdr field reads (iov_ptr, iov_len).
             let (iov_ptr, iov_len) = unsafe {
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -2263,7 +2263,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             };
             if iov_ptr == 0 || iov_len == 0 { return 0; }
             if iov_len > 1024 { return -22; } // IOV_MAX per POSIX sendmsg(2)
-            if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
+            if !crate::syscall::validate_user_or_kdispatch_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
                 return -14;
             }
             // Copy the iovec array into kernel memory so the per-iov
@@ -2357,7 +2357,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let cl = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
                     if cp != 0
                         && cl >= 16
-                        && crate::syscall::validate_user_ptr(cp, cl)
+                        && crate::syscall::validate_user_or_kdispatch_ptr(cp, cl)
                     {
                         let ctrl = cp as *const u8;
                         (cp, cl,
@@ -2632,7 +2632,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let msghdr_ptr = arg2 as *const u64;
             if msghdr_ptr.is_null() { return -22; }
             // CWE-823: validate msghdr is in user space (see sendmsg above).
-            if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
+            if !crate::syscall::validate_user_or_kdispatch_ptr(arg2, 56) { return -14; }
             // SMAP bracket the msghdr field reads.
             let (iov_ptr, iov_len) = unsafe {
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -2645,7 +2645,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // size the caller advertised so a malformed iov_len cannot mask a
             // kernel-address iov_ptr; the dereferenced iov_base is bounded by
             // the cap below and reaches fd_read via socket_recv.
-            if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
+            if !crate::syscall::validate_user_or_kdispatch_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
                 return -14;
             }
             // SMAP-bracketed iov[0] read; we only consume the first element.
@@ -5522,7 +5522,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 118: getresuid(ruid, euid, suid) — all zero (root)
         118 => {
             for ptr in [arg1, arg2, arg3] {
-                if ptr != 0 && crate::syscall::validate_user_ptr(ptr, 4) {
+                if ptr != 0 && crate::syscall::validate_user_or_kdispatch_ptr(ptr, 4) {
                     unsafe {
                         let _g = crate::arch::x86_64::smap::UserGuard::new();
                         core::ptr::write(ptr as *mut u32, 0u32);
@@ -5536,7 +5536,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 120: getresgid(rgid, egid, sgid) — all zero
         120 => {
             for ptr in [arg1, arg2, arg3] {
-                if ptr != 0 && crate::syscall::validate_user_ptr(ptr, 4) {
+                if ptr != 0 && crate::syscall::validate_user_or_kdispatch_ptr(ptr, 4) {
                     unsafe {
                         let _g = crate::arch::x86_64::smap::UserGuard::new();
                         core::ptr::write(ptr as *mut u32, 0u32);
@@ -5752,7 +5752,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // under a single UserGuard.  Per Intel SDM Vol. 3A §4.6 and
             // openat2(2) man page (which specifies a `struct open_how`).
             let (how_flags, how_mode) = if arg3 != 0 {
-                if !crate::syscall::validate_user_ptr(arg3, 16) {
+                if !crate::syscall::validate_user_or_kdispatch_ptr(arg3, 16) {
                     return -14; // EFAULT
                 }
                 unsafe {
@@ -5847,7 +5847,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let timeout_ms: i32 = if arg4 == 0 {
                 -1 // NULL timespec → block indefinitely per spec
             } else {
-                if !crate::syscall::validate_user_ptr(arg4, 16) {
+                if !crate::syscall::validate_user_or_kdispatch_ptr(arg4, 16) {
                     return -14; // EFAULT
                 }
                 let (tv_sec, tv_nsec) = unsafe {
@@ -5960,7 +5960,7 @@ fn sys_nanosleep_linux(req_ptr: u64, _rem_ptr: u64) -> i64 {
         crate::sched::yield_cpu();
         return -22; // EINVAL
     }
-    if !crate::syscall::validate_user_ptr(req_ptr, 16) { return -14; } // EFAULT
+    if !crate::syscall::validate_user_or_kdispatch_ptr(req_ptr, 16) { return -14; } // EFAULT
     let (tv_sec, tv_nsec) = unsafe {
         let _g = crate::arch::x86_64::smap::UserGuard::new();
         let p = req_ptr as *const i64;
@@ -5984,7 +5984,7 @@ fn sys_nanosleep_linux(req_ptr: u64, _rem_ptr: u64) -> i64 {
 /// getrlimit(resource, rlim) — fill `struct rlimit { rlim_cur, rlim_max }` (2×u64).
 /// Also called by prlimit64() for GET operations.
 fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> i64 {
-    if !crate::syscall::validate_user_ptr(rlim_ptr, 16) { return -14; } // EFAULT
+    if !crate::syscall::validate_user_or_kdispatch_ptr(rlim_ptr, 16) { return -14; } // EFAULT
     const RLIM_INFINITY: u64 = u64::MAX;
     // Hard limits (max) are fixed; soft limits come from per-process rlimits_soft.
     let hard: u64 = match resource {
@@ -9159,10 +9159,17 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
         return -22;
     }
 
-    if oldact != 0 && (oldact < USER_PTR_MIN || oldact >= USER_PTR_MAX) {
+    // Opt-in arm (iovec/msg-family model): in-kernel test dispatch
+    // (dispatch_linux_kernel) legitimately passes a kernel-resident sigaction
+    // struct, so honour the per-CPU bypass; real user SYSCALL traffic still
+    // enforces the USER_PTR range.  Compile-time false in production (DCE'd).
+    // rt_sigaction has NO under-bypass rejection canary — its Test-240 matrix
+    // entry uses dispatch_linux (bypass inactive) — so this is safe.
+    let kbypass = crate::syscall::user_ptr_check_bypassed();
+    if oldact != 0 && !kbypass && (oldact < USER_PTR_MIN || oldact >= USER_PTR_MAX) {
         return -14; // EFAULT
     }
-    if act != 0 && (act < USER_PTR_MIN || act >= USER_PTR_MAX) {
+    if act != 0 && !kbypass && (act < USER_PTR_MIN || act >= USER_PTR_MAX) {
         return -14; // EFAULT
     }
 
@@ -9797,7 +9804,7 @@ pub fn sys_futex_linux(
         // Read the full timespec (tv_sec, tv_nsec) under ONE SMAP
         // bracket; the helper validates the 16-byte range internally
         // (one validate_user_ptr call vs the prior shape's three).
-        let (tv_sec, tv_nsec) = match unsafe { crate::syscall::user_read_timespec(timeout_ptr) } {
+        let (tv_sec, tv_nsec) = match unsafe { crate::syscall::user_read_timespec_or_kdispatch(timeout_ptr) } {
             Some(t) => t,
             None => return -14, // EFAULT
         };
@@ -9898,7 +9905,7 @@ pub fn sys_futex_linux(
             // safe (no allocation, no further locks, no #PF handler that
             // would re-enter the futex queue), but failing fast on EFAULT
             // before touching the queue avoids a needless lock acquire.
-            if !crate::syscall::validate_user_ptr(uaddr, 4) || (uaddr & 3) != 0 {
+            if !crate::syscall::validate_user_or_kdispatch_ptr(uaddr, 4) || (uaddr & 3) != 0 {
                 return -14; // EFAULT
             }
 
@@ -9943,7 +9950,7 @@ pub fn sys_futex_linux(
             // we're still mid-registration.
             match crate::syscall::futex_wait_check_and_enqueue(
                 pid, uaddr, val, tid, wake_tick,
-                || unsafe { crate::syscall::user_read_u32(uaddr) },
+                || unsafe { crate::syscall::user_read_u32_or_kdispatch(uaddr) },
             ) {
                 crate::syscall::FutexWaitOutcome::Enqueued     => {}
                 crate::syscall::FutexWaitOutcome::ValueMismatch => return -11, // EAGAIN
@@ -10308,7 +10315,7 @@ pub fn sys_futex_linux(
                 // proceeding.  Per futex(2): if *uaddr != val3, return EAGAIN.
                 // `_val3` is arg6, the dedicated comparison value (distinct from
                 // `val`, which is the wake count).
-                let current = match unsafe { crate::syscall::user_read_u32(uaddr) } {
+                let current = match unsafe { crate::syscall::user_read_u32_or_kdispatch(uaddr) } {
                     Some(v) => v,
                     None => return -14, // EFAULT
                 };
@@ -10448,7 +10455,7 @@ pub fn sys_futex_linux(
             // against other futex operations.)
             let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
 
-            let oldval = match unsafe { crate::syscall::user_read_u32(uaddr2) } {
+            let oldval = match unsafe { crate::syscall::user_read_u32_or_kdispatch(uaddr2) } {
                 Some(v) => v as i32,
                 None => return -14, // EFAULT — *uaddr2 unreadable
             };
@@ -10462,7 +10469,7 @@ pub fn sys_futex_linux(
             };
             // Store the new value into *uaddr2 in the caller's own address
             // space (symmetric with the user_read_u32 above).
-            if !unsafe { crate::syscall::user_write_u32(uaddr2, newval as u32) } {
+            if !unsafe { crate::syscall::user_write_u32_or_kdispatch(uaddr2, newval as u32) } {
                 return -14; // EFAULT — *uaddr2 unwritable
             }
 
@@ -11671,7 +11678,7 @@ fn sys_timerfd_gettime(fd_num: u64, curr_value_ptr: u64) -> i64 {
 ///
 /// If `fd == -1`, create a new signalfd. Otherwise update the mask of fd.
 fn sys_signalfd4(fd_num: u64, mask_ptr: u64, sizemask: u64, _flags: u32) -> i64 {
-    if sizemask < 8 || !crate::syscall::validate_user_ptr(mask_ptr, 8) { return -22; } // EINVAL/EFAULT
+    if sizemask < 8 || !crate::syscall::validate_user_or_kdispatch_ptr(mask_ptr, 8) { return -22; } // EINVAL/EFAULT
     let sigmask = unsafe { *(mask_ptr as *const u64) };
     let pid = crate::proc::current_pid_lockless();
 
@@ -12103,7 +12110,7 @@ fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
         None => return -9,
     };
 
-    if buf == 0 || !crate::syscall::validate_user_ptr(buf, count as usize) {
+    if buf == 0 || !crate::syscall::validate_user_or_kdispatch_ptr(buf, count as usize) {
         return -14; // EFAULT
     }
     // SMAP bracket — `buf` is a user-VA pointer.
@@ -12175,7 +12182,7 @@ fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
     // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
-    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+    if !crate::syscall::validate_user_or_kdispatch_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
         return -14; // EFAULT
     }
     let pid = crate::proc::current_pid_lockless();
@@ -12219,7 +12226,7 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
     // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
-    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+    if !crate::syscall::validate_user_or_kdispatch_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
         return -14; // EFAULT
     }
     let pid = crate::proc::current_pid_lockless();
