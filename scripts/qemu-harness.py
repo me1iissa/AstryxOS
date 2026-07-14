@@ -923,7 +923,14 @@ def _save_session(data: dict):
     with p.open("w") as f:
         json.dump(data, f)
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid) -> bool:
+    # Session JSONs written by older harness versions can carry the pid as a
+    # string; coerce before signalling so `list`/`status` don't crash on a
+    # stale record. A non-numeric pid means a malformed record → not alive.
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
     try:
         os.kill(pid, 0)
         return True
