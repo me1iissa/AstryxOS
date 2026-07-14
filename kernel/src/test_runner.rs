@@ -14785,7 +14785,16 @@ fn test_task4_identity_wp_guard() -> bool {
             if is_identity_map_phys(va, phys) { ident_va = cand; break; }
         }
 
-        if ident_va != 0 {
+        if ident_va == 0 {
+            // The kernel identity map always has present low pages; not finding
+            // one means the guard lost its live coverage — fail rather than
+            // silently downgrade to a predicate-only pass.
+            test_fail!("task4_identity_wp_guard",
+                "on kernel_cr3 but found no present identity page to target");
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        {
             // (a) mprotect of an identity page → EINVAL (refused).
             let r = crate::syscall::dispatch_linux_kernel(
                 10, ident_va, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
@@ -14815,11 +14824,16 @@ fn test_task4_identity_wp_guard() -> bool {
                 return false;
             }
             test_println!("  mprotect(identity {:#x})→EINVAL, PTE stays writable, high-VA mprotect→0 ✓", ident_va);
-        } else {
-            test_println!("  no present low identity page found to target — SKIP mprotect sub-check");
         }
     } else {
-        test_println!("  runner VmSpace cr3={:#x} != kernel_cr3={:#x} — SKIP mprotect sub-check", space_cr3, kcr3);
+        // In test-mode the PID-0 runner runs on kernel_cr3, so its lazily
+        // created VmSpace adopts kernel_cr3 — this is the invariant the guard
+        // relies on for its only live coverage.  If it no longer holds, fail
+        // loudly rather than silently downgrade to a predicate-only pass.
+        test_fail!("task4_identity_wp_guard",
+            "runner VmSpace cr3={:#x} != kernel_cr3={:#x} — guard's live coverage lost", space_cr3, kcr3);
+        let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+        return false;
     }
 
     // Clean up the anon page.
