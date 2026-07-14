@@ -3597,11 +3597,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 let proc = match procs.iter_mut().find(|p| p.pid == pid) {
                     Some(p) => p,
-                    None => break 'evict None, // ESRCH (exited between phases)
+                    // ESRCH (process exited between phases) — insert_vma never
+                    // ran, so bypass the `[MMAP-ERR]` insert-failure arm below.
+                    None => break 'phase3 -3,
                 };
                 let space = match proc.vm_space.as_mut() {
                     Some(s) => s,
-                    None => break 'evict None,
+                    None => break 'phase3 -3,
                 };
 
                 // The non-FIXED re-pick loop runs entirely under this held lock
@@ -3692,7 +3694,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 -12 // ENOMEM
             }
         }
-    }; // PROCESS_TABLE released here
+    };
 
     // A MAP_FIXED replacement (Phase 2a above) may have dropped the last pin of
     // an unlinked shm inode under PROCESS_TABLE; free it now that the lock is
