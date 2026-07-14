@@ -8039,7 +8039,7 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     use crate::mm::vma::{page_align_down, page_align_up, PROT_READ, PROT_WRITE, PROT_EXEC};
     use crate::mm::vmm::{read_pte, write_pte, PAGE_PRESENT, PAGE_WRITABLE,
-                         PAGE_USER, PAGE_NO_EXECUTE};
+                         PAGE_USER, PAGE_NO_EXECUTE, PAGE_HUGE};
 
     if len == 0 {
         return 0;
@@ -8066,6 +8066,44 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         None => return -22,
     };
     let cr3 = space.cr3;
+
+    // task#4 identity-map guard.  Refuse to retag the kernel's own 1:1
+    // identity map (PML4[0]).  Only a caller running on `kernel_cr3` — the
+    // in-kernel test runner, whose lazily-created VmSpace adopts `kernel_cr3`
+    // (see sys_mmap's from_existing_cr3 path) — can name identity pages.  A
+    // normal user address space never maps `phys == va`, so this rejects
+    // nothing a real program does.  Without the guard an mprotect(PROT_READ)
+    // on an identity-mapped page would clear PAGE_WRITABLE on a kernel-owned
+    // mapping (the running kernel writes through it), faulting the kernel.
+    // The check runs before any VMA-list mutation so the refusal is clean.
+    // Per mprotect(2), EINVAL is the error for an unsupported range request.
+    {
+        let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
+        if kernel_cr3 != 0 && cr3 == kernel_cr3 {
+            let mut p = base;
+            while p < end {
+                let pte = read_pte(cr3, p);
+                if pte & PAGE_PRESENT != 0 {
+                    // Identity (phys == va) is detected at leaf granularity.
+                    // read_pte returns a huge leaf without telling us whether it
+                    // is a 1 GiB PDPTE or a 2 MiB PDE, so a huge leaf is checked
+                    // at BOTH alignments and refused if either matches (identity
+                    // has phys == va at every granularity; a non-identity huge
+                    // leaf matches neither).  A 4 KiB leaf is checked at the page.
+                    let hit = if pte & PAGE_HUGE != 0 {
+                        crate::mm::vmm::is_identity_map_phys(p & !0x1F_FFFF,       pte & 0x000F_FFFF_FFE0_0000)
+                     || crate::mm::vmm::is_identity_map_phys(p & !0x3FFF_FFFF,     pte & 0x000F_FFFF_C000_0000)
+                    } else {
+                        crate::mm::vmm::is_identity_map_phys(p, pte & 0x000F_FFFF_FFFF_F000)
+                    };
+                    if hit {
+                        return -22; // EINVAL
+                    }
+                }
+                p = p.wrapping_add(0x1000);
+            }
+        }
+    }
 
     // W216 H_5j-B: mprotect rewrites VMA prot/areas in place; bump generation
     // to invalidate any in-flight PFH install loop that snapshotted the old

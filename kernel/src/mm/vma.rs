@@ -796,7 +796,8 @@ impl VmSpace {
     /// Also syncs `self.cr3 = actual_cr3` so subsequent VmSpace operations
     /// (demand-paging, CoW handling) use the correct page tables.
     pub fn clone_for_fork(&mut self, actual_cr3: u64) -> Option<Self> {
-        use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_HUGE, ADDR_MASK};
+        use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_HUGE, ADDR_MASK,
+                             get_kernel_cr3, is_identity_map_phys};
         use crate::mm::pmm;
         use crate::mm::refcount::page_ref_inc;
 
@@ -840,6 +841,23 @@ impl VmSpace {
             );
             self.cr3 = actual_cr3;
         }
+
+        // task#4 identity-map guard.  A fork whose page tables ARE the kernel's
+        // own (`actual_cr3 == kernel_cr3`) is only ever the in-kernel test
+        // runner (a `vm_space == None` process runs on `kernel_cr3`).  For such
+        // a fork the CoW write-protect pass below would clear `PAGE_WRITABLE`
+        // on the kernel's 1:1 identity map (PML4[0]); the running kernel writes
+        // through that map (e.g. the BSP bootstrap stack), so the next kernel
+        // store to a now-read-only identity page faults — a #PF that re-pushes
+        // onto the same read-only stack and escalates to #DF, or a getrandom /
+        // sysinfo kernel-context write that fault-loops.  When this flag is set
+        // the leaf loops below leave identity leaves (`phys == va`, low VA)
+        // writable and CoW every other (non-identity, high-VA) leaf normally.
+        // A real user address space never satisfies `actual_cr3 == kernel_cr3`
+        // — its PML4[0] is built empty and never shares a page-table page with
+        // the kernel identity map — so this is inert for every real fork(2).
+        let kernel_cr3 = get_kernel_cr3();
+        let fork_on_kernel_cr3 = kernel_cr3 != 0 && actual_cr3 == kernel_cr3;
 
         // Per-fork [FORK-COW] dump (START line + one line per VMA, ~100 VMAs
         // per Firefox process).  ALWAYS-ON historically — this taxed every
@@ -904,8 +922,16 @@ impl VmSpace {
 
                     // 1 GB huge page — write-protect in both, no CoW split.
                     if pdpte & PAGE_HUGE != 0 {
-                        let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
                         let phys_1g  = pdpte & !0x3FFF_FFFFu64;
+                        let va_1g    = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30);
+                        if fork_on_kernel_cr3 && is_identity_map_phys(va_1g, phys_1g) {
+                            // Kernel identity 1 GiB page: keep it writable in
+                            // both parent and child (copy the PDPTE verbatim).
+                            *parent_pdpt.add(pdpt_idx) = pdpte;
+                            *child_pdpt .add(pdpt_idx) = pdpte;
+                            continue;
+                        }
+                        let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
                         *parent_pdpt.add(pdpt_idx) = phys_1g | flags_ro;
                         *child_pdpt .add(pdpt_idx) = phys_1g | flags_ro;
                         continue;
@@ -928,11 +954,35 @@ impl VmSpace {
                         // 2 MB huge page — write-protect in both and ref-count sub-pages.
                         if pde & PAGE_HUGE != 0 {
                             let phys_2m     = pde & 0x000F_FFFF_FFE0_0000u64;
-                            let flags_ro    = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
-                            *parent_pd.add(pd_idx) = phys_2m | flags_ro;
-                            *child_pd .add(pd_idx) = phys_2m | flags_ro;
-                            for sub in 0..512u64 {
-                                page_ref_inc(phys_2m + sub * 0x1000);
+                            let va_2m       = ((pml4_idx as u64) << 39)
+                                            | ((pdpt_idx as u64) << 30)
+                                            | ((pd_idx as u64) << 21);
+                            let identity =
+                                fork_on_kernel_cr3 && is_identity_map_phys(va_2m, phys_2m);
+                            let (parent_pde, child_pde) = if identity {
+                                // Kernel identity 2 MiB page: keep it writable in
+                                // both (copy the PDE verbatim) AND take no
+                                // reference on its sub-pages.  The child holds a
+                                // writable alias to a kernel-owned frame it must
+                                // never be able to free, so it owns no reference;
+                                // the sub-page page_ref_inc below is skipped,
+                                // mirroring the write-protect skip.  Identity
+                                // leaves are covered by no VMA, so teardown
+                                // (free_process_memory walks VMAs;
+                                // free_user_page_tables skips huge leaves)
+                                // decrements none of them — skipping the inc
+                                // keeps inc and dec both absent = balanced.
+                                (pde, pde)
+                            } else {
+                                let flags_ro = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
+                                (phys_2m | flags_ro, phys_2m | flags_ro)
+                            };
+                            *parent_pd.add(pd_idx) = parent_pde;
+                            *child_pd .add(pd_idx) = child_pde;
+                            if !identity {
+                                for sub in 0..512u64 {
+                                    page_ref_inc(phys_2m + sub * 0x1000);
+                                }
                             }
                             continue;
                         }
@@ -952,16 +1002,36 @@ impl VmSpace {
                             if pte & PAGE_PRESENT == 0 { continue; }
 
                             let phys       = pte & ADDR_MASK;
-                            let flags_ro   = (pte & !ADDR_MASK) & !PAGE_WRITABLE;
+                            let va         = ((pml4_idx as u64) << 39)
+                                           | ((pdpt_idx as u64) << 30)
+                                           | ((pd_idx as u64) << 21)
+                                           | ((pt_idx as u64) << 12);
 
-                            // Write-protect parent PTE in place.
-                            *parent_pt.add(pt_idx) = phys | flags_ro;
+                            // Kernel identity leaf under kernel_cr3: keep the
+                            // parent (and child) PTE writable — never CoW the
+                            // kernel's own 1:1 map.  Otherwise write-protect in
+                            // place as usual.
+                            let identity =
+                                fork_on_kernel_cr3 && is_identity_map_phys(va, phys);
+                            let entry = if identity {
+                                pte
+                            } else {
+                                phys | ((pte & !ADDR_MASK) & !PAGE_WRITABLE)
+                            };
 
-                            // Child PTE: same physical page, read-only.
-                            *child_pt.add(pt_idx) = phys | flags_ro;
+                            // Parent PTE in place; child PTE: same physical page.
+                            *parent_pt.add(pt_idx) = entry;
+                            *child_pt.add(pt_idx)  = entry;
 
-                            // Keep page alive until both mappings are gone.
-                            page_ref_inc(phys);
+                            // Take a reference to keep the page alive until both
+                            // mappings are gone — EXCEPT for a kernel identity
+                            // leaf, which the child aliases writable but must
+                            // never free, and which no VMA covers so teardown
+                            // decrements none of them; inc and dec both absent =
+                            // balanced (mirrors the write-protect skip).
+                            if !identity {
+                                page_ref_inc(phys);
+                            }
                             total_pages_cow += 1;
                         }
                     }
