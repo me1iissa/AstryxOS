@@ -3552,100 +3552,149 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // syscall result rather than returning directly so the reap below always
     // runs (Phase 2a above may have queued an inode free even on the rare
     // process-exited-between-phases path).
+    //
+    // Two placement TOCTOU windows are closed here.  Both are opened because
+    // Phase 1 (base selection) and Phase 2b (MAP_FIXED PTE clear) release
+    // PROCESS_TABLE before this point, so on SMP a sibling thread on the shared
+    // CR3 can claim the range in between:
+    //
+    //   * non-FIXED — the base was picked by find_free_range /
+    //     find_free_stack_range in Phase 1 under a lock since released.  A
+    //     racing sibling mmap can take the gap, so a bare insert here would
+    //     wrongly return ENOMEM while free address space remains — a spurious
+    //     failure POSIX mmap(2) forbids for a kernel-chosen address.  Re-pick
+    //     and re-insert under the lock we now hold (find→insert is atomic while
+    //     held, so the retry cannot itself race).  Safe because a non-FIXED
+    //     mmap installs NO page-table entries — the base lives only in the VMA
+    //     record.
+    //
+    //   * MAP_FIXED — POSIX/Linux mmap(2): "if the memory region specified by
+    //     addr and len overlaps pages of any existing mapping(s), then the
+    //     overlapping part of the existing mapping(s) will be discarded."  So
+    //     MAP_FIXED must EVICT any overlap and place at the caller's exact
+    //     base — it must not fail on overlap.  Phase 2a/2b already cleared the
+    //     range, but a sibling can race a mapping back into it in the
+    //     lock-dropped window; the insert then hits Overlap.  Evict that raced
+    //     mapping and retry (bounded, ≤2×, then ENOMEM — a wrong success is
+    //     worse than ENOMEM, and the bound is livelock-safe against a sibling
+    //     that keeps re-racing).  The eviction MIRRORS the Phase 2a/2b split:
+    //     remove the VMA record under PROCESS_TABLE, then DROP the lock before
+    //     `unmap_and_free_range_in`, which issues a synchronous cross-CPU TLB
+    //     shootdown and acquires mm_sem internally — holding PROCESS_TABLE (or
+    //     mm_sem) across it would reintroduce the lock-across-shootdown
+    //     deadlock class closed on the #PF path.  MAP_FIXED_NOREPLACE is
+    //     excluded: its overlap is a genuine caller error, not a race to evict.
     let result = 'phase3: {
-        let mut procs = crate::proc::PROCESS_TABLE.lock();
-        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-            Some(p) => p,
-            None => break 'phase3 -3, // ESRCH (process exited between phases)
-        };
-        let space = match proc.vm_space.as_mut() {
-            Some(s) => s,
-            None => break 'phase3 -3,
-        };
+        enum Step { Done(Option<u64>), Evict }
 
-        // Close the Phase-1/Phase-3 placement TOCTOU for kernel-chosen
-        // (non-FIXED) mappings.
-        //
-        // For a non-FIXED mmap the base was picked by find_free_range /
-        // find_free_stack_range in Phase 1 under a PROCESS_TABLE lock that was
-        // then RELEASED before this point.  On SMP a concurrent mmap into the
-        // SAME address space (sibling thread / shared CR3) can claim that gap
-        // in the window, so `insert_vma` here would fail with Overlap and we
-        // would wrongly return ENOMEM even though free address space remains —
-        // a spurious failure that POSIX mmap(2) forbids for a kernel-chosen
-        // address.  (Observed live under SMP=2: a sibling thread's memfd
-        // MAP_SHARED mmap lost this race, the userland SharedMemory map failed,
-        // and a downstream NULL dereference of the unmapped region followed.)
-        //
-        // Re-pick the gap and re-insert under the lock we now hold; with the
-        // lock held the find→insert pair is atomic, so the retry cannot itself
-        // race.  This is safe because a non-FIXED sys_mmap installs NO page
-        // table entries (frames are demand-faulted later): the chosen base
-        // lives only in the VMA record, so re-choosing it here is complete —
-        // the return value and every subsequent fault use the recorded base.
-        //
-        // MAP_FIXED placements keep the caller-supplied base unchanged (no
-        // re-pick): their Overlap is a genuine caller error and Phase 2b has
-        // already edited the page table for that exact base.
         let mut cur_base = base;
-        let mut attempts = 0u32;
-        let installed: Option<u64> = loop {
-            let vma = VmArea {
-                base: cur_base,
-                length,
-                prot,
-                flags,
-                backing: backing.clone(),
-                name,
-            };
-            match space.insert_vma(vma) {
-                Ok(()) => break Some(cur_base),
-                Err(crate::mm::vma::VmaError::Overlap) if !is_fixed && attempts < 8 => {
-                    attempts += 1;
-                    let repick = if is_stack_alloc {
-                        space.find_free_stack_range(length)
-                    } else {
-                        space.find_free_range(length)
+        let mut fixed_evict_attempts = 0u32;
+
+        let installed: Option<u64> = 'evict: loop {
+            // Re-acquire PROCESS_TABLE each `'evict` iteration so a MAP_FIXED
+            // eviction can drop it before the lock-free shootdown, then retry.
+            let step = {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+                    Some(p) => p,
+                    // ESRCH (process exited between phases) — insert_vma never
+                    // ran, so bypass the `[MMAP-ERR]` insert-failure arm below.
+                    None => break 'phase3 -3,
+                };
+                let space = match proc.vm_space.as_mut() {
+                    Some(s) => s,
+                    None => break 'phase3 -3,
+                };
+
+                // The non-FIXED re-pick loop runs entirely under this held lock
+                // so find→insert stays atomic.
+                let mut attempts = 0u32;
+                loop {
+                    let vma = VmArea {
+                        base: cur_base,
+                        length,
+                        prot,
+                        flags,
+                        backing: backing.clone(),
+                        name,
                     };
-                    match repick {
-                        Some(nb) => { cur_base = nb; continue; }
-                        None => break None, // genuine address-space exhaustion
+                    match space.insert_vma(vma) {
+                        Ok(()) => {
+                            // Lower `mmap_hint` only for the NULL-hint
+                            // downward-walk regime (neither MAP_FIXED nor a
+                            // MAP_STACK kernel-chosen allocation): a MAP_FIXED at
+                            // a PIE-biased load base would otherwise destroy the
+                            // per-process entropy seeded by
+                            // `randomised_mmap_hint()` (POSIX mmap(2), CWE-330).
+                            let hint_before = space.mmap_hint;
+                            space.note_mmap_placement(cur_base, is_fixed, is_stack_alloc);
+                            let hint_after = space.mmap_hint;
+                            #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
+                            crate::serial_println!(
+                                "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={} attempts={} fixed_evict={}",
+                                pid, cur_base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8, attempts, fixed_evict_attempts
+                            );
+                            let _ = (hint_before, hint_after);
+                            break Step::Done(Some(cur_base));
+                        }
+                        Err(crate::mm::vma::VmaError::Overlap) if !is_fixed && attempts < 8 => {
+                            attempts += 1;
+                            let repick = if is_stack_alloc {
+                                space.find_free_stack_range(length)
+                            } else {
+                                space.find_free_range(length)
+                            };
+                            match repick {
+                                Some(nb) => { cur_base = nb; continue; }
+                                None => break Step::Done(None), // address-space exhaustion
+                            }
+                        }
+                        Err(crate::mm::vma::VmaError::Overlap)
+                            if is_fixed && !is_noreplace && fixed_evict_attempts < 2 =>
+                        {
+                            // MAP_FIXED must evict the raced overlap.  Remove the
+                            // VMA record now (under the lock); the PTE clear +
+                            // cross-CPU shootdown runs lock-free after we drop it.
+                            let _ = space.remove_range(cur_base, length);
+                            break Step::Evict;
+                        }
+                        Err(_) => break Step::Done(None),
                     }
                 }
-                Err(_) => break None,
+            }; // PROCESS_TABLE released here
+
+            match step {
+                Step::Done(r) => break 'evict r,
+                Step::Evict => {
+                    // Lock-free, mirroring Phase 2b: `unmap_and_free_range_in`
+                    // performs its own cross-CPU shootdown + mm_sem — no lock is
+                    // held across it.
+                    crate::mm::vmm::unmap_and_free_range_in(cr3, cur_base, length);
+                    fixed_evict_attempts += 1;
+                    // Rare event (a MAP_FIXED that lost the Phase-2a→Phase-3 race
+                    // to a sibling and had to re-evict): log unconditionally, same
+                    // as the `[MMAP-ERR]` error line, so a race caught-and-fixed is
+                    // observable without a debug feature flag.
+                    crate::serial_println!(
+                        "[MMAP] pid={} MAP_FIXED re-evicted a raced overlap at base={:#x} len={:#x} (attempt {})",
+                        pid, cur_base, length, fixed_evict_attempts
+                    );
+                    continue 'evict; // re-acquire the lock, retry at the same base
+                }
             }
         };
 
         match installed {
-            Some(b) => {
-                // Lower `mmap_hint` only when this allocation participates in the
-                // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
-                // MAP_STACK kernel-chosen allocation.  See
-                // `VmSpace::note_mmap_placement` for the full rationale; the
-                // critical case is MAP_FIXED at a PIE-biased shared-library load
-                // base, which would otherwise destroy the per-process entropy
-                // seeded by `randomised_mmap_hint()` before any NULL-hint
-                // allocation is ever issued (POSIX mmap(2), CWE-330).
-                let hint_before = space.mmap_hint;
-                space.note_mmap_placement(b, is_fixed, is_stack_alloc);
-                let hint_after = space.mmap_hint;
-                #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
-                crate::serial_println!(
-                    "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={} attempts={}",
-                    pid, b, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8, attempts
-                );
-                let _ = (hint_before, hint_after);
-                b as i64
-            }
+            Some(b) => b as i64,
             None => {
                 crate::serial_println!(
-                    "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={} attempts={}",
-                    pid, cur_base, length, flags, fd as i64, attempts
+                    "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={} fixed_evict_attempts={}",
+                    pid, cur_base, length, flags, fd as i64, fixed_evict_attempts
                 );
                 -12 // ENOMEM
             }
         }
-    }; // PROCESS_TABLE released here
+    };
 
     // A MAP_FIXED replacement (Phase 2a above) may have dropped the last pin of
     // an unlinked shm inode under PROCESS_TABLE; free it now that the lock is
