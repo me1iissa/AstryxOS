@@ -778,6 +778,11 @@ pub fn run() -> ! {
     total += 1;
     if test_mprotect_syscall() { passed += 1; }
 
+    // ── Test 49b: task#4 identity-range write-protect guard ───────────────
+
+    total += 1;
+    if test_task4_identity_wp_guard() { passed += 1; }
+
     // ── Test 50: eventfd (counter signaling fd) ───────────────────────────
 
     total += 1;
@@ -14696,6 +14701,131 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  munmap ✓");
 
     test_pass!("mprotect page-table protection changes");
+    true
+}
+
+/// Test 49b — task#4 identity-range write-protect guard.
+///
+/// `VmSpace::clone_for_fork` and `sys_mprotect` must never clear
+/// `PAGE_WRITABLE` on (nor otherwise retag) the kernel's 1:1 identity map
+/// (PML4[0]) when they run on `kernel_cr3`.  Only the in-kernel test runner
+/// (a `vm_space == None` process runs on `kernel_cr3`, and its lazily-created
+/// VmSpace adopts `kernel_cr3`) can name identity pages; a real user address
+/// space never maps `phys == va`, so the guard is identity-scoped, not
+/// cr3-wholesale (Test 49 above mprotects a HIGH-VA anon page on this same
+/// `kernel_cr3` and still succeeds).
+///
+/// A live `clone_for_fork(kernel_cr3)` is deliberately NOT exercised here: it
+/// would write-protect the runner's own non-identity high-VA mmaps (the same
+/// destructive mechanism), making the suite flaky.  The fork site shares the
+/// exact `is_identity_map_phys` discriminator and the same "keep writable"
+/// decision as the mprotect site, which this test drives end-to-end.
+/// See fork(2) / mprotect(2).
+fn test_task4_identity_wp_guard() -> bool {
+    use crate::mm::vmm::{is_identity_map_phys, get_kernel_cr3, read_pte,
+                         PAGE_PRESENT, PAGE_HUGE, PAGE_WRITABLE, IDENTITY_WINDOW_TOP};
+    test_header!("task#4: identity-range write-protect guard (fork/mprotect on kernel_cr3)");
+
+    // 1. Predicate unit checks — the discriminator shared by both guard sites.
+    //    Identity iff phys == va AND va inside the low identity window.
+    let cases: [(u64, u64, bool); 6] = [
+        (0x0020_0000, 0x0020_0000, true),   // 2 MiB identity
+        (0x3fe0_e000, 0x3fe0_e000, true),   // bootstrap-stack-region identity
+        (0x0020_0000, 0x0020_1000, false),  // phys != va
+        (0x7f00_0000_0000, 0x0000_1000, false), // high user VA, low phys
+        (IDENTITY_WINDOW_TOP, IDENTITY_WINDOW_TOP, false), // at/above window top
+        (0x0000_1000, 0x0000_2000, false),  // low but phys != va
+    ];
+    for (va, phys, want) in cases.iter() {
+        if is_identity_map_phys(*va, *phys) != *want {
+            test_fail!("task4_identity_wp_guard",
+                "is_identity_map_phys({:#x},{:#x}) != {}", va, phys, want);
+            return false;
+        }
+    }
+    test_println!("  is_identity_map_phys discriminator: 6/6 cases ✓");
+
+    // 2. mprotect guard end-to-end.  Ensure the runner has a VmSpace by
+    //    mmapping an anonymous page (returns a HIGH, non-identity VA).
+    let addr = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, 3 /*PROT_READ|WRITE*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+    if addr <= 0 {
+        test_fail!("task4_identity_wp_guard", "mmap failed: {}", addr);
+        return false;
+    }
+
+    // Read the running process's VmSpace CR3.  The guard only applies when it
+    // equals kernel_cr3; if the runner is on a distinct CR3, the end-to-end
+    // sub-check is not applicable (the predicate check above still gates it).
+    let pid = crate::proc::current_pid_lockless();
+    let space_cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|vs| vs.cr3)
+            .unwrap_or(0)
+    };
+    let kcr3 = get_kernel_cr3();
+
+    if space_cr3 == kcr3 && kcr3 != 0 {
+        // Find a present low identity page in kernel_cr3 to target.  Low
+        // (< 4 MiB) candidates can be ELF-overlaid (phys != va), so the scan
+        // includes the bootstrap-stack region and 1-2 GiB identity ranges
+        // which are never overlaid.
+        let mut ident_va = 0u64;
+        for cand in [0x3fe0_0000u64, 0x4000_0000, 0x8000_0000,
+                     0x0020_0000, 0x0040_0000, 0x0100_0000] {
+            let pte = read_pte(kcr3, cand);
+            if pte & PAGE_PRESENT == 0 { continue; }
+            let (phys, va) = if pte & PAGE_HUGE != 0 {
+                (pte & 0x000F_FFFF_FFE0_0000, cand & !0x1F_FFFF)
+            } else {
+                (pte & 0x000F_FFFF_FFFF_F000, cand)
+            };
+            if is_identity_map_phys(va, phys) { ident_va = cand; break; }
+        }
+
+        if ident_va != 0 {
+            // (a) mprotect of an identity page → EINVAL (refused).
+            let r = crate::syscall::dispatch_linux_kernel(
+                10, ident_va, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
+            if r != -22 {
+                test_fail!("task4_identity_wp_guard",
+                    "mprotect(identity {:#x}) = {} (expected -22/EINVAL)", ident_va, r);
+                let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+                return false;
+            }
+            // (b) the identity PTE must still be WRITABLE (guard refused, did
+            //     not clear PAGE_WRITABLE).  Huge or 4 KiB, the leaf carries W.
+            let pte_after = read_pte(kcr3, ident_va);
+            if pte_after & PAGE_WRITABLE == 0 {
+                test_fail!("task4_identity_wp_guard",
+                    "identity PTE {:#x} lost PAGE_WRITABLE after refused mprotect", ident_va);
+                let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+                return false;
+            }
+            // (c) identity-SCOPED, not cr3-wholesale: mprotect of the HIGH-VA
+            //     anon page on this same kernel_cr3 still succeeds.
+            let r2 = crate::syscall::dispatch_linux_kernel(
+                10, addr as u64, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
+            if r2 != 0 {
+                test_fail!("task4_identity_wp_guard",
+                    "mprotect(non-identity {:#x}) = {} (expected 0 — guard must be identity-scoped)", addr, r2);
+                let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+                return false;
+            }
+            test_println!("  mprotect(identity {:#x})→EINVAL, PTE stays writable, high-VA mprotect→0 ✓", ident_va);
+        } else {
+            test_println!("  no present low identity page found to target — SKIP mprotect sub-check");
+        }
+    } else {
+        test_println!("  runner VmSpace cr3={:#x} != kernel_cr3={:#x} — SKIP mprotect sub-check", space_cr3, kcr3);
+    }
+
+    // Clean up the anon page.
+    let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+
+    test_pass!("task#4 identity-range write-protect guard");
     true
 }
 

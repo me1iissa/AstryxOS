@@ -96,6 +96,33 @@ pub fn get_kernel_cr3() -> u64 {
     KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Top of the kernel's low 1:1 identity window (PML4[0]).
+///
+/// The bootloader identity-maps the first 4 GiB of physical address space at
+/// virtual address 0 (`bootloader/src/paging.rs`: four 1 GiB PDs of 2 MiB
+/// huge pages).  Any leaf whose virtual address is below this bound and whose
+/// masked physical address equals its virtual address is part of that map.
+pub const IDENTITY_WINDOW_TOP: u64 = 0x1_0000_0000;
+
+/// True when a leaf (or large-page) mapping `va → phys` belongs to the
+/// kernel's low 1:1 identity map (PML4[0]).
+///
+/// The 1:1 property (`phys == va`, within the identity window) is the
+/// discriminator.  Fork-CoW (`VmSpace::clone_for_fork`) and `mprotect`(2) must
+/// never write-protect or retag such a leaf when they run on `kernel_cr3`:
+/// the running kernel writes through the identity map (e.g. the BSP bootstrap
+/// stack), so clearing `PAGE_WRITABLE` there faults the kernel itself.
+///
+/// Only the in-kernel test runner (`vm_space == None`, running on
+/// `kernel_cr3`) can name these mappings — a normal user address space never
+/// shares a page-table page with the kernel identity map and never maps
+/// `phys == va`, so a low-VA user `mmap`/`mprotect` (e.g. an in-kernel
+/// mprotect test) is left to the normal path.  See fork(2) / mprotect(2).
+#[inline]
+pub fn is_identity_map_phys(va: u64, phys: u64) -> bool {
+    va < IDENTITY_WINDOW_TOP && phys == va
+}
+
 /// Initialize the VMM.
 ///
 /// 1. Reserves the physical pages that back the higher-half kernel heap
