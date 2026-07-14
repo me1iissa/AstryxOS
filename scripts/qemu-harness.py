@@ -911,19 +911,40 @@ def _session_path(sid: str) -> Path:
 def _events_path(sid: str) -> Path:
     return HARNESS_DIR / f"{sid}.events.jsonl"
 
+def _normalize_pid(value):
+    """Session JSONs written by older harness versions may carry the pid as
+    a string, and signal sites pass it straight to os.kill — normalize at
+    the read boundary. Malformed or non-positive values become None so a
+    corrupt record reads as a dead session (os.kill with 0/negative pids
+    would signal a process group, never a single stale QEMU)."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
 def _load_session(sid: str) -> dict:
     p = _session_path(sid)
     if not p.exists():
         _err(f"Unknown session: {sid}")
     with p.open() as f:
-        return json.load(f)
+        data = json.load(f)
+    if "pid" in data:
+        data["pid"] = _normalize_pid(data["pid"])
+    return data
 
 def _save_session(data: dict):
     p = _session_path(data["sid"])
     with p.open("w") as f:
         json.dump(data, f)
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid) -> bool:
+    # Defence in depth for callers that read session JSON without
+    # `_load_session` (e.g. the `list` sweep does its own json.load): a
+    # malformed pid reads as not-alive rather than crashing the subcommand.
+    pid = _normalize_pid(pid)
+    if pid is None:
+        return False
     try:
         os.kill(pid, 0)
         return True
