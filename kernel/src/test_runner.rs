@@ -14824,6 +14824,48 @@ fn test_task4_identity_wp_guard() -> bool {
                 return false;
             }
             test_println!("  mprotect(identity {:#x})→EINVAL, PTE stays writable, high-VA mprotect→0 ✓", ident_va);
+
+            // (d) F1 regression — the fork guard must take NO reference on an
+            //     identity frame (it skips page_ref_inc mirroring the WP skip);
+            //     otherwise every clone_for_fork(kernel_cr3) leaks ~1M refcount
+            //     increments that no VMA-based teardown can ever decrement.
+            //     Unmap the anon page first so the driven fork walks an
+            //     identity-only low half (no non-identity leaf to CoW), then
+            //     confirm a known identity frame's refcount is unchanged across
+            //     fork AND the child's teardown (which decrements no identity
+            //     leaf).  from_existing_cr3 keeps self.cr3 == kernel_cr3 so
+            //     clone_for_fork performs no cr3 sync; the child is a distinct
+            //     cr3 that free_vm_space tears down cleanly, and dropping the
+            //     handle is safe (shared sem strong_count > 2; Drop frees no
+            //     page tables).
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
+            if let Some(sem) = crate::mm::vma::mm_sem_for_cr3(kcr3) {
+                let mut vs = crate::mm::vma::VmSpace::from_existing_cr3(kcr3, sem);
+                let before = crate::mm::refcount::page_ref_count(ident_va);
+                match vs.clone_for_fork(kcr3) {
+                    Some(child) => {
+                        let after_fork = crate::mm::refcount::page_ref_count(ident_va);
+                        crate::proc::free_vm_space(child);
+                        let after_free = crate::mm::refcount::page_ref_count(ident_va);
+                        drop(vs);
+                        if after_fork != before || after_free != before {
+                            test_fail!("task4_identity_wp_guard",
+                                "identity frame {:#x} refcount {}→{}(fork)→{}(teardown), expected unchanged — F1 leak",
+                                ident_va, before, after_fork, after_free);
+                            return false;
+                        }
+                        test_println!("  identity frame {:#x} refcount balanced across kernel_cr3 fork+teardown ({}) ✓", ident_va, before);
+                    }
+                    None => {
+                        drop(vs);
+                        test_println!("  clone_for_fork(kernel_cr3) → None (OOM) — SKIP fork-balance");
+                    }
+                }
+            } else {
+                test_fail!("task4_identity_wp_guard",
+                    "no mm_sem registered for kernel_cr3 — cannot drive fork-balance check");
+                return false;
+            }
         }
     } else {
         // In test-mode the PID-0 runner runs on kernel_cr3, so its lazily

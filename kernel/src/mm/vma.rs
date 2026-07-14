@@ -957,22 +957,32 @@ impl VmSpace {
                             let va_2m       = ((pml4_idx as u64) << 39)
                                             | ((pdpt_idx as u64) << 30)
                                             | ((pd_idx as u64) << 21);
-                            let (parent_pde, child_pde) =
-                                if fork_on_kernel_cr3 && is_identity_map_phys(va_2m, phys_2m) {
-                                    // Kernel identity 2 MiB page: keep writable
-                                    // in both (copy the PDE verbatim).  The
-                                    // sub-page ref-count accounting is unchanged
-                                    // from the normal path so teardown stays
-                                    // balanced — only the writable bit differs.
-                                    (pde, pde)
-                                } else {
-                                    let flags_ro = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
-                                    (phys_2m | flags_ro, phys_2m | flags_ro)
-                                };
+                            let identity =
+                                fork_on_kernel_cr3 && is_identity_map_phys(va_2m, phys_2m);
+                            let (parent_pde, child_pde) = if identity {
+                                // Kernel identity 2 MiB page: keep it writable in
+                                // both (copy the PDE verbatim) AND take no
+                                // reference on its sub-pages.  The child holds a
+                                // writable alias to a kernel-owned frame it must
+                                // never be able to free, so it owns no reference;
+                                // the sub-page page_ref_inc below is skipped,
+                                // mirroring the write-protect skip.  Identity
+                                // leaves are covered by no VMA, so teardown
+                                // (free_process_memory walks VMAs;
+                                // free_user_page_tables skips huge leaves)
+                                // decrements none of them — skipping the inc
+                                // keeps inc and dec both absent = balanced.
+                                (pde, pde)
+                            } else {
+                                let flags_ro = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
+                                (phys_2m | flags_ro, phys_2m | flags_ro)
+                            };
                             *parent_pd.add(pd_idx) = parent_pde;
                             *child_pd .add(pd_idx) = child_pde;
-                            for sub in 0..512u64 {
-                                page_ref_inc(phys_2m + sub * 0x1000);
+                            if !identity {
+                                for sub in 0..512u64 {
+                                    page_ref_inc(phys_2m + sub * 0x1000);
+                                }
                             }
                             continue;
                         }
@@ -1001,7 +1011,9 @@ impl VmSpace {
                             // parent (and child) PTE writable — never CoW the
                             // kernel's own 1:1 map.  Otherwise write-protect in
                             // place as usual.
-                            let entry = if fork_on_kernel_cr3 && is_identity_map_phys(va, phys) {
+                            let identity =
+                                fork_on_kernel_cr3 && is_identity_map_phys(va, phys);
+                            let entry = if identity {
                                 pte
                             } else {
                                 phys | ((pte & !ADDR_MASK) & !PAGE_WRITABLE)
@@ -1011,8 +1023,15 @@ impl VmSpace {
                             *parent_pt.add(pt_idx) = entry;
                             *child_pt.add(pt_idx)  = entry;
 
-                            // Keep page alive until both mappings are gone.
-                            page_ref_inc(phys);
+                            // Take a reference to keep the page alive until both
+                            // mappings are gone — EXCEPT for a kernel identity
+                            // leaf, which the child aliases writable but must
+                            // never free, and which no VMA covers so teardown
+                            // decrements none of them; inc and dec both absent =
+                            // balanced (mirrors the write-protect skip).
+                            if !identity {
+                                page_ref_inc(phys);
+                            }
                             total_pages_cow += 1;
                         }
                     }

@@ -8084,15 +8084,19 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
             while p < end {
                 let pte = read_pte(cr3, p);
                 if pte & PAGE_PRESENT != 0 {
-                    // A 2 MiB huge leaf reports its 2 MiB-aligned identity
-                    // (phys == va) at the aligned base; a 4 KiB leaf reports
-                    // it at the page.
-                    let (phys, va) = if pte & PAGE_HUGE != 0 {
-                        (pte & 0x000F_FFFF_FFE0_0000, p & !0x1F_FFFF)
+                    // Identity (phys == va) is detected at leaf granularity.
+                    // read_pte returns a huge leaf without telling us whether it
+                    // is a 1 GiB PDPTE or a 2 MiB PDE, so a huge leaf is checked
+                    // at BOTH alignments and refused if either matches (identity
+                    // has phys == va at every granularity; a non-identity huge
+                    // leaf matches neither).  A 4 KiB leaf is checked at the page.
+                    let hit = if pte & PAGE_HUGE != 0 {
+                        crate::mm::vmm::is_identity_map_phys(p & !0x1F_FFFF,       pte & 0x000F_FFFF_FFE0_0000)
+                     || crate::mm::vmm::is_identity_map_phys(p & !0x3FFF_FFFF,     pte & 0x000F_FFFF_C000_0000)
                     } else {
-                        (pte & 0x000F_FFFF_FFFF_F000, p)
+                        crate::mm::vmm::is_identity_map_phys(p, pte & 0x000F_FFFF_FFFF_F000)
                     };
-                    if crate::mm::vmm::is_identity_map_phys(va, phys) {
+                    if hit {
                         return -22; // EINVAL
                     }
                 }

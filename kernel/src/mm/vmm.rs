@@ -102,6 +102,12 @@ pub fn get_kernel_cr3() -> u64 {
 /// virtual address 0 (`bootloader/src/paging.rs`: four 1 GiB PDs of 2 MiB
 /// huge pages).  Any leaf whose virtual address is below this bound and whose
 /// masked physical address equals its virtual address is part of that map.
+///
+/// This bound is COUPLED to that bootloader extent — it is the single source
+/// of truth.  If the bootloader is ever changed to identity-map beyond 4 GiB,
+/// this constant MUST be raised in lockstep; otherwise `is_identity_map_phys`
+/// under-covers and the fork/mprotect guards would write-protect or retag the
+/// now-uncovered identity leaves (the exact fault class task#4 closes).
 pub const IDENTITY_WINDOW_TOP: u64 = 0x1_0000_0000;
 
 /// True when a leaf (or large-page) mapping `va → phys` belongs to the
