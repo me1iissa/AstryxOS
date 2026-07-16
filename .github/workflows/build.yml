@@ -238,7 +238,9 @@ jobs:
       # in-place / write-through-symlink regen that clobbered a shared data.img
       # under running QEMU sessions.
       - name: create-data-disk write-safety smoke (atomic rename + refuse guards)
-        run: bash scripts/create-data-disk-safety-smoke.sh
+        # --require-tools: a runner missing e2fsprogs/psmisc/lsof FAILS here
+        # instead of silently self-skipping and reducing coverage while green.
+        run: bash scripts/create-data-disk-safety-smoke.sh --require-tools
 
   kernel-build:
     name: bootloader + kernel builds

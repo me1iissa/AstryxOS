@@ -272,6 +272,11 @@ echo "[DATA-DISK] Output image: ${DATA_IMG}"
 # fuser(1) prints PIDs to stdout (its "FILE:" banner goes to stderr); some
 # builds append an access-type letter (e.g. "1234m"), so we extract digit
 # runs.  lsof(8) -t is the fallback when fuser is unavailable.
+# Best-effort by design: it fails OPEN when neither fuser nor lsof is present,
+# and as non-root cannot see holders owned by another user.  That residual is
+# backstopped by the atomic rename (fix 1, existing readers keep the old inode)
+# and the write-through-symlink refusal (fix 3) — the refusal here is a policy
+# guard for FUTURE-boot comparability, not the correctness safety net.
 _image_open_pids() {
     local target="$1" pids=""
     if command -v fuser >/dev/null 2>&1; then
@@ -322,13 +327,35 @@ PY
     fi
 }
 
+# _lexical_abspath <path> — absolutise + normalise "." / ".." WITHOUT following
+# any symlink (unlike readlink -f).  Used to tell "the caller lexically aimed
+# inside this tree" (an in-tree path a symlink then redirected out — the
+# incident) apart from "the caller explicitly aimed at a foreign path"
+# (e.g. --output=/tmp/private.img — the sanctioned private-copy escape hatch).
+_lexical_abspath() {
+    local p="$1" part res="" IFS=/
+    case "$p" in /*) ;; *) p="$(pwd)/$p" ;; esac
+    local -a out=()
+    for part in $p; do
+        case "$part" in
+            ''|.) ;;
+            ..) [ "${#out[@]}" -gt 0 ] && unset 'out[${#out[@]}-1]' ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    for part in "${out[@]}"; do res="${res}/${part}"; done
+    echo "${res:-/}"
+}
+
 # Resolve the real path we will actually overwrite.  When build/data.img is a
 # symlink we follow it so the atomic rename lands on the real inode (preserving
 # the symlink) and the checks below inspect the true target.  readlink -f
-# resolves every component and still yields an absolute path when the final
-# component does not yet exist.
+# resolves every component (leaf AND ancestor dirs) and still yields an absolute
+# path when the final component does not yet exist.
 IMG_FINAL="$(readlink -f -- "${DATA_IMG}" 2>/dev/null || true)"
 [ -n "${IMG_FINAL}" ] || IMG_FINAL="${DATA_IMG}"
+# Lexical (no-symlink) form of the requested path — see _lexical_abspath.
+DATA_IMG_LEXICAL="$(_lexical_abspath "${DATA_IMG}")"
 
 # Will this invocation actually (re)write the image?  Mirrors the
 # "exists && !force → exit 0" early-return far below, so the guard only fires
@@ -341,22 +368,30 @@ fi
 if [ "${WILL_WRITE}" = true ]; then
     ROOT_REAL="$(readlink -f -- "${ROOT_DIR}" 2>/dev/null || echo "${ROOT_DIR}")"
 
-    # (3) Never write THROUGH a symlink into foreign territory.  A symlink whose
-    #     resolved target lives outside this tree is the incident pattern (a
-    #     worktree link to the canonical image); regenerating would clobber a
-    #     file another tree owns.  Refuse regardless of --force / --force-inuse.
-    if [ -L "${DATA_IMG}" ]; then
-        case "${IMG_FINAL}/" in
-            "${ROOT_REAL}/"*) : ;;  # resolves inside this tree — allowed
-            *)
-                echo "[DATA-DISK] REFUSED: ${DATA_IMG} is a symlink to ${IMG_FINAL}, which is OUTSIDE this tree (${ROOT_REAL})." >&2
-                echo "[DATA-DISK]          Regenerating would write through the link and clobber a shared/foreign image" >&2
-                echo "[DATA-DISK]          (e.g. the canonical build/data.img other QEMU sessions boot from)." >&2
-                echo "[DATA-DISK]          Use a PRIVATE copy instead: cp the image into this tree and pass --output=<local path>," >&2
-                echo "[DATA-DISK]          or run create-data-disk.sh in the tree that owns the real image.  (no override for this case)" >&2
-                exit 3
-                ;;
-        esac
+    # (3) Never write THROUGH a symlink into foreign territory.  The incident
+    #     pattern is a worktree build/data.img that links to the canonical image;
+    #     regenerating writes through the link and clobbers a file another tree
+    #     owns.  A LEAF symlink is not the only way in — an ANCESTOR directory
+    #     can be the symlink while data.img is a regular file within it — so we
+    #     do NOT gate on `-L "${DATA_IMG}"`.  Instead compare the two resolutions
+    #     of the requested path: if it aims INSIDE this tree lexically but the
+    #     fully-resolved (symlink-followed) path lands OUTSIDE, some symlink
+    #     component redirected the write out of the tree — refuse, regardless of
+    #     --force / --force-inuse.  An explicitly-foreign path (e.g.
+    #     --output=/tmp/private.img, the sanctioned private-copy escape hatch)
+    #     is lexically outside and is left alone.
+    _lex_inside=false
+    case "${DATA_IMG_LEXICAL}/" in "${ROOT_REAL}/"*) _lex_inside=true ;; esac
+    _phys_inside=false
+    case "${IMG_FINAL}/" in "${ROOT_REAL}/"*) _phys_inside=true ;; esac
+    if [ "${_lex_inside}" = true ] && [ "${_phys_inside}" = false ]; then
+        echo "[DATA-DISK] REFUSED: ${DATA_IMG} is inside this tree (${ROOT_REAL}) but a symlink component redirects it to ${IMG_FINAL}, which is OUTSIDE." >&2
+        echo "[DATA-DISK]          Regenerating would write through the link and clobber a shared/foreign image" >&2
+        echo "[DATA-DISK]          (e.g. the canonical build/data.img other QEMU sessions boot from)." >&2
+        echo "[DATA-DISK]          Use a PRIVATE copy instead: cp the image into this tree, or pass an explicitly" >&2
+        echo "[DATA-DISK]          foreign --output=<path outside the tree>, or run create-data-disk.sh in the tree" >&2
+        echo "[DATA-DISK]          that owns the real image.  (no override for this case)" >&2
+        exit 3
     fi
 
     # (2) Refuse to regenerate while the resolved image is held open.  With the

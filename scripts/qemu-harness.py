@@ -2316,6 +2316,14 @@ def _data_img_symlink_info(data_img: Path, wt_root: Path) -> dict:
         `wt_root` (i.e. mutating it would clobber a different worktree's or
         the main checkout's data.img).  Conservative default False when we
         cannot resolve.
+      write_through_outside_wt: bool — True when the requested path aims INSIDE
+        `wt_root` lexically (no symlink resolution) but the fully-resolved path
+        lands OUTSIDE it.  That means some symlink component — the LEAF or any
+        ANCESTOR directory — redirects the write out of the worktree (the
+        incident class).  A path the caller aimed at a foreign location on
+        purpose (lexically outside `wt_root`) is NOT flagged, so the private
+        --output escape hatch still works.  Additive (2026-07-16); supersedes
+        the leaf-only `is_symlink AND target_outside_wt` test for the pre-check.
 
     Per POSIX symlink(7), st_mode on the link itself reports S_IFLNK; we
     use os.path.islink for that classification and os.path.realpath to
@@ -2326,7 +2334,7 @@ def _data_img_symlink_info(data_img: Path, wt_root: Path) -> dict:
     own; the symlink path is the documented one (see cmd_start banner).
     """
     out = {"is_symlink": False, "target": None, "resolved": None,
-           "target_outside_wt": False}
+           "target_outside_wt": False, "write_through_outside_wt": False}
     try:
         out["is_symlink"] = os.path.islink(str(data_img))
     except OSError:
@@ -2340,15 +2348,26 @@ def _data_img_symlink_info(data_img: Path, wt_root: Path) -> dict:
         out["resolved"] = os.path.realpath(str(data_img))
     except OSError:
         out["resolved"] = None
-    if out["resolved"]:
+    wt_real = None
+    try:
+        wt_real = os.path.realpath(str(wt_root))
+    except OSError:
+        wt_real = None
+    def _inside(path: str) -> bool:
+        # True iff `path` is at or under wt_real.  commonpath raises ValueError
+        # on cross-drive paths (Windows); on Linux that never trips here.
         try:
-            wt_real = os.path.realpath(str(wt_root))
-            # commonpath raises ValueError on cross-drive paths (Windows);
-            # on Linux that path never trips for our absolute paths.
-            common = os.path.commonpath([out["resolved"], wt_real])
-            out["target_outside_wt"] = (common != wt_real)
-        except (ValueError, OSError):
-            out["target_outside_wt"] = False
+            return os.path.commonpath([path, wt_real]) == wt_real
+        except (ValueError, OSError, TypeError):
+            return False
+    if out["resolved"] and wt_real:
+        out["target_outside_wt"] = not _inside(out["resolved"])
+        # os.path.abspath normalises "." / ".." lexically WITHOUT following any
+        # symlink, so it reflects where the caller *aimed*; realpath reflects
+        # where a symlink component actually lands.
+        lex = os.path.abspath(str(data_img))
+        out["write_through_outside_wt"] = (
+            _inside(lex) and not _inside(out["resolved"]))
     return out
 
 
@@ -3866,12 +3885,12 @@ def cmd_start(args):
                 "║  --no-regen-data-img set; booting stale image as requested.  ║",
                 file=sys.stderr,
             )
-        elif (_data_img_symlink.get("is_symlink")
-              and _data_img_symlink.get("target_outside_wt")):
-            # 2026-07-16 write-safety: build/data.img is a symlink whose target
-            # resolves OUTSIDE this worktree — the incident pattern (a link to
-            # the canonical image other QEMU sessions boot from).  An in-place
-            # regen would write THROUGH the link and clobber that shared image.
+        elif _data_img_symlink.get("write_through_outside_wt"):
+            # 2026-07-16 write-safety: build/data.img aims inside this worktree
+            # but a symlink component (the leaf link OR an ancestor directory)
+            # redirects it OUTSIDE — the incident pattern (a link to the
+            # canonical image other QEMU sessions boot from).  An in-place regen
+            # would write THROUGH the link and clobber that shared image.
             # create-data-disk.sh now refuses this itself, but we skip the call
             # entirely so the failure is fast and the reason structured; boot
             # the (untouched) stale image.
@@ -3972,10 +3991,10 @@ def cmd_start(args):
         # writes through the link and clobbers the shared image — taking
         # every sibling agent's session down with it.  Refuse politely
         # and tell the caller exactly what to do.
-        _shared_symlink = (
-            _data_img_symlink.get("is_symlink")
-            and _data_img_symlink.get("target_outside_wt")
-        )
+        # write_through_outside_wt covers the leaf-symlink case AND the
+        # ancestor-directory-symlink case (a regular data.img inside a linked
+        # dir), so a foreign target reached via either path is refused.
+        _shared_symlink = _data_img_symlink.get("write_through_outside_wt")
         if _shared_symlink and not _no_regen:
             _target_disp = (_data_img_symlink.get("resolved")
                             or _data_img_symlink.get("target") or "<unknown>")
