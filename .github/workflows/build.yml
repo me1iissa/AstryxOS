@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
@@ -105,7 +105,7 @@ jobs:
           - name: ff-bundle
             features: firefox-test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -289,7 +289,7 @@ jobs:
     # the worst all-flake case). The happy path is a single ~3–4 min attempt.
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
@@ -658,7 +658,7 @@ jobs:
     needs: kernel-build
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
