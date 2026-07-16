@@ -2888,19 +2888,35 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                     let read_end = offset + n as u64;
                     let mut pg = offset & !(PAGE - 1);
                     while pg < read_end {
-                        if let Some(phys) = crate::mm::cache::lookup(mount_idx, inode, pg) {
+                        // Acquire a guard reference under the cache lock so the
+                        // frame cannot be freed/recycled during the copy below.
+                        // A ref-less `cache::lookup` would return a bare `phys`
+                        // whose liveness ends the moment the cache lock is
+                        // dropped — a concurrent evict / collision-insert /
+                        // truncate on another CPU could free and recycle the
+                        // frame mid-copy, so the copy would pull a recycled
+                        // frame's bytes (another file's data) into the user
+                        // buffer.  `lookup_and_acquire` increments the refcount
+                        // while the cache lock is held (cache.rs), closing that
+                        // window.
+                        if let Some(phys) =
+                            crate::mm::cache::lookup_and_acquire(mount_idx, inode, pg)
+                        {
                             // Intersect [pg, pg+PAGE) with [offset, read_end).
                             let seg_start = core::cmp::max(pg, offset);
                             let seg_end = core::cmp::min(pg + PAGE, read_end);
                             let in_page_off = (seg_start - pg) as usize;
                             let buf_off = (seg_start - offset) as usize;
                             let len = (seg_end - seg_start) as usize;
-                            // SAFETY: `phys` is a live cache frame (cache holds
-                            // a reference); the higher-half map covers it
-                            // (Intel SDM Vol. 3A §4.10.5).  `in_page_off + len
-                            // <= PAGE` and `buf_off + len <= n <= count` by the
-                            // intersection bounds above, so the copy stays in
-                            // bounds of both the frame and `buffer`.
+                            // SAFETY: `lookup_and_acquire` incremented `phys`'s
+                            // refcount under the cache lock, so the frame stays
+                            // live for the whole copy even if a sibling CPU
+                            // evicts the cache entry concurrently (Intel SDM
+                            // Vol. 3A §4.10.5); the higher-half map covers every
+                            // PMM frame.  `in_page_off + len <= PAGE` and
+                            // `buf_off + len <= n <= count` by the intersection
+                            // bounds above, so the copy stays in bounds of both
+                            // the frame and `buffer`.
                             let src = (PHYS_OFF + phys + in_page_off as u64) as *const u8;
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
@@ -2908,6 +2924,16 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                                     buffer.as_mut_ptr().add(buf_off),
                                     len,
                                 );
+                            }
+                            // Release the guard reference.  If a concurrent
+                            // eviction dropped the cache's own reference during
+                            // the copy, this guard is the last holder: route the
+                            // frame through the TLB quarantine free — the same
+                            // deferred-free protocol the eviction path uses,
+                            // since a sibling CPU may still hold a translation
+                            // (Intel SDM Vol. 3A §4.10.5).
+                            if crate::mm::refcount::page_ref_dec(phys) == 0 {
+                                crate::mm::tlb::quarantine_free(phys);
                             }
                         }
                         pg += PAGE;
