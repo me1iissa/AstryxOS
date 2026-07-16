@@ -98,6 +98,91 @@ pub fn lookup(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
         .map(|e| e.phys)
 }
 
+/// PHYS → kernel-higher-half direct-map offset.  Same constant as
+/// `mm/pmm.rs`; the page cache reads/writes cached frames through this map.
+/// Per Intel SDM Vol. 3A §4.10.5 the higher-half identity map covers every
+/// PMM frame, so `PHYS_OFFSET + phys` is always a valid kernel VA for an
+/// allocated frame.
+const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+/// Write a cache frame back to its in-memory filesystem's inode buffer.
+///
+/// ## Why this exists — ramfs/tmpfs MAP_SHARED dual-storage coherence
+///
+/// An in-memory filesystem (ramfs / tmpfs) keeps a file's bytes in TWO
+/// places once a page is demand-faulted:
+///
+///   1. the inode's own buffer (`RamInode::File::data`), which is what
+///      `FileSystemOps::read` / `write` / `stat.size` operate on; and
+///   2. the page-cache frame the demand-fault path installs, which a
+///      `mmap(MAP_SHARED)` PTE aliases directly.
+///
+/// A `MAP_SHARED + PROT_WRITE` store lands ONLY in the cache frame — the CPU
+/// writes the frame through the aliasing PTE; the kernel is never on that
+/// write path, so the inode buffer is never updated.  If the frame is then
+/// evicted (and freed), a subsequent `read(2)` (which goes to the inode
+/// buffer via `FileSystemOps::read`) returns the STALE, never-updated bytes
+/// — for a freshly-`ftruncate`d memfd, all zeros.  This is the
+/// dual-storage incoherence that empties Firefox's WebRender display-list /
+/// blob transport.
+///
+/// This helper restores coherence by flushing the cache frame's current
+/// bytes back into the inode buffer just before the frame leaves the cache,
+/// so the inode buffer becomes the authoritative copy of any mmap writes for
+/// any later cache-miss `read`.  For block-backed filesystems (ext2 / fat32)
+/// `is_in_memory()` is false and this is a no-op — those filesystems re-read
+/// the on-disk image and never alias a writable cache frame in this way, so
+/// they are unaffected.
+///
+/// Per POSIX.1-2017 mmap(2): a `MAP_SHARED` write "shall change the
+/// underlying file object" and be visible to a subsequent `read(2)`.
+///
+/// ## Lock order
+///
+/// This MUST be called with NO cache lock held.  It snapshots the
+/// filesystem handle via [`crate::vfs::fs_at`] (which takes and immediately
+/// drops `MOUNTS`), then dispatches `FileSystemOps::write`, which on
+/// ramfs/tmpfs takes only the inode mutex.  Lock order is therefore
+/// cache → (released) → MOUNTS → (released) → inode — no cycle, no nesting.
+/// Callers that hold the cache lock collect `(mount_idx, inode, page_offset,
+/// phys)` while locked and invoke this after releasing the lock, exactly as
+/// the quarantine-free deferral does.
+///
+/// `phys` must still be a live frame (the caller holds a reference, e.g. the
+/// cache's own reference that has not yet been dropped) so the direct-map
+/// read is valid.  Best-effort: a write error (e.g. a read-only tmpfs, which
+/// has no MAP_SHARED writers anyway) is ignored.
+fn writeback_frame_to_inode(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
+    let fs = match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => fs,
+        None => return,
+    };
+    if !fs.is_in_memory() {
+        return;
+    }
+    // Snapshot the frame's 4 KiB through the higher-half direct map.  The
+    // frame is alive (caller holds a reference), so the read is valid.
+    let mut frame = [0u8; 4096];
+    let src = (PHYS_OFFSET + phys) as *const u8;
+    // SAFETY: `phys` is a live, page-aligned PMM frame; the higher-half
+    // identity map covers it (Intel SDM Vol. 3A §4.10.5).  We copy exactly
+    // one 4 KiB page into a stack buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, frame.as_mut_ptr(), 4096);
+    }
+    // Write the page's bytes back into the inode buffer at this file offset,
+    // bounded to the file's current size so we do not zero-extend a sealed /
+    // shrunk file.  ramfs `write` grows the buffer as needed; we cap the
+    // write at `stat.size` so a partial last page does not artificially
+    // extend the file past its real end.
+    let file_size = fs.stat(inode).map(|s| s.size).unwrap_or(0);
+    if page_offset >= file_size {
+        return; // page is entirely past EOF — nothing authoritative to flush.
+    }
+    let span = core::cmp::min(4096u64, file_size - page_offset) as usize;
+    let _ = fs.write(inode, page_offset, &frame[..span]);
+}
+
 /// Look up a cached page and atomically acquire a guard reference on it.
 ///
 /// The reference count is incremented while the cache lock is still held, so
@@ -487,6 +572,14 @@ pub fn insert_with_expected(
     }
 
     if let Some(old_phys) = evicted_zero_rc {
+        // Flush any MAP_SHARED mmap writes held only in the evicted frame
+        // back to the in-memory inode buffer before the frame is retired —
+        // this collision eviction is the dominant fault-path eviction on the
+        // single-CPU path, and the evicted frame (rc now 0, no other holder)
+        // is the last copy of those bytes.  No-op for block-backed
+        // filesystems.  Done after the cache lock is released
+        // (cache → MOUNTS → inode); the frame is alive until quarantine.
+        writeback_frame_to_inode(mount_idx, inode, page_offset, old_phys);
         // Defer PMM release through the quarantine to ensure any stale
         // TLB entry on a sibling CPU is retired before the frame is
         // recycled.  See module-level doc for the quiescent-state
@@ -546,7 +639,7 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
         return;
     }
     const PAGE: u64 = 4096;
-    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+    // PHYS_OFFSET is the module-level const (mm/cache.rs).
 
     let start = offset;
     let end = offset.saturating_add(data.len() as u64);
@@ -635,7 +728,7 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
 /// the cache lock is released to preserve the cache → TLB → PMM lock order.
 pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64) {
     const PAGE: u64 = 4096;
-    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+    // PHYS_OFFSET is the module-level const (mm/cache.rs).
 
     // The lowest offset whose page contents are stale after the resize.
     let boundary = core::cmp::min(old_size, new_size);
@@ -720,33 +813,50 @@ pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64
 
 /// Evict a page from the cache, releasing the cache's reference.
 /// Returns the physical address of the evicted page, if any.
+///
+/// Before the frame leaves the cache, its bytes are written back to the
+/// inode buffer for in-memory filesystems (ramfs / tmpfs) so any
+/// `MAP_SHARED` mmap write that landed only in the frame survives the
+/// eviction and is visible to a subsequent cache-miss `read(2)` — see
+/// [`writeback_frame_to_inode`].  The writeback is deferred to AFTER the
+/// cache lock is released (lock order: cache → MOUNTS → inode); the frame is
+/// still alive at that point because the caller takes ownership of it and
+/// frees it only after this function returns.
 pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
-    let mut cache = PAGE_CACHE.lock();
-    if let Some(entry) = cache.remove(&(mount_idx, inode, page_offset)) {
-        // Caller takes ownership of the phys frame; freeing it (with proper
-        // shootdown) is the caller's responsibility.  Here we only release
-        // the cache's reference.
-        let _ = crate::mm::refcount::page_ref_dec(entry.phys);
-        // W215 diagnostic Arm-1 / Arm-2.
-        #[cfg(feature = "firefox-test-core")]
-        {
-            crate::mm::w215_diag::prov_record(
-                entry.phys,
-                crate::mm::w215_diag::KIND_EVICT,
-                crate::mm::w215_diag::pack_cache_key(inode, page_offset),
-            );
-            crate::mm::w215_diag::preins_check_op(
-                entry.phys,
-                crate::mm::w215_diag::OP_EVICT,
-                ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
-            );
-            #[cfg(feature = "w215-diag")]
-            crate::mm::w215_crc::record_evict(entry.phys);
+    let evicted_phys: u64;
+    {
+        let mut cache = PAGE_CACHE.lock();
+        if let Some(entry) = cache.remove(&(mount_idx, inode, page_offset)) {
+            // Caller takes ownership of the phys frame; freeing it (with proper
+            // shootdown) is the caller's responsibility.  Here we only release
+            // the cache's reference.
+            let _ = crate::mm::refcount::page_ref_dec(entry.phys);
+            // W215 diagnostic Arm-1 / Arm-2.
+            #[cfg(feature = "firefox-test-core")]
+            {
+                crate::mm::w215_diag::prov_record(
+                    entry.phys,
+                    crate::mm::w215_diag::KIND_EVICT,
+                    crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+                );
+                crate::mm::w215_diag::preins_check_op(
+                    entry.phys,
+                    crate::mm::w215_diag::OP_EVICT,
+                    ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
+                );
+                #[cfg(feature = "w215-diag")]
+                crate::mm::w215_crc::record_evict(entry.phys);
+            }
+            evicted_phys = entry.phys;
+        } else {
+            return None;
         }
-        Some(entry.phys)
-    } else {
-        None
-    }
+    } // release cache lock before the FS writeback (cache → MOUNTS → inode)
+
+    // Flush any MAP_SHARED mmap writes held only in the frame back to the
+    // in-memory inode buffer before the caller frees the frame.
+    writeback_frame_to_inode(mount_idx, inode, page_offset, evicted_phys);
+    Some(evicted_phys)
 }
 
 /// Mark all dirty pages for a given inode as clean.

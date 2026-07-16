@@ -115,6 +115,10 @@ impl FileSystemOps for RamFs {
         "ramfs"
     }
 
+    fn is_in_memory(&self) -> bool {
+        true
+    }
+
     fn create_file(&self, parent_inode: u64, name: &str) -> VfsResult<u64> {
         let mut inodes = self.inodes.lock();
 

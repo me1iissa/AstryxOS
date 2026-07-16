@@ -60,6 +60,11 @@ impl FileSystemOps for TmpFs {
         "tmpfs"
     }
 
+    fn is_in_memory(&self) -> bool {
+        // Backed entirely by the embedded RamFs — same dual-storage model.
+        true
+    }
+
     fn create_file(&self, parent_inode: u64, name: &str) -> VfsResult<u64> {
         self.check_writable()?;
         self.inner.create_file(parent_inode, name)
