@@ -194,6 +194,34 @@ pub fn is_initialized() -> bool {
     MOUSE_INITIALIZED.load(Ordering::Relaxed)
 }
 
+/// Current screen bounds (width, height) used for cursor clamping.  Exposed so
+/// an absolute pointing device (virtio-tablet) can scale its device-space
+/// coordinates onto the framebuffer.
+pub fn screen_bounds() -> (i32, i32) {
+    (
+        SCREEN_WIDTH.load(Ordering::Relaxed),
+        SCREEN_HEIGHT.load(Ordering::Relaxed),
+    )
+}
+
+/// Set the full pointer state (absolute screen position + button bitmask) in a
+/// single update.  Used by absolute pointing devices (e.g. virtio-tablet) whose
+/// hardware already reports an absolute location, unlike the PS/2 mouse which
+/// integrates relative deltas in [`handle_irq`].  Coordinates are clamped to the
+/// screen.  `buttons` follows the same bit layout as [`buttons`] (bit 0=left,
+/// 1=right, 2=middle).
+///
+/// Marking the mouse initialized here lets a virtio-tablet drive the cursor even
+/// on a guest where the PS/2 controller never came up.
+pub fn set_state(x: i32, y: i32, buttons: u8) {
+    let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
+    let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
+    MOUSE_X.store(x.clamp(0, max_x), Ordering::Relaxed);
+    MOUSE_Y.store(y.clamp(0, max_y), Ordering::Relaxed);
+    MOUSE_BUTTONS.store(buttons, Ordering::Relaxed);
+    MOUSE_INITIALIZED.store(true, Ordering::Relaxed);
+}
+
 /// Best-effort read of the live i8042 controller command byte (CCB), for the
 /// `mouse-state` kdb diagnostic.
 ///

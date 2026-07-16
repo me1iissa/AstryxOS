@@ -20,6 +20,7 @@ pub mod pty;
 pub mod tty;
 pub mod usb;
 pub mod virtio_blk;
+pub mod virtio_input;
 #[cfg(feature = "qga")]
 pub mod virtio_serial;
 pub mod vmware_svga;
@@ -52,6 +53,12 @@ pub fn init(boot_info: &BootInfo) {
     usb::init();
     if virtio_blk::init() {
         crate::serial_println!("[DRIVERS] Virtio-blk initialized");
+    }
+    // virtio-input (modern transport): claims a virtio-tablet/-mouse PCI device
+    // to drive the cursor from an *absolute* pointer (what VNC delivers).  Must
+    // run after pci::init() above.  Polled from gui::input::pump_input.
+    if virtio_input::init() {
+        crate::serial_println!("[DRIVERS] Virtio-input initialized (absolute pointer)");
     }
     #[cfg(feature = "qga")]
     {

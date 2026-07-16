@@ -241,6 +241,7 @@ def _firmware_args(ovmf_code: str, ovmf_vars: str,
 # are clear of those defaults.  Lower number = enumerated first by the guest.
 _DATA_DISK_PCI_ADDR = 0x04   # ext2 data overlay — bound by the kernel
 _BOOT_DISK_PCI_ADDR = 0x05   # read-only vvfat boot ESP — must NOT be bound
+_INPUT_TABLET_PCI_ADDR = 0x0a  # virtio-tablet-pci absolute pointer (GUI/VNC path)
 
 
 def _boot_disk_args(esp_dir: str, snapshottable: bool = False) -> list[str]:
@@ -384,6 +385,35 @@ def _display_args(mode: str, show_window: bool) -> list[str]:
     return ["-display", "none"]
 
 
+def _input_args(mode: str, show_window: bool) -> list[str]:
+    """
+    Absolute pointing device for the GUI / VNC paths.
+
+    `virtio-tablet-pci` is a virtio-input device that reports *absolute*
+    pointer coordinates (EV_ABS/ABS_X/ABS_Y) — exactly what a VNC client and
+    QMP `input-send-event move-abs` deliver, and what the relative-only PS/2
+    mouse cannot satisfy.  The in-kernel `virtio_input` driver claims it and
+    drives the cursor from it.  Added only when a framebuffer is present
+    (windowed, VNC, or the headless-but-vmware gui/firefox modes); PS/2 is
+    left in place as a fallback.  Additive and harmless when no VNC client
+    connects.
+    """
+    has_fb = (
+        bool(os.environ.get("ASTRYX_VNC"))
+        or show_window
+        or mode in ("gui-test", "firefox-test")
+    )
+    if has_fb:
+        # Pin the tablet to a fixed, known-free i440fx slot.  QEMU's automatic
+        # PCI-slot assignment for `-device` entries is NOT argv order and varies
+        # with the device set, so an auto-placed tablet sometimes landed on a
+        # function the guest enumerator skipped — `addr=` makes enumeration
+        # deterministic (same rationale as _BOOT_DISK_PCI_ADDR).  0x0a sits well
+        # above the auto-assigned data-disk/NIC slots and the pinned boot disk.
+        return ["-device", f"virtio-tablet-pci,addr={_INPUT_TABLET_PCI_ADDR:#x}"]
+    return []
+
+
 def _net_args() -> list[str]:
     """
     e1000 + SLIRP user-mode NAT. No TAP, no bridge, no sudo. The
@@ -523,6 +553,7 @@ def build_qemu_cmd(
     cmd += _qmp_args(qmp_sock)
     cmd += _qga_args(qga_sock)
     cmd += _display_args(mode, show_window)
+    cmd += _input_args(mode, show_window)
     cmd += _firmware_args(ovmf_code, ovmf_vars, snapshottable=snapshottable)
     cmd += _boot_disk_args(esp_dir, snapshottable=snapshottable)
     # Orphan qcow2 vmstate device FIRST among the qcow2 block devices.

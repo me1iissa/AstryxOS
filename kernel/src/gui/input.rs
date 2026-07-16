@@ -136,6 +136,12 @@ pub fn init() {
 /// 1. Reads mouse hardware state and posts mouse / non-client messages.
 /// 2. Drains the keyboard scancode ring-buffer and posts key messages.
 pub fn pump_input() {
+    // Drain any pending virtio-input (tablet/mouse) events first so the mouse
+    // state read below reflects the latest absolute pointer position.  No-op
+    // until a virtio-input device is claimed; the relative PS/2 path is
+    // unaffected (it updates the same mouse state from its IRQ12 handler).
+    crate::drivers::virtio_input::poll();
+
     let mut state = INPUT_STATE.lock();
 
     // ── Mouse ──────────────────────────────────────────────────────────
