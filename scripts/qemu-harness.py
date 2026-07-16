@@ -2086,7 +2086,15 @@ def _regen_data_img(root_dir: Path,
     out = {"ok": False, "rc": -1, "duration_s": 0.0, "tail": "",
            "firefox_variant": firefox_variant,
            "argv": argv,
-           "env_overrides": env_overrides}
+           "env_overrides": env_overrides,
+           # Additive (2026-07-16 regen-safety): create-data-disk.sh exits 3
+           # and prints a "REFUSED:" line when it declines to regenerate a
+           # shared / in-use image (its atomic temp+rename write-safety guard).
+           # `refused` lets the start path treat that distinctly from a build
+           # failure — boot the (untouched) stale image instead.  Never passes
+           # --force-inuse: the auto path always fails safe.
+           "refused": False,
+           "refused_reason": None}
     if not script.exists():
         out["tail"] = f"create-data-disk.sh not found at {script}"
         return out
@@ -2115,6 +2123,18 @@ def _regen_data_img(root_dir: Path,
     except Exception as e:
         out["rc"] = -3
         out["tail"] = f"{type(e).__name__}: {e}"
+    # Exit-code 3 is create-data-disk.sh's "refused for safety" sentinel; pull
+    # the compact reason out of the emitted "REFUSED:" line for the caller.
+    if out.get("rc") == 3:
+        out["refused"] = True
+        for line in (out.get("tail") or "").splitlines():
+            if "REFUSED:" in line:
+                out["refused_reason"] = line.split("REFUSED:", 1)[1].strip()
+                break
+        if not out["refused_reason"]:
+            out["refused_reason"] = (
+                "create-data-disk.sh refused regeneration (image in use or "
+                "symlink to a foreign tree)")
     out["duration_s"] = time.monotonic() - t0
     return out
 
@@ -3846,6 +3866,29 @@ def cmd_start(args):
                 "║  --no-regen-data-img set; booting stale image as requested.  ║",
                 file=sys.stderr,
             )
+        elif (_data_img_symlink.get("is_symlink")
+              and _data_img_symlink.get("target_outside_wt")):
+            # 2026-07-16 write-safety: build/data.img is a symlink whose target
+            # resolves OUTSIDE this worktree — the incident pattern (a link to
+            # the canonical image other QEMU sessions boot from).  An in-place
+            # regen would write THROUGH the link and clobber that shared image.
+            # create-data-disk.sh now refuses this itself, but we skip the call
+            # entirely so the failure is fast and the reason structured; boot
+            # the (untouched) stale image.
+            _tgt = (_data_img_symlink.get("resolved")
+                    or _data_img_symlink.get("target") or "<unknown>")
+            _ff_variant_info["regen_refused_reason"] = (
+                f"data.img is a symlink to a shared target ({_tgt}) outside "
+                "this worktree; refusing to auto-regenerate through it. Boot "
+                "the stale image, or make a private --output copy / re-stage in "
+                "the tree that owns the image."
+            )
+            print(
+                "║  REFUSING auto-regen — data.img symlinks a shared target.   ║\n"
+                f"║  target: {_tgt[:50]:<50}    ║\n"
+                "║  Booting stale image (private --output copy to regen safely).║",
+                file=sys.stderr,
+            )
         else:
             print(
                 "║  Auto-regenerating via scripts/create-data-disk.sh --force … ║",
@@ -3869,6 +3912,20 @@ def cmd_start(args):
                 _dur = _data_img_regen_info.get("duration_s", 0.0)
                 print(
                     f"║  data.img regenerated in {_dur:.1f}s.                          ║",
+                    file=sys.stderr,
+                )
+            elif _data_img_regen_info.get("refused"):
+                # create-data-disk.sh declined for safety (image in use, or a
+                # foreign-symlink slip past the pre-check above).  Surface the
+                # structured reason and boot the untouched stale image — this is
+                # NOT a build failure.
+                _ff_variant_info["regen_refused_reason"] = (
+                    _data_img_regen_info.get("refused_reason")
+                    or "create-data-disk.sh refused regeneration for safety")
+                _rr = _ff_variant_info["regen_refused_reason"]
+                print(
+                    "║  REGEN REFUSED for safety — booting stale image.            ║\n"
+                    f"║  {_rr[:58]:<58}║",
                     file=sys.stderr,
                 )
             else:
