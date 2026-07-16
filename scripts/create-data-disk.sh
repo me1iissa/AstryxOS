@@ -16,6 +16,19 @@
 #   ./scripts/create-data-disk.sh 128       # Create 128 MiB image
 #   ./scripts/create-data-disk.sh --force   # Recreate even if it exists
 #
+# Write-safety (incident 2026-07-16 — regen clobbered a shared image held
+# open by running QEMU sessions):
+#   * The image is built to a temp file in the SAME directory and renamed(2)
+#     over the target, so a QEMU session holding the old inode via an open fd
+#     keeps reading a consistent old image; only new opens see the new one.
+#   * If the resolved target is currently held open by any process the regen
+#     is REFUSED (exit 3) unless --force-inuse is passed.
+#   * If build/data.img is a symlink whose target resolves OUTSIDE this tree,
+#     the regen is REFUSED (exit 3) with no override — use a private copy.
+#   --force-inuse   Override the "refuse while held open" check (human only;
+#                   the harness auto-regen never passes it).  Safe because the
+#                   atomic rename leaves existing readers on the old inode.
+#
 # Isolated / alternate-image builds (additive — default behaviour unchanged):
 #   --output=PATH        Write the produced image to PATH instead of
 #                        build/data.img (env: ASTRYXOS_DATA_IMG).  Lets a
@@ -46,6 +59,11 @@ DATA_IMG_OVERRIDE="${ASTRYXOS_DATA_IMG:-}"
 DATA_IMG="${BUILD_DIR}/data.img"
 SIZE_MB=2048
 FORCE=false
+# Explicit override for the "refuse while the target image is held open"
+# safety check (see the write-safety guard below).  Off by default; only a
+# human / explicit caller may set it.  The harness auto-regen path never
+# passes it, so automatic regeneration always fails safe.
+FORCE_INUSE=false
 FIREFOX=false
 
 # Firefox variant selector — picks which userspace ELF / libc combination
@@ -195,6 +213,7 @@ FIREFOX_DEBUG="${ASTRYXOS_FIREFOX_DEBUG:-}"
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
+        --force-inuse) FORCE_INUSE=true ;;
         --firefox) FIREFOX=true; FORCE=true ;;
         --firefox-variant=*) FIREFOX_VARIANT="${arg#--firefox-variant=}" ;;
         --firefox-variant) :;;   # next arg consumed by trailing path
@@ -239,6 +258,165 @@ fi
 mkdir -p "$(dirname "${DATA_IMG}")" 2>/dev/null || true
 echo "[DATA-DISK] Staging root: ${BUILD_DIR}"
 echo "[DATA-DISK] Output image: ${DATA_IMG}"
+
+# ── data.img write-safety guard (incident 2026-07-16) ────────────────────────
+# A worktree's build/data.img was a symlink to the canonical image; an
+# auto-triggered `--force` regen wrote THROUGH the symlink and rewrote the
+# canonical file in place while two running QEMU sessions held it open as
+# `snapshot=on` backing — the live guests then read a half-old/half-new ext2
+# layout.  Three additive guards close that hazard; the actual atomic rename
+# happens at the write step far below (temp file + rename(2), same directory).
+# Refs: rename(2), fuser(1), lsof(8).
+
+# _image_open_pids <path> — print space-separated PIDs holding <path> open.
+# fuser(1) prints PIDs to stdout (its "FILE:" banner goes to stderr); some
+# builds append an access-type letter (e.g. "1234m"), so we extract digit
+# runs.  lsof(8) -t is the fallback when fuser is unavailable.
+# Best-effort by design: it fails OPEN when neither fuser nor lsof is present,
+# and as non-root cannot see holders owned by another user.  That residual is
+# backstopped by the atomic rename (fix 1, existing readers keep the old inode)
+# and the write-through-symlink refusal (fix 3) — the refusal here is a policy
+# guard for FUTURE-boot comparability, not the correctness safety net.
+_image_open_pids() {
+    local target="$1" pids=""
+    if command -v fuser >/dev/null 2>&1; then
+        pids="$(fuser -- "${target}" 2>/dev/null | grep -oE '[0-9]+' | sort -un | tr '\n' ' ')"
+    fi
+    if [ -z "${pids//[[:space:]]/}" ] && command -v lsof >/dev/null 2>&1; then
+        pids="$(lsof -t -- "${target}" 2>/dev/null | grep -oE '[0-9]+' | sort -un | tr '\n' ' ')"
+    fi
+    echo "${pids}" | tr -s ' ' | sed 's/^ *//; s/ *$//'
+}
+
+# _describe_holders <path> <pids...> — human-readable holder list, mapping any
+# PID that matches a running harness session (~/.astryx-harness/<sid>.json,
+# `pid` field = the QEMU process) to its session id so the caller knows which
+# `qemu-harness.py stop <sid>` to run.  Falls back to bare PIDs without python3.
+_describe_holders() {
+    local target="$1"; shift
+    local pids="$*"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "${target}" ${pids} <<'PY'
+import sys, glob, os, json
+pids = [int(p) for p in sys.argv[2:] if p.isdigit()]
+sid_by_pid = {}
+for f in glob.glob(os.path.expanduser('~/.astryx-harness/*.json')):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    try:
+        p = int(d.get('pid') or 0)
+    except Exception:
+        p = 0
+    if p:
+        sid_by_pid[p] = d.get('sid') or os.path.splitext(os.path.basename(f))[0]
+parts = []
+for p in sorted(set(pids)):
+    try:
+        comm = open('/proc/%d/comm' % p).read().strip() or '?'
+    except Exception:
+        comm = '?'
+    sid = sid_by_pid.get(p)
+    parts.append('pid=%d(%s,harness-sid=%s)' % (p, comm, sid) if sid
+                 else 'pid=%d(%s)' % (p, comm))
+print('; '.join(parts) if parts else '(none)')
+PY
+    else
+        echo "pids: ${pids}"
+    fi
+}
+
+# _lexical_abspath <path> — absolutise + normalise "." / ".." WITHOUT following
+# any symlink (unlike readlink -f).  Used to tell "the caller lexically aimed
+# inside this tree" (an in-tree path a symlink then redirected out — the
+# incident) apart from "the caller explicitly aimed at a foreign path"
+# (e.g. --output=/tmp/private.img — the sanctioned private-copy escape hatch).
+_lexical_abspath() {
+    local p="$1" part res="" IFS=/
+    case "$p" in /*) ;; *) p="$(pwd)/$p" ;; esac
+    local -a out=()
+    for part in $p; do
+        case "$part" in
+            ''|.) ;;
+            ..) [ "${#out[@]}" -gt 0 ] && unset 'out[${#out[@]}-1]' ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    for part in "${out[@]}"; do res="${res}/${part}"; done
+    echo "${res:-/}"
+}
+
+# Resolve the real path we will actually overwrite.  When build/data.img is a
+# symlink we follow it so the atomic rename lands on the real inode (preserving
+# the symlink) and the checks below inspect the true target.  readlink -f
+# resolves every component (leaf AND ancestor dirs) and still yields an absolute
+# path when the final component does not yet exist.
+IMG_FINAL="$(readlink -f -- "${DATA_IMG}" 2>/dev/null || true)"
+[ -n "${IMG_FINAL}" ] || IMG_FINAL="${DATA_IMG}"
+# Lexical (no-symlink) form of the requested path — see _lexical_abspath.
+DATA_IMG_LEXICAL="$(_lexical_abspath "${DATA_IMG}")"
+
+# Will this invocation actually (re)write the image?  Mirrors the
+# "exists && !force → exit 0" early-return far below, so the guard only fires
+# when a write is really about to happen.
+WILL_WRITE=false
+if [ "${FORCE}" = true ] || [ ! -f "${DATA_IMG}" ]; then
+    WILL_WRITE=true
+fi
+
+if [ "${WILL_WRITE}" = true ]; then
+    ROOT_REAL="$(readlink -f -- "${ROOT_DIR}" 2>/dev/null || echo "${ROOT_DIR}")"
+
+    # (3) Never write THROUGH a symlink into foreign territory.  The incident
+    #     pattern is a worktree build/data.img that links to the canonical image;
+    #     regenerating writes through the link and clobbers a file another tree
+    #     owns.  A LEAF symlink is not the only way in — an ANCESTOR directory
+    #     can be the symlink while data.img is a regular file within it — so we
+    #     do NOT gate on `-L "${DATA_IMG}"`.  Instead compare the two resolutions
+    #     of the requested path: if it aims INSIDE this tree lexically but the
+    #     fully-resolved (symlink-followed) path lands OUTSIDE, some symlink
+    #     component redirected the write out of the tree — refuse, regardless of
+    #     --force / --force-inuse.  An explicitly-foreign path (e.g.
+    #     --output=/tmp/private.img, the sanctioned private-copy escape hatch)
+    #     is lexically outside and is left alone.
+    _lex_inside=false
+    case "${DATA_IMG_LEXICAL}/" in "${ROOT_REAL}/"*) _lex_inside=true ;; esac
+    _phys_inside=false
+    case "${IMG_FINAL}/" in "${ROOT_REAL}/"*) _phys_inside=true ;; esac
+    if [ "${_lex_inside}" = true ] && [ "${_phys_inside}" = false ]; then
+        echo "[DATA-DISK] REFUSED: ${DATA_IMG} is inside this tree (${ROOT_REAL}) but a symlink component redirects it to ${IMG_FINAL}, which is OUTSIDE." >&2
+        echo "[DATA-DISK]          Regenerating would write through the link and clobber a shared/foreign image" >&2
+        echo "[DATA-DISK]          (e.g. the canonical build/data.img other QEMU sessions boot from)." >&2
+        echo "[DATA-DISK]          Use a PRIVATE copy instead: cp the image into this tree, or pass an explicitly" >&2
+        echo "[DATA-DISK]          foreign --output=<path outside the tree>, or run create-data-disk.sh in the tree" >&2
+        echo "[DATA-DISK]          that owns the real image.  (no override for this case)" >&2
+        exit 3
+    fi
+
+    # (2) Refuse to regenerate while the resolved image is held open.  With the
+    #     atomic rename (fix 1) existing readers stay on the old inode and are
+    #     safe, but silently swapping the image under an active investigation
+    #     invalidates the comparability of FUTURE boots — so we still refuse
+    #     unless the caller explicitly overrides.
+    if [ -e "${IMG_FINAL}" ]; then
+        HOLDER_PIDS="$(_image_open_pids "${IMG_FINAL}")"
+        if [ -n "${HOLDER_PIDS}" ]; then
+            HOLDER_DESC="$(_describe_holders "${IMG_FINAL}" ${HOLDER_PIDS})"
+            if [ "${FORCE_INUSE}" = true ]; then
+                echo "[DATA-DISK] WARNING: ${IMG_FINAL} is held open by: ${HOLDER_DESC}" >&2
+                echo "[DATA-DISK]          --force-inuse set; regenerating via atomic rename (existing readers keep the old image)." >&2
+            else
+                echo "[DATA-DISK] REFUSED: ${IMG_FINAL} is held open by: ${HOLDER_DESC}" >&2
+                echo "[DATA-DISK]          Regenerating now would make future boots read a different image than the running fleet," >&2
+                echo "[DATA-DISK]          poisoning any in-flight investigation.  Stop those sessions first" >&2
+                echo "[DATA-DISK]          (qemu-harness.py stop <sid>), isolate this caller with a private --output copy," >&2
+                echo "[DATA-DISK]          or pass --force-inuse to override." >&2
+                exit 3
+            fi
+        fi
+    fi
+fi
 
 case "${FIREFOX_PACKAGE}" in
     firefox-esr|firefox) ;;
@@ -997,9 +1175,18 @@ done
 # The "MBR type byte 0x83" requirement from the plan spec is met by writing
 # a minimal MBR with type=0x83 before the ext2 data.
 
-# Implementation: create the image file, then let mke2fs populate it.
+# Implementation: build the image into a temp file in the SAME directory as the
+# real target, then rename(2) it into place (fix 1, incident 2026-07-16).  Any
+# QEMU session holding the old inode via an open fd keeps reading a consistent
+# old image; only new opens see the new one.  rename(2) is atomic only within a
+# filesystem, so the temp MUST share the target's directory.
 # Whole-device ext2 (superblock at byte 1024, per the ext2 spec §3).
-dd if=/dev/zero of="${DATA_IMG}" bs=1M count="${SIZE_MB}" status=none
+IMG_DIR="$(dirname -- "${IMG_FINAL}")"
+mkdir -p "${IMG_DIR}"
+IMG_TMP="$(mktemp "${IMG_DIR}/.data.img.tmp.XXXXXX")"
+# Remove the temp on any early exit so a failed build never leaves a stray file.
+trap 'rm -f "${IMG_TMP}" 2>/dev/null || true' EXIT
+dd if=/dev/zero of="${IMG_TMP}" bs=1M count="${SIZE_MB}" status=none
 
 if [ -d "${STAGING_TREE}" ] && [ -n "$(ls -A "${STAGING_TREE}" 2>/dev/null)" ]; then
     echo "[DATA-DISK] Populating ext2 image from ${STAGING_TREE} ..."
@@ -1009,7 +1196,7 @@ if [ -d "${STAGING_TREE}" ] && [ -n "$(ls -A "${STAGING_TREE}" 2>/dev/null)" ]; 
         -d "${STAGING_TREE}" \
         -N 200000 \
         -F \
-        "${DATA_IMG}" 2>&1 | grep -v "^$" || true
+        "${IMG_TMP}" 2>&1 | grep -v "^$" || true
     echo "[DATA-DISK] ext2 image populated via mke2fs -d (symlinks preserved natively)"
 else
     # Empty-tree fallback: format without -d (no files staged yet).
@@ -1018,11 +1205,19 @@ else
         -L "ASTRYXDATA" \
         -N 200000 \
         -F \
-        "${DATA_IMG}" 2>&1 | grep -v "^$" || true
+        "${IMG_TMP}" 2>&1 | grep -v "^$" || true
     echo "[DATA-DISK] ext2 image formatted empty (staging tree absent — missing binaries OK)"
 fi
 
-echo "[DATA-DISK] Created: ${DATA_IMG} (${SIZE_MB} MiB, ext2)"
+# mktemp created the temp 0600; match the conventional 0644 the old direct-dd
+# path produced so downstream tooling sees the usual mode, then atomically
+# replace the target.  After this, ${DATA_IMG} (symlink or regular) resolves to
+# the new content.
+chmod 0644 "${IMG_TMP}"
+mv -f "${IMG_TMP}" "${IMG_FINAL}"
+trap - EXIT
+
+echo "[DATA-DISK] Created: ${DATA_IMG} (${SIZE_MB} MiB, ext2) via temp+rename (${IMG_FINAL})"
 
 # ── Verify the software-GL closure landed in the produced image ──────────────
 # The windowed (--ff-gui) Firefox path's GPU-feature probe (glxtest) and the

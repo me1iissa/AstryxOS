@@ -225,6 +225,22 @@ jobs:
       # render), or an injection path that corrupts the ext2 image.
       - name: patch-gui-gl smoke (software-GL image provisioning + ext2 integrity)
         run: python3 scripts/patch-gui-gl-smoke.py
+      # Boot-free smoke for the create-data-disk.sh write-safety guard.  Drives
+      # the script in a throwaway isolated tree (no staging, ~2s) and asserts
+      # the three guards from the 2026-07-16 incident: (a) regen builds to a
+      # temp file and renames(2) over the target so a process holding the old
+      # image open keeps reading it; (b) a held-open target is refused (exit 3)
+      # unless --force-inuse; (c) a data.img symlinked to a target outside the
+      # tree is refused with no override, while a within-tree symlink is honored
+      # and its resolved target replaced atomically.  Self-skips any sub-check
+      # whose tool (mke2fs / fuser|lsof) is absent so a minimal runner can't
+      # false-fail.  Failure mode this prevents: a refactor re-introducing the
+      # in-place / write-through-symlink regen that clobbered a shared data.img
+      # under running QEMU sessions.
+      - name: create-data-disk write-safety smoke (atomic rename + refuse guards)
+        # --require-tools: a runner missing e2fsprogs/psmisc/lsof FAILS here
+        # instead of silently self-skipping and reducing coverage while green.
+        run: bash scripts/create-data-disk-safety-smoke.sh --require-tools
 
   kernel-build:
     name: bootloader + kernel builds
