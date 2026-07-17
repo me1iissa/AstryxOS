@@ -1393,6 +1393,8 @@ pub fn run() -> ! {
         if test_656_alloc_side_alias_guard() { passed += 1; }
         total += 1;
         if test_657_percpu_idle_work_steal() { passed += 1; }
+        total += 1;
+        if test_707_load_balance() { passed += 1; }
     }
 
     // ── Test 659: kstack-free quarantine survey per-tick throttle ────────
@@ -53068,6 +53070,137 @@ fn test_658_tsc_deadline_cadence() -> bool {
 
     test_println!("  next-deadline: now+period strictly-future / modulo-2^64 wrap — \
 TSC-deadline one-shot re-arm cadence GREEN (KVM dead-CPU0-timer fix)");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 707: load-balance victim selection (Perf P2 phase 3d) ──────────────
+//
+// Phase 3d migrates the most-overdue eligible thread from the busiest runqueue
+// to the least-loaded one when the depth imbalance exceeds the threshold. The
+// live `mirror_maintain` applies the eligibility guards (not Running, not
+// `!ctx_rsp_valid`, not pinned) and homing before calling the selection core;
+// this test drives the pure decision (`test_pick_balance`) over caller-supplied
+// loads + pre-filtered candidates to prove the policy: imbalance threshold,
+// busiest→emptiest direction, most-overdue victim, pull-on-idle, and the
+// no-migration cases. The eligibility guards themselves are structural in the
+// live path (a Running/mid-switch/pinned thread is never placed in the
+// candidate list) and are covered by the by-construction argument in the code.
+fn test_707_load_balance() -> bool {
+    use crate::sched::percpu::test_pick_balance as pb;
+    use crate::proc::Tid;
+    const NAME: &str = "[SCHED/P2] load-balance victim selection (Test 707)";
+    test_header!(NAME);
+
+    // Candidate tuple: (tid, prio, home_cpu, abs_deadline). Lower abs_deadline =
+    // more overdue (longer effective wait).
+    type Cand = (Tid, u8, usize, u64);
+
+    // Case 1 — balanced within threshold: depths [2,1] differ by 1 (< 2) → no
+    // migration even though candidates exist on the busier CPU.
+    {
+        let loads = [2u32, 1];
+        let cands: [Cand; 2] = [(10, 4, 0, 100), (11, 4, 0, 100)];
+        if pb(&loads, 2, &cands).is_some() {
+            test_fail!(NAME, "case1: migrated despite imbalance < threshold");
+            return false;
+        }
+    }
+
+    // Case 2 — imbalance at threshold: depths [3,1] differ by 2 (>= 2) → migrate
+    // from busiest (0) to emptiest (1), choosing the MOST-overdue victim on cpu 0
+    // (tid 21, abs 50 < tid 20's abs 100).
+    {
+        let loads = [3u32, 1, 2];
+        let cands: [Cand; 3] = [(20, 4, 0, 100), (21, 4, 0, 50), (22, 4, 2, 10)];
+        match pb(&loads, 3, &cands) {
+            Some((src, dst, tid, _prio)) => {
+                if src != 0 || dst != 1 || tid != 21 {
+                    test_fail!(NAME, "case2: got src={} dst={} tid={} expected 0->1 tid=21", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case2: no migration despite imbalance >= threshold"); return false; }
+        }
+    }
+
+    // Case 3 — pull-on-idle: emptiest CPU is empty (depth 0). depths [4,0] →
+    // migrate the most-overdue cpu-0 victim to cpu 1.
+    {
+        let loads = [4u32, 0];
+        let cands: [Cand; 3] = [(30, 4, 0, 200), (31, 4, 0, 80), (32, 4, 0, 150)];
+        match pb(&loads, 2, &cands) {
+            Some((src, dst, tid, _)) => {
+                if src != 0 || dst != 1 || tid != 31 {
+                    test_fail!(NAME, "case3: got src={} dst={} tid={} expected 0->1 tid=31 (most overdue)", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case3: pull-on-idle did not fire"); return false; }
+        }
+    }
+
+    // Case 4 — imbalance present but NO eligible victim homed on the busiest CPU
+    // (all candidates live on other CPUs) → no migration (the busiest CPU's load
+    // is pinned/running threads the caller already filtered out).
+    {
+        let loads = [5u32, 1];
+        let cands: [Cand; 2] = [(40, 4, 1, 100), (41, 4, 1, 100)]; // none on cpu 0
+        if pb(&loads, 2, &cands).is_some() {
+            test_fail!(NAME, "case4: migrated with no eligible victim on busiest");
+            return false;
+        }
+    }
+
+    // Case 5 — uniprocessor: ncpus 1 → never migrate.
+    {
+        let loads = [9u32];
+        let cands: [Cand; 1] = [(50, 4, 0, 10)];
+        if pb(&loads, 1, &cands).is_some() {
+            test_fail!(NAME, "case5: migrated on a uniprocessor");
+            return false;
+        }
+    }
+
+    // Case 6 — three CPUs, picks the GLOBAL busiest and emptiest. depths
+    // [2,6,1]: busiest=1, emptiest=2, diff 5 >= 2 → migrate cpu1's overdue victim
+    // to cpu 2.
+    {
+        let loads = [2u32, 6, 1];
+        let cands: [Cand; 3] = [(60, 4, 1, 70), (61, 4, 1, 30), (62, 4, 0, 5)];
+        match pb(&loads, 3, &cands) {
+            Some((src, dst, tid, _)) => {
+                if src != 1 || dst != 2 || tid != 61 {
+                    test_fail!(NAME, "case6: got src={} dst={} tid={} expected 1->2 tid=61", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case6: no migration on 3-CPU imbalance"); return false; }
+        }
+    }
+
+    // Case 7 — deadline tie → deterministic lower-tid victim. Two equally-overdue
+    // threads (same abs 40) on the busiest CPU; the lower tid (70) is chosen
+    // regardless of candidate order, so the pure decision and the live
+    // table-order decision cannot diverge on a tie.
+    {
+        let loads = [3u32, 0];
+        // Present the higher tid FIRST to prove order-independence.
+        let cands: [Cand; 2] = [(71, 4, 0, 40), (70, 4, 0, 40)];
+        match pb(&loads, 2, &cands) {
+            Some((_, _, tid, _)) => {
+                if tid != 70 {
+                    test_fail!(NAME, "case7: tie picked tid {} expected 70 (lower tid)", tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case7: no migration on tie"); return false; }
+        }
+    }
+
+    test_println!("  load-balance: threshold-gated / busiest->emptiest / most-overdue-victim / \
+pull-on-idle / no-eligible-victim-skip / uniproc-noop / 3-CPU-global-extremes / \
+deadline-tie-lower-tid — migration policy correct GREEN");
     test_pass!(NAME);
     true
 }
