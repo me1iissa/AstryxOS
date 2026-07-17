@@ -18993,16 +18993,25 @@ fn test_kuser_shared_data() -> bool {
     }
 
     // ─── Sub-test 7: SystemTime advances (forward progress) ──────────────────
+    // SystemTime is derived from the RTC, which has 1-second granularity, so a
+    // fixed short busy-wait frequently reads within the same second and sees no
+    // change (a false "did not advance" flake).  Instead wait for a forward
+    // EDGE with a bounded timeout: advancing within the window is success; a
+    // value that never advances across the whole window is a genuine stall and
+    // still fails.  TICK_HZ = 100, so 300 ticks ≈ 3 s comfortably spans more
+    // than one 1 s RTC tick.
     let st1 = ku::current_system_time();
-    let start2 = crate::arch::x86_64::irq::get_ticks();
-    while crate::arch::x86_64::irq::get_ticks() < start2.saturating_add(2) {
+    let deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(300);
+    let mut st2 = st1;
+    while crate::arch::x86_64::irq::get_ticks() < deadline {
+        st2 = ku::current_system_time();
+        if st2 > st1 { break; }
         core::hint::spin_loop();
     }
-    let st2 = ku::current_system_time();
     test_println!("  [7] SystemTime (NT FILETIME): {} → {} (Δ={})",
         st1, st2, (st2 - st1).max(0));
     if st2 <= st1 {
-        test_fail!("kuser_shared", "SystemTime did not advance ({} → {})", st1, st2);
+        test_fail!("kuser_shared", "SystemTime did not advance within ~3s ({} → {})", st1, st2);
         ok = false;
     }
     // NT FILETIME should land in a sane window — after 2020-01-01 if the RTC
