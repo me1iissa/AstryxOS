@@ -6334,9 +6334,15 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                 // re-faults — an anonymous page demand-faults a FRESH
                 // zero-filled frame, and a file-backed page re-faults through
                 // the page cache to the authoritative file content — so the
-                // observable result already matches POSIX madvise(2): after
-                // MADV_DONTNEED "subsequent accesses ... will succeed, but will
-                // result in ... zero-fill-on-demand pages".
+                // observable result already matches the madvise(2) man-page
+                // MADV_DONTNEED contract: "subsequent accesses ... will
+                // succeed, but will result in ... zero-fill-on-demand pages".
+                // MADV_FREE's man-page contract is laxer — the pages may be
+                // lazily reclaimed and, absent an intervening write, a later
+                // read may return the old contents OR zeros.  We take the
+                // eager option (free now → refault to zeros): a conformant,
+                // stricter-than-required choice.  NOT writing the frame is
+                // correct under both contracts.
                 //
                 // Zeroing the frame in place (as a prior revision did for the
                 // anonymous arm) is both redundant and unsafe.  Redundant
@@ -6354,9 +6360,9 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                 // Clearing the PTE alone is sufficient and leaves shared
                 // frames intact for their remaining mappers.
                 //
-                // Cite: madvise(2) (POSIX.1-2017) MADV_DONTNEED / MADV_FREE;
-                // Intel SDM Vol. 3A §4.10.5 (propagate paging-structure
-                // changes before a frame is reused).
+                // Cite: madvise(2) man page (man7.org) MADV_DONTNEED /
+                // MADV_FREE; Intel SDM Vol. 3A §4.10.5 (propagate
+                // paging-structure changes before a frame is reused).
                 //
                 // Clear the PTE.  Do NOT free the frame yet.
                 crate::mm::vmm::write_pte(cr3, page, 0);

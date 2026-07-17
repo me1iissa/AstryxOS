@@ -1223,12 +1223,9 @@ pub fn run() -> ! {
     total += 1;
     if test_pf_permission_gate() { passed += 1; }
 
-    // ── Test 94: madvise MADV_DONTNEED frees physical pages ───────────────
-
-    total += 1;
-    if test_madvise_dontneed() { passed += 1; }
-
     // ── Test 723: madvise must not zero frames in place (W215 regression) ─
+    // (Supersedes the former Test 94 twin, which reimplemented the OLD
+    //  in-place-zero path inline; Test 723 drives the real sys_madvise.)
     total += 1;
     if test_723_madvise_no_inplace_zero() { passed += 1; }
 
@@ -25570,96 +25567,6 @@ fn test_pf_permission_gate() -> bool {
     true
 }
 
-// ── Test 94: madvise MADV_DONTNEED ────────────────────────────────────────────
-
-fn test_madvise_dontneed() -> bool {
-    test_header!("madvise MADV_DONTNEED — frees physical pages");
-
-    const MADV_DONTNEED: u64 = 4;
-    const PAGE_SIZE: usize   = 4096;
-
-    // Create a blocked user process to have a valid VmSpace + CR3.
-    let pid = match crate::proc::usermode::create_user_process_with_args_blocked(
-        "madvise_test",
-        &crate::proc::hello_elf::HELLO_ELF,
-        &[],
-        &[],
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            test_fail!("madvise", "create blocked process failed: {:?}", e);
-            return false;
-        }
-    };
-
-    // Find the stack VMA (top eager region) — it has pre-mapped pages.
-    let (cr3, stack_page) = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
-        let mut cr3 = 0u64; let mut sp = 0u64;
-        if let Some(proc) = procs.iter().find(|p| p.pid == pid) {
-            if let Some(vs) = proc.vm_space.as_ref() {
-                cr3 = vs.cr3;
-                // Pick the bottom page of the eager stack region.
-                for area in vs.areas.iter() {
-                    if area.name == "[stack]" { sp = area.base; break; }
-                }
-            }
-        }
-        (cr3, sp)
-    };
-
-    if cr3 == 0 || stack_page == 0 {
-        test_fail!("madvise", "Could not find stack VMA or CR3");
-        crate::proc::unblock_process(pid);
-        return false;
-    }
-    test_println!("  Stack page at {:#x}, CR3={:#x} ✓", stack_page, cr3);
-
-    // The stack page should be present (eagerly mapped).
-    let pte_before = crate::mm::vmm::read_pte(cr3, stack_page);
-    if pte_before & 1 == 0 {
-        test_fail!("madvise", "Stack bottom page not yet mapped (PTE=0) — can't test DONTNEED");
-        crate::proc::unblock_process(pid);
-        return false;
-    }
-    test_println!("  Stack page PTE before DONTNEED: present ✓");
-
-    // Call sys_madvise via the kernel API.  We need to temporarily set the
-    // PROCESS_TABLE entry as the "current process" so sys_madvise finds a
-    // VmSpace.  Simplest: use pid's cr3 directly and test at vmm level.
-    // Verify that after DONTNEED the PTE becomes 0 (not-present).
-    {
-        // Directly exercise the same logic sys_madvise would use.
-        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
-        let phys = pte_before & 0x000F_FFFF_FFFF_F000;
-        // Zero the page and clear the PTE (same as sys_madvise MADV_DONTNEED).
-        unsafe { core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, PAGE_SIZE); }
-        crate::mm::vmm::write_pte(cr3, stack_page, 0);
-        crate::mm::vmm::invlpg(stack_page);
-        let rc = crate::mm::refcount::page_ref_count(phys);
-        if rc <= 1 {
-            crate::mm::refcount::page_ref_set(phys, 0);
-            crate::mm::pmm::free_page(phys);
-        } else {
-            // rc > 1: shared; dec without freeing.
-            let _ = crate::mm::refcount::page_ref_dec(phys);
-        }
-    }
-
-    let pte_after = crate::mm::vmm::read_pte(cr3, stack_page);
-    if pte_after & 1 != 0 {
-        test_fail!("madvise", "PTE still present after DONTNEED: {:#x}", pte_after);
-        crate::proc::unblock_process(pid);
-        return false;
-    }
-    test_println!("  PTE after DONTNEED: not-present (freed) ✓");
-    test_println!("  madvise MADV_DONTNEED={} frees pages correctly ✓", MADV_DONTNEED);
-
-    crate::proc::unblock_process(pid);
-    test_pass!("madvise MADV_DONTNEED — frees physical pages");
-    true
-}
-
 // ── Test 723: madvise MADV_DONTNEED/FREE must NOT zero frames in place ────────
 //
 // Regression guard for the W215 corruption root cause.  sys_madvise's
@@ -25675,14 +25582,15 @@ fn test_madvise_dontneed() -> bool {
 // Two properties, verified against the REAL sys_madvise (Linux dispatch
 // nr=28 — not a reimplementation, so a reintroduced in-place write is caught):
 //   (a) SHARED-FRAME SURVIVAL — a refcount-2 frame madvise'd through one
-//       mapping keeps its bytes and is dec'd (not freed).  The pre-fix code
-//       fails this (bytes read back all-zero).
+//       mapping keeps its bytes and is dec'd (not freed).  Checked for BOTH
+//       MADV_DONTNEED and MADV_FREE (they share the clear-PTE path, so neither
+//       may zero in place).  The pre-fix code fails this (bytes read all-zero).
 //   (b) DONTNEED SEMANTICS — an unshared (refcount-1) frame madvise'd is
 //       PTE-cleared and freed; the next access demand-faults FRESH zeros,
-//       satisfying POSIX madvise(2) ("subsequent accesses ... will result in
-//       ... zero-fill-on-demand pages").
+//       matching the madvise(2) man-page MADV_DONTNEED contract ("subsequent
+//       accesses ... will result in ... zero-fill-on-demand pages").
 //
-// Cite: madvise(2) (POSIX.1-2017); Intel SDM Vol. 3A §4.10.5.
+// Cite: madvise(2) man page (man7.org); Intel SDM Vol. 3A §4.10.5.
 fn test_723_madvise_no_inplace_zero() -> bool {
     test_header!("madvise MADV_DONTNEED/FREE — no in-place zero (W215 shared-frame survival)");
     const PHYS_OFF: u64  = 0xFFFF_8000_0000_0000;
@@ -25703,83 +25611,89 @@ fn test_723_madvise_no_inplace_zero() -> bool {
         return false;
     }
 
-    // ---- (a) SHARED-FRAME SURVIVAL ----
-    let addr = crate::syscall::dispatch_linux_kernel(
-        9, 0, 0x1000, 3 /*PROT_RW*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
-    if addr <= 0 {
-        test_fail!("madv_nozero", "mmap(a) failed: {}", addr);
-        return false;
-    }
-    let addr = addr as u64;
-    // Demand-fault the frame in via a real touch (anon page lifecycle).
-    unsafe {
-        let _g = crate::arch::x86_64::smap::UserGuard::new();
-        core::ptr::write_volatile(addr as *mut u8, 0x11);
-    }
-    let pte = crate::mm::vmm::read_pte(cr3, addr);
-    if pte & 1 == 0 {
-        test_fail!("madv_nozero", "anon page not present after touch (PTE={:#x})", pte);
-        let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
-    }
-    let frame = pte & PHYS_MASK;
-    // Stamp the whole frame through the kernel higher-half map.
-    for off in (0..0x1000u64).step_by(8) {
-        unsafe { core::ptr::write_volatile((PHYS_OFF + frame + off) as *mut u64, pat(off)); }
-    }
-    // Model the CoW sibling: a second live reference to the same frame — now
-    // SHARED (refcount 2), exactly as after fork.
-    crate::mm::refcount::page_ref_inc(frame);
-    let rc_shared = crate::mm::refcount::page_ref_count(frame);
-    if rc_shared < 2 {
-        test_fail!("madv_nozero", "expected shared rc>=2, got {}", rc_shared);
-        crate::mm::refcount::page_ref_dec(frame);
-        let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
-    }
+    // ---- (a) SHARED-FRAME SURVIVAL — for BOTH MADV_DONTNEED and MADV_FREE ----
+    // Both advices are served by the same clear-PTE + refcount-dec path, so
+    // NEITHER may zero a shared frame in place.  Run the survival check for each.
+    const MADV_FREE: u64 = 8;
+    for &advice in &[MADV_DONTNEED, MADV_FREE] {
+        let aname = if advice == MADV_DONTNEED { "DONTNEED" } else { "FREE" };
+        let addr = crate::syscall::dispatch_linux_kernel(
+            9, 0, 0x1000, 3 /*PROT_RW*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+        if addr <= 0 {
+            test_fail!("madv_nozero", "mmap(a/{}) failed: {}", aname, addr);
+            return false;
+        }
+        let addr = addr as u64;
+        // Demand-fault the frame in via a real touch (anon page lifecycle).
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::write_volatile(addr as *mut u8, 0x11);
+        }
+        let pte = crate::mm::vmm::read_pte(cr3, addr);
+        if pte & 1 == 0 {
+            test_fail!("madv_nozero", "anon page not present after touch (PTE={:#x})", pte);
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        let frame = pte & PHYS_MASK;
+        // Stamp the whole frame through the kernel higher-half map.
+        for off in (0..0x1000u64).step_by(8) {
+            unsafe { core::ptr::write_volatile((PHYS_OFF + frame + off) as *mut u64, pat(off)); }
+        }
+        // Model the CoW sibling: a second live reference to the same frame — now
+        // SHARED (refcount 2), exactly as after fork.
+        crate::mm::refcount::page_ref_inc(frame);
+        let rc_shared = crate::mm::refcount::page_ref_count(frame);
+        if rc_shared < 2 {
+            test_fail!("madv_nozero", "expected shared rc>=2, got {}", rc_shared);
+            crate::mm::refcount::page_ref_dec(frame);
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
 
-    // madvise(DONTNEED) through THIS mapping — the real sys_madvise.
-    let r = crate::syscall::dispatch_linux_kernel(28, addr, 0x1000, MADV_DONTNEED, 0, 0, 0);
-    if r != 0 {
-        test_fail!("madv_nozero", "madvise(DONTNEED) returned {}", r);
-        crate::mm::refcount::page_ref_dec(frame);
+        // madvise(advice) through THIS mapping — the real sys_madvise.
+        let r = crate::syscall::dispatch_linux_kernel(28, addr, 0x1000, advice, 0, 0, 0);
+        if r != 0 {
+            test_fail!("madv_nozero", "madvise({}) returned {}", aname, r);
+            crate::mm::refcount::page_ref_dec(frame);
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        if crate::mm::vmm::read_pte(cr3, addr) & 1 != 0 {
+            test_fail!("madv_nozero", "PTE still present after {}", aname);
+            crate::mm::refcount::page_ref_dec(frame);
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        // Frame must have survived: rc 2 -> 1 (dec'd, NOT freed).
+        let rc_after = crate::mm::refcount::page_ref_count(frame);
+        if rc_after != 1 {
+            test_fail!("madv_nozero", "shared frame rc after {} = {} (want 1)", aname, rc_after);
+            if rc_after != 0 { crate::mm::refcount::page_ref_dec(frame); }
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        // KEY ASSERTION: the shared frame's bytes were NOT zeroed in place.
+        let mut clobbered_off = u64::MAX;
+        for off in (0..0x1000u64).step_by(0x100) {
+            let got = unsafe { core::ptr::read_volatile((PHYS_OFF + frame + off) as *const u64) };
+            if got != pat(off) { clobbered_off = off; break; }
+        }
+        if clobbered_off != u64::MAX {
+            test_fail!("madv_nozero",
+                "shared frame {:#x} CLOBBERED at +{:#x} by in-place zero after {} (W215 regression)",
+                frame, clobbered_off, aname);
+            crate::mm::refcount::page_ref_dec(frame);
+            let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
+            return false;
+        }
+        test_println!("  (a) shared frame {:#x}: rc 2->1, bytes intact after {} ✓", frame, aname);
+        // Release the modelled sibling ref → frame freed (rc 1 -> 0), balanced.
+        if crate::mm::refcount::page_ref_dec(frame) == 0 {
+            crate::mm::pmm::free_page(frame);
+        }
         let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
     }
-    if crate::mm::vmm::read_pte(cr3, addr) & 1 != 0 {
-        test_fail!("madv_nozero", "PTE still present after DONTNEED");
-        crate::mm::refcount::page_ref_dec(frame);
-        let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
-    }
-    // Frame must have survived: rc 2 -> 1 (dec'd, NOT freed).
-    let rc_after = crate::mm::refcount::page_ref_count(frame);
-    if rc_after != 1 {
-        test_fail!("madv_nozero", "shared frame rc after DONTNEED = {} (want 1)", rc_after);
-        if rc_after != 0 { crate::mm::refcount::page_ref_dec(frame); }
-        let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
-    }
-    // KEY ASSERTION: the shared frame's bytes were NOT zeroed in place.
-    let mut clobbered_off = u64::MAX;
-    for off in (0..0x1000u64).step_by(0x100) {
-        let got = unsafe { core::ptr::read_volatile((PHYS_OFF + frame + off) as *const u64) };
-        if got != pat(off) { clobbered_off = off; break; }
-    }
-    if clobbered_off != u64::MAX {
-        test_fail!("madv_nozero",
-            "shared frame {:#x} CLOBBERED at +{:#x} by in-place zero (W215 regression)",
-            frame, clobbered_off);
-        crate::mm::refcount::page_ref_dec(frame);
-        let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
-        return false;
-    }
-    test_println!("  (a) shared frame {:#x}: rc 2->1, bytes intact after DONTNEED ✓", frame);
-    // Release the modelled sibling ref → frame freed (rc 1 -> 0), balanced.
-    if crate::mm::refcount::page_ref_dec(frame) == 0 {
-        crate::mm::pmm::free_page(frame);
-    }
-    let _ = crate::syscall::dispatch_linux_kernel(11, addr, 0x1000, 0, 0, 0, 0);
 
     // ---- (b) DONTNEED SEMANTICS: refault yields fresh zeros ----
     let addr2 = crate::syscall::dispatch_linux_kernel(9, 0, 0x1000, 3, 0x22, u64::MAX, 0);
