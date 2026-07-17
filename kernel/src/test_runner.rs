@@ -18993,13 +18993,16 @@ fn test_kuser_shared_data() -> bool {
     }
 
     // ─── Sub-test 7: SystemTime advances (forward progress) ──────────────────
-    // SystemTime is derived from the RTC, which has 1-second granularity, so a
-    // fixed short busy-wait frequently reads within the same second and sees no
-    // change (a false "did not advance" flake).  Instead wait for a forward
+    // SystemTime blends the RTC's whole-second wall clock with a boot-tick
+    // sub-second residue (see kuser_shared::update_time_fields), from two
+    // clocks that are not mutually synchronized.  A fixed short read pair can
+    // therefore observe no forward step — or a transient backward blip when the
+    // tick residue wraps a second before the RTC increments — under scheduling
+    // jitter (a false "did not advance" flake).  Instead wait for a forward
     // EDGE with a bounded timeout: advancing within the window is success; a
     // value that never advances across the whole window is a genuine stall and
-    // still fails.  TICK_HZ = 100, so 300 ticks ≈ 3 s comfortably spans more
-    // than one 1 s RTC tick.
+    // still fails.  TICK_HZ = 100, so the 300-tick (~3 s) budget spans several
+    // RTC seconds.
     let st1 = ku::current_system_time();
     let deadline = crate::arch::x86_64::irq::get_ticks().saturating_add(300);
     let mut st2 = st1;

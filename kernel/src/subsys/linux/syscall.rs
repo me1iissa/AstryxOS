@@ -6311,7 +6311,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     // continuation across multiple batches, so this is a tuning change only:
     // no caller observes the batch boundary.
     //
-    // Cite: madvise(2) (POSIX.1-2017); Intel SDM Vol. 3A §4.10.4-5.
+    // Cite: madvise(2) man page (man7.org); Intel SDM Vol. 3A §4.10.4-5.
     const BATCH: usize = 128;
 
     let mut page = start;
@@ -6384,7 +6384,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                 // this PTE's released reference.
                 //
                 // Cite: Intel SDM Vol. 3A §4.10.5 (TLB consistency);
-                // POSIX madvise(2) MADV_DONTNEED — the kernel may free
+                // madvise(2) (man page) MADV_DONTNEED — the kernel may free
                 // the pages but must do so without violating concurrent
                 // mapping invariants.
                 let new_rc = crate::mm::refcount::page_ref_dec(phys);
