@@ -1393,6 +1393,10 @@ pub fn run() -> ! {
         if test_656_alloc_side_alias_guard() { passed += 1; }
         total += 1;
         if test_657_percpu_idle_work_steal() { passed += 1; }
+        total += 1;
+        if test_707_load_balance() { passed += 1; }
+        total += 1;
+        if test_708_load_balance_live() { passed += 1; }
     }
 
     // ── Test 659: kstack-free quarantine survey per-tick throttle ────────
@@ -53068,6 +53072,268 @@ fn test_658_tsc_deadline_cadence() -> bool {
 
     test_println!("  next-deadline: now+period strictly-future / modulo-2^64 wrap — \
 TSC-deadline one-shot re-arm cadence GREEN (KVM dead-CPU0-timer fix)");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 707: load-balance victim selection (Perf P2 phase 3d) ──────────────
+//
+// Phase 3d migrates the most-overdue eligible thread from the busiest runqueue
+// to the least-loaded one when the depth imbalance exceeds the threshold. The
+// live `mirror_maintain` applies the eligibility guards (not Running, not
+// `!ctx_rsp_valid`, not pinned) and homing before calling the selection core;
+// this test drives the pure decision (`test_pick_balance`) over caller-supplied
+// loads + pre-filtered candidates to prove the policy: imbalance threshold,
+// busiest→emptiest direction, most-overdue victim, pull-on-idle, and the
+// no-migration cases. The eligibility guards themselves are structural in the
+// live path (a Running/mid-switch/pinned thread is never placed in the
+// candidate list) and are covered by the by-construction argument in the code.
+fn test_707_load_balance() -> bool {
+    use crate::sched::percpu::test_pick_balance as pb;
+    use crate::proc::Tid;
+    const NAME: &str = "[SCHED/P2] load-balance victim selection (Test 707)";
+    test_header!(NAME);
+
+    // Candidate tuple: (tid, prio, home_cpu, abs_deadline). Lower abs_deadline =
+    // more overdue (longer effective wait).
+    type Cand = (Tid, u8, usize, u64);
+
+    // Case 1 — balanced within threshold: depths [2,1] differ by 1 (< 2) → no
+    // migration even though candidates exist on the busier CPU.
+    {
+        let loads = [2u32, 1];
+        let cands: [Cand; 2] = [(10, 4, 0, 100), (11, 4, 0, 100)];
+        if pb(&loads, 2, &cands).is_some() {
+            test_fail!(NAME, "case1: migrated despite imbalance < threshold");
+            return false;
+        }
+    }
+
+    // Case 2 — imbalance at threshold: depths [3,1] differ by 2 (>= 2) → migrate
+    // from busiest (0) to emptiest (1), choosing the MOST-overdue victim on cpu 0
+    // (tid 21, abs 50 < tid 20's abs 100).
+    {
+        let loads = [3u32, 1, 2];
+        let cands: [Cand; 3] = [(20, 4, 0, 100), (21, 4, 0, 50), (22, 4, 2, 10)];
+        match pb(&loads, 3, &cands) {
+            Some((src, dst, tid, _prio)) => {
+                if src != 0 || dst != 1 || tid != 21 {
+                    test_fail!(NAME, "case2: got src={} dst={} tid={} expected 0->1 tid=21", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case2: no migration despite imbalance >= threshold"); return false; }
+        }
+    }
+
+    // Case 3 — pull-on-idle: emptiest CPU is empty (depth 0). depths [4,0] →
+    // migrate the most-overdue cpu-0 victim to cpu 1.
+    {
+        let loads = [4u32, 0];
+        let cands: [Cand; 3] = [(30, 4, 0, 200), (31, 4, 0, 80), (32, 4, 0, 150)];
+        match pb(&loads, 2, &cands) {
+            Some((src, dst, tid, _)) => {
+                if src != 0 || dst != 1 || tid != 31 {
+                    test_fail!(NAME, "case3: got src={} dst={} tid={} expected 0->1 tid=31 (most overdue)", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case3: pull-on-idle did not fire"); return false; }
+        }
+    }
+
+    // Case 4 — imbalance present but NO eligible victim homed on the busiest CPU
+    // (all candidates live on other CPUs) → no migration (the busiest CPU's load
+    // is pinned/running threads the caller already filtered out).
+    {
+        let loads = [5u32, 1];
+        let cands: [Cand; 2] = [(40, 4, 1, 100), (41, 4, 1, 100)]; // none on cpu 0
+        if pb(&loads, 2, &cands).is_some() {
+            test_fail!(NAME, "case4: migrated with no eligible victim on busiest");
+            return false;
+        }
+    }
+
+    // Case 5 — uniprocessor: ncpus 1 → never migrate.
+    {
+        let loads = [9u32];
+        let cands: [Cand; 1] = [(50, 4, 0, 10)];
+        if pb(&loads, 1, &cands).is_some() {
+            test_fail!(NAME, "case5: migrated on a uniprocessor");
+            return false;
+        }
+    }
+
+    // Case 6 — three CPUs, picks the GLOBAL busiest and emptiest. depths
+    // [2,6,1]: busiest=1, emptiest=2, diff 5 >= 2 → migrate cpu1's overdue victim
+    // to cpu 2.
+    {
+        let loads = [2u32, 6, 1];
+        let cands: [Cand; 3] = [(60, 4, 1, 70), (61, 4, 1, 30), (62, 4, 0, 5)];
+        match pb(&loads, 3, &cands) {
+            Some((src, dst, tid, _)) => {
+                if src != 1 || dst != 2 || tid != 61 {
+                    test_fail!(NAME, "case6: got src={} dst={} tid={} expected 1->2 tid=61", src, dst, tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case6: no migration on 3-CPU imbalance"); return false; }
+        }
+    }
+
+    // Case 7 — deadline tie → deterministic lower-tid victim. Two equally-overdue
+    // threads (same abs 40) on the busiest CPU; the lower tid (70) is chosen
+    // regardless of candidate order, so the pure decision and the live
+    // table-order decision cannot diverge on a tie.
+    {
+        let loads = [3u32, 0];
+        // Present the higher tid FIRST to prove order-independence.
+        let cands: [Cand; 2] = [(71, 4, 0, 40), (70, 4, 0, 40)];
+        match pb(&loads, 2, &cands) {
+            Some((_, _, tid, _)) => {
+                if tid != 70 {
+                    test_fail!(NAME, "case7: tie picked tid {} expected 70 (lower tid)", tid);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "case7: no migration on tie"); return false; }
+        }
+    }
+
+    test_println!("  load-balance: threshold-gated / busiest->emptiest / most-overdue-victim / \
+pull-on-idle / no-eligible-victim-skip / uniproc-noop / 3-CPU-global-extremes / \
+deadline-tie-lower-tid — migration policy correct GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 708: LIVE load-balance selector + apply + dead-timer exclusion ──────
+//
+// Test 707 proves the pure decision core; this drives the CODE THAT ACTUALLY
+// RUNS in `mirror_maintain`: the live `pick_balance_victim` (eligibility guards +
+// most-overdue-victim + tie-break, over a synthetic `&[Thread]` slice) and the
+// live `apply_balance_migration` (dequeue/enqueue/re-home + `BALANCE_MIGRATIONS`
+// bump, over caller-held `PerCpuRq` guards) — the pattern Test 657 establishes
+// for `try_steal_to`. Case B is the regression guard for the dead-LAPIC-timer
+// destination exclusion: the SAME thread set migrates onto the dead CPU when the
+// selector reads RAW load (the pre-fix hazard) and does NOT when it reads through
+// `cpu_wake_load` (a dead-timer CPU reports u32::MAX), matching the wake edge.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_708_load_balance_live() -> bool {
+    use crate::proc::{Thread, ThreadState, Tid};
+    use crate::sched::percpu::{
+        apply_balance_migration, balance_migrations, pick_balance_victim, PerCpuRq,
+    };
+    use core::sync::atomic::Ordering;
+    const NAME: &str = "[SCHED/P2] load-balance LIVE selector + dead-timer exclusion (Test 708)";
+    test_header!(NAME);
+
+    // A migratable Ready thread homed on `home` at `prio`; smaller `ready_since`
+    // = more overdue (smaller absolute force-deadline). `affinity`/`ctx_valid`
+    // drive the eligibility guards. (force_deadline_for_tid is identical for all
+    // non-zero tids, so ordering is by ready_since alone.)
+    let mk = |tid: Tid, prio: u8, home: u8, ready_since: u64,
+              affinity: Option<u8>, ctx_valid: bool| -> Thread {
+        let mut t = Thread::new_for_test(prio);
+        t.tid = tid;
+        t.state = ThreadState::Ready;
+        t.cpu_affinity = affinity;
+        t.mirror_slot = Some((home, prio));
+        t.last_cpu = home;
+        t.ready_since_tick = ready_since;
+        t.ctx_rsp_valid.store(ctx_valid, Ordering::Release);
+        t
+    };
+
+    // ── Case A: clean imbalance → live selection + apply. ────────────────────
+    {
+        let loads = [3u32, 1];
+        let mut threads = [
+            mk(100, 8, 0, 5, None, true),     // homed cpu0, less overdue
+            mk(101, 8, 0, 1, None, true),     // homed cpu0, MOST overdue → victim
+            mk(102, 8, 0, 3, Some(0), true),  // homed cpu0 but PINNED → skipped
+            mk(103, 8, 0, 0, None, false),    // homed cpu0 but mid-switch → skipped
+            mk(200, 8, 1, 2, None, true),     // homed cpu1 (not busiest)
+        ];
+        // Live selector (no dead timer): reads the closure loads.
+        match pick_balance_victim(|c| loads[c], 2, &threads) {
+            Some((src, dst, tid, prio)) => {
+                if src != 0 || dst != 1 || tid != 101 || prio != 8 {
+                    test_fail!(NAME, "caseA decision src={} dst={} tid={} prio={} (want 0->1 tid101 prio8)",
+                        src, dst, tid, prio);
+                    return false;
+                }
+            }
+            None => { test_fail!(NAME, "caseA: no migration on clean imbalance"); return false; }
+        }
+        // Drive the REAL apply over held guards; assert the counter advances.
+        let rq0 = spin::Mutex::new(PerCpuRq::new_for_test());
+        let rq1 = spin::Mutex::new(PerCpuRq::new_for_test());
+        {
+            let mut g = rq0.lock();
+            g.enqueue(101, 8);
+            g.enqueue(100, 8);
+        }
+        let before = balance_migrations();
+        let mut guards = [Some(rq0.lock()), Some(rq1.lock())];
+        let applied = apply_balance_migration(&mut guards, &mut threads, 0, 1, 101, 8);
+        drop(guards);
+        if !applied {
+            test_fail!(NAME, "caseA: apply_balance_migration reported not-applied");
+            return false;
+        }
+        if balance_migrations() <= before {
+            test_fail!(NAME, "caseA: BALANCE_MIGRATIONS did not advance (was {})", before);
+            return false;
+        }
+        if rq0.lock().nr_running() != 1 || rq1.lock().nr_running() != 1 {
+            test_fail!(NAME, "caseA: rq depths wrong after apply cpu0={} cpu1={} (want 1/1)",
+                rq0.lock().nr_running(), rq1.lock().nr_running());
+            return false;
+        }
+        let v = threads.iter().find(|t| t.tid == 101).unwrap();
+        if v.mirror_slot != Some((1, 8)) || v.last_cpu != 1 {
+            test_fail!(NAME, "caseA: victim not re-homed slot={:?} last_cpu={}", v.mirror_slot, v.last_cpu);
+            return false;
+        }
+    }
+
+    // ── Case B (F1 regression): dead-timer destination is NEVER chosen. ──────
+    // Same threads, all homed on cpu0; raw depths [3,0]. With RAW load the
+    // selector ranks cpu1 emptiest and would strand the most-overdue thread on
+    // it (the pre-fix hazard). Reading through cpu_wake_load (cpu1 = u32::MAX)
+    // ranks cpu1 busiest instead; it has no homed victim, so no migration onto
+    // cpu1 occurs — the dead CPU is never the destination.
+    {
+        let threads = [
+            mk(110, 8, 0, 1, None, true),
+            mk(111, 8, 0, 2, None, true),
+            mk(112, 8, 0, 3, None, true),
+        ];
+        let raw = [3u32, 0];
+        // Precondition: raw-load selection targets cpu1 (demonstrates the hazard
+        // the fix removes — i.e. this is what the pre-fix live path would do).
+        match pick_balance_victim(|c| raw[c], 2, &threads) {
+            Some((_, 1, _, _)) => {}
+            other => {
+                test_fail!(NAME, "caseB precondition: raw-load selection expected dst=1, got {:?}", other);
+                return false;
+            }
+        }
+        // Fixed: a dead-timer destination (u32::MAX) is excluded.
+        let dead1 = |c: usize| if c == 1 { u32::MAX } else { raw[c] };
+        match pick_balance_victim(dead1, 2, &threads) {
+            None => {}
+            Some((_, dst, _, _)) if dst != 1 => {}
+            Some((_, dst, tid, _)) => {
+                test_fail!(NAME, "caseB: dead-timer CPU {} chosen as destination for tid {}", dst, tid);
+                return false;
+            }
+        }
+    }
+
+    test_println!("  load-balance LIVE: most-overdue eligible busiest-homed victim / pinned+mid-switch skipped / \
+apply re-homes + advances BALANCE_MIGRATIONS / dead-timer destination excluded (Leg 3) — GREEN");
     test_pass!(NAME);
     true
 }

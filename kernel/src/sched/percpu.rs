@@ -746,6 +746,236 @@ pub fn test_wake_target(affinity: Option<u8>, last_cpu: u8, loads: &[u32]) -> u8
     })
 }
 
+// ── Load balancing (Perf P2 phase 3d) ───────────────────────────────────────
+
+/// Minimum runqueue-depth difference (busiest minus least-loaded) that triggers
+/// a migration.  A difference of 2 means the busiest CPU has at least two more
+/// queued threads than the emptiest — enough that moving one strictly improves
+/// the spread (busiest-1 vs emptiest+1 cannot cross over).  A threshold of 2
+/// (not 1) avoids ping-ponging a single thread between two CPUs that differ by
+/// one, which would only churn cache with no fairness gain.
+const BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
+
+/// Balance-pass throttle: run the migration check once every this many
+/// maintenance passes.  Balancing every pass would add an O(N) victim scan to
+/// the hot path for little benefit (load does not change that fast); spacing it
+/// keeps the amortized cost negligible while still reacting within a few ticks.
+const BALANCE_EVERY_PASSES: u32 = 16;
+
+/// Monotone pass counter driving the [`BALANCE_EVERY_PASSES`] cadence.
+static BALANCE_PASSES: AtomicU32 = AtomicU32::new(0);
+
+/// Cumulative count of load-balance migrations performed.  Diagnostic / test
+/// signal that balancing actually moved a thread.  Monotone since boot.
+pub static BALANCE_MIGRATIONS: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of [`BALANCE_MIGRATIONS`].
+pub fn balance_migrations() -> u32 {
+    BALANCE_MIGRATIONS.load(Ordering::Relaxed)
+}
+
+/// True once every [`BALANCE_EVERY_PASSES`] maintenance passes (the throttle).
+#[inline]
+fn balance_due() -> bool {
+    let n = BALANCE_PASSES.fetch_add(1, Ordering::Relaxed);
+    n % BALANCE_EVERY_PASSES == 0
+}
+
+/// Pure load-balance decision: given per-CPU runqueue depths and the candidate
+/// victim threads, decide whether to migrate and pick (src, dst, tid, prio).
+///
+/// Returns `Some((src, dst, victim_tid, victim_prio))` when the busiest CPU's
+/// depth exceeds the least-loaded CPU's by more than
+/// [`BALANCE_IMBALANCE_THRESHOLD`] AND there is an eligible victim queued on the
+/// busiest CPU; `None` otherwise.  The victim is the MOST-OVERDUE eligible
+/// thread on the busiest CPU (smallest absolute force-deadline = longest
+/// effective wait), so balancing also relieves the rq most likely to be
+/// starving — pull-on-idle (dst depth 0) falls out as the special case.
+///
+/// `loads[cpu]` is the runqueue depth, `here` is the current CPU.  `candidates`
+/// is the eligible-victim list as `(tid, prio, home_cpu, abs_deadline)` tuples —
+/// the caller has ALREADY applied the eligibility guards (not Running, not
+/// `!ctx_rsp_valid`, not pinned) so this pure function only does selection.
+fn pick_balance_core(
+    loads: &[u32],
+    ncpus: usize,
+    candidates: &[(Tid, u8, usize, u64)],
+) -> Option<(usize, usize, Tid, u8)> {
+    if ncpus < 2 {
+        return None;
+    }
+    // Busiest and least-loaded CPUs (ties → lowest index).
+    let mut busiest = 0usize;
+    let mut emptiest = 0usize;
+    for cpu in 0..ncpus {
+        let l = loads.get(cpu).copied().unwrap_or(0);
+        if l > loads.get(busiest).copied().unwrap_or(0) {
+            busiest = cpu;
+        }
+        if l < loads.get(emptiest).copied().unwrap_or(0) {
+            emptiest = cpu;
+        }
+    }
+    if busiest == emptiest {
+        return None;
+    }
+    let busy_load = loads.get(busiest).copied().unwrap_or(0);
+    let empty_load = loads.get(emptiest).copied().unwrap_or(0);
+    // Need a strict imbalance beyond the threshold to bother moving anything.
+    if busy_load.saturating_sub(empty_load) < BALANCE_IMBALANCE_THRESHOLD {
+        return None;
+    }
+    // Most-overdue eligible victim that is HOMED on the busiest CPU.  Ties on
+    // the absolute deadline are broken toward the LOWER tid so the choice is
+    // deterministic and independent of iteration order — this keeps the pure
+    // `pick_balance_core` (driven by Test 707 over a candidate slice) and the
+    // live `pick_balance_victim` (driven over the thread table) selecting the
+    // identical victim even when two equally-overdue threads compete.
+    let mut victim: Option<(Tid, u8, u64)> = None;
+    for &(tid, prio, home, abs_deadline) in candidates {
+        if home != busiest {
+            continue;
+        }
+        let take = match victim {
+            Some((best_tid, _, best_abs)) => {
+                abs_deadline < best_abs || (abs_deadline == best_abs && tid < best_tid)
+            }
+            None => true,
+        };
+        if take {
+            victim = Some((tid, prio, abs_deadline));
+        }
+    }
+    victim.map(|(tid, prio, _)| (busiest, emptiest, tid, prio))
+}
+
+/// Test-facing replica of the load-balance decision (Test 707), over
+/// caller-supplied loads + candidates so the migration policy is provable
+/// without spinning threads or touching the live `RQS`.
+#[doc(hidden)]
+pub fn test_pick_balance(
+    loads: &[u32],
+    ncpus: usize,
+    candidates: &[(Tid, u8, usize, u64)],
+) -> Option<(usize, usize, Tid, u8)> {
+    pick_balance_core(loads, ncpus, candidates)
+}
+
+/// Live load-balance victim selection over the thread table.  Allocation-free:
+/// a single pass over the table tracking only the running best per-CPU victim,
+/// so no candidate vector is built.
+///
+/// Per-CPU load is read through the `load` closure rather than off the guards
+/// directly, matching the wake-edge spread ([`wake_target_with_loads`]): the
+/// LIVE caller wires `|cpu| cpu_wake_load(cpu, nr_running)` so a dead-LAPIC-timer
+/// CPU reports `u32::MAX` and is never selected as the migration destination
+/// (the Leg-3 dead-timer exclusion).  Reading `nr_running` raw here would rank a
+/// dead-timer CPU — whose runqueue stays shallow precisely because the wake edge
+/// already steers work away from it — as `emptiest` and strand the most-overdue
+/// thread on the one CPU that cannot drain it.  The closure also lets the
+/// selection be driven directly over caller-supplied loads in Test 707 (the same
+/// pattern [`test_wake_target`] uses for the wake edge).
+pub(crate) fn pick_balance_victim(
+    load: impl Fn(usize) -> u32,
+    ncpus: usize,
+    threads: &[proc::Thread],
+) -> Option<(usize, usize, Tid, u8)> {
+    let mut loads = [0u32; MAX_CPUS];
+    for cpu in 0..ncpus {
+        loads[cpu] = load(cpu);
+    }
+    // Identify busiest/emptiest + threshold via the pure core over a single
+    // synthesized best-victim-per-busiest candidate.  We first find busiest so
+    // we only need to track the most-overdue eligible victim on THAT CPU.
+    let mut busiest = 0usize;
+    let mut emptiest = 0usize;
+    for cpu in 0..ncpus {
+        if loads[cpu] > loads[busiest] { busiest = cpu; }
+        if loads[cpu] < loads[emptiest] { emptiest = cpu; }
+    }
+    if busiest == emptiest
+        || loads[busiest].saturating_sub(loads[emptiest]) < BALANCE_IMBALANCE_THRESHOLD
+    {
+        return None;
+    }
+    // Most-overdue ELIGIBLE thread homed on the busiest CPU.  Eligibility:
+    // Ready non-idle, NOT pinned, NOT mid-switch (`ctx_rsp_valid`), and homed on
+    // `busiest` (its current mirror slot is on busiest).  The currently-Running
+    // task is excluded automatically: a Running thread is not in the
+    // mirrored-runnable (Ready) pool, so it has no Some(busiest) mirror slot.
+    let mut best: Option<(Tid, u8, u64)> = None;
+    for t in threads.iter() {
+        if t.cpu_affinity.is_some() {
+            continue; // pinned — never migrate off its CPU
+        }
+        if !t.ctx_rsp_valid.load(Ordering::Acquire) {
+            continue; // mid context-switch — unsafe to move
+        }
+        match t.mirror_slot {
+            Some((c, prio)) if (c as usize) == busiest => {
+                let abs = t.ready_since_tick
+                    .saturating_add(super::force_deadline_for_tid(t.tid));
+                // Tie-break toward the lower tid (matches `pick_balance_core`),
+                // so the live victim choice is order-independent and identical
+                // to the tested pure decision even on equal deadlines.
+                let take = match best {
+                    Some((best_tid, _, best_abs)) => {
+                        abs < best_abs || (abs == best_abs && t.tid < best_tid)
+                    }
+                    None => true,
+                };
+                if take {
+                    best = Some((t.tid, prio, abs));
+                }
+            }
+            _ => {}
+        }
+    }
+    best.map(|(tid, prio, _)| (busiest, emptiest, tid, prio))
+}
+
+/// Apply a chosen load-balance migration under the runqueue guards
+/// `mirror_maintain` already holds: dequeue the victim from its source rq,
+/// enqueue it on the destination, re-home its `last_cpu` + `mirror_slot`, and
+/// bump [`BALANCE_MIGRATIONS`].  Returns `true` iff the migration was applied.
+///
+/// Extracted from [`mirror_maintain`] so the live apply and the migration
+/// counter are exercised directly (Test 707) rather than only inferred from the
+/// pure decision.  The mirror invariant (slot ⟺ rq membership, stable across the
+/// held guards) guarantees the victim is present in the source bucket; the
+/// dequeue result is asserted and, if it ever misses, the enqueue/re-home/count
+/// are skipped so a weakened invariant cannot silently double-count `nr_running`
+/// on the destination (the same defensiveness [`try_steal_to`] applies).
+pub(crate) fn apply_balance_migration(
+    guards: &mut [Option<spin::MutexGuard<'_, PerCpuRq>>],
+    threads: &mut [proc::Thread],
+    src: usize,
+    dst: usize,
+    victim_tid: Tid,
+    victim_prio: u8,
+) -> bool {
+    let removed = match guards.get_mut(src).and_then(|g| g.as_mut()) {
+        Some(g) => g.dequeue(victim_tid, victim_prio),
+        None => false,
+    };
+    debug_assert!(
+        removed,
+        "balance victim absent from its source runqueue (mirror invariant weakened)"
+    );
+    if !removed {
+        return false;
+    }
+    if let Some(g) = guards.get_mut(dst).and_then(|g| g.as_mut()) {
+        g.enqueue(victim_tid, victim_prio);
+    }
+    if let Some(t) = threads.iter_mut().find(|t| t.tid == victim_tid) {
+        t.last_cpu = dst as u8;
+        t.mirror_slot = Some((dst as u8, victim_prio));
+    }
+    BALANCE_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// True iff `t` belongs to the mirrored non-idle runnable pool: a `Ready`
 /// thread that is NOT an idle-class thread.
 ///
@@ -1019,6 +1249,59 @@ pub fn mirror_maintain(threads: &mut [proc::Thread]) {
     for cpu in 0..MAX_CPUS {
         if let Some(g) = guards[cpu].as_mut() {
             g.set_min_deadline(mins[cpu]);
+        }
+    }
+
+    // ── Load balancing (Perf P2 phase 3d) ────────────────────────────────────
+    // Periodically even out the per-CPU runqueues: if the busiest CPU's depth
+    // exceeds the least-loaded CPU's by more than `BALANCE_IMBALANCE_THRESHOLD`,
+    // migrate the single most-overdue ELIGIBLE thread from the busiest to the
+    // least-loaded runqueue.  "Pull-on-idle" is the special case where the
+    // least-loaded CPU is empty (depth 0).  All of this happens under the rq
+    // guards `mirror_maintain` already holds in ascending CPU-index order (the
+    // documented migration lock order), so there is no separate two-lock dance
+    // and no deadlock surface.
+    //
+    // Eligibility (mirrors the dispatch's migration guards): NEVER migrate the
+    // currently-Running task, a task whose context is mid-switch
+    // (`!ctx_rsp_valid`), or a task pinned to a specific CPU (`cpu_affinity`).
+    // Migrating = reassign the victim's `last_cpu` to the destination and move
+    // its tid between the two runqueues + its `mirror_slot`; the destination is
+    // then poked via the reschedule mask so it picks the migrated thread up
+    // promptly.  Gated on `ncpus > 1` and throttled, so SMP=1 never balances.
+    //
+    // ORDERING INVARIANT (load-bearing — do not move this block above the delta
+    // loop): the Running-task exclusion is implicit, and relies on the delta
+    // loop having ALREADY run this pass.  A thread that is Running carries a
+    // stale `mirror_slot = Some(..)` (the picker does not clear it on
+    // Ready→Running), but `desired_slot` returns `None` for any non-Ready
+    // thread, so the delta loop above dequeued it and set `mirror_slot = None`
+    // BEFORE we read slots here.  `mirror_maintain` runs only under
+    // THREAD_TABLE, so no other CPU reconciles concurrently.  Hence by this
+    // point every Running thread has `mirror_slot = None` and can never match
+    // the `Some((busiest, _))` victim predicate — a Running thread is never
+    // migrated.  If a future refactor reorders these blocks, that guarantee
+    // breaks.
+    if ncpus > 1 && balance_due() {
+        // Per-CPU load read through `cpu_wake_load` — identical to the wake-edge
+        // spread above — so a dead-LAPIC-timer CPU (reported u32::MAX) is never
+        // chosen as the migration destination (Leg 3): balance must not strand
+        // the most-overdue thread on a CPU that cannot drain its own runqueue.
+        // `nr_running` is read straight off the guards already held (no re-lock).
+        if let Some((src, dst, victim_tid, victim_prio)) = pick_balance_victim(
+            |cpu| cpu_wake_load(cpu, guards[cpu].as_ref().map_or(0, |g| g.nr_running())),
+            ncpus,
+            threads,
+        ) {
+            // Apply the migration (dequeue → enqueue → re-home → count) under the
+            // held guards, then poke the destination so it reschedules and picks
+            // up the pulled task (remote by construction: dst != src).
+            if apply_balance_migration(&mut guards, threads, src, dst, victim_tid, victim_prio)
+                && dst != here
+                && dst < 32
+            {
+                resched_mask |= 1u32 << (dst as u32);
+            }
         }
     }
 
