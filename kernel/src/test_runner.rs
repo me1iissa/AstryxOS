@@ -447,6 +447,11 @@ pub fn run() -> ! {
     total += 1;
     if test_exec_fork() { passed += 1; }
 
+    // ── Test CLEARTID-COW: resolve_user_write_page refcount/content balance ──
+
+    total += 1;
+    if test_cleartid_cow_refcount_balance() { passed += 1; }
+
     // ── Test 15: TTY Subsystem ──────────────────────────────────────
 
     total += 1;
@@ -5235,6 +5240,258 @@ fn test_exec_fork() -> bool {
 
     test_pass!("exec/fork (per-process page tables + CoW)");
     true
+}
+
+// ============================================================================
+// Test CLEARTID-COW: resolve_user_write_page refcount + content balance
+// ============================================================================
+//
+// The CLONE_CHILD_CLEARTID exit write — `write_u32_to_user` →
+// `resolve_user_write_page` — is the kernel's demand-fault / CoW-break that
+// runs from thread exit (clone(2), set_tid_address(2)) rather than a hardware
+// `#PF`, so it never goes through the fault handler.  This test drives it
+// directly on a synthetic address space and asserts the exact refcount +
+// content invariants that keep it from corrupting a fork sibling's live frame
+// (the post-#724 wiki/SMP=2 residual this fix targets):
+//
+//   (a) Arm B (not-present)           → zeroed private frame, refcount == 1.
+//   (b) Arm A (present RO, rc == 2)   → a private COPY of the live content
+//       (NOT a zero page), old frame 2→1 (its sibling mapping stays intact and
+//       unzeroed), new frame rc == 1.
+//   (c) The sibling-won CAS back-out  → a lost `map_page_in_cow_if_unchanged`
+//       install frees the redundant frame and leaves the shared frame's count
+//       UNTOUCHED (no speculative double-dec) — the deterministic slice of the
+//       concurrent-`#PF` race the guard closes.
+//
+// Frames are accounted so teardown is leak-free: `free_vm_space` decrements
+// exactly one ref per live PTE it walks, so every mapped frame reaches rc 0 and
+// returns to the PMM; the one intentionally-unmapped frame in (c) is freed
+// explicitly.
+fn test_cleartid_cow_refcount_balance() -> bool {
+    use crate::mm::vmm::{
+        read_pte, map_page_in, map_page_in_cow_if_unchanged,
+        ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_NO_EXECUTE,
+    };
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    test_header!("CLEARTID CoW-break refcount balance");
+
+    let test_pid: u64 = 9974;
+
+    // A synthetic user address space with one writable anonymous VMA (4 pages).
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("cleartid_cow", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+    let vma_base: u64 = 0x5000_0000;
+    {
+        let vma = crate::mm::vma::VmArea {
+            base: vma_base,
+            length: 0x4000,
+            prot: crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
+            flags: crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+            backing: crate::mm::vma::VmBacking::Anonymous,
+            name: "[cleartid-test]",
+        };
+        if vm.insert_vma(vma).is_err() {
+            test_fail!("cleartid_cow", "insert_vma failed");
+            crate::proc::free_vm_space(vm);
+            return false;
+        }
+    }
+
+    // Register the synthetic process so resolve_user_write_page's VMA lookup
+    // (keyed on cr3 in PROCESS_TABLE) resolves.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.push(crate::proc::Process {
+            pid: test_pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8; 64]; n[..9].copy_from_slice(b"cleartid\0"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: test_pid as u32, sid: test_pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        });
+    }
+
+    // A second address space to hold the fork-sibling mapping in sub-test (b).
+    let mut sibling_vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("cleartid_cow", "sibling VmSpace::new_user() OOM");
+            let vm = { let mut procs = crate::proc::PROCESS_TABLE.lock();
+                let t = procs.iter_mut().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.take());
+                procs.retain(|p| p.pid != test_pid); t };
+            if let Some(vm) = vm { crate::proc::free_vm_space(vm); }
+            return false;
+        }
+    };
+    let sibling_cr3 = sibling_vm.cr3;
+
+    let mut ok = true;
+
+    // ── (a) Arm B: not-present demand-fault ─────────────────────────────────
+    let va_b = vma_base; // 0x5000_0000
+    if read_pte(cr3, va_b) & PAGE_PRESENT != 0 {
+        test_fail!("cleartid_cow", "(a) precondition: va_b already present");
+        ok = false;
+    } else if !crate::syscall::resolve_user_write_page(cr3, va_b) {
+        test_fail!("cleartid_cow", "(a) resolve returned false for writable anon VMA");
+        ok = false;
+    } else {
+        let pte = read_pte(cr3, va_b);
+        let phys = pte & ADDR_MASK;
+        let present_writable = pte & PAGE_PRESENT != 0 && pte & PAGE_WRITABLE != 0;
+        let rc = crate::mm::refcount::page_ref_count(phys);
+        let zeroed = unsafe {
+            let p = (PHYS_OFF + phys) as *const u8;
+            (0..4096).all(|i| *p.add(i) == 0)
+        };
+        // The CLEARTID store itself must land and be readable.
+        crate::syscall::write_u32_to_user(cr3, va_b + 8, 0xDEAD_BEEF);
+        let readback = unsafe { core::ptr::read_volatile((PHYS_OFF + phys + 8) as *const u32) };
+        if !(present_writable && rc == 1 && zeroed && readback == 0xDEAD_BEEF) {
+            test_fail!("cleartid_cow",
+                "(a) present_writable={} rc={} (want 1) zeroed={} readback={:#x} (want 0xDEADBEEF)",
+                present_writable, rc, zeroed, readback);
+            ok = false;
+        } else {
+            test_println!("  (a) Arm B demand-fault: rc=1, zeroed, writable ✓");
+        }
+    }
+
+    // ── (b) Arm A: present RO, refcount == 2 (shared with a fork sibling) ────
+    let va_a = vma_base + 0x1000; // 0x5000_1000
+    let va_sib = 0x5100_0000u64;
+    let shared_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!("cleartid_cow", "(b) alloc shared_phys OOM"); ok = false; 0 }
+    };
+    if ok && shared_phys != 0 {
+        // Live sibling content — a non-zero sentinel that MUST survive the break.
+        unsafe { core::ptr::write_bytes((PHYS_OFF + shared_phys) as *mut u8, 0xAB, 4096); }
+        // Two live read-only PTEs: cr3@va_a and sibling@va_sib → refcount 2.
+        let ro = PAGE_PRESENT | PAGE_USER | PAGE_NO_EXECUTE;
+        map_page_in(cr3, va_a, shared_phys, ro);
+        map_page_in(sibling_cr3, va_sib, shared_phys, ro);
+        crate::mm::refcount::page_ref_set(shared_phys, 2);
+
+        if !crate::syscall::resolve_user_write_page(cr3, va_a) {
+            test_fail!("cleartid_cow", "(b) resolve returned false");
+            ok = false;
+        } else {
+            let pte = read_pte(cr3, va_a);
+            let new_phys = pte & ADDR_MASK;
+            let present_writable = pte & PAGE_PRESENT != 0 && pte & PAGE_WRITABLE != 0;
+            let distinct = new_phys != shared_phys;
+            let new_rc = crate::mm::refcount::page_ref_count(new_phys);
+            let old_rc = crate::mm::refcount::page_ref_count(shared_phys);
+            // New frame is a COPY of the live content (0xAB), never a zero page.
+            let copied = distinct && unsafe {
+                let p = (PHYS_OFF + new_phys) as *const u8;
+                (0..4096).all(|i| *p.add(i) == 0xAB)
+            };
+            // Sibling mapping intact: still maps shared_phys, still 0xAB.
+            let sib_pte = read_pte(sibling_cr3, va_sib);
+            let sib_intact = (sib_pte & ADDR_MASK) == shared_phys
+                && (sib_pte & PAGE_PRESENT != 0)
+                && unsafe {
+                    let p = (PHYS_OFF + shared_phys) as *const u8;
+                    (0..4096).all(|i| *p.add(i) == 0xAB)
+                };
+            if !(present_writable && distinct && new_rc == 1 && old_rc == 1 && copied && sib_intact) {
+                test_fail!("cleartid_cow",
+                    "(b) pw={} distinct={} new_rc={} (want 1) old_rc={} (want 1) copied={} sib_intact={}",
+                    present_writable, distinct, new_rc, old_rc, copied, sib_intact);
+                ok = false;
+            } else {
+                test_println!("  (b) Arm A rc=2 CoW-break: old 2→1, new rc=1 copied, sibling intact ✓");
+            }
+        }
+    }
+
+    // ── (c) sibling-won CAS back-out: shared frame count must be UNTOUCHED ───
+    let va_c = 0x6000_0000u64;
+    let sc_shared = crate::mm::pmm::alloc_page().unwrap_or(0);
+    let sc_winner = crate::mm::pmm::alloc_page().unwrap_or(0);
+    let sc_new = crate::mm::pmm::alloc_page().unwrap_or(0);
+    if ok && sc_shared != 0 && sc_winner != 0 && sc_new != 0 {
+        // sc_shared: shared by two fork lineages elsewhere (count 2, we don't
+        // map it here — we only assert the guard never touches its count).
+        crate::mm::refcount::page_ref_set(sc_shared, 2);
+        // sc_winner: the sibling CPU's already-published private PTE at va_c.
+        crate::mm::refcount::page_ref_set(sc_winner, 1);
+        map_page_in(sibling_cr3, va_c, sc_winner, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        // sc_new: our redundant copy, marked before the (doomed) install exactly
+        // as resolve_user_write_page does.
+        crate::mm::refcount::page_ref_set(sc_new, 1);
+        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        // Expected == sc_shared, but va_c maps sc_winner → the CAS must refuse.
+        let won = map_page_in_cow_if_unchanged(sibling_cr3, va_c, sc_new, flags, sc_shared);
+        // Back-out exactly as the production loss path does.
+        let _ = crate::mm::refcount::page_ref_dec(sc_new); // 1 → 0
+        crate::mm::pmm::free_page(sc_new);
+        let shared_rc = crate::mm::refcount::page_ref_count(sc_shared);
+        let winner_still = (read_pte(sibling_cr3, va_c) & ADDR_MASK) == sc_winner;
+        if won || shared_rc != 2 || !winner_still {
+            test_fail!("cleartid_cow",
+                "(c) won={} (want false) shared_rc={} (want 2, no double-dec) winner_intact={}",
+                won, shared_rc, winner_still);
+            ok = false;
+        } else {
+            test_println!("  (c) sibling-won back-out: redundant frame freed, shared count untouched ✓");
+        }
+        // sc_shared has no live PTE — free it explicitly. sc_new already freed.
+        crate::mm::refcount::page_ref_set(sc_shared, 0);
+        crate::mm::pmm::free_page(sc_shared);
+    } else if ok {
+        test_fail!("cleartid_cow", "(c) scratch alloc OOM");
+        ok = false;
+        for f in [sc_shared, sc_winner, sc_new] {
+            if f != 0 { crate::mm::refcount::page_ref_set(f, 0); crate::mm::pmm::free_page(f); }
+        }
+    }
+
+    // ── Teardown ────────────────────────────────────────────────────────────
+    // free_vm_space decrements one ref per live PTE: cr3 holds va_b (Arm B
+    // frame) + va_a (new_phys); sibling holds va_sib (shared_phys) + va_c
+    // (sc_winner) — all reach rc 0 and free cleanly.
+    let vm = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let t = procs.iter_mut().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.take());
+        procs.retain(|p| p.pid != test_pid);
+        t
+    };
+    if let Some(vm) = vm { crate::proc::free_vm_space(vm); }
+    crate::proc::free_vm_space(sibling_vm);
+
+    if ok {
+        test_pass!("CLEARTID CoW-break refcount balance");
+    }
+    ok
 }
 
 // ============================================================================

@@ -714,12 +714,14 @@ pub fn map_page_in_if_absent(
     phys_addr: u64,
     flags: u64,
 ) -> bool {
-    // mm_sem/shootdown reentrancy: every caller of this function is inside
+    // mm_sem/shootdown reentrancy: the hot callers of this function run inside
     // `handle_page_fault` (IF=0), so the plain `RwLock::read()` used elsewhere
     // in this file risks the mm_sem-vs-shootdown-ACK deadlock documented on
-    // `mm::vma::mm_sem_read_draining` — use the draining acquire
-    // unconditionally here rather than forking a `_fault_path` sibling, since
-    // there is no non-fault-path caller to keep on the plain acquire.
+    // `mm::vma::mm_sem_read_draining` — use the draining acquire unconditionally
+    // here rather than forking a `_fault_path` sibling.  The draining acquire is
+    // a superset-safe acquire (it services incoming shootdowns while spinning),
+    // so the one non-fault-path caller — `syscall::resolve_user_write_page` on
+    // the CLONE_CHILD_CLEARTID exit path, IF=1 — is equally correct on it.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()
@@ -807,11 +809,13 @@ pub fn map_page_in_cow_if_unchanged(
     flags: u64,
     expected_phys: u64,
 ) -> bool {
-    // mm_sem/shootdown reentrancy: the sole caller of this function is the
+    // mm_sem/shootdown reentrancy: the hot caller of this function is the
     // write-fault CoW arm inside `handle_page_fault` (IF=0) — see
-    // `mm::vma::mm_sem_read_draining` for the deadlock this closes.  No
-    // non-fault-path caller exists, so the draining acquire is used
-    // unconditionally rather than forking a sibling function.
+    // `mm::vma::mm_sem_read_draining` for the deadlock this closes.  The draining
+    // acquire is used unconditionally rather than forking a sibling function; it
+    // is a superset-safe acquire (services incoming shootdowns while spinning),
+    // so the one non-fault-path caller — `syscall::resolve_user_write_page` on
+    // the CLONE_CHILD_CLEARTID exit path, IF=1 — is equally correct on it.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()
