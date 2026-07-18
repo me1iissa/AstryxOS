@@ -866,6 +866,96 @@ pub fn map_page_in_cow_if_unchanged(
     true
 }
 
+/// Sole-owner CoW-break: flip the leaf PTE at `virt_addr` writable
+/// (`expected_phys | flags | PAGE_PRESENT`) **only if**, atomically under
+/// `VMM_LOCK`, it is still present, still maps `expected_phys`, AND
+/// `expected_phys` is still sole-owner (`pte_share_count(expected_phys) <= 1`).
+/// Returns `false` (writing nothing) on any mismatch.
+///
+/// # Why the refcount re-check (not just phys-unchanged)
+///
+/// The in-place writable flip is only correct while the frame is private to
+/// this address space.  A caller that sampled `page_ref_count == 1` **without a
+/// lock** can be overtaken by a concurrent `fork()`: `VmSpace::clone_for_fork`
+/// (kernel/src/mm/vma.rs) runs under `mm_sem.write()`, walks the parent page
+/// table, `page_ref_inc`s every present PTE and mirrors a read-only copy into
+/// the child — **without moving the frame**.  A phys-only CAS
+/// (`map_page_in_cow_if_unchanged`) is blind to that 1→2 transition (the PTE
+/// still maps `expected_phys`), so it would flip a now-fork-shared frame
+/// writable — a silent copy-on-write violation (the parent then writes through
+/// a frame the child still reads as private memory).
+///
+/// This guard closes the window because the re-check runs under
+/// `mm_sem_read_draining`, which is mutually exclusive with `clone_for_fork`'s
+/// `mm_sem.write()`: while this call holds the read lock the fork walk cannot be
+/// in progress, so a fork that raced our (lock-free) sample is now *visible* as
+/// `pte_share_count > 1` and we refuse.  The caller then retries and its
+/// re-sampled refcount takes the shared-copy arm instead (correct for any
+/// refcount).  No `PROCESS_TABLE` is held across the install, so this stays
+/// clear of the lock-vs-shootdown-IPI deadlock class (cf. PR #703); the mm_sem
+/// exclusion is the actual W216 fork-vs-faulter invariant.  Per Intel SDM
+/// Vol. 3A §4.10.4.3 the read-only → writable change needs a caller-side
+/// shootdown of sibling CPUs, which the caller performs on `true`.
+pub fn flip_writable_if_sole_owner(
+    pml4_phys: u64,
+    virt_addr: u64,
+    expected_phys: u64,
+    flags: u64,
+) -> bool {
+    // Same shootdown-draining acquire as the sibling CAS primitives; superset-
+    // safe from the IF=1 CLEARTID caller.  See `mm_sem_read_draining`.
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_read_draining(s));
+    let _lock = VMM_LOCK.lock();
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let pt_ptr = p2v(pt_phys);
+        let existing = *pt_ptr.add(pt_idx);
+        // Re-validate present + still-maps-expected under the lock…
+        if existing & PAGE_PRESENT == 0 || (existing & ADDR_MASK) != (expected_phys & ADDR_MASK) {
+            return false;
+        }
+        // …and still sole-owner.  Refuse if a concurrent fork raised the
+        // share-count without moving the frame (see doc comment above).
+        if crate::mm::refcount::pte_share_count(expected_phys) > 1 {
+            return false;
+        }
+        *pt_ptr.add(pt_idx) = (expected_phys & ADDR_MASK) | flags | PAGE_PRESENT;
+    }
+
+    #[cfg(feature = "firefox-test-core")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        expected_phys & ADDR_MASK,
+        expected_phys & ADDR_MASK,
+        crate::mm::w215_diag::PTE_KIND_MAP,
+        ring_caller_rip(),
+        pml4_phys,
+    );
+
+    true
+}
+
 /// Unmap a virtual page in an arbitrary page table.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.

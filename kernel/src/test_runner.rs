@@ -5258,18 +5258,79 @@ fn test_exec_fork() -> bool {
 //   (b) Arm A (present RO, rc == 2)   → a private COPY of the live content
 //       (NOT a zero page), old frame 2→1 (its sibling mapping stays intact and
 //       unzeroed), new frame rc == 1.
-//   (c) The sibling-won CAS back-out  → a lost `map_page_in_cow_if_unchanged`
-//       install frees the redundant frame and leaves the shared frame's count
-//       UNTOUCHED (no speculative double-dec) — the deterministic slice of the
-//       concurrent-`#PF` race the guard closes.
+//   (c) Arm A sole-owner (rc == 1)    → in-place writable flip, SAME frame (no
+//       copy), refcount unchanged, content preserved; and the fork-race guard
+//       `flip_writable_if_sole_owner` REFUSES once the share-count is > 1.
+//   (d) Production CAS-loss back-out  → a test-mode seam flips the PTE out from
+//       under a live `resolve_user_write_page` call (simulating a sibling `#PF`
+//       CoW-break winning), and we assert the PRODUCTION loss branch dec+frees
+//       the redundant frame, leaves the old frame's count UNTOUCHED (no
+//       speculative double-dec), and the retry converges to writable.
 //
-// Frames are accounted so teardown is leak-free: `free_vm_space` decrements
-// exactly one ref per live PTE it walks, so every mapped frame reaches rc 0 and
-// returns to the PMM; the one intentionally-unmapped frame in (c) is freed
-// explicitly.
+// Frames are accounted so teardown is leak-free: both `vm` and `sibling_vm`
+// carry a covering anonymous VMA, and `free_vm_space` is VMA-driven — it walks
+// each VMA's PTEs and decrements one ref per live frame — so every frame reaches
+// rc 0 and returns to the PMM (the frame `resolve` allocates then frees on the
+// (d) loss path is returned by the production back-out itself).
+
+// ── Sub-test (d) injection state (test-mode only) ───────────────────────────
+// The seam `crate::syscall::cleartid_cow_test_hook` fires `cleartid_loss_hook`
+// once inside the shared-copy arm of `resolve_user_write_page` (after the
+// private frame is alloc'd + refcounted, before the CAS install).  It stands in
+// for a sibling CPU winning the CoW-break race so the PRODUCTION loss / back-out
+// / retry branch runs end-to-end.  All state is single-boot, single-threaded
+// (the suite runs on one CPU), so plain atomics with SeqCst suffice.  Compiled
+// out of every non-test-mode build (the seam itself is `#[cfg(test-mode)]`).
+#[cfg(feature = "test-mode")]
+static CLEARTID_D_OLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-mode")]
+static CLEARTID_D_WIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-mode")]
+static CLEARTID_D_NEW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-mode")]
+static CLEARTID_HOOK_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Injected mid-`resolve_user_write_page` (shared-copy arm, pre-CAS) to
+/// reproduce a sibling CPU's concurrent `#PF` CoW-break winning the race:
+/// install a DIFFERENT private frame (`d_win`, present + writable) at
+/// `page_addr` and drop the old shared frame's ref once — exactly the PTE
+/// transition + `page_ref_dec(old)` the sibling's own break performs.  The
+/// pending CAS (`map_page_in_cow_if_unchanged`, `expected == d_old`) then
+/// observes the changed PTE, loses, and runs its back-out (dec+free the
+/// redundant frame, leave `old` untouched, retry) — the path sub-test (d)
+/// verifies.  Fires at most once; the resolve retry converges on the winner
+/// PTE without re-entering the shared arm.  No lock is held by `resolve` at the
+/// fire point, so the ordinary `map_page_in` / refcount calls here are safe.
+#[cfg(feature = "test-mode")]
+fn cleartid_loss_hook(cr3: u64, page_addr: u64, new_phys: u64) {
+    use core::sync::atomic::Ordering::SeqCst;
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    if CLEARTID_HOOK_FIRED.swap(true, SeqCst) {
+        return; // already fired — do not clobber the converged winner PTE
+    }
+    CLEARTID_D_NEW.store(new_phys, SeqCst);
+    let d_old = CLEARTID_D_OLD.load(SeqCst);
+    let d_win = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => return, // OOM — leave state so the test's hook_ran check fails loudly
+    };
+    unsafe { core::ptr::write_bytes((PHYS_OFF + d_win) as *mut u8, 0xA5, 4096); }
+    crate::mm::refcount::page_ref_set(d_win, 1);
+    // Publish the sibling's winning PTE so the pending CAS (which expects d_old)
+    // refuses.  present + writable ⇒ the resolve retry returns `true` at once.
+    crate::mm::vmm::map_page_in(
+        cr3, page_addr, d_win,
+        crate::mm::vmm::PAGE_PRESENT | crate::mm::vmm::PAGE_WRITABLE | crate::mm::vmm::PAGE_USER,
+    );
+    // The sibling's CoW-break also released ITS reference to the shared old
+    // frame (rc 2→1).  `resolve` must NOT dec `old` a second time on its loss.
+    let _ = crate::mm::refcount::page_ref_dec(d_old);
+    CLEARTID_D_WIN.store(d_win, SeqCst);
+}
+
 fn test_cleartid_cow_refcount_balance() -> bool {
     use crate::mm::vmm::{
-        read_pte, map_page_in, map_page_in_cow_if_unchanged,
+        read_pte, map_page_in,
         ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_NO_EXECUTE,
     };
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
@@ -5350,6 +5411,27 @@ fn test_cleartid_cow_refcount_balance() -> bool {
         }
     };
     let sibling_cr3 = sibling_vm.cr3;
+    // Covering anon VMA for the sibling frames (va_sib, va_d_sib) so
+    // free_vm_space — which is VMA-driven — actually reclaims them at teardown.
+    {
+        let vma = crate::mm::vma::VmArea {
+            base: 0x5100_0000,
+            length: 0x4000,
+            prot: crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
+            flags: crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+            backing: crate::mm::vma::VmBacking::Anonymous,
+            name: "[cleartid-test-sib]",
+        };
+        if sibling_vm.insert_vma(vma).is_err() {
+            test_fail!("cleartid_cow", "sibling insert_vma failed");
+            let vm = { let mut procs = crate::proc::PROCESS_TABLE.lock();
+                let t = procs.iter_mut().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.take());
+                procs.retain(|p| p.pid != test_pid); t };
+            if let Some(vm) = vm { crate::proc::free_vm_space(vm); }
+            crate::proc::free_vm_space(sibling_vm);
+            return false;
+        }
+    }
 
     let mut ok = true;
 
@@ -5433,52 +5515,113 @@ fn test_cleartid_cow_refcount_balance() -> bool {
         }
     }
 
-    // ── (c) sibling-won CAS back-out: shared frame count must be UNTOUCHED ───
-    let va_c = 0x6000_0000u64;
-    let sc_shared = crate::mm::pmm::alloc_page().unwrap_or(0);
-    let sc_winner = crate::mm::pmm::alloc_page().unwrap_or(0);
-    let sc_new = crate::mm::pmm::alloc_page().unwrap_or(0);
-    if ok && sc_shared != 0 && sc_winner != 0 && sc_new != 0 {
-        // sc_shared: shared by two fork lineages elsewhere (count 2, we don't
-        // map it here — we only assert the guard never touches its count).
-        crate::mm::refcount::page_ref_set(sc_shared, 2);
-        // sc_winner: the sibling CPU's already-published private PTE at va_c.
-        crate::mm::refcount::page_ref_set(sc_winner, 1);
-        map_page_in(sibling_cr3, va_c, sc_winner, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        // sc_new: our redundant copy, marked before the (doomed) install exactly
-        // as resolve_user_write_page does.
-        crate::mm::refcount::page_ref_set(sc_new, 1);
-        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-        // Expected == sc_shared, but va_c maps sc_winner → the CAS must refuse.
-        let won = map_page_in_cow_if_unchanged(sibling_cr3, va_c, sc_new, flags, sc_shared);
-        // Back-out exactly as the production loss path does.
-        let _ = crate::mm::refcount::page_ref_dec(sc_new); // 1 → 0
-        crate::mm::pmm::free_page(sc_new);
-        let shared_rc = crate::mm::refcount::page_ref_count(sc_shared);
-        let winner_still = (read_pte(sibling_cr3, va_c) & ADDR_MASK) == sc_winner;
-        if won || shared_rc != 2 || !winner_still {
-            test_fail!("cleartid_cow",
-                "(c) won={} (want false) shared_rc={} (want 2, no double-dec) winner_intact={}",
-                won, shared_rc, winner_still);
+    // ── (c) Arm A sole-owner (rc == 1): in-place flip, SAME frame, no copy ───
+    let va_so = vma_base + 0x2000; // 0x5000_2000
+    let so_phys = if ok { crate::mm::pmm::alloc_page().unwrap_or(0) } else { 0 };
+    if ok && so_phys != 0 {
+        // Private sole-owner content — must survive the in-place flip verbatim.
+        unsafe { core::ptr::write_bytes((PHYS_OFF + so_phys) as *mut u8, 0xEE, 4096); }
+        let ro = PAGE_PRESENT | PAGE_USER | PAGE_NO_EXECUTE;
+        map_page_in(cr3, va_so, so_phys, ro);
+        crate::mm::refcount::page_ref_set(so_phys, 1);
+
+        if !crate::syscall::resolve_user_write_page(cr3, va_so) {
+            test_fail!("cleartid_cow", "(c) sole-owner resolve returned false");
             ok = false;
         } else {
-            test_println!("  (c) sibling-won back-out: redundant frame freed, shared count untouched ✓");
+            let pte = read_pte(cr3, va_so);
+            let same = (pte & ADDR_MASK) == so_phys; // in place, no copy allocated
+            let pw = pte & PAGE_PRESENT != 0 && pte & PAGE_WRITABLE != 0;
+            let rc = crate::mm::refcount::page_ref_count(so_phys); // unchanged: 1
+            let content = unsafe {
+                let p = (PHYS_OFF + so_phys) as *const u8;
+                (0..4096).all(|i| *p.add(i) == 0xEE)
+            };
+            // (c2) fork-race guard: with the share-count raised (as a concurrent
+            // fork would), the sole-owner flip primitive must REFUSE.
+            crate::mm::refcount::page_ref_set(so_phys, 2);
+            let refused = !crate::mm::vmm::flip_writable_if_sole_owner(
+                cr3, va_so, so_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+            crate::mm::refcount::page_ref_set(so_phys, 1); // restore live-PTE count
+            if !(same && pw && rc == 1 && content && refused) {
+                test_fail!("cleartid_cow",
+                    "(c) same={} pw={} rc={} (want 1) content={} refused_when_shared={}",
+                    same, pw, rc, content, refused);
+                ok = false;
+            } else {
+                test_println!("  (c) Arm A sole-owner: in-place flip, same frame rc=1, content kept; fork-race refused ✓");
+            }
         }
-        // sc_shared has no live PTE — free it explicitly. sc_new already freed.
-        crate::mm::refcount::page_ref_set(sc_shared, 0);
-        crate::mm::pmm::free_page(sc_shared);
     } else if ok {
-        test_fail!("cleartid_cow", "(c) scratch alloc OOM");
+        test_fail!("cleartid_cow", "(c) alloc so_phys OOM");
         ok = false;
-        for f in [sc_shared, sc_winner, sc_new] {
-            if f != 0 { crate::mm::refcount::page_ref_set(f, 0); crate::mm::pmm::free_page(f); }
-        }
     }
 
+    // ── (d) Production CAS-loss back-out driven through resolve_user_write_page
+    // A test-mode seam (cleartid_cow_test_hook) fires inside the shared-copy arm
+    // just before the CAS and flips the PTE to a "sibling-won" private frame, so
+    // the REAL loss branch (dec new + free new + leave old untouched + retry)
+    // executes.  Asserts: converged to writable; old frame decremented exactly
+    // once (by the simulated sibling, NOT a second time by resolve); the frame
+    // resolve allocated is at rc 0 AND actually returned to the PMM (exactly one
+    // net frame — the sibling's — consumed across the call; a missing free would
+    // show two).
+    //
+    // Gated to test-mode: the injection seam `cleartid_cow_test_hook` only
+    // exists in test-mode builds.  Sub-tests (a)-(c) still run in every build
+    // that compiles this suite (e.g. firefox-test-core).
+    #[cfg(feature = "test-mode")]
+    {
+    let va_d = vma_base + 0x3000; // 0x5000_3000
+    let va_d_sib = 0x5100_1000u64;
+    let d_old = if ok { crate::mm::pmm::alloc_page().unwrap_or(0) } else { 0 };
+    if ok && d_old != 0 {
+        unsafe { core::ptr::write_bytes((PHYS_OFF + d_old) as *mut u8, 0xCD, 4096); }
+        let ro = PAGE_PRESENT | PAGE_USER | PAGE_NO_EXECUTE;
+        map_page_in(cr3, va_d, d_old, ro);
+        map_page_in(sibling_cr3, va_d_sib, d_old, ro);
+        crate::mm::refcount::page_ref_set(d_old, 2);
+
+        CLEARTID_D_OLD.store(d_old, core::sync::atomic::Ordering::SeqCst);
+        CLEARTID_D_WIN.store(0, core::sync::atomic::Ordering::SeqCst);
+        CLEARTID_D_NEW.store(0, core::sync::atomic::Ordering::SeqCst);
+        CLEARTID_HOOK_FIRED.store(false, core::sync::atomic::Ordering::SeqCst);
+        crate::syscall::cleartid_cow_test_hook::set(cleartid_loss_hook);
+
+        let free_before = crate::mm::pmm::free_page_count();
+        let resolved = crate::syscall::resolve_user_write_page(cr3, va_d);
+        let free_after = crate::mm::pmm::free_page_count();
+        crate::syscall::cleartid_cow_test_hook::clear();
+
+        let d_new = CLEARTID_D_NEW.load(core::sync::atomic::Ordering::SeqCst);
+        let d_win = CLEARTID_D_WIN.load(core::sync::atomic::Ordering::SeqCst);
+        let hook_ran = d_new != 0 && d_win != 0;
+        let new_rc = crate::mm::refcount::page_ref_count(d_new); // want 0 (loss dec'd + freed)
+        let old_rc = crate::mm::refcount::page_ref_count(d_old); // want 1 (sibling dec only)
+        let pte = read_pte(cr3, va_d);
+        let now_win = (pte & ADDR_MASK) == d_win && pte & PAGE_WRITABLE != 0;
+        // Only the sibling's frame should be net-consumed; d_new is alloc'd then
+        // freed inside the window → net 0.  A missing free_page(d_new) → 2.
+        let consumed = free_before.saturating_sub(free_after);
+        if !(resolved && hook_ran && new_rc == 0 && old_rc == 1 && now_win && consumed == 1) {
+            test_fail!("cleartid_cow",
+                "(d) resolved={} hook_ran={} new_rc={} (want 0) old_rc={} (want 1) now_win={} consumed={} (want 1)",
+                resolved, hook_ran, new_rc, old_rc, now_win, consumed);
+            ok = false;
+        } else {
+            test_println!("  (d) production CAS-loss back-out: redundant frame freed (rc0, 1 frame reclaimed), old not double-dec'd (rc1), converged ✓");
+        }
+    } else if ok {
+        test_fail!("cleartid_cow", "(d) alloc d_old OOM");
+        ok = false;
+    }
+    } // end #[cfg(feature = "test-mode")] sub-test (d)
+
     // ── Teardown ────────────────────────────────────────────────────────────
-    // free_vm_space decrements one ref per live PTE: cr3 holds va_b (Arm B
-    // frame) + va_a (new_phys); sibling holds va_sib (shared_phys) + va_c
-    // (sc_winner) — all reach rc 0 and free cleanly.
+    // free_vm_space is VMA-driven: cr3's VMA covers va_b (Arm B), va_a (new_phys
+    // from (b)), va_so ((c)), va_d (d_win from the (d) hook); sibling's VMA
+    // covers va_sib (shared_phys) and va_d_sib (d_old).  Each frame has rc ==
+    // its live-PTE count, so all reach rc 0 and free cleanly (no leak).
     let vm = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let t = procs.iter_mut().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.take());

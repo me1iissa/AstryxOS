@@ -2539,6 +2539,36 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
 /// `exit_thread` with no table lock held, so no lock-order inversion is
 /// introduced.  Cite Intel SDM Vol. 3A §4.10.4.3 (optional invalidation),
 /// §4.10.5 (TLB/paging-structure caches) and §8.2.3 (memory-ordering of stores).
+/// Test-only injection seam for `resolve_user_write_page` (test-mode builds).
+///
+/// A unit test can install a callback that fires once inside the shared-copy
+/// arm — after the private frame is allocated + refcounted, before the CAS
+/// install — to flip the PTE out from under the call (simulating a sibling
+/// CPU's `#PF` CoW-break winning the race) and thereby drive the PRODUCTION
+/// CAS-loss / back-out / retry branch end-to-end.  Compiled out of every
+/// shipping build.
+#[cfg(feature = "test-mode")]
+pub(crate) mod cleartid_cow_test_hook {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Install a `fn(cr3, page_addr, new_phys)` fired before the shared-arm CAS.
+    pub fn set(f: fn(u64, u64, u64)) {
+        HOOK.store(f as usize, Ordering::SeqCst);
+    }
+    /// Remove the callback (subsequent resolves run unmodified).
+    pub fn clear() {
+        HOOK.store(0, Ordering::SeqCst);
+    }
+    pub(super) fn fire(cr3: u64, page_addr: u64, new_phys: u64) {
+        let f = HOOK.load(Ordering::SeqCst);
+        if f != 0 {
+            let g: fn(u64, u64, u64) = unsafe { core::mem::transmute(f) };
+            g(cr3, page_addr, new_phys);
+        }
+    }
+}
+
 pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
     use crate::mm::vmm::{
         read_pte, ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,
@@ -2552,9 +2582,22 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
     // (CLONE_VM threads share one CR3 across logical processors — clone(2)) can
     // never be clobbered.  On such a loss the guard writes nothing and the PTE
     // is already resolved by the winner; we drop any redundant frame and retry.
-    // Each loss leaves the PTE present, so the loop converges (normally in one
-    // extra pass).  The bound is a safety net, mirroring the fault handler's
-    // re-validate-then-retry discipline (Intel SDM Vol. 3A §4.10.4.3).
+    //
+    // Convergence / why MAX_ATTEMPTS == 4 suffices: every retry is triggered by
+    // a concurrent winner, and each winner's transition is monotone toward
+    // "present + writable": a sibling `#PF` CoW-break or anon-fault installs a
+    // present (usually writable) PTE, so the immediately-following iteration's
+    // Arm-A `writable` check returns `true`; a fork-race refusal in the
+    // sole-owner arm leaves the PTE present+RO but raises the refcount, so the
+    // next pass takes the shared-copy arm and its CAS then wins deterministically
+    // (fork does not move the frame, so `expected == old_phys` still holds).
+    // Thus at most one productive retry per racing CPU; with the dual-core
+    // ceiling that is ≤3 iterations, and 4 gives margin.  On the (practically
+    // unreachable) exhaustion the loop falls through to the truthful current-
+    // state re-read below and the caller declines the store — per clone(2)
+    // CLONE_CHILD_CLEARTID / set_tid_address(2) that drops the clear+wake, which
+    // can strand a `pthread_join` waiter, so the bound is deliberately generous
+    // rather than minimal; it is never hit outside adversarial same-VA churn.
     const MAX_ATTEMPTS: u32 = 4;
     for _ in 0..MAX_ATTEMPTS {
         let pte = read_pte(cr3, page_addr);
@@ -2591,6 +2634,12 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 // freshly-published private PTE with a second private frame (one
                 // VA, two frames — a silent lost cross-CPU store) and double-dec
                 // old_phys (dropping a frame a fork sibling still maps).
+                //
+                // The inverse stale read (refcount sampled >1 here but dropped to
+                // 1 before the CAS, e.g. a sibling exited) is benign: we make an
+                // unnecessary private copy, but copying is correct for ANY
+                // refcount, so no invariant is violated — only the dangerous
+                // 1→2 direction (handled by the sole-owner arm below) can corrupt.
                 let new_phys = match crate::mm::pmm::alloc_page() {
                     Some(p) => p,
                     None => return false,
@@ -2606,6 +2655,13 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 // faulter that observes the installed PTE never sees a
                 // 0-refcount frame.
                 crate::mm::refcount::page_ref_set(new_phys, 1);
+                // Test-only seam (test-mode builds): lets a unit test flip the
+                // PTE out from under this call — simulating a sibling CPU's #PF
+                // CoW-break winning the race — to drive the PRODUCTION CAS-loss
+                // back-out branch below end-to-end.  No-op / zero-cost in every
+                // shipping build.
+                #[cfg(feature = "test-mode")]
+                cleartid_cow_test_hook::fire(cr3, page_addr, new_phys);
                 if crate::mm::vmm::map_page_in_cow_if_unchanged(
                     cr3, page_addr, new_phys, flags, old_phys,
                 ) {
@@ -2628,19 +2684,25 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 continue;
             }
 
-            // Sole owner (refcount == 1) — flip writable in place, but still via
-            // the CAS guard (same phys, expected == old_phys) so a concurrent
-            // munmap+remap that left the PTE mapping a DIFFERENT frame cannot be
-            // silently clobbered back to old_phys.  Same phys ⇒ no refcount
-            // change on success.
-            if crate::mm::vmm::map_page_in_cow_if_unchanged(
-                cr3, page_addr, old_phys, flags, old_phys,
+            // Sole owner (refcount sampled == 1) — flip writable in place.  The
+            // refcount was sampled WITHOUT a lock, so a concurrent `fork()`
+            // (`clone_for_fork`, under `mm_sem.write()`) can raise old_phys's
+            // share-count 1→2 and mirror a read-only child PTE — WITHOUT moving
+            // the frame — between that sample and this install.  A phys-only CAS
+            // is blind to it and would flip a now-fork-shared frame writable (a
+            // silent CoW violation).  `flip_writable_if_sole_owner` therefore
+            // re-validates `pte_share_count <= 1` atomically under `VMM_LOCK`,
+            // where the held `mm_sem` read lock excludes the fork's `mm_sem`
+            // write walk (the W216 invariant).  On refusal — the frame is now
+            // fork-shared, or the PTE was remapped — retry: the top-of-loop
+            // re-samples the refcount and takes the shared-copy arm (correct for
+            // any refcount).  Same phys ⇒ no refcount change on success.
+            if crate::mm::vmm::flip_writable_if_sole_owner(
+                cr3, page_addr, old_phys, flags,
             ) {
                 crate::mm::tlb::shootdown_page(cr3, page_addr);
                 return true;
             }
-            // The PTE changed under us (a sibling resolved it, or the VA was
-            // remapped).  Re-read and re-decide.
             continue;
         }
 
