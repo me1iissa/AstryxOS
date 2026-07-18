@@ -2508,108 +2508,256 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
 ///     copy it to a private frame, else flip the existing frame writable;
 ///     shoot down stale read-only TLB entries on sibling CPUs.
 ///
+/// # Concurrency (CLONE_VM shared CR3)
+///
+/// `exit_thread` runs fully concurrently with a sibling thread's genuine
+/// hardware write-`#PF` on the *identical* VA (CLONE_VM/vfork threads share one
+/// CR3 across logical processors — clone(2)).  Both would resolve the same
+/// page.  Every install here therefore goes through the SAME CAS-guarded
+/// primitives the `#PF` handler uses — `map_page_in_cow_if_unchanged` (Arm A)
+/// and `map_page_in_if_absent` (Arm B) — which install only if the leaf PTE
+/// still holds the value the arm's decision was based on.  A sibling that
+/// resolved first wins; this side observes the guard's `false` return, frees
+/// its now-redundant frame (undoing any refcount it set, so the frame frees at
+/// share-count 0), leaves the winner's frame accounting untouched, and retries.
+/// `page_ref_dec(old_phys)` in the shared-copy arm happens ONLY after a
+/// successful CAS install — never speculatively — so the decrement is always
+/// exactly the single live-PTE transition this break performed.  Without this,
+/// an unconditional install/dec races the `#PF` CoW arm: a double-dec can drop
+/// a frame a fork sibling still maps to refcount 0 while live, and a blind
+/// overwrite can replace the sibling's published PTE (losing its writes,
+/// leaking its frame) — the refcount-invisible-alias class this guards against.
+///
 /// Returns `true` if the page is now present and writable, `false` for any
 /// unrecoverable case (no covering VMA, a non-writable VMA, OOM) — in which
 /// case the caller declines the write, preserving the historical no-op outcome
 /// but only for genuinely-unresolvable targets.
 ///
 /// Locking: takes `PROCESS_TABLE` only in short snapshot critical sections and
-/// drops it before `map_page_in` / `write_pte` (which take the per-CR3 `mm_sem`
-/// in read mode).  It is called from `exit_thread` with no table lock held, so
-/// no lock-order inversion is introduced.  Cite Intel SDM Vol. 3A §4.10.5
-/// (TLB/paging-structure caches) and §8.2.3 (memory-ordering of stores).
-fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
+/// drops it before the install primitives (which take the per-CR3 `mm_sem` in
+/// read mode via the shootdown-draining acquire).  It is called from
+/// `exit_thread` with no table lock held, so no lock-order inversion is
+/// introduced.  Cite Intel SDM Vol. 3A §4.10.4.3 (optional invalidation),
+/// §4.10.5 (TLB/paging-structure caches) and §8.2.3 (memory-ordering of stores).
+/// Test-only injection seam for `resolve_user_write_page` (test-mode builds).
+///
+/// A unit test can install a callback that fires once inside the shared-copy
+/// arm — after the private frame is allocated + refcounted, before the CAS
+/// install — to flip the PTE out from under the call (simulating a sibling
+/// CPU's `#PF` CoW-break winning the race) and thereby drive the PRODUCTION
+/// CAS-loss / back-out / retry branch end-to-end.  Compiled out of every
+/// shipping build.
+#[cfg(feature = "test-mode")]
+pub(crate) mod cleartid_cow_test_hook {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Install a `fn(cr3, page_addr, new_phys)` fired before the shared-arm CAS.
+    pub fn set(f: fn(u64, u64, u64)) {
+        HOOK.store(f as usize, Ordering::SeqCst);
+    }
+    /// Remove the callback (subsequent resolves run unmodified).
+    pub fn clear() {
+        HOOK.store(0, Ordering::SeqCst);
+    }
+    pub(super) fn fire(cr3: u64, page_addr: u64, new_phys: u64) {
+        let f = HOOK.load(Ordering::SeqCst);
+        if f != 0 {
+            let g: fn(u64, u64, u64) = unsafe { core::mem::transmute(f) };
+            g(cr3, page_addr, new_phys);
+        }
+    }
+}
+
+pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
     use crate::mm::vmm::{
-        read_pte, map_page_in, write_pte, ADDR_MASK,
-        PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,
+        read_pte, ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,
     };
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     let page_addr = crate::mm::vma::page_align_down(vaddr);
 
-    let pte = read_pte(cr3, page_addr);
+    // Bounded resolve-and-retry.  Every install below is CAS-guarded: it takes
+    // effect only if the leaf PTE still holds the value the arm's decision was
+    // based on, so a sibling CPU's genuine hardware `#PF` on the SAME VA
+    // (CLONE_VM threads share one CR3 across logical processors — clone(2)) can
+    // never be clobbered.  On such a loss the guard writes nothing and the PTE
+    // is already resolved by the winner; we drop any redundant frame and retry.
+    //
+    // Convergence / why MAX_ATTEMPTS == 4 suffices: every retry is triggered by
+    // a concurrent winner, and each winner's transition is monotone toward
+    // "present + writable": a sibling `#PF` CoW-break or anon-fault installs a
+    // present (usually writable) PTE, so the immediately-following iteration's
+    // Arm-A `writable` check returns `true`; a fork-race refusal in the
+    // sole-owner arm leaves the PTE present+RO but raises the refcount, so the
+    // next pass takes the shared-copy arm and its CAS then wins deterministically
+    // (fork does not move the frame, so `expected == old_phys` still holds).
+    // Thus at most one productive retry per racing CPU; with the dual-core
+    // ceiling that is ≤3 iterations, and 4 gives margin.  On the (practically
+    // unreachable) exhaustion the loop falls through to the truthful current-
+    // state re-read below and the caller declines the store — per clone(2)
+    // CLONE_CHILD_CLEARTID / set_tid_address(2) that drops the clear+wake, which
+    // can strand a `pthread_join` waiter, so the bound is deliberately generous
+    // rather than minimal; it is never hit outside adversarial same-VA churn.
+    const MAX_ATTEMPTS: u32 = 4;
+    for _ in 0..MAX_ATTEMPTS {
+        let pte = read_pte(cr3, page_addr);
 
-    // ── Arm A: present-but-read-only — break copy-on-write ──────────────────
-    if pte & PAGE_PRESENT != 0 {
-        if pte & PAGE_WRITABLE != 0 {
-            return true; // already writable; nothing to do
+        // ── Arm A: present-but-read-only — break copy-on-write ──────────────
+        if pte & PAGE_PRESENT != 0 {
+            if pte & PAGE_WRITABLE != 0 {
+                return true; // already writable (possibly a sibling just did it)
+            }
+            // Confirm the VMA actually permits writes before breaking COW; a
+            // genuinely read-only mapping (e.g. a const .rodata word) must not
+            // be promoted — that would be a real protection error.
+            let writable_vma = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter()
+                    .find(|p| p.cr3 == cr3)
+                    .and_then(|p| p.vm_space.as_ref())
+                    .and_then(|vs| vs.find_vma(page_addr))
+                    .map(|vma| vma.prot & crate::mm::vma::PROT_WRITE != 0)
+                    .unwrap_or(false)
+            };
+            if !writable_vma {
+                return false;
+            }
+            let old_phys = pte & ADDR_MASK;
+            let flags = (pte & !ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+            if crate::mm::refcount::page_ref_count(old_phys) > 1 {
+                // Shared frame — copy to a private one, then install ONLY if the
+                // leaf PTE still maps old_phys.  This mirrors the hardware
+                // write-fault CoW arm in `handle_page_fault` exactly: on a
+                // shared CR3 a sibling CPU can CoW-break the same VA
+                // concurrently; an unconditional install would overwrite its
+                // freshly-published private PTE with a second private frame (one
+                // VA, two frames — a silent lost cross-CPU store) and double-dec
+                // old_phys (dropping a frame a fork sibling still maps).
+                //
+                // The inverse stale read (refcount sampled >1 here but dropped to
+                // 1 before the CAS, e.g. a sibling exited) is benign: we make an
+                // unnecessary private copy, but copying is correct for ANY
+                // refcount, so no invariant is violated — only the dangerous
+                // 1→2 direction (handled by the sole-owner arm below) can corrupt.
+                let new_phys = match crate::mm::pmm::alloc_page() {
+                    Some(p) => p,
+                    None => return false,
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (PHYS_OFF + old_phys) as *const u8,
+                        (PHYS_OFF + new_phys) as *mut u8,
+                        crate::mm::pmm::PAGE_SIZE,
+                    );
+                }
+                // Mark the private copy before publishing so a concurrent
+                // faulter that observes the installed PTE never sees a
+                // 0-refcount frame.
+                crate::mm::refcount::page_ref_set(new_phys, 1);
+                // Test-only seam (test-mode builds): lets a unit test flip the
+                // PTE out from under this call — simulating a sibling CPU's #PF
+                // CoW-break winning the race — to drive the PRODUCTION CAS-loss
+                // back-out branch below end-to-end.  No-op / zero-cost in every
+                // shipping build.
+                #[cfg(feature = "test-mode")]
+                cleartid_cow_test_hook::fire(cr3, page_addr, new_phys);
+                if crate::mm::vmm::map_page_in_cow_if_unchanged(
+                    cr3, page_addr, new_phys, flags, old_phys,
+                ) {
+                    // Won: release this address space's reference to old_phys —
+                    // and ONLY now, after a successful install, never before, so
+                    // the dec is exactly the single live-PTE transition this
+                    // break performed.
+                    let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                    crate::mm::tlb::shootdown_page(cr3, page_addr);
+                    return true;
+                }
+                // Lost: a sibling CoW-broke this VA first and published its own
+                // private frame.  Drop our redundant copy (undo the ref we set,
+                // 1→0, so free_page's share-count==0 invariant holds) and leave
+                // old_phys's count UNTOUCHED — the sibling's install already
+                // accounted for removing the old mapping.  Retry: the PTE is now
+                // present+writable and the next pass returns true.
+                let _ = crate::mm::refcount::page_ref_dec(new_phys);
+                crate::mm::pmm::free_page(new_phys);
+                continue;
+            }
+
+            // Sole owner (refcount sampled == 1) — flip writable in place.  The
+            // refcount was sampled WITHOUT a lock, so a concurrent `fork()`
+            // (`clone_for_fork`, under `mm_sem.write()`) can raise old_phys's
+            // share-count 1→2 and mirror a read-only child PTE — WITHOUT moving
+            // the frame — between that sample and this install.  A phys-only CAS
+            // is blind to it and would flip a now-fork-shared frame writable (a
+            // silent CoW violation).  `flip_writable_if_sole_owner` therefore
+            // re-validates `pte_share_count <= 1` atomically under `VMM_LOCK`,
+            // where the held `mm_sem` read lock excludes the fork's `mm_sem`
+            // write walk (the W216 invariant).  On refusal — the frame is now
+            // fork-shared, or the PTE was remapped — retry: the top-of-loop
+            // re-samples the refcount and takes the shared-copy arm (correct for
+            // any refcount).  Same phys ⇒ no refcount change on success.
+            if crate::mm::vmm::flip_writable_if_sole_owner(
+                cr3, page_addr, old_phys, flags,
+            ) {
+                crate::mm::tlb::shootdown_page(cr3, page_addr);
+                return true;
+            }
+            continue;
         }
-        // Confirm the VMA actually permits writes before breaking COW; a
-        // genuinely read-only mapping (e.g. a const .rodata word) must not be
-        // promoted — that would be a real protection error.
-        let writable_vma = {
+
+        // ── Arm B: not present — demand-fault an anonymous frame ────────────
+        // Look up the covering VMA and require it to be writable (a
+        // clear_child_tid target is always a writable libc global per clone(2)).
+        // We install a zeroed RW|User frame; for an untouched .bss/lock word
+        // zero IS the correct file/anon content, and the caller immediately
+        // overwrites it with the CLEARTID value anyway.
+        let install_flags = {
             let procs = crate::proc::PROCESS_TABLE.lock();
-            procs.iter()
+            match procs.iter()
                 .find(|p| p.cr3 == cr3)
                 .and_then(|p| p.vm_space.as_ref())
                 .and_then(|vs| vs.find_vma(page_addr))
-                .map(|vma| vma.prot & crate::mm::vma::PROT_WRITE != 0)
-                .unwrap_or(false)
-        };
-        if !writable_vma {
-            return false;
-        }
-        let old_phys = pte & ADDR_MASK;
-        let flags = (pte & !ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-        // This site only runs for the clone(2) clear_child_tid target, which is
-        // guaranteed a private anonymous libc global (never MAP_SHARED), so the
-        // refcount-keyed copy-vs-flip decision below is safe here and need not
-        // route through mm::vma::write_fault_action (which keys on MAP_SHARED).
-        if crate::mm::refcount::page_ref_count(old_phys) > 1 {
-            // Shared frame — copy to a private one.
-            let new_phys = match crate::mm::pmm::alloc_page() {
-                Some(p) => p,
-                None => return false,
-            };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (PHYS_OFF + old_phys) as *const u8,
-                    (PHYS_OFF + new_phys) as *mut u8,
-                    crate::mm::pmm::PAGE_SIZE,
-                );
+            {
+                Some(vma) if vma.prot & crate::mm::vma::PROT_WRITE != 0 => {
+                    // Build flags from the VMA but force writable+user+present;
+                    // the VMA's own to_page_flags already encodes NX correctly.
+                    vma.to_page_flags() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                }
+                _ => return false, // no VMA, or non-writable VMA → real error
             }
-            let _ = crate::mm::refcount::page_ref_dec(old_phys);
-            crate::mm::refcount::page_ref_set(new_phys, 1);
-            map_page_in(cr3, page_addr, new_phys, flags);
-        } else {
-            // Sole owner — just flip the writable bit in place.
-            write_pte(cr3, page_addr, old_phys | flags);
+        };
+        let phys = match crate::mm::pmm::alloc_page() {
+            Some(p) => p,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
         }
-        crate::mm::tlb::shootdown_page(cr3, page_addr);
-        return true;
+        // Install atomically-with-present-check: a sibling CPU may have faulted
+        // the same anonymous VA in first.  `map_page_in_if_absent` writes
+        // nothing (returns false) in that case, so we never overwrite its frame
+        // with our zero page (which would drop its populated data and leak its
+        // frame at refcount 1).  Set the refcount AFTER a successful install so
+        // a lost race leaves the frame at 0 and frees cleanly (pmm::free_page
+        // refuses a frame whose share-count is non-zero).
+        if crate::mm::vmm::map_page_in_if_absent(cr3, page_addr, phys, install_flags) {
+            crate::mm::refcount::page_ref_set(phys, 1);
+            crate::mm::vmm::invlpg(page_addr);
+            return true;
+        }
+        // Lost: a sibling already mapped this VA.  Our frame was never installed
+        // (refcount still 0) so it frees cleanly; retry to observe the winner's
+        // PTE (present → Arm A returns true if it is writable).
+        crate::mm::pmm::free_page(phys);
+        crate::mm::vmm::invlpg(page_addr);
+        continue;
     }
 
-    // ── Arm B: not present — demand-fault an anonymous frame ────────────────
-    // Look up the covering VMA and require it to be writable (a clear_child_tid
-    // target is always a writable libc global per clone(2)).  We install a
-    // zeroed RW|User frame; for an untouched .bss/lock word zero IS the correct
-    // file/anon content, and the caller immediately overwrites it with the
-    // CLEARTID value anyway.
-    let install_flags = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
-        match procs.iter()
-            .find(|p| p.cr3 == cr3)
-            .and_then(|p| p.vm_space.as_ref())
-            .and_then(|vs| vs.find_vma(page_addr))
-        {
-            Some(vma) if vma.prot & crate::mm::vma::PROT_WRITE != 0 => {
-                // Build flags from the VMA but force writable+user+present; the
-                // VMA's own to_page_flags already encodes NX correctly.
-                vma.to_page_flags() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
-            }
-            _ => return false, // no VMA, or non-writable VMA → real error
-        }
-    };
-    let phys = match crate::mm::pmm::alloc_page() {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe {
-        core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
-    }
-    crate::mm::refcount::page_ref_set(phys, 1);
-    map_page_in(cr3, page_addr, phys, install_flags);
-    crate::mm::vmm::invlpg(page_addr);
-    true
+    // Retries exhausted (pathological concurrent churn on this VA): report the
+    // current resolved state rather than risk a duplicate install.
+    let pte = read_pte(cr3, page_addr);
+    pte & PAGE_PRESENT != 0 && pte & PAGE_WRITABLE != 0
 }
 
 // ===== waitpid() Implementation =============================================
