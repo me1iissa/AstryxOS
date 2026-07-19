@@ -134,6 +134,22 @@ static PMM_ALLOC_NONZERO_RC: AtomicU64 = AtomicU64::new(0);
 /// path, dwarfed by the bitmap-clear under PMM_LOCK).
 static PMM_FREE_RESIDUAL_REFS: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of `free_page` calls refused because the frame lies
+/// inside the running kernel's own image (`.text`/`.rodata`/`.data`/`.bss`
+/// — see `is_kernel_static_phys`). Every increment identifies a caller that
+/// reached the free path (directly or via a "refcount hit zero" check) for
+/// a frame the PMM must never recycle: kernel-static frames are mapped
+/// read-only into user address spaces (`KUSER_SHARED_DATA`, vDSO) without
+/// ever being `page_ref_inc`'d, so a refcount of zero is their PERMANENT
+/// steady state, not a signal that the frame is free. This guard is the
+/// single chokepoint that makes that distinction authoritative regardless
+/// of which unmap/teardown path reached here — see `free_page`'s doc
+/// comment for the full rationale. Always 0 in a correctly-behaving build;
+/// a nonzero value means some path still needs its own backing-type check
+/// tightened (this counter catches it without the frame ever actually
+/// leaving the reserved pool).
+static PMM_FREE_KERNEL_STATIC_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 // ── Kernel image linker symbols ────────────────────────────────────────────
 //
 // The bootloader passes `kernel_size = kernel_data.len()`, which is the size
@@ -776,6 +792,43 @@ pub fn free_page(phys_addr: u64) {
         return;
     }
 
+    // Kernel-static-frame free refusal — checked FIRST, before the bitmap is
+    // touched, because every present-PTE-based teardown path funnels through
+    // this one function to actually recycle a frame: process exit's VMA
+    // walk (`proc::free_process_memory`/`free_vm_space`, which DOES consult
+    // VMA backing type), but also `sys_munmap`'s raw-PTE
+    // `vmm::unmap_and_free_range_in` — which runs AFTER the VMA record has
+    // already been dropped (`VmSpace::remove_range`) and so has no backing
+    // type left to consult — plus `mremap` and `madvise(MADV_DONTNEED/FREE)`,
+    // which take the same backing-agnostic raw-PTE path. A kernel-static
+    // frame (e.g. `KUSER_SHARED_DATA`, mapped read-only into every Win32
+    // process at a fixed VA — see `proc::usermode::create_win32_process`)
+    // is present in a user PTE without ever being `page_ref_inc`'d, so its
+    // refcount reads 0 from the moment it is first mapped: to every one of
+    // those raw-PTE paths, "refcount hit zero" is indistinguishable from
+    // "genuinely last reference dropped". Tagging the owning VMA
+    // `VmBacking::Device` (as `sysv_shm` and `kuser_shared`'s installer do)
+    // fixes the VMA-aware paths, but a single enum tag cannot reach a path
+    // that no longer has the VMA to read. This range check is the actual
+    // authority: it refuses the free regardless of which path — existing or
+    // future — reached here, closing the class in one place rather than at
+    // each call site individually. Pure comparison against two relaxed
+    // atomic loads (`is_kernel_static_phys`): no lock is taken and no
+    // freelist state is touched before the refusal, so it cannot introduce
+    // a new interaction with the PMM's free-list/bitmap race surface.
+    if is_kernel_static_phys(phys_addr) {
+        let total = PMM_FREE_KERNEL_STATIC_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if total <= 16 || total % 1000 == 0 {
+            let (base, end) = kernel_image_phys_range();
+            crate::serial_println!(
+                "[PMM/KERNEL-STATIC] refusing free of phys={:#x} — inside kernel image \
+                 [{:#x}, {:#x}); refused_total={}",
+                phys_addr, base, end, total,
+            );
+        }
+        return;
+    }
+
     // W215 PTE-share-count free-time invariant — see function-level doc.
     // The check is performed BEFORE the bitmap is cleared so that a
     // refused free leaves no PMM-side state change.  An out-of-range
@@ -968,6 +1021,17 @@ pub fn pmm_alloc_nonzero_rc_count() -> u64 {
 /// upstream PTE-decref bug that needs investigation.
 pub fn pmm_free_residual_refs_count() -> u64 {
     PMM_FREE_RESIDUAL_REFS.load(Ordering::Relaxed)
+}
+
+/// Read the cumulative `PMM_FREE_KERNEL_STATIC_REFUSED` counter.
+///
+/// Returns the number of times [`free_page`] refused to free a frame
+/// because it lies inside the running kernel's own image. Each refusal
+/// corresponds to a caller (any unmap/teardown path) that reached the free
+/// chokepoint for a kernel-static frame — the frame is never actually
+/// freed, so a nonzero count is a diagnostic signal, not damage.
+pub fn pmm_free_kernel_static_refused_count() -> u64 {
+    PMM_FREE_KERNEL_STATIC_REFUSED.load(Ordering::Relaxed)
 }
 
 /// Mark a page as used in the bitmap.

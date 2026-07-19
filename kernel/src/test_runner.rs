@@ -1122,6 +1122,10 @@ pub fn run() -> ! {
     total += 1;
     if test_shm_phys_map_invariant() { passed += 1; }
 
+    // ── SHM attach survives fork() — disjoint-refcount + shared-write ───────
+    total += 1;
+    if test_shm_fork_disjoint_refcount() { passed += 1; }
+
     // ── Test 79: syscall completeness — fcntl FD_CLOEXEC, fsync, fd table ────
 
     total += 1;
@@ -1178,6 +1182,26 @@ pub fn run() -> ! {
 
     total += 1;
     if test_new_syscall_stubs() { passed += 1; }
+
+    // ── kernel-static frame survives munmap() (free-chokepoint guard) ──────────
+    // Unconditional — runs in every CI leg. See the sibling win32-pe-test-gated
+    // test below for the same hazard reached via a real Win32 process exit;
+    // this one reaches it via the munmap path, which the exit-time Device-tag
+    // fix elsewhere in this PR does not cover (munmap's raw-PTE free loop has
+    // no VMA left to consult by the time it runs).
+    total += 1;
+    if test_kernel_static_frame_survives_munmap() { passed += 1; }
+
+    // ── KUSER_SHARED_DATA survives Win32 process exit (no kernel-frame free) ──
+    // Gated with the same feature as the Win32 process tests below (needs
+    // `create_win32_process`), but drives teardown directly — no scheduling,
+    // so it does not share the sibling test's known Ring-3-spin hang risk.
+    // Ordered BEFORE Test 82 so it completes even when that gate is enabled.
+    #[cfg(feature = "win32-pe-test")]
+    {
+        total += 1;
+        if test_kuser_shared_survives_win32_exit() { passed += 1; }
+    }
 
     // ── Test 82: Win32 PE32+ process via create_win32_process ─────────────────
     // Gated: the Win32 binary spins in Ring 3 without calling ExitProcess under
@@ -19688,6 +19712,266 @@ fn test_kuser_shared_data() -> bool {
     ok
 }
 
+/// KUSER_SHARED_DATA's global physical page must survive a Win32 process exit.
+///
+/// Regression test for the refinc-hygiene fix in `proc::usermode::create_win32_process`:
+/// the one kernel-BSS-resident `KUSER_SHARED_DATA` frame (see `nt::kuser_shared`)
+/// used to be registered as a plain `VmBacking::Anonymous` VMA. Since that
+/// frame is never `page_ref_inc`'d anywhere, the ordinary Anonymous-VMA
+/// teardown walk in `proc::free_process_memory` would call
+/// `refcount::page_ref_dec` on an untouched (0) count, which — per that
+/// function's own documented underflow-refusal contract — returns 0, the
+/// exact signal the teardown walk treats as "safe to free". `pmm::free_page`
+/// has no guard against freeing a frame inside the running kernel's own
+/// image, so the very first Win32 process to exit would return this shared
+/// frame to the general allocator while every other Win32 process (and the
+/// kernel's own periodic time-refresh writer) still used it.
+///
+/// This drives a REAL `create_win32_process` → `free_process_memory` cycle
+/// (the exact teardown path a real process exit takes) without scheduling
+/// or running the process — deterministic and SMP=1-friendly, matching the
+/// project's other direct-teardown-driven fork/exit regression tests. It
+/// asserts the frame stays marked "used" in the PMM bitmap across process
+/// A's teardown, then spawns a second Win32 process and confirms its
+/// KUSER_SHARED_DATA mapping still resolves to the same physical frame with
+/// uncorrupted content.
+#[cfg(feature = "win32-pe-test")]
+fn test_kuser_shared_survives_win32_exit() -> bool {
+    use crate::nt::kuser_shared as ku;
+    test_header!("KUSER_SHARED_DATA page survives Win32 process exit (no kernel-frame double-free)");
+
+    let kernel_phys = ku::physical_address();
+    let page_idx = (kernel_phys / crate::mm::pmm::PAGE_SIZE as u64) as usize;
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} not marked used before the test even starts (unexpected)",
+            kernel_phys);
+        return false;
+    }
+
+    let pe_data = crate::proc::hello_win32_pe::HELLO_WIN32_PE;
+
+    // ── Process A: create, then drive teardown directly (no scheduling) ────
+    let pid_a = match crate::proc::usermode::create_win32_process("kuser_exit_a.exe", pe_data) {
+        Ok(pid) => pid,
+        Err(e) => {
+            test_fail!("kuser_shared_exit", "create_win32_process (A) failed: {:?}", e);
+            return false;
+        }
+    };
+    // Exactly the teardown a real exit_group(2) takes — see
+    // `proc::free_process_memory`'s doc comment for the CR3-drain preamble,
+    // which is a no-op here since this process was never scheduled onto
+    // any CPU.
+    crate::proc::free_process_memory(pid_a);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pid_a);
+    }
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} was FREED by process A's teardown — \
+             kernel-static page returned to the PMM free pool", kernel_phys);
+        return false;
+    }
+    test_println!("  KUSER_SHARED_DATA frame {:#x} still marked used after process A's teardown ✓", kernel_phys);
+
+    // ── Process B: confirm the shared page is still sane post-A-teardown ───
+    let pid_b = match crate::proc::usermode::create_win32_process("kuser_exit_b.exe", pe_data) {
+        Ok(pid) => pid,
+        Err(e) => {
+            test_fail!("kuser_shared_exit", "create_win32_process (B) failed: {:?}", e);
+            return false;
+        }
+    };
+    let mut ok = true;
+
+    let cr3_b = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid_b).map(|p| p.cr3).unwrap_or(0)
+    };
+    match crate::mm::vmm::virt_to_phys_in(cr3_b, ku::KUSER_SHARED_DATA_VA) {
+        Some(p) if p == kernel_phys => {
+            test_println!("  process B kuser mapping still resolves to {:#x} ✓", p);
+        }
+        Some(p) => {
+            test_fail!("kuser_shared_exit",
+                "process B kuser phys {:#x} != original {:#x} — frame was reallocated after A's exit",
+                p, kernel_phys);
+            ok = false;
+        }
+        None => {
+            test_fail!("kuser_shared_exit", "process B: KUSER_SHARED_DATA_VA not mapped");
+            ok = false;
+        }
+    }
+
+    let maj_via_phys = unsafe {
+        core::ptr::read_unaligned(
+            (crate::mm::vmm::PHYS_OFF + kernel_phys + ku::OFF_NT_MAJOR_VERSION as u64) as *const u32,
+        )
+    };
+    if maj_via_phys != ku::NT_MAJOR_VERSION {
+        test_fail!("kuser_shared_exit",
+            "NtMajorVersion via kernel frame corrupted after A's teardown: {} (expect {})",
+            maj_via_phys, ku::NT_MAJOR_VERSION);
+        ok = false;
+    }
+
+    crate::proc::free_process_memory(pid_b);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pid_b);
+    }
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} was FREED by process B's teardown", kernel_phys);
+        ok = false;
+    }
+
+    if !ok { return false; }
+
+    test_pass!("KUSER_SHARED_DATA page survives Win32 process exit (no kernel-frame double-free)");
+    true
+}
+
+/// UNCONDITIONAL (no feature gate) regression test for the free-chokepoint
+/// guard in `pmm::free_page`.
+///
+/// `test_kuser_shared_survives_win32_exit` above needs `win32-pe-test`
+/// (not enabled by any CI leg) to spawn a real Win32 process, so it gives
+/// no CI signal. This test reproduces the exact same class of hazard
+/// without that machinery: `sys_munmap`'s Phase 2
+/// (`vmm::unmap_and_free_range_in`) walks raw PTEs AFTER the owning VMA
+/// record has already been dropped by Phase 1 (`VmSpace::remove_range`), so
+/// it has no `VmBacking::Device` tag left to consult — the
+/// `clone_for_fork`/`free_process_memory` Device-skip elsewhere in this PR
+/// does not reach this path at all. `VirtualFree(0x7FFE_0000, MEM_RELEASE)`
+/// on a real Win32 process would take exactly this route.
+///
+/// Maps the real, kernel-BSS-resident `KUSER_SHARED_DATA` physical frame at
+/// a throwaway VA (tagged `Device`, matching this PR's install-site fix —
+/// the point being that `munmap` ignores that tag anyway), drives it
+/// through the REAL `sys_munmap` syscall, and asserts:
+///   (a) the frame is still marked used in the PMM bitmap afterward,
+///   (b) `pmm_free_kernel_static_refused_count()` increased by exactly
+///       one — the new `free_page` guard actually fired, not a
+///       coincidental survival,
+///   (c) the kernel's own live view of the page (read via the direct map —
+///       a "second context" independent of the just-removed user mapping)
+///       still reads back correct, uncorrupted content.
+fn test_kernel_static_frame_survives_munmap() -> bool {
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ};
+    use crate::mm::vmm::{PAGE_PRESENT, PAGE_USER, PAGE_NO_EXECUTE, PHYS_OFF};
+    use crate::nt::kuser_shared as ku;
+
+    test_header!("kernel-static frame survives munmap() (free-chokepoint guard)");
+
+    let kernel_phys = ku::physical_address();
+    let page_idx = (kernel_phys / crate::mm::pmm::PAGE_SIZE as u64) as usize;
+    let refused_before = crate::mm::pmm::pmm_free_kernel_static_refused_count();
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kernel_static_munmap",
+            "kernel-static frame {:#x} not marked used before the test starts", kernel_phys);
+        return false;
+    }
+
+    // Force a VmSpace into existence — same throwaway-mmap technique as
+    // `test_shm_fork_disjoint_refcount`, so this test doesn't depend on
+    // incidental prior-test ordering.
+    let probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, 3 /*PROT_READ|WRITE*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+    if probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+
+    const TEST_VA: u64 = 0x5555_0000_0000u64;
+    let pid = crate::proc::current_pid_lockless();
+    let cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|v| v.cr3)
+            .unwrap_or(0)
+    };
+    if cr3 == 0 {
+        test_fail!("kernel_static_munmap", "runner has no VmSpace even after the mmap probe");
+        return false;
+    }
+
+    // Map the real kernel-static frame at TEST_VA — the same raw
+    // `map_page_in` + `Device`-tagged-VMA pattern `create_win32_process`
+    // uses for KUSER_SHARED_DATA.
+    if !crate::mm::vmm::map_page_in(cr3, TEST_VA, kernel_phys, PAGE_PRESENT | PAGE_USER | PAGE_NO_EXECUTE) {
+        test_fail!("kernel_static_munmap", "map_page_in failed for the kernel-static frame");
+        return false;
+    }
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(vs) = p.vm_space.as_mut() {
+                let _ = vs.insert_vma(VmArea {
+                    base:    TEST_VA,
+                    length:  crate::mm::pmm::PAGE_SIZE as u64,
+                    prot:    PROT_READ,
+                    flags:   crate::mm::vma::MAP_PRIVATE,
+                    backing: VmBacking::Device { phys_base: kernel_phys },
+                    name:    "[kernel-static-test]",
+                });
+            }
+        }
+    }
+
+    // Drive the REAL munmap(2) syscall path — exactly what
+    // `VirtualFree(0x7FFE_0000, MEM_RELEASE)` takes in a real Win32 process.
+    let r = crate::syscall::dispatch_linux_kernel(11, TEST_VA, 0x1000, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("kernel_static_munmap", "munmap(TEST_VA) returned {} (expected 0)", r);
+        return false;
+    }
+
+    let mut ok = true;
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kernel_static_munmap",
+            "kernel-static frame {:#x} was FREED by munmap() — free-chokepoint guard did not fire",
+            kernel_phys);
+        ok = false;
+    }
+
+    let refused_after = crate::mm::pmm::pmm_free_kernel_static_refused_count();
+    if refused_after != refused_before + 1 {
+        test_fail!("kernel_static_munmap",
+            "PMM_FREE_KERNEL_STATIC_REFUSED {} → {} (expected exactly +1 — guard should have fired once)",
+            refused_before, refused_after);
+        ok = false;
+    }
+
+    // Second context: the kernel's own live view of the page (direct map),
+    // independent of the user mapping that was just removed.
+    let maj_via_phys = unsafe {
+        core::ptr::read_unaligned(
+            (PHYS_OFF + kernel_phys + ku::OFF_NT_MAJOR_VERSION as u64) as *const u32,
+        )
+    };
+    if maj_via_phys != ku::NT_MAJOR_VERSION {
+        test_fail!("kernel_static_munmap",
+            "NtMajorVersion via kernel frame corrupted after munmap: {} (expect {})",
+            maj_via_phys, ku::NT_MAJOR_VERSION);
+        ok = false;
+    }
+
+    if !ok { return false; }
+
+    test_println!("  kernel-static frame {:#x} survived munmap(); refused_total={} ✓", kernel_phys, refused_after);
+    test_pass!("kernel-static frame survives munmap() (free-chokepoint guard)");
+    true
+}
+
 // ── Test 63: TinyCC compiler — compile C source to ELF, execute it ───────────
 //
 // Verifies the full developer workflow inside AstryxOS:
@@ -23824,6 +24108,158 @@ fn test_shm_phys_map_invariant() -> bool {
 
     if ok { test_pass!("SHM higher-half direct-map invariant (>1 GiB zero-fill guard)"); }
     ok
+}
+
+/// SysV SHM attach must survive `fork()` as true POSIX sharing.
+///
+/// `VmSpace::clone_for_fork`'s raw PTE walk write-protects every present,
+/// non-identity leaf into a private CoW page and takes a `page_ref_inc` on
+/// it — with no notion of VMA backing type. Before the `Device`-VMA
+/// fork-alias fix, an `shmat()`-installed leaf got that exact treatment:
+/// forking a process with a live SHM attachment would write-protect the
+/// mapping in BOTH the parent and the child (silently downgrading the
+/// POSIX-mandated shared mapping into a private CoW page on the next write
+/// from either side — see `shmat(2)`/`fork(2)`), and would leave a
+/// `page_ref_inc` that no teardown path ever balances, because
+/// `free_process_memory`/`free_vm_space` deliberately skip every `Device`
+/// VMA (see the disjoint-refcount contract documented on `sysv_shm`).
+///
+/// This drives a real `clone_for_fork` over a `Device`-backed leaf the same
+/// way `test_task4_identity_wp_guard` drives one over an identity leaf, and
+/// asserts both properties hold: the leaf stays present+writable in parent
+/// AND child, and `page_ref_count` for the segment's frame is unchanged
+/// across both the fork and the child's teardown.
+fn test_shm_fork_disjoint_refcount() -> bool {
+    use crate::ipc::sysv_shm;
+    use crate::mm::vma::{VmSpace, VmArea, VmBacking, PROT_READ, PROT_WRITE, MAP_SHARED, mm_sem_for_cr3};
+    use crate::mm::vmm::{get_kernel_cr3, read_pte, PAGE_WRITABLE, PAGE_PRESENT};
+    use crate::mm::refcount::page_ref_count;
+
+    test_header!("SysV SHM attach survives fork() — disjoint-refcount + shared-write invariant");
+
+    // `shmat` requires the calling process to already have a `VmSpace`
+    // (`sysv_shm::pick_vaddr` returns 0 — ENOMEM — otherwise). Every prior
+    // test in the normal suite order happens to give the runner one, but
+    // this test must not depend on that incidental ordering: force one into
+    // existence the same way `test_task4_identity_wp_guard` does, via a
+    // throwaway anonymous mmap.
+    let vmspace_probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, 3 /*PROT_READ|WRITE*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+    if vmspace_probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, vmspace_probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+
+    let shmid = sysv_shm::shmget(sysv_shm::IPC_PRIVATE, 4096, sysv_shm::IPC_CREAT | 0o600);
+    if shmid < 0 {
+        test_fail!("shm_fork_disjoint_refcount", "shmget failed: {}", shmid);
+        return false;
+    }
+    let shmid = shmid as u32;
+
+    let va = sysv_shm::shmat(shmid, 0, 0);
+    if va <= 0 {
+        test_fail!("shm_fork_disjoint_refcount", "shmat failed: {}", va);
+        sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+        return false;
+    }
+    let va = va as u64;
+
+    let (phys_base, size) = match sysv_shm::segment_phys(shmid) {
+        Some(v) => v,
+        None => {
+            test_fail!("shm_fork_disjoint_refcount", "segment_phys lookup failed after shmat");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return false;
+        }
+    };
+
+    let kcr3 = get_kernel_cr3();
+    let before_rc = page_ref_count(phys_base);
+    let pte_before = read_pte(kcr3, va);
+    if pte_before & PAGE_PRESENT == 0 || pte_before & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "shmat mapping at {:#x} not present+writable pre-fork (pte={:#x})", va, pte_before);
+        sysv_shm::shmdt(va);
+        sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+        return false;
+    }
+
+    let sem = match mm_sem_for_cr3(kcr3) {
+        Some(s) => s,
+        None => {
+            test_fail!("shm_fork_disjoint_refcount", "no mm_sem registered for kernel_cr3");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return false;
+        }
+    };
+
+    // Drive a real clone_for_fork over exactly this Device VMA — mirroring
+    // how a real fork(2) sees it via the forking process's own vm_space.areas.
+    let mut vs = VmSpace::from_existing_cr3(kcr3, sem);
+    vs.areas.push(VmArea {
+        base: va,
+        length: size,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_SHARED,
+        backing: VmBacking::Device { phys_base },
+        name: "[shm]",
+    });
+
+    let child = match vs.clone_for_fork(kcr3) {
+        Some(c) => c,
+        None => {
+            drop(vs);
+            test_println!("  clone_for_fork(kernel_cr3) → None (OOM) — SKIP");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return true; // OOM is orthogonal to the invariant under test
+        }
+    };
+
+    let pte_parent_after = read_pte(kcr3, va);
+    let pte_child_after  = read_pte(child.cr3, va);
+    let rc_after_fork = page_ref_count(phys_base);
+
+    crate::proc::free_vm_space(child);
+    let rc_after_teardown = page_ref_count(phys_base);
+    drop(vs);
+
+    let mut ok = true;
+    if pte_parent_after & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "parent SHM PTE lost PAGE_WRITABLE across fork (pte={:#x}) — MAP_SHARED broken",
+            pte_parent_after);
+        ok = false;
+    }
+    if pte_child_after & PAGE_PRESENT == 0 || pte_child_after & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "child SHM PTE not present+writable (pte={:#x}) — MAP_SHARED broken",
+            pte_child_after);
+        ok = false;
+    }
+    if rc_after_fork != before_rc {
+        test_fail!("shm_fork_disjoint_refcount",
+            "page_ref_count {} → {} across fork (expected unchanged — disjoint-refcount)",
+            before_rc, rc_after_fork);
+        ok = false;
+    }
+    if rc_after_teardown != before_rc {
+        test_fail!("shm_fork_disjoint_refcount",
+            "page_ref_count {} → {} after child teardown (expected unchanged)",
+            before_rc, rc_after_teardown);
+        ok = false;
+    }
+
+    sysv_shm::shmdt(va);
+    sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+
+    if !ok { return false; }
+
+    test_println!("  fork: parent+child PTE stay present+writable, page_ref_count unchanged ({}) ✓", before_rc);
+    test_pass!("SysV SHM attach survives fork()");
+    true
 }
 
 // ── Test 79: fcntl FD_CLOEXEC + fsync + getsockopt ───────────────────────────

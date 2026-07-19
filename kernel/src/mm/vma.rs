@@ -892,6 +892,30 @@ impl VmSpace {
             }
         }
 
+        // Precompute the parent's Device-backed VA ranges (SysV shared-memory
+        // attachments — see `VmBacking::Device`) before the raw PTE walk below.
+        // A `shmat`-installed mapping is deliberately outside the page-refcount
+        // accounting: the segment's backing frames are owned and freed via the
+        // segment's own attach count (`shmdt` / `shmctl(IPC_RMID)`), not
+        // `page_ref_dec`, and `free_process_memory` / `free_vm_space` already
+        // skip `Device` VMAs for exactly that reason. The walk below otherwise
+        // treats every present leaf as a private CoW candidate — write-protect
+        // plus `page_ref_inc` — with no notion of VMA backing type. Left
+        // unchecked, an SHM-attached fork would (a) silently split the POSIX
+        // "shared with every attacher" segment into independent read-only
+        // parent/child copies on the first post-fork write, since the leaf is
+        // write-protected exactly like an anonymous COW page, and (b) leave a
+        // `page_ref_inc` that no teardown path ever pairs with a dec, because
+        // both processes' `Device` VMAs are skipped by the teardown walk —
+        // an unrecoverable, ever-growing refcount leak on the segment's frames.
+        // Matching the identity-leaf treatment below (keep the entry as-is,
+        // take no reference) restores true POSIX sharing across fork and keeps
+        // the inc/dec pair absent-on-both-sides, same as the identity case.
+        let device_ranges: Vec<(u64, u64)> = self.areas.iter()
+            .filter(|v| matches!(v.backing, VmBacking::Device { .. }))
+            .map(|v| (v.base, v.base + v.length))
+            .collect();
+
         // Walk parent's user page tables (PML4[0..256]).
         // At each level allocate a fresh table for the child so the child's
         // PD/PT pages are never shared with the parent's.
@@ -1009,11 +1033,20 @@ impl VmSpace {
 
                             // Kernel identity leaf under kernel_cr3: keep the
                             // parent (and child) PTE writable — never CoW the
-                            // kernel's own 1:1 map.  Otherwise write-protect in
-                            // place as usual.
+                            // kernel's own 1:1 map.  A SysV SHM attachment
+                            // (`Device`-backed VMA) gets the same treatment for
+                            // a different reason: it is a POSIX MAP_SHARED
+                            // mapping that every attacher must observe writes
+                            // to identically, and its refcount is disjointly
+                            // owned by the segment's own attach count (see the
+                            // precomputed `device_ranges` above). Otherwise
+                            // write-protect in place as usual.
                             let identity =
                                 fork_on_kernel_cr3 && is_identity_map_phys(va, phys);
-                            let entry = if identity {
+                            let in_device_range = device_ranges.iter()
+                                .any(|&(lo, hi)| va >= lo && va < hi);
+                            let skip_refcount = identity || in_device_range;
+                            let entry = if skip_refcount {
                                 pte
                             } else {
                                 phys | ((pte & !ADDR_MASK) & !PAGE_WRITABLE)
@@ -1025,11 +1058,13 @@ impl VmSpace {
 
                             // Take a reference to keep the page alive until both
                             // mappings are gone — EXCEPT for a kernel identity
-                            // leaf, which the child aliases writable but must
-                            // never free, and which no VMA covers so teardown
-                            // decrements none of them; inc and dec both absent =
-                            // balanced (mirrors the write-protect skip).
-                            if !identity {
+                            // leaf (never covered by a VMA) or an SHM `Device`
+                            // leaf (deliberately excluded from page_ref_count by
+                            // both `shmat` and the `Device`-skip in
+                            // `free_process_memory`/`free_vm_space`). Skipping
+                            // the inc for either keeps inc and dec both absent
+                            // = balanced (mirrors the write-protect skip).
+                            if !skip_refcount {
                                 page_ref_inc(phys);
                             }
                             total_pages_cow += 1;
