@@ -152,7 +152,9 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 3: Memory management init...");
     mm::init(info);
     mm::refcount::init();
-    mm::dma_pin::init();
+    // Note: `mm::init()` above already calls `dma_pin::init()` internally
+    // (see mm/mod.rs) — no separate call needed here (Once-guarded, but the
+    // duplicate call was dead weight; removed per #727 review follow-up).
     serial_println!("[Aether] Phase 3: Memory management OK");
 
     // Phase 4: Initialize drivers

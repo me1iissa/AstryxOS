@@ -902,6 +902,92 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Test-only exercise of the **ISR-context** release branch of the DMA-pin
+/// lifecycle — `slot_unpin_dma(slot, can_free_now=false)`, the path
+/// [`handle_irq`] actually takes when it reclaims a quarantined slot from hard
+/// IRQ context.  [`test_slot_dma_pin_deferred_free`] (Test 0e5) only drives
+/// the `can_free_now=true` thread-context branch (a direct `pmm::free_page`);
+/// this test drives the `false` branch, which must instead post the frame to
+/// the lock-free deferred ring (see `crate::mm::dma_pin`'s "Hard-IRQ context"
+/// release path) and leave the PMM bitmap untouched until a subsequent
+/// thread-context [`crate::mm::dma_pin::drain_deferred`] runs.
+///
+/// Uses a real PMM frame (allocated and returned by this test) so it verifies
+/// the `submit_request` → `free_page` → ISR-context `drain_used_ring` reclaim
+/// → deferred-ring → thread-context drain chain end to end, without any
+/// device I/O or a real IRQ. On success the PMM free-page count and the
+/// deferred-free ledger stats are left exactly as found.
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
+    use crate::mm::{dma_pin, pmm};
+
+    let free_before = pmm::free_page_count();
+    let (_, deferred_freed_before, overflow_before) = dma_pin::stats();
+
+    let p = pmm::alloc_page().ok_or("alloc_page failed")?;
+    let slot = acquire_slot().ok_or("no free slot")?;
+    dma_pin::pin_range(p, 0x1000);
+    COMPLETIONS[slot].dma_phys.store(p, Ordering::Release);
+    COMPLETIONS[slot].dma_len.store(0x1000, Ordering::Release);
+    // Submitter timed out: the request is still device-owned.  Quarantine it
+    // — the pin must stay held (mirrors `test_slot_dma_pin_deferred_free`).
+    quarantine_slot(slot);
+    if !dma_pin::is_pinned(p) {
+        release_slot(slot);
+        return Err("frame not pinned after submit+quarantine");
+    }
+
+    // Caller's error path frees the device-owned buffer: deferred by the pin.
+    let free_after_alloc = pmm::free_page_count();
+    pmm::free_page(p);
+    if pmm::free_page_count() != free_after_alloc {
+        return Err("free_page returned a device-owned (pinned) frame — not deferred");
+    }
+
+    // Simulate `handle_irq`'s reclaim path: `drain_used_ring(..., can_free =
+    // false)` → `slot_unpin_dma(slot, false)`.  This is the ISR-context
+    // branch under test: the last unpin's due free must be posted to the
+    // lock-free ring, NEVER freed inline (no `pmm::free_page` / PMM-lock
+    // acquisition on this call, by construction — see `unpin`).
+    slot_unpin_dma(slot, false);
+    COMPLETIONS[slot].quarantined.store(false, Ordering::Release);
+    COMPLETIONS[slot].in_use.store(false, Ordering::Release);
+
+    if dma_pin::is_pinned(p) {
+        return Err("frame still pinned after ISR-context reclaim");
+    }
+    // The frame must NOT be back in the PMM pool yet — it is parked in the
+    // deferred ring pending a thread-context drain.
+    if pmm::free_page_count() != free_after_alloc {
+        return Err("ISR-context reclaim freed the frame inline instead of deferring it");
+    }
+    let (_, deferred_freed_mid, overflow_mid) = dma_pin::stats();
+    if overflow_mid != overflow_before {
+        return Err("deferred ring overflowed under a single-frame test (ring corrupt?)");
+    }
+    if deferred_freed_mid != deferred_freed_before {
+        return Err("DEFERRED_FREED advanced before any drain ran");
+    }
+
+    // Thread-context drain — what the next `unpin_range(can_free_now=true)`
+    // or `dma_pin::drain_deferred_if_due` would do — must complete the
+    // deferred free posted from ISR context above.
+    dma_pin::drain_deferred();
+    if pmm::free_page_count() != free_after_alloc + 1 {
+        return Err("drain_deferred did not return the ISR-deferred frame to the PMM");
+    }
+    let (_, deferred_freed_after, _) = dma_pin::stats();
+    if deferred_freed_after != deferred_freed_before + 1 {
+        return Err("DEFERRED_FREED did not advance by exactly one for the ISR-deferred path");
+    }
+
+    // Net PMM accounting must balance: the one frame allocated here is freed.
+    if pmm::free_page_count() != free_before {
+        return Err("PMM free-page count not restored (frame leaked or double-freed)");
+    }
+    Ok(())
+}
+
 // ── Lock-Free Snapshot for the ISR ──────────────────────────────────────────
 //
 // The submit path holds `VIRTIO_BLK.lock()` only during descriptor build +

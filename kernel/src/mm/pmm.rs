@@ -654,6 +654,13 @@ unsafe fn alloc_page_locked() -> Option<u64> {
 /// If the retry also fails, None is returned (or the caller may panic — that
 /// is preserved from whatever the caller was already doing).
 pub fn alloc_page() -> Option<u64> {
+    // Opportunistic, tick-throttled sweep of the DMA-pin deferred-free ring
+    // (~once/second) — closes the "device went idle right after an
+    // ISR-context reclaim" gap without a block-layer-specific idle hook. See
+    // `dma_pin::drain_deferred_if_due` for why this lives on the allocator's
+    // hot path: it is cheap when not due, and fires independent of disk I/O.
+    crate::mm::dma_pin::drain_deferred_if_due();
+
     // Fast path: try the normal allocation first.
     {
         let _lock = PMM_LOCK.lock();

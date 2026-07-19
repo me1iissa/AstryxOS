@@ -363,6 +363,16 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_slot_dma_pin_deferred_free() { passed += 1; }
 
+    // ── Test 0e6: virtio-blk ISR-context deferred DMA free ───────────────
+    // #727 review follow-up: 0e5 only drives the can_free_now=true
+    // thread-context release branch of slot_unpin_dma.  This exercises the
+    // can_free_now=false branch handle_irq actually takes — the reclaimed
+    // frame must be posted to the lock-free deferred ring (never freed
+    // inline from IRQ context) and completed only by a later thread-context
+    // drain_deferred().
+    total += 1;
+    if test_virtio_blk_slot_dma_pin_isr_deferred_free() { passed += 1; }
+
     // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
@@ -41411,6 +41421,23 @@ fn test_virtio_blk_slot_dma_pin_deferred_free() -> bool {
         }
         Err(why) => {
             test_fail!("virtio_blk_slot_dma_pin_deferred_free", "{}", why);
+            false
+        }
+    }
+}
+
+// ── Test 0e6: virtio-blk ISR-context deferred DMA free ──────────────────────
+fn test_virtio_blk_slot_dma_pin_isr_deferred_free() -> bool {
+    test_header!("virtio-blk ISR-context deferred DMA free (Test 0e6)");
+    match crate::drivers::virtio_blk::test_slot_dma_pin_isr_deferred_free() {
+        Ok(()) => {
+            test_println!("  ISR-context reclaim posts to the deferred ring, not pmm::free_page; \
+                            thread-context drain_deferred completes it ✓");
+            test_pass!("virtio-blk ISR-context deferred DMA free (Test 0e6)");
+            true
+        }
+        Err(why) => {
+            test_fail!("virtio_blk_slot_dma_pin_isr_deferred_free", "{}", why);
             false
         }
     }
