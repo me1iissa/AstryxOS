@@ -801,6 +801,45 @@ pub fn test_quarantine_lifecycle() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Test-only RAII guard: frees a PMM frame on drop unless the test has
+/// already handed it off to the DMA-pin/reclaim state machine under test (via
+/// [`TestFrameGuard::forget`]).  Every allocation-then-fallible-step sequence
+/// below needs one so a `?`/early-return on a slot or pin-count check can
+/// never leak the frame it already allocated — the standard RAII rule that
+/// every successful acquisition needs a release on every code path, error
+/// paths included.
+///
+/// Safe to let run to completion on an error path even after the frame has
+/// been pinned: [`dma_pin::mark_free_pending_if_pinned`] is idempotent when
+/// the frame is still pinned (defers again, harmlessly) and frees it directly
+/// when it is not, so the guard never double-frees or fights the pin ledger.
+/// Callers must [`forget`](TestFrameGuard::forget) it once the frame's
+/// lifecycle has been handed to that machinery, so the guard doesn't also
+/// free it a second time on the success path after reclaim has already
+/// returned it to the allocator.
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+struct TestFrameGuard(Option<u64>);
+
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+impl TestFrameGuard {
+    fn new(phys: u64) -> Self {
+        Self(Some(phys))
+    }
+
+    fn forget(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+impl Drop for TestFrameGuard {
+    fn drop(&mut self) {
+        if let Some(phys) = self.0.take() {
+            crate::mm::pmm::free_page(phys);
+        }
+    }
+}
+
 /// Test-only exercise of the DMA-pin lifecycle at the SLOT level: prove that a
 /// caller's `pmm::free_page` on a device-owned (quarantined) request buffer is
 /// DEFERRED by the pin and completed only when the slot is reclaimed, and that
@@ -827,6 +866,7 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
 
     // ── Single-pin case ──────────────────────────────────────────────
     let p = pmm::alloc_page().ok_or("alloc_page failed")?;
+    let mut p_guard = TestFrameGuard::new(p);
     let slot = acquire_slot().ok_or("no free slot")?;
     arm_slot_pin(slot, p);
     // Submitter timed out: the request is still device-owned.  Quarantine it —
@@ -836,6 +876,9 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
         release_slot(slot);
         return Err("frame not pinned after submit+quarantine");
     }
+    // `p` is now owned by the deferred-free/reclaim machinery under test;
+    // step back so the guard doesn't double-free it once reclaimed below.
+    p_guard.forget();
     // Caller's error path frees the buffer.  With the pin held this must NOT
     // return the frame to the PMM (deferred).
     let free_after_alloc = pmm::free_page_count();
@@ -862,6 +905,7 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
     // ── Multi-pin case (8x-retry-same-phys): two quarantined slots pin the
     //    SAME frame; the free completes only after BOTH are reclaimed. ──
     let q = pmm::alloc_page().ok_or("alloc_page (multi) failed")?;
+    let mut q_guard = TestFrameGuard::new(q);
     let s1 = acquire_slot().ok_or("no free slot (multi #1)")?;
     let s2 = acquire_slot().ok_or("no free slot (multi #2)")?;
     arm_slot_pin(s1, q);
@@ -873,6 +917,8 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
         release_slot(s2);
         return Err("multi-pin count != 2");
     }
+    // `q` is now owned by the deferred-free/reclaim machinery under test.
+    q_guard.forget();
     let free_after_q_alloc = pmm::free_page_count();
     pmm::free_page(q); // caller frees once
     // First reclaim: pin drops to 1, frame must NOT be freed yet.
@@ -925,6 +971,7 @@ pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
     let (_, deferred_freed_before, overflow_before) = dma_pin::stats();
 
     let p = pmm::alloc_page().ok_or("alloc_page failed")?;
+    let mut p_guard = TestFrameGuard::new(p);
     let slot = acquire_slot().ok_or("no free slot")?;
     dma_pin::pin_range(p, 0x1000);
     COMPLETIONS[slot].dma_phys.store(p, Ordering::Release);
@@ -936,6 +983,9 @@ pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
         release_slot(slot);
         return Err("frame not pinned after submit+quarantine");
     }
+    // `p` is now owned by the deferred-free/reclaim machinery under test;
+    // step back so the guard doesn't double-free it once reclaimed below.
+    p_guard.forget();
 
     // Caller's error path frees the device-owned buffer: deferred by the pin.
     let free_after_alloc = pmm::free_page_count();
