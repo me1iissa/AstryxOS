@@ -1183,6 +1183,15 @@ pub fn run() -> ! {
     total += 1;
     if test_new_syscall_stubs() { passed += 1; }
 
+    // ── kernel-static frame survives munmap() (free-chokepoint guard) ──────────
+    // Unconditional — runs in every CI leg. See the sibling win32-pe-test-gated
+    // test below for the same hazard reached via a real Win32 process exit;
+    // this one reaches it via the munmap path, which the exit-time Device-tag
+    // fix elsewhere in this PR does not cover (munmap's raw-PTE free loop has
+    // no VMA left to consult by the time it runs).
+    total += 1;
+    if test_kernel_static_frame_survives_munmap() { passed += 1; }
+
     // ── KUSER_SHARED_DATA survives Win32 process exit (no kernel-frame free) ──
     // Gated with the same feature as the Win32 process tests below (needs
     // `create_win32_process`), but drives teardown directly — no scheduling,
@@ -19826,6 +19835,140 @@ fn test_kuser_shared_survives_win32_exit() -> bool {
     if !ok { return false; }
 
     test_pass!("KUSER_SHARED_DATA page survives Win32 process exit (no kernel-frame double-free)");
+    true
+}
+
+/// UNCONDITIONAL (no feature gate) regression test for the free-chokepoint
+/// guard in `pmm::free_page`.
+///
+/// `test_kuser_shared_survives_win32_exit` above needs `win32-pe-test`
+/// (not enabled by any CI leg) to spawn a real Win32 process, so it gives
+/// no CI signal. This test reproduces the exact same class of hazard
+/// without that machinery: `sys_munmap`'s Phase 2
+/// (`vmm::unmap_and_free_range_in`) walks raw PTEs AFTER the owning VMA
+/// record has already been dropped by Phase 1 (`VmSpace::remove_range`), so
+/// it has no `VmBacking::Device` tag left to consult — the
+/// `clone_for_fork`/`free_process_memory` Device-skip elsewhere in this PR
+/// does not reach this path at all. `VirtualFree(0x7FFE_0000, MEM_RELEASE)`
+/// on a real Win32 process would take exactly this route.
+///
+/// Maps the real, kernel-BSS-resident `KUSER_SHARED_DATA` physical frame at
+/// a throwaway VA (tagged `Device`, matching this PR's install-site fix —
+/// the point being that `munmap` ignores that tag anyway), drives it
+/// through the REAL `sys_munmap` syscall, and asserts:
+///   (a) the frame is still marked used in the PMM bitmap afterward,
+///   (b) `pmm_free_kernel_static_refused_count()` increased by exactly
+///       one — the new `free_page` guard actually fired, not a
+///       coincidental survival,
+///   (c) the kernel's own live view of the page (read via the direct map —
+///       a "second context" independent of the just-removed user mapping)
+///       still reads back correct, uncorrupted content.
+fn test_kernel_static_frame_survives_munmap() -> bool {
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ};
+    use crate::mm::vmm::{PAGE_PRESENT, PAGE_USER, PAGE_NO_EXECUTE, PHYS_OFF};
+    use crate::nt::kuser_shared as ku;
+
+    test_header!("kernel-static frame survives munmap() (free-chokepoint guard)");
+
+    let kernel_phys = ku::physical_address();
+    let page_idx = (kernel_phys / crate::mm::pmm::PAGE_SIZE as u64) as usize;
+    let refused_before = crate::mm::pmm::pmm_free_kernel_static_refused_count();
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kernel_static_munmap",
+            "kernel-static frame {:#x} not marked used before the test starts", kernel_phys);
+        return false;
+    }
+
+    // Force a VmSpace into existence — same throwaway-mmap technique as
+    // `test_shm_fork_disjoint_refcount`, so this test doesn't depend on
+    // incidental prior-test ordering.
+    let probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, 3 /*PROT_READ|WRITE*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+    if probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+
+    const TEST_VA: u64 = 0x5555_0000_0000u64;
+    let pid = crate::proc::current_pid_lockless();
+    let cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|v| v.cr3)
+            .unwrap_or(0)
+    };
+    if cr3 == 0 {
+        test_fail!("kernel_static_munmap", "runner has no VmSpace even after the mmap probe");
+        return false;
+    }
+
+    // Map the real kernel-static frame at TEST_VA — the same raw
+    // `map_page_in` + `Device`-tagged-VMA pattern `create_win32_process`
+    // uses for KUSER_SHARED_DATA.
+    if !crate::mm::vmm::map_page_in(cr3, TEST_VA, kernel_phys, PAGE_PRESENT | PAGE_USER | PAGE_NO_EXECUTE) {
+        test_fail!("kernel_static_munmap", "map_page_in failed for the kernel-static frame");
+        return false;
+    }
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(vs) = p.vm_space.as_mut() {
+                let _ = vs.insert_vma(VmArea {
+                    base:    TEST_VA,
+                    length:  crate::mm::pmm::PAGE_SIZE as u64,
+                    prot:    PROT_READ,
+                    flags:   crate::mm::vma::MAP_PRIVATE,
+                    backing: VmBacking::Device { phys_base: kernel_phys },
+                    name:    "[kernel-static-test]",
+                });
+            }
+        }
+    }
+
+    // Drive the REAL munmap(2) syscall path — exactly what
+    // `VirtualFree(0x7FFE_0000, MEM_RELEASE)` takes in a real Win32 process.
+    let r = crate::syscall::dispatch_linux_kernel(11, TEST_VA, 0x1000, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("kernel_static_munmap", "munmap(TEST_VA) returned {} (expected 0)", r);
+        return false;
+    }
+
+    let mut ok = true;
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kernel_static_munmap",
+            "kernel-static frame {:#x} was FREED by munmap() — free-chokepoint guard did not fire",
+            kernel_phys);
+        ok = false;
+    }
+
+    let refused_after = crate::mm::pmm::pmm_free_kernel_static_refused_count();
+    if refused_after != refused_before + 1 {
+        test_fail!("kernel_static_munmap",
+            "PMM_FREE_KERNEL_STATIC_REFUSED {} → {} (expected exactly +1 — guard should have fired once)",
+            refused_before, refused_after);
+        ok = false;
+    }
+
+    // Second context: the kernel's own live view of the page (direct map),
+    // independent of the user mapping that was just removed.
+    let maj_via_phys = unsafe {
+        core::ptr::read_unaligned(
+            (PHYS_OFF + kernel_phys + ku::OFF_NT_MAJOR_VERSION as u64) as *const u32,
+        )
+    };
+    if maj_via_phys != ku::NT_MAJOR_VERSION {
+        test_fail!("kernel_static_munmap",
+            "NtMajorVersion via kernel frame corrupted after munmap: {} (expect {})",
+            maj_via_phys, ku::NT_MAJOR_VERSION);
+        ok = false;
+    }
+
+    if !ok { return false; }
+
+    test_println!("  kernel-static frame {:#x} survived munmap(); refused_total={} ✓", kernel_phys, refused_after);
+    test_pass!("kernel-static frame survives munmap() (free-chokepoint guard)");
     true
 }
 
