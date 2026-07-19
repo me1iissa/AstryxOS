@@ -4,6 +4,7 @@
 //! and kernel heap allocation.
 
 pub mod cache;
+pub mod dma_pin;
 pub mod heap;
 pub mod oom;
 pub mod pmm;
@@ -57,5 +58,9 @@ pub fn init(boot_info: &BootInfo) {
     heap::init_guard_pages();
     crate::serial_println!("[MM] Heap guard pages installed, starting refcount init...");
     refcount::init();
+    // DMA pin ledger — holds device-owned frames out of PMM reuse while an
+    // in-flight transfer references them (VIRTIO 1.2 §2.7.13.3).  Must follow
+    // heap+refcount init: it heap-allocates its per-PFN table.
+    dma_pin::init();
     crate::serial_println!("[MM] Memory management subsystem initialized");
 }

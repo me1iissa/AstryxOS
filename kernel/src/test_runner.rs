@@ -345,6 +345,24 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_quarantine_lifecycle() { passed += 1; }
 
+    // ── Test 0e4: DMA-pin ledger accounting ──────────────────────────────
+    // Unit coverage for the block-layer DMA pin (mm::dma_pin): a pinned frame
+    // defers its free until the last unpin, the multi-pin (retry-same-phys)
+    // shape releases only on the last unpin, the free-vs-last-unpin race is
+    // resolved atomically, and the underflow guard holds.  VIRTIO 1.2 §2.7.13.3
+    // (device-owned buffer must not be recycled until retired).
+    total += 1;
+    if test_dma_pin_ledger() { passed += 1; }
+
+    // ── Test 0e5: virtio-blk slot-level deferred DMA free ────────────────
+    // End-to-end: a caller's free_page on a quarantined (device-owned) request
+    // buffer is deferred by the pin and completed only when drain_used_ring
+    // reclaims the slot; the 8x-retry-same-phys multi-pin releases the frame
+    // only on the last reclaim.  Directly exercises the DMA-buffer
+    // use-after-free the pin closes.
+    total += 1;
+    if test_virtio_blk_slot_dma_pin_deferred_free() { passed += 1; }
+
     // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
     total += 1;
     if test_ahci_per_port_mutex() { passed += 1; }
@@ -41361,6 +41379,38 @@ fn test_virtio_blk_quarantine_lifecycle() -> bool {
         }
         Err(why) => {
             test_fail!("virtio_blk_quarantine_lifecycle", "{}", why);
+            false
+        }
+    }
+}
+
+// ── Test 0e4: DMA-pin ledger accounting ─────────────────────────────────────
+fn test_dma_pin_ledger() -> bool {
+    test_header!("DMA-pin ledger accounting (Test 0e4)");
+    match crate::mm::dma_pin::test_ledger() {
+        Ok(()) => {
+            test_println!("  pin defers free; last unpin frees; race + underflow held ✓");
+            test_pass!("DMA-pin ledger accounting (Test 0e4)");
+            true
+        }
+        Err(why) => {
+            test_fail!("dma_pin_ledger", "{}", why);
+            false
+        }
+    }
+}
+
+// ── Test 0e5: virtio-blk slot-level deferred DMA free ────────────────────────
+fn test_virtio_blk_slot_dma_pin_deferred_free() -> bool {
+    test_header!("virtio-blk slot deferred DMA free (Test 0e5)");
+    match crate::drivers::virtio_blk::test_slot_dma_pin_deferred_free() {
+        Ok(()) => {
+            test_println!("  free of device-owned buffer deferred; freed on reclaim; multi-pin ok ✓");
+            test_pass!("virtio-blk slot deferred DMA free (Test 0e5)");
+            true
+        }
+        Err(why) => {
+            test_fail!("virtio_blk_slot_dma_pin_deferred_free", "{}", why);
             false
         }
     }
