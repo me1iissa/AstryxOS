@@ -720,6 +720,15 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_self_cwd_readlink() { passed += 1; }
 
+    // ── Test 728: mouse position-update guard on zero screen dims ────────
+    //
+    // Placed BEFORE Test 40 (Desktop Launch) for the same reason as Test
+    // 206/207 above: Desktop Launch calls warp() unconditionally during
+    // bring-up, so this guards the panic regression regardless of whether
+    // Desktop Launch itself stays healthy.
+    total += 1;
+    if test_mouse_zero_dims_guard() { passed += 1; }
+
     // ── Test 40: Desktop Launch with Timeout ────────────────────────────
 
     total += 1;
@@ -13869,6 +13878,99 @@ fn test_damage_region() -> bool {
         test_pass!("Damage-region compositing");
     } else {
         test_fail!("Damage-region", "damage_region_selftest() returned false");
+    }
+    ok
+}
+
+// ── Test 728: mouse position-update zero screen dims guard ──────────────────
+
+/// Regression test for a startup-race panic: `gui::desktop::init` calls
+/// `drivers::mouse::warp()` unconditionally during bring-up, and on a boot
+/// where the SVGA framebuffer is absent (no display device attached) the
+/// screen dimensions can still be 0 at that point. `warp()` used to compute
+/// `max = dimension - 1` and pass it straight to `i32::clamp(0, max)`, which
+/// panics ("min > max") once `max` goes negative — crashing the whole kernel
+/// test runner. The same `clamp_to_screen` helper backs `warp()`,
+/// `set_state()` (used by the virtio-tablet input path,
+/// `drivers/virtio_input.rs`), and `handle_irq()` (the PS/2 IRQ12 path), so
+/// this test exercises `warp()` and `set_state()` directly.
+/// `handle_irq()` is not covered here: it reads the live 8042 data port via
+/// `inb()` to assemble its 3-byte packet, so there is no clean way to drive
+/// it to the position-update branch from a unit test without faking
+/// hardware I/O — its call site was converted to the same helper and is
+/// covered by inspection + the shared `clamp_to_screen` logic below.
+fn test_mouse_zero_dims_guard() -> bool {
+    test_header!("Mouse zero-screen-dims guard (warp + set_state)");
+    let mut ok = true;
+
+    // Save whatever bounds are live so later tests (Desktop Launch right
+    // after this one) see the environment undisturbed.
+    let (orig_w, orig_h) = crate::drivers::mouse::screen_bounds();
+
+    // ── warp() ────────────────────────────────────────────────────────
+    // Reproduce the startup race directly: force zero dims, then warp().
+    // Before the fix this panicked (i32::clamp(0, -1)) and never returned.
+    crate::drivers::mouse::set_bounds(0, 0);
+    crate::drivers::mouse::warp(550, 375);
+    let (x, y) = crate::drivers::mouse::position();
+    if x != 0 || y != 0 {
+        test_println!("  FAIL: warp() on zero dims moved cursor to ({}, {}), expected (0, 0)", x, y);
+        ok = false;
+    } else {
+        test_println!("  warp() on zero dims left cursor at (0, 0) — no panic ✓");
+    }
+
+    // Sanity-check warp() still clamps normally with real (positive) dims,
+    // so the guard only suppresses the invalid-bounds case.
+    crate::drivers::mouse::set_bounds(800, 600);
+    crate::drivers::mouse::warp(550, 375);
+    let (x2, y2) = crate::drivers::mouse::position();
+    if x2 != 550 || y2 != 375 {
+        test_println!("  FAIL: warp() with valid dims gave ({}, {}), expected (550, 375)", x2, y2);
+        ok = false;
+    } else {
+        test_println!("  warp() with valid dims still works ✓");
+    }
+
+    // ── set_state() ──────────────────────────────────────────────────
+    // The virtio-tablet absolute-pointer path (drivers/virtio_input.rs)
+    // hits the identical panic through set_state() instead of warp() — same
+    // helper, same regression shape. Force zero dims again and confirm the
+    // position update no-ops while buttons + initialized still land.
+    crate::drivers::mouse::set_bounds(0, 0);
+    crate::drivers::mouse::set_state(550, 375, 0x01);
+    let (sx, sy) = crate::drivers::mouse::position();
+    if sx != 0 || sy != 0 {
+        test_println!("  FAIL: set_state() on zero dims moved cursor to ({}, {}), expected (0, 0)", sx, sy);
+        ok = false;
+    } else if crate::drivers::mouse::buttons() != 0x01 {
+        test_println!("  FAIL: set_state() on zero dims did not record button state");
+        ok = false;
+    } else if !crate::drivers::mouse::is_initialized() {
+        test_println!("  FAIL: set_state() on zero dims did not mark the mouse initialized");
+        ok = false;
+    } else {
+        test_println!("  set_state() on zero dims left cursor at (0, 0), buttons/init still recorded — no panic ✓");
+    }
+
+    // Sanity-check set_state() still clamps normally with real dims.
+    crate::drivers::mouse::set_bounds(800, 600);
+    crate::drivers::mouse::set_state(550, 375, 0);
+    let (sx2, sy2) = crate::drivers::mouse::position();
+    if sx2 != 550 || sy2 != 375 {
+        test_println!("  FAIL: set_state() with valid dims gave ({}, {}), expected (550, 375)", sx2, sy2);
+        ok = false;
+    } else {
+        test_println!("  set_state() with valid dims still works ✓");
+    }
+
+    // Restore the original bounds for subsequent tests.
+    crate::drivers::mouse::set_bounds(orig_w.max(0) as u32, orig_h.max(0) as u32);
+
+    if ok {
+        test_pass!("Mouse zero-screen-dims guard (warp + set_state)");
+    } else {
+        test_fail!("Mouse zero-screen-dims guard", "see FAIL lines above");
     }
     ok
 }
