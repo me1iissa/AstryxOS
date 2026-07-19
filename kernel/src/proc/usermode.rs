@@ -578,12 +578,34 @@ pub fn create_win32_process(name: &str, pe_data: &[u8]) -> Result<proc::Pid, cra
     ) {
         return Err(crate::proc::pe::PeError::MappingFailed);
     }
+    // Disjoint-refcount contract (see `ipc::sysv_shm` for the reference
+    // definition of this pattern): `kuser_phys` is ONE global, kernel-BSS-
+    // resident physical frame shared read-only by every Win32 process, never
+    // `page_ref_inc`'d anywhere, and never individually freed — it lives for
+    // the life of the kernel. Tagging it `VmBacking::Device` (rather than
+    // `Anonymous`) makes `proc::free_process_memory` / `free_vm_space` skip
+    // it in their per-VMA teardown walk, exactly as they already do for
+    // SysV SHM segments, instead of calling `refcount::page_ref_dec` on a
+    // frame whose count was never bumped. Before this fix the VMA was
+    // `Anonymous`, so exit's normal teardown walk did NOT skip it: it called
+    // `page_ref_dec(kuser_phys)`, which found the count already at 0 and (per
+    // its own documented underflow-refusal contract) returned 0 — the exact
+    // signal the walk treats as "safe to free" — so `pmm::free_page` ran on
+    // a frame inside the running kernel's own image. `pmm::free_page` has no
+    // guard against freeing a kernel-static frame (`is_kernel_static_phys` is
+    // only consulted by the page-cache insert path), so the very first Win32
+    // process to exit returned this frame to the general allocator while
+    // every other Win32 process still mapped it read-only and the kernel's
+    // own periodic time-refresh writer kept writing into it via its separate,
+    // always-live kernel-mode mapping — corrupting whatever the frame was
+    // reallocated to, indefinitely. See `KUSER_SHARED_DATA` (ntddk.h):
+    // <https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data>.
     let _ = vm_space.insert_vma(crate::mm::vma::VmArea {
         base:    crate::nt::kuser_shared::KUSER_SHARED_DATA_VA,
         length:  crate::mm::pmm::PAGE_SIZE as u64,
         prot:    crate::mm::vma::PROT_READ,
         flags:   crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
-        backing: crate::mm::vma::VmBacking::Anonymous,
+        backing: crate::mm::vma::VmBacking::Device { phys_base: kuser_phys },
         name:    "[kuser-shared]",
     });
 

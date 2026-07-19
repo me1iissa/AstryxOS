@@ -1183,6 +1183,17 @@ pub fn run() -> ! {
     total += 1;
     if test_new_syscall_stubs() { passed += 1; }
 
+    // ── KUSER_SHARED_DATA survives Win32 process exit (no kernel-frame free) ──
+    // Gated with the same feature as the Win32 process tests below (needs
+    // `create_win32_process`), but drives teardown directly — no scheduling,
+    // so it does not share the sibling test's known Ring-3-spin hang risk.
+    // Ordered BEFORE Test 82 so it completes even when that gate is enabled.
+    #[cfg(feature = "win32-pe-test")]
+    {
+        total += 1;
+        if test_kuser_shared_survives_win32_exit() { passed += 1; }
+    }
+
     // ── Test 82: Win32 PE32+ process via create_win32_process ─────────────────
     // Gated: the Win32 binary spins in Ring 3 without calling ExitProcess under
     // current scheduler timing, causing the headless runner to hang forever on
@@ -19690,6 +19701,132 @@ fn test_kuser_shared_data() -> bool {
         test_pass!("KUSER_SHARED_DATA layout + live time fields");
     }
     ok
+}
+
+/// KUSER_SHARED_DATA's global physical page must survive a Win32 process exit.
+///
+/// Regression test for the refinc-hygiene fix in `proc::usermode::create_win32_process`:
+/// the one kernel-BSS-resident `KUSER_SHARED_DATA` frame (see `nt::kuser_shared`)
+/// used to be registered as a plain `VmBacking::Anonymous` VMA. Since that
+/// frame is never `page_ref_inc`'d anywhere, the ordinary Anonymous-VMA
+/// teardown walk in `proc::free_process_memory` would call
+/// `refcount::page_ref_dec` on an untouched (0) count, which — per that
+/// function's own documented underflow-refusal contract — returns 0, the
+/// exact signal the teardown walk treats as "safe to free". `pmm::free_page`
+/// has no guard against freeing a frame inside the running kernel's own
+/// image, so the very first Win32 process to exit would return this shared
+/// frame to the general allocator while every other Win32 process (and the
+/// kernel's own periodic time-refresh writer) still used it.
+///
+/// This drives a REAL `create_win32_process` → `free_process_memory` cycle
+/// (the exact teardown path a real process exit takes) without scheduling
+/// or running the process — deterministic and SMP=1-friendly, matching the
+/// project's other direct-teardown-driven fork/exit regression tests. It
+/// asserts the frame stays marked "used" in the PMM bitmap across process
+/// A's teardown, then spawns a second Win32 process and confirms its
+/// KUSER_SHARED_DATA mapping still resolves to the same physical frame with
+/// uncorrupted content.
+#[cfg(feature = "win32-pe-test")]
+fn test_kuser_shared_survives_win32_exit() -> bool {
+    use crate::nt::kuser_shared as ku;
+    test_header!("KUSER_SHARED_DATA page survives Win32 process exit (no kernel-frame double-free)");
+
+    let kernel_phys = ku::physical_address();
+    let page_idx = (kernel_phys / crate::mm::pmm::PAGE_SIZE as u64) as usize;
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} not marked used before the test even starts (unexpected)",
+            kernel_phys);
+        return false;
+    }
+
+    let pe_data = crate::proc::hello_win32_pe::HELLO_WIN32_PE;
+
+    // ── Process A: create, then drive teardown directly (no scheduling) ────
+    let pid_a = match crate::proc::usermode::create_win32_process("kuser_exit_a.exe", pe_data) {
+        Ok(pid) => pid,
+        Err(e) => {
+            test_fail!("kuser_shared_exit", "create_win32_process (A) failed: {:?}", e);
+            return false;
+        }
+    };
+    // Exactly the teardown a real exit_group(2) takes — see
+    // `proc::free_process_memory`'s doc comment for the CR3-drain preamble,
+    // which is a no-op here since this process was never scheduled onto
+    // any CPU.
+    crate::proc::free_process_memory(pid_a);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pid_a);
+    }
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} was FREED by process A's teardown — \
+             kernel-static page returned to the PMM free pool", kernel_phys);
+        return false;
+    }
+    test_println!("  KUSER_SHARED_DATA frame {:#x} still marked used after process A's teardown ✓", kernel_phys);
+
+    // ── Process B: confirm the shared page is still sane post-A-teardown ───
+    let pid_b = match crate::proc::usermode::create_win32_process("kuser_exit_b.exe", pe_data) {
+        Ok(pid) => pid,
+        Err(e) => {
+            test_fail!("kuser_shared_exit", "create_win32_process (B) failed: {:?}", e);
+            return false;
+        }
+    };
+    let mut ok = true;
+
+    let cr3_b = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid_b).map(|p| p.cr3).unwrap_or(0)
+    };
+    match crate::mm::vmm::virt_to_phys_in(cr3_b, ku::KUSER_SHARED_DATA_VA) {
+        Some(p) if p == kernel_phys => {
+            test_println!("  process B kuser mapping still resolves to {:#x} ✓", p);
+        }
+        Some(p) => {
+            test_fail!("kuser_shared_exit",
+                "process B kuser phys {:#x} != original {:#x} — frame was reallocated after A's exit",
+                p, kernel_phys);
+            ok = false;
+        }
+        None => {
+            test_fail!("kuser_shared_exit", "process B: KUSER_SHARED_DATA_VA not mapped");
+            ok = false;
+        }
+    }
+
+    let maj_via_phys = unsafe {
+        core::ptr::read_unaligned(
+            (crate::mm::vmm::PHYS_OFF + kernel_phys + ku::OFF_NT_MAJOR_VERSION as u64) as *const u32,
+        )
+    };
+    if maj_via_phys != ku::NT_MAJOR_VERSION {
+        test_fail!("kuser_shared_exit",
+            "NtMajorVersion via kernel frame corrupted after A's teardown: {} (expect {})",
+            maj_via_phys, ku::NT_MAJOR_VERSION);
+        ok = false;
+    }
+
+    crate::proc::free_process_memory(pid_b);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pid_b);
+    }
+
+    if !crate::mm::pmm::is_page_used_for_test(page_idx) {
+        test_fail!("kuser_shared_exit",
+            "KUSER_SHARED_DATA frame {:#x} was FREED by process B's teardown", kernel_phys);
+        ok = false;
+    }
+
+    if !ok { return false; }
+
+    test_pass!("KUSER_SHARED_DATA page survives Win32 process exit (no kernel-frame double-free)");
+    true
 }
 
 // ── Test 63: TinyCC compiler — compile C source to ELF, execute it ───────────
