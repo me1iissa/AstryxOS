@@ -921,15 +921,6 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
 pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
     use crate::mm::{dma_pin, pmm};
 
-    // `pmm::alloc_page()` opportunistically calls `dma_pin::drain_deferred_if_due`
-    // on every allocation (see that function's doc), and its ~1s throttle is a
-    // single GLOBAL compare-exchange — any CPU's allocation can win it, not just
-    // this test's own calls. Consume this interval's throttle turn right here,
-    // before this test posts its own frame to the ring below, so no unrelated
-    // allocation elsewhere in the kernel can win the CAS and drain our frame out
-    // from under the "not yet drained" assertions later in this function.
-    dma_pin::drain_deferred_if_due();
-
     let free_before = pmm::free_page_count();
     let (_, deferred_freed_before, overflow_before) = dma_pin::stats();
 
@@ -952,6 +943,20 @@ pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
     if pmm::free_page_count() != free_after_alloc {
         return Err("free_page returned a device-owned (pinned) frame — not deferred");
     }
+
+    // `pmm::alloc_page()` opportunistically calls `dma_pin::drain_deferred_if_due`
+    // on every allocation (see that function's doc); its ~1s throttle is a
+    // single GLOBAL compare-exchange, so any CPU's allocation elsewhere in the
+    // kernel can win it, not just this test's own calls. This call consumes the
+    // current throttle interval's drain turn immediately before the ring-post
+    // below, leaving only a few fixed, lock-free instructions in the window
+    // before the "not yet drained" assertions — it does NOT guarantee no other
+    // CPU can cross the interval boundary in that window (a boundary crossing
+    // during `pmm::alloc_page()`'s own PMM_LOCK critical section earlier in
+    // this test, above, remains a narrow pre-existing residual risk that
+    // placement here cannot reach), but it closes the reset-to-ring-post gap
+    // as tightly as a same-thread, lock-free call can.
+    dma_pin::drain_deferred_if_due();
 
     // Simulate `handle_irq`'s reclaim path: `drain_used_ring(..., can_free =
     // false)` → `slot_unpin_dma(slot, false)`.  This is the ISR-context
