@@ -720,6 +720,15 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_self_cwd_readlink() { passed += 1; }
 
+    // ── Test 728: mouse::warp() no-ops on zero screen dims ───────────────
+    //
+    // Placed BEFORE Test 40 (Desktop Launch) for the same reason as Test
+    // 206/207 above: Desktop Launch calls warp() unconditionally during
+    // bring-up, so this guards the panic regression regardless of whether
+    // Desktop Launch itself stays healthy.
+    total += 1;
+    if test_mouse_warp_zero_dims_guard() { passed += 1; }
+
     // ── Test 40: Desktop Launch with Timeout ────────────────────────────
 
     total += 1;
@@ -13869,6 +13878,59 @@ fn test_damage_region() -> bool {
         test_pass!("Damage-region compositing");
     } else {
         test_fail!("Damage-region", "damage_region_selftest() returned false");
+    }
+    ok
+}
+
+// ── Test 728: mouse::warp() zero screen dims guard ──────────────────────────
+
+/// Regression test for a startup-race panic: `gui::desktop::init` calls
+/// `drivers::mouse::warp()` unconditionally during bring-up, and on a boot
+/// where the SVGA framebuffer is absent (no display device attached) the
+/// screen dimensions can still be 0 at that point. `warp()` used to compute
+/// `max = dimension - 1` and pass it straight to `i32::clamp(0, max)`, which
+/// panics ("min > max") once `max` goes negative — crashing the whole kernel
+/// test runner. Verifies the guard no-ops on zero dims (no panic, cursor left
+/// alone) and that warp() still works normally once valid dims are set.
+fn test_mouse_warp_zero_dims_guard() -> bool {
+    test_header!("Mouse warp() zero-screen-dims guard");
+    let mut ok = true;
+
+    // Save whatever bounds are live so later tests (Desktop Launch right
+    // after this one) see the environment undisturbed.
+    let (orig_w, orig_h) = crate::drivers::mouse::screen_bounds();
+
+    // Reproduce the startup race directly: force zero dims, then warp().
+    // Before the fix this panicked (i32::clamp(0, -1)) and never returned.
+    crate::drivers::mouse::set_bounds(0, 0);
+    crate::drivers::mouse::warp(550, 375);
+    let (x, y) = crate::drivers::mouse::position();
+    if x != 0 || y != 0 {
+        test_println!("  FAIL: warp() on zero dims moved cursor to ({}, {}), expected (0, 0)", x, y);
+        ok = false;
+    } else {
+        test_println!("  warp() on zero dims left cursor at (0, 0) — no panic ✓");
+    }
+
+    // Sanity-check warp() still clamps normally with real (positive) dims,
+    // so the guard only suppresses the invalid-bounds case.
+    crate::drivers::mouse::set_bounds(800, 600);
+    crate::drivers::mouse::warp(550, 375);
+    let (x2, y2) = crate::drivers::mouse::position();
+    if x2 != 550 || y2 != 375 {
+        test_println!("  FAIL: warp() with valid dims gave ({}, {}), expected (550, 375)", x2, y2);
+        ok = false;
+    } else {
+        test_println!("  warp() with valid dims still works ✓");
+    }
+
+    // Restore the original bounds for subsequent tests.
+    crate::drivers::mouse::set_bounds(orig_w.max(0) as u32, orig_h.max(0) as u32);
+
+    if ok {
+        test_pass!("Mouse warp() zero-screen-dims guard");
+    } else {
+        test_fail!("Mouse warp() zero-screen-dims guard", "see FAIL lines above");
     }
     ok
 }

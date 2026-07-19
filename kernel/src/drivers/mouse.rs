@@ -185,6 +185,18 @@ pub fn buttons() -> u8 {
 pub fn warp(x: i32, y: i32) {
     let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
     let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
+    // Guard a startup race: on a boot where the SVGA framebuffer is absent
+    // (headless boot, no display device attached), init()/set_bounds() may
+    // not yet have published real dimensions by the time a caller warps the
+    // cursor, leaving SCREEN_WIDTH/HEIGHT at 0 and max_x/max_y at -1.
+    // `i32::clamp(min, max)` requires `min <= max` and panics otherwise, so
+    // an unguarded warp() here turns a benign "no screen yet" state into a
+    // fatal boot panic. No-op until real (positive) dimensions are set — a
+    // later set_bounds()/set_state() call establishes a valid cursor
+    // position once the display comes up.
+    if max_x < 0 || max_y < 0 {
+        return;
+    }
     MOUSE_X.store(x.clamp(0, max_x), Ordering::Relaxed);
     MOUSE_Y.store(y.clamp(0, max_y), Ordering::Relaxed);
 }
