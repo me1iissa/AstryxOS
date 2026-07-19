@@ -27,6 +27,36 @@ static PACKET_BUF: Mutex<[u8; 3]> = Mutex::new([0; 3]);
 static SCREEN_WIDTH: AtomicI32 = AtomicI32::new(1024);
 static SCREEN_HEIGHT: AtomicI32 = AtomicI32::new(768);
 
+/// Clamp an absolute cursor position to the current screen bounds, or report
+/// that the screen has not been sized yet.
+///
+/// Returns `None` when either screen dimension is still unpublished (0) —
+/// e.g. `init()`/`set_bounds()` has not run with real values yet because the
+/// SVGA framebuffer is absent on this boot (headless, no display device
+/// attached). That state is *permanent* for the rest of the boot unless a
+/// later `set_bounds()`/`set_state()` call publishes real dimensions:
+/// `drivers::init()` seeds SCREEN_WIDTH/HEIGHT from `BootInfo` exactly once,
+/// and `main.rs` only re-publishes them via `set_bounds()` when an SVGA
+/// device was found. In the unpublished state `dimension - 1` is negative,
+/// and `i32::clamp(min, max)` requires `min <= max` — clamping against that
+/// negative bound panics. Every call site must skip the position update
+/// entirely rather than clamp against a bogus bound.
+///
+/// Each dimension is loaded from its atomic exactly once, so the same value
+/// is used for both the validity check and the clamp even if a concurrent
+/// `set_bounds()`/`init()` races this read. This runs on the IRQ12 ISR path
+/// ([`handle_irq`]) as well as ordinary kernel context, so it is
+/// atomics-only: no locks, no allocation.
+#[inline]
+fn clamp_to_screen(x: i32, y: i32) -> Option<(i32, i32)> {
+    let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
+    let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
+    if max_x < 0 || max_y < 0 {
+        return None;
+    }
+    Some((x.clamp(0, max_x), y.clamp(0, max_y)))
+}
+
 /// Wait for the PS/2 controller input buffer to be ready.
 fn wait_input() {
     for _ in 0..100_000 {
@@ -148,15 +178,16 @@ pub fn handle_irq() {
         // explicit negation here; Y comes out correct without any negation.
         dx = -dx;
 
-        // Update position
-        let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
-        let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
-
-        let new_x = (MOUSE_X.load(Ordering::Relaxed) + dx).clamp(0, max_x);
-        let new_y = (MOUSE_Y.load(Ordering::Relaxed) + dy).clamp(0, max_y);
-
-        MOUSE_X.store(new_x, Ordering::Relaxed);
-        MOUSE_Y.store(new_y, Ordering::Relaxed);
+        // Update position — no-ops if the screen hasn't been sized yet
+        // (SVGA-absent boot; see clamp_to_screen). Buttons still update so a
+        // click isn't silently lost once the screen comes up.
+        if let Some((new_x, new_y)) = clamp_to_screen(
+            MOUSE_X.load(Ordering::Relaxed) + dx,
+            MOUSE_Y.load(Ordering::Relaxed) + dy,
+        ) {
+            MOUSE_X.store(new_x, Ordering::Relaxed);
+            MOUSE_Y.store(new_y, Ordering::Relaxed);
+        }
         MOUSE_BUTTONS.store(buttons, Ordering::Relaxed);
     }
 }
@@ -182,23 +213,15 @@ pub fn buttons() -> u8 {
 }
 
 /// Warp the cursor to an absolute position (clamped to screen bounds).
+///
+/// No-ops if the screen hasn't been sized yet (see [`clamp_to_screen`]) — a
+/// later `set_bounds()`/`set_state()` call establishes a valid cursor
+/// position once the display comes up.
 pub fn warp(x: i32, y: i32) {
-    let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
-    let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
-    // Guard a startup race: on a boot where the SVGA framebuffer is absent
-    // (headless boot, no display device attached), init()/set_bounds() may
-    // not yet have published real dimensions by the time a caller warps the
-    // cursor, leaving SCREEN_WIDTH/HEIGHT at 0 and max_x/max_y at -1.
-    // `i32::clamp(min, max)` requires `min <= max` and panics otherwise, so
-    // an unguarded warp() here turns a benign "no screen yet" state into a
-    // fatal boot panic. No-op until real (positive) dimensions are set — a
-    // later set_bounds()/set_state() call establishes a valid cursor
-    // position once the display comes up.
-    if max_x < 0 || max_y < 0 {
-        return;
+    if let Some((cx, cy)) = clamp_to_screen(x, y) {
+        MOUSE_X.store(cx, Ordering::Relaxed);
+        MOUSE_Y.store(cy, Ordering::Relaxed);
     }
-    MOUSE_X.store(x.clamp(0, max_x), Ordering::Relaxed);
-    MOUSE_Y.store(y.clamp(0, max_y), Ordering::Relaxed);
 }
 
 /// Check if mouse is initialized.
@@ -225,11 +248,15 @@ pub fn screen_bounds() -> (i32, i32) {
 ///
 /// Marking the mouse initialized here lets a virtio-tablet drive the cursor even
 /// on a guest where the PS/2 controller never came up.
+///
+/// The position update no-ops if the screen hasn't been sized yet (see
+/// [`clamp_to_screen`]); buttons and the initialized flag still update so a
+/// subsequent call positions the cursor correctly once the display comes up.
 pub fn set_state(x: i32, y: i32, buttons: u8) {
-    let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
-    let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
-    MOUSE_X.store(x.clamp(0, max_x), Ordering::Relaxed);
-    MOUSE_Y.store(y.clamp(0, max_y), Ordering::Relaxed);
+    if let Some((cx, cy)) = clamp_to_screen(x, y) {
+        MOUSE_X.store(cx, Ordering::Relaxed);
+        MOUSE_Y.store(cy, Ordering::Relaxed);
+    }
     MOUSE_BUTTONS.store(buttons, Ordering::Relaxed);
     MOUSE_INITIALIZED.store(true, Ordering::Relaxed);
 }
