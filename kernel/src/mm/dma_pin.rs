@@ -51,6 +51,32 @@
 //!     reset-recovery path releases every pin — a bounded leak, never a
 //!     use-after-free.
 //!
+//! [`unpin_range`] already sweeps the whole ring on every thread-context
+//! release, so under any ongoing block I/O the ring never sits full for long.
+//! The remaining gap is a device that goes idle immediately after an
+//! ISR-context reclaim posts a frame: no further virtio-blk call ever runs to
+//! drain it.  [`drain_deferred_if_due`] closes that gap with an opportunistic,
+//! tick-throttled sweep hooked into [`crate::mm::pmm::alloc_page`] — the
+//! allocator's hot path, not the block layer, so the sweep fires as soon as
+//! the system does anything that touches memory, independent of disk activity.
+//!
+//! # Ordering contract (happens-before)
+//!
+//! [`pin`] is a plain `fetch_add` and [`mark_free_pending_if_pinned`] defers a
+//! free the instant it observes a non-zero count; neither establishes any
+//! ordering between agents beyond the single word they operate on.  This is
+//! sound for virtio-blk only because a request's pin (`submit_request`)
+//! strictly happens-before that same request's own release (its error-path
+//! free, its `release_slot`, or its used-ring reclaim) — the pin and every
+//! matching unpin are always issued by the same logical request, so the frame
+//! is never concurrently pinned by one agent and freed on behalf of another.
+//! A driver that lets one agent pin a frame while a *different*, independently
+//! scheduled agent might free the same phys concurrently must establish its
+//! own happens-before edge between that pin and that free (e.g. via a shared
+//! lock or a completion signal) before relying on this ledger — the CAS in
+//! [`mark_free_pending_if_pinned`] only makes the check-and-mark atomic, it
+//! does not order *when* a pin becomes visible relative to an unrelated free.
+//!
 //! Per Intel SDM Vol. 3A §4.10.5, paging-structure and frame-repurposing
 //! changes must be serialised against every agent that can still reference the
 //! frame; a DMA-capable device is such an agent, and this ledger is how the
@@ -376,6 +402,55 @@ pub fn drain_deferred() {
             crate::mm::pmm::free_page(phys);
         }
     }
+}
+
+/// Ticks between opportunistic [`drain_deferred_if_due`] sweeps.  At the
+/// kernel's 100 Hz scheduler tick this is ~1 second: frequent enough that a
+/// frame an ISR-context reclaim posted to the ring is not held out of
+/// circulation for long once the system does anything that touches the page
+/// allocator, cheap enough that the extra tick comparison on
+/// [`crate::mm::pmm::alloc_page`]'s hot path is noise.
+const IDLE_DRAIN_INTERVAL_TICKS: u64 = 100;
+
+/// Tick at which [`drain_deferred_if_due`] last actually swept the ring.
+static LAST_IDLE_DRAIN_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Best-effort, tick-throttled sweep of the deferred-free ring — the
+/// "device goes fully idle right after an ISR-context reclaim" edge case that
+/// [`unpin_range`]'s per-release sweep cannot reach on its own (see the module
+/// doc's deferred-free contract).
+///
+/// Safe to call from any thread context that can already afford
+/// [`drain_deferred`] (it takes the PMM lock indirectly): this function is
+/// only ever invoked from [`crate::mm::pmm::alloc_page`], never from an ISR.
+/// The throttle is a single relaxed load-and-compare in the common case
+/// (interval not yet due); when due, a compare-exchange on
+/// [`LAST_IDLE_DRAIN_TICK`] lets exactly one caller across all CPUs perform
+/// the sweep per interval, so concurrent allocators never redundantly walk
+/// the ring together.
+///
+/// Hooking this into the allocator rather than the block layer means the
+/// sweep does not depend on disk activity at all — any live thread doing
+/// anything that allocates memory (a page fault, `mmap`, `fork`, …) drains a
+/// stranded ISR-deferred frame within one interval.  On a truly quiescent
+/// system (no allocation of any kind) the frame stays parked, which is the
+/// same bounded, safe leak the module doc already accepts: no allocator
+/// activity also means nothing is contending for the frame.
+#[inline]
+pub fn drain_deferred_if_due() {
+    let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let last = LAST_IDLE_DRAIN_TICK.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < IDLE_DRAIN_INTERVAL_TICKS {
+        return;
+    }
+    if LAST_IDLE_DRAIN_TICK
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another CPU already claimed this interval's sweep.
+        return;
+    }
+    drain_deferred();
 }
 
 /// Diagnostic totals: (frees deferred, deferred frees executed, ring overflows).
