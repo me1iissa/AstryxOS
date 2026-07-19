@@ -1122,6 +1122,10 @@ pub fn run() -> ! {
     total += 1;
     if test_shm_phys_map_invariant() { passed += 1; }
 
+    // ── SHM attach survives fork() — disjoint-refcount + shared-write ───────
+    total += 1;
+    if test_shm_fork_disjoint_refcount() { passed += 1; }
+
     // ── Test 79: syscall completeness — fcntl FD_CLOEXEC, fsync, fd table ────
 
     total += 1;
@@ -23824,6 +23828,158 @@ fn test_shm_phys_map_invariant() -> bool {
 
     if ok { test_pass!("SHM higher-half direct-map invariant (>1 GiB zero-fill guard)"); }
     ok
+}
+
+/// SysV SHM attach must survive `fork()` as true POSIX sharing.
+///
+/// `VmSpace::clone_for_fork`'s raw PTE walk write-protects every present,
+/// non-identity leaf into a private CoW page and takes a `page_ref_inc` on
+/// it — with no notion of VMA backing type. Before the `Device`-VMA
+/// fork-alias fix, an `shmat()`-installed leaf got that exact treatment:
+/// forking a process with a live SHM attachment would write-protect the
+/// mapping in BOTH the parent and the child (silently downgrading the
+/// POSIX-mandated shared mapping into a private CoW page on the next write
+/// from either side — see `shmat(2)`/`fork(2)`), and would leave a
+/// `page_ref_inc` that no teardown path ever balances, because
+/// `free_process_memory`/`free_vm_space` deliberately skip every `Device`
+/// VMA (see the disjoint-refcount contract documented on `sysv_shm`).
+///
+/// This drives a real `clone_for_fork` over a `Device`-backed leaf the same
+/// way `test_task4_identity_wp_guard` drives one over an identity leaf, and
+/// asserts both properties hold: the leaf stays present+writable in parent
+/// AND child, and `page_ref_count` for the segment's frame is unchanged
+/// across both the fork and the child's teardown.
+fn test_shm_fork_disjoint_refcount() -> bool {
+    use crate::ipc::sysv_shm;
+    use crate::mm::vma::{VmSpace, VmArea, VmBacking, PROT_READ, PROT_WRITE, MAP_SHARED, mm_sem_for_cr3};
+    use crate::mm::vmm::{get_kernel_cr3, read_pte, PAGE_WRITABLE, PAGE_PRESENT};
+    use crate::mm::refcount::page_ref_count;
+
+    test_header!("SysV SHM attach survives fork() — disjoint-refcount + shared-write invariant");
+
+    // `shmat` requires the calling process to already have a `VmSpace`
+    // (`sysv_shm::pick_vaddr` returns 0 — ENOMEM — otherwise). Every prior
+    // test in the normal suite order happens to give the runner one, but
+    // this test must not depend on that incidental ordering: force one into
+    // existence the same way `test_task4_identity_wp_guard` does, via a
+    // throwaway anonymous mmap.
+    let vmspace_probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, 3 /*PROT_READ|WRITE*/, 0x22 /*MAP_PRIVATE|ANON*/, u64::MAX, 0);
+    if vmspace_probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, vmspace_probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+
+    let shmid = sysv_shm::shmget(sysv_shm::IPC_PRIVATE, 4096, sysv_shm::IPC_CREAT | 0o600);
+    if shmid < 0 {
+        test_fail!("shm_fork_disjoint_refcount", "shmget failed: {}", shmid);
+        return false;
+    }
+    let shmid = shmid as u32;
+
+    let va = sysv_shm::shmat(shmid, 0, 0);
+    if va <= 0 {
+        test_fail!("shm_fork_disjoint_refcount", "shmat failed: {}", va);
+        sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+        return false;
+    }
+    let va = va as u64;
+
+    let (phys_base, size) = match sysv_shm::segment_phys(shmid) {
+        Some(v) => v,
+        None => {
+            test_fail!("shm_fork_disjoint_refcount", "segment_phys lookup failed after shmat");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return false;
+        }
+    };
+
+    let kcr3 = get_kernel_cr3();
+    let before_rc = page_ref_count(phys_base);
+    let pte_before = read_pte(kcr3, va);
+    if pte_before & PAGE_PRESENT == 0 || pte_before & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "shmat mapping at {:#x} not present+writable pre-fork (pte={:#x})", va, pte_before);
+        sysv_shm::shmdt(va);
+        sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+        return false;
+    }
+
+    let sem = match mm_sem_for_cr3(kcr3) {
+        Some(s) => s,
+        None => {
+            test_fail!("shm_fork_disjoint_refcount", "no mm_sem registered for kernel_cr3");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return false;
+        }
+    };
+
+    // Drive a real clone_for_fork over exactly this Device VMA — mirroring
+    // how a real fork(2) sees it via the forking process's own vm_space.areas.
+    let mut vs = VmSpace::from_existing_cr3(kcr3, sem);
+    vs.areas.push(VmArea {
+        base: va,
+        length: size,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_SHARED,
+        backing: VmBacking::Device { phys_base },
+        name: "[shm]",
+    });
+
+    let child = match vs.clone_for_fork(kcr3) {
+        Some(c) => c,
+        None => {
+            drop(vs);
+            test_println!("  clone_for_fork(kernel_cr3) → None (OOM) — SKIP");
+            sysv_shm::shmdt(va);
+            sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+            return true; // OOM is orthogonal to the invariant under test
+        }
+    };
+
+    let pte_parent_after = read_pte(kcr3, va);
+    let pte_child_after  = read_pte(child.cr3, va);
+    let rc_after_fork = page_ref_count(phys_base);
+
+    crate::proc::free_vm_space(child);
+    let rc_after_teardown = page_ref_count(phys_base);
+    drop(vs);
+
+    let mut ok = true;
+    if pte_parent_after & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "parent SHM PTE lost PAGE_WRITABLE across fork (pte={:#x}) — MAP_SHARED broken",
+            pte_parent_after);
+        ok = false;
+    }
+    if pte_child_after & PAGE_PRESENT == 0 || pte_child_after & PAGE_WRITABLE == 0 {
+        test_fail!("shm_fork_disjoint_refcount",
+            "child SHM PTE not present+writable (pte={:#x}) — MAP_SHARED broken",
+            pte_child_after);
+        ok = false;
+    }
+    if rc_after_fork != before_rc {
+        test_fail!("shm_fork_disjoint_refcount",
+            "page_ref_count {} → {} across fork (expected unchanged — disjoint-refcount)",
+            before_rc, rc_after_fork);
+        ok = false;
+    }
+    if rc_after_teardown != before_rc {
+        test_fail!("shm_fork_disjoint_refcount",
+            "page_ref_count {} → {} after child teardown (expected unchanged)",
+            before_rc, rc_after_teardown);
+        ok = false;
+    }
+
+    sysv_shm::shmdt(va);
+    sysv_shm::shmctl(shmid, sysv_shm::IPC_RMID, 0);
+
+    if !ok { return false; }
+
+    test_println!("  fork: parent+child PTE stay present+writable, page_ref_count unchanged ({}) ✓", before_rc);
+    test_pass!("SysV SHM attach survives fork()");
+    true
 }
 
 // ── Test 79: fcntl FD_CLOEXEC + fsync + getsockopt ───────────────────────────

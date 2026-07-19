@@ -402,6 +402,26 @@ pub fn trampoline_phys() -> u64 {
 ///
 /// The page is mapped as **user + present + read-only** (no NX — must be
 /// executable).  Call this from `create_user_process` and `fork_process`.
+///
+/// ## Disjoint-refcount contract
+///
+/// This installs a raw PTE via `vmm::map_page_in` directly — it is
+/// intentionally **not** backed by a `VmArea` in the process's `vm_space`,
+/// and this call site never touches `mm::refcount::page_ref_count` for the
+/// single, permanent, never-freed physical page every process shares. The
+/// page is read-only and never written after `init_trampoline` fills it in,
+/// so it never takes a CoW write-fault regardless of its tracked refcount.
+///
+/// `VmSpace::clone_for_fork`'s raw PTE walk does still visit this leaf (it
+/// is present in the parent's page tables like any other) and, because
+/// `PAGE_WRITABLE` is already clear, its write-protect step is a harmless
+/// no-op; the walk currently has no VMA to consult here (unlike the SysV SHM
+/// case in `ipc::sysv_shm`) and so still takes a `page_ref_inc` on this
+/// shared frame at every `fork()` in the system with no matching dec (no
+/// VMA means the teardown walk never visits it either). This is a dormant,
+/// write-inert accounting drift, not a live aliasing bug — call it out here
+/// rather than special-casing `clone_for_fork` for a page that is never
+/// written and never freed.
 pub fn map_trampoline(cr3: u64) {
     let phys = trampoline_phys();
     if phys == 0 {

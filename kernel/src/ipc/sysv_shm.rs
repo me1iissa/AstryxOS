@@ -6,6 +6,37 @@
 //! process's VmSpace as a Device-backed VMA; `shmdt` removes that VMA.
 //!
 //! Maximum 64 concurrent segments (sufficient for Firefox/compositor use).
+//!
+//! ## Disjoint-refcount contract
+//!
+//! Segment frames are **deliberately never tracked** in the PMM's
+//! `mm::refcount::page_ref_count` table (the CoW-fork reference counter).
+//! Ownership of a segment's backing frames is instead tracked entirely by
+//! this module's own [`ShmSegment::refcount`] (attach count, bumped by
+//! `shmat`, dropped by `shmdt`) and released by `shmctl(IPC_RMID)` via
+//! `pmm::free_page` directly — never through `refcount::page_ref_dec`.
+//!
+//! This is intentional and load-bearing, not an oversight: a segment's
+//! `PROT_WRITE` mapping must stay identically shared with every attacher for
+//! the lifetime of the attachment (POSIX `shmat()` / `shmget()`), so it must
+//! never be silently write-protected and copy-on-write split the way an
+//! ordinary anonymous or file-backed page is. Three call sites cooperate to
+//! keep the "never touched" side of the contract consistent:
+//!
+//!   - `proc::free_process_memory` / `proc::free_vm_space` skip every
+//!     `VmBacking::Device` VMA in their teardown walk (no dec on exit/exec).
+//!   - `mm::vma::VmSpace::clone_for_fork` recognises a `Device`-backed VA
+//!     range and keeps the leaf PTE writable and unreferenced across `fork`,
+//!     instead of write-protecting it and taking a `page_ref_inc` like a
+//!     normal CoW leaf (which would both break the POSIX sharing semantics
+//!     and leak an un-decrementable reference, since the teardown walk above
+//!     never visits `Device` VMAs to pair it with a dec).
+//!   - This module never calls `page_ref_inc`/`page_ref_dec` itself.
+//!
+//! If any of the three ever starts touching `page_ref_count` for these
+//! frames without the other two following suit, the invariant breaks in one
+//! direction or the other (a leak, or a false-zero double-free); change them
+//! together.
 
 extern crate alloc;
 
@@ -161,6 +192,16 @@ pub fn shmat(shmid: u32, shmaddr: u64, _shmflg: i32) -> i64 {
     for i in 0..n_pages {
         let vaddr = map_vaddr + i * PAGE_SIZE;
         let phys  = phys_base + i * PAGE_SIZE;
+        // Disjoint-refcount invariant (see module doc comment): an SHM frame
+        // must never accumulate a tracked `page_ref_count`.  A nonzero count
+        // here means some other path started refcounting this frame despite
+        // the `Device`-VMA skips in teardown and `clone_for_fork` — those
+        // three sites must be revisited together, not just this assert.
+        debug_assert_eq!(
+            crate::mm::refcount::page_ref_count(phys), 0,
+            "[SHM] shmat: frame {:#x} has a tracked page_ref_count (disjoint-refcount invariant violated)",
+            phys
+        );
         crate::mm::vmm::map_page_in(
             get_cr3(pid),
             vaddr,
