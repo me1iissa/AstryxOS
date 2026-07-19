@@ -789,6 +789,21 @@ pub fn free_page(phys_addr: u64) {
         return;
     }
 
+    // DMA-in-flight deferred-free invariant.  A block driver that exposed this
+    // frame to a device (its physical address is programmed into a live
+    // descriptor) holds a DMA pin on it until the device retires the request.
+    // Per VIRTIO 1.2 §2.7.13.3 the device may read or write the buffer at any
+    // time until it returns the chain via the used ring (§2.7.14), so returning
+    // the frame to the allocator now would let it be repurposed under an
+    // in-flight device transfer — a DMA-buffer use-after-free.  Atomically
+    // record the free request against the pin; if the frame is pinned the free
+    // is DEFERRED (the last unpin returns it to the PMM) and we return here
+    // without touching the bitmap.  The check-and-mark is a single CAS so it
+    // cannot race the last unpin (see `dma_pin::mark_free_pending_if_pinned`).
+    if crate::mm::dma_pin::mark_free_pending_if_pinned(phys_addr) {
+        return;
+    }
+
     // Phase D (2026-05-20) — record the upstream unmap path in the per-phys
     // event ring AND the dedicated direct-addressed free-shadow BEFORE the
     // bitmap clear so that a concurrent fault-site dump always observes the

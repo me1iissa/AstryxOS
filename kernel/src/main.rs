@@ -152,6 +152,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 3: Memory management init...");
     mm::init(info);
     mm::refcount::init();
+    mm::dma_pin::init();
     serial_println!("[Aether] Phase 3: Memory management OK");
 
     // Phase 4: Initialize drivers

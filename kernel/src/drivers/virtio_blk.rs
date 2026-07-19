@@ -314,15 +314,29 @@ struct Completion {
     /// not yet retired in the used ring).  Per VIRTIO 1.2 §2.7.13.3 the device
     /// MAY access the descriptor chain — and the data buffer it points at — at
     /// any time until it returns the chain via the used ring (§2.7.14); recycling
-    /// the slot's descriptors or its data buffer before then is a use-after-free
-    /// from the device's perspective and corrupts the virtqueue (the device sees
-    /// a chain it never expected to be re-published and stops the queue).  A
-    /// quarantined slot stays `in_use` — so `acquire_slot` skips it and never
-    /// overwrites its descriptors — until [`drain_used_ring`] observes its
-    /// used-ring entry and reclaims it.  See the completion-stall autopsy:
-    /// abandoning device-owned chains is what let in-flight escape `MAX_INFLIGHT`
-    /// and wedged the device.
+    /// the slot's descriptors before then is a use-after-free from the device's
+    /// perspective and corrupts the virtqueue (the device sees a chain it never
+    /// expected to be re-published and stops the queue).  A quarantined slot
+    /// stays `in_use` — so `acquire_slot` skips it and never overwrites its
+    /// descriptors — until [`drain_used_ring`] observes its used-ring entry and
+    /// reclaims it.  See the completion-stall autopsy: abandoning device-owned
+    /// chains is what let in-flight escape `MAX_INFLIGHT` and wedged the device.
+    ///
+    /// Quarantining protects only the SLOT (its descriptors).  The DATA BUFFER
+    /// the middle descriptor points at is a caller frame that the caller's
+    /// error path is free to `pmm::free_page` the moment the request returns
+    /// `Err` — quarantine does NOT own that frame.  Its device-ownership is held
+    /// instead by a DMA pin (`dma_phys`/`dma_len` below); see [`submit_request`].
     quarantined: AtomicBool,
+    /// Base physical address of the DMA data buffer this slot pinned at submit,
+    /// or 0 when the slot has no pinned buffer (unallocated, flush, or already
+    /// released).  Read-and-cleared with an atomic swap by [`slot_unpin_dma`] so
+    /// the pin is released exactly once even if two reclaim paths observe the
+    /// slot.  See the DMA-pin contract in [`crate::mm::dma_pin`].
+    dma_phys: AtomicU64,
+    /// Byte length of the pinned DMA data buffer (spans `dma_phys ..
+    /// dma_phys+dma_len`); paired with `dma_phys`.
+    dma_len: AtomicU32,
 }
 
 impl Completion {
@@ -334,6 +348,8 @@ impl Completion {
             waiter_tid: AtomicU64::new(NO_WAITER),
             submit_ns: AtomicU64::new(0),
             quarantined: AtomicBool::new(false),
+            dma_phys: AtomicU64::new(0),
+            dma_len: AtomicU32::new(0),
         }
     }
 }
@@ -602,6 +618,11 @@ fn acquire_slot() -> Option<usize> {
             COMPLETIONS[i].status.store(0xFF, Ordering::Relaxed);
             COMPLETIONS[i].waiter_tid.store(NO_WAITER, Ordering::Release);
             COMPLETIONS[i].quarantined.store(false, Ordering::Release);
+            // No DMA buffer pinned yet; `submit_request` records the range it
+            // pins.  A freshly-acquired slot must start with an empty record so
+            // an early error return (before submit) unpins nothing.
+            COMPLETIONS[i].dma_phys.store(0, Ordering::Release);
+            COMPLETIONS[i].dma_len.store(0, Ordering::Release);
             return Some(i);
         }
     }
@@ -633,9 +654,43 @@ fn quarantined_count() -> usize {
 /// still in flight in the device is a use-after-free of the descriptor chain
 /// — use [`quarantine_slot`] for that case instead.
 fn release_slot(slot_idx: usize) {
+    // Release the DMA pin the submit took on this slot's data buffer BEFORE the
+    // slot is handed back: the device has retired the chain (the only callers
+    // are the retired-with-status paths), so the frame is no longer
+    // device-owned.  `release_slot` always runs in thread context (a waiter or
+    // the early boot poll fallback), where taking the PMM lock to complete a
+    // deferred free is safe.  See [`slot_unpin_dma`].
+    slot_unpin_dma(slot_idx, true);
     COMPLETIONS[slot_idx].waiter_tid.store(NO_WAITER, Ordering::Release);
     COMPLETIONS[slot_idx].quarantined.store(false, Ordering::Release);
     COMPLETIONS[slot_idx].in_use.store(false, Ordering::Release);
+}
+
+/// Release the DMA pin recorded on `slot_idx` (if any) and clear the record.
+///
+/// The pin was taken in [`submit_request`] when the data-buffer descriptor was
+/// exposed to the device.  It must be dropped only once the device has truly
+/// retired the request (a slot release on a status-carrying completion, a
+/// quarantine reclaim from the used ring, or a device reset that abandons all
+/// in-flight chains) — never on the submitter's timeout, when the device still
+/// owns the buffer.
+///
+/// `dma_phys` is read-and-cleared with a single atomic swap so the unpin is
+/// idempotent: whichever reclaim path observes a non-zero base performs the
+/// unpin, and any second observer sees 0 and does nothing.  `can_free_now`
+/// selects the deferred-free release context (see [`crate::mm::dma_pin::unpin`]):
+/// `true` in thread context (safe to take the PMM lock), `false` from the
+/// completion ISR.
+fn slot_unpin_dma(slot_idx: usize, can_free_now: bool) {
+    let base = COMPLETIONS[slot_idx].dma_phys.swap(0, Ordering::AcqRel);
+    if base == 0 {
+        return;
+    }
+    let len = COMPLETIONS[slot_idx].dma_len.swap(0, Ordering::AcqRel) as usize;
+    if len == 0 {
+        return;
+    }
+    crate::mm::dma_pin::unpin_range(base, len, can_free_now);
 }
 
 /// Mark a slot quarantined: the waiter is giving up (timeout) but the request
@@ -651,12 +706,19 @@ fn release_slot(slot_idx: usize) {
 /// reclaimed (its `in_use` cleared) by [`drain_used_ring`] when the device
 /// finally retires the chain.  Until then it counts against `MAX_INFLIGHT`,
 /// which is exactly the back-pressure that keeps in-flight bounded.
+///
+/// Quarantine deliberately does NOT touch the slot's DMA pin: the data buffer
+/// is STILL device-owned (that is the whole reason for quarantining), so its
+/// pin must stay held.  The caller's error path is free to `pmm::free_page` the
+/// buffer frame; the held pin defers that free until `drain_used_ring` reclaims
+/// the slot and calls [`slot_unpin_dma`].  Dropping the pin here would reopen
+/// the DMA-buffer use-after-free this pin exists to close.
 fn quarantine_slot(slot_idx: usize) {
     QUARANTINED_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
     COMPLETIONS[slot_idx].waiter_tid.store(NO_WAITER, Ordering::Release);
     COMPLETIONS[slot_idx].quarantined.store(true, Ordering::Release);
     // `in_use` is left set — the slot stays reserved until the device retires
-    // its chain and `drain_used_ring` reclaims it.
+    // its chain and `drain_used_ring` reclaims it.  The DMA pin stays held.
 }
 
 /// Test-only exercise of the slot-quarantine lifecycle invariant (the
@@ -735,6 +797,107 @@ pub fn test_quarantine_lifecycle() -> Result<(), &'static str> {
             release_slot(s);
         }
         None => return Err("no slot acquirable after reclaim"),
+    }
+    Ok(())
+}
+
+/// Test-only exercise of the DMA-pin lifecycle at the SLOT level: prove that a
+/// caller's `pmm::free_page` on a device-owned (quarantined) request buffer is
+/// DEFERRED by the pin and completed only when the slot is reclaimed, and that
+/// the multi-pin (8x-retry-same-phys) shape releases the frame only on the last
+/// reclaim.  Uses real `pmm` frames (allocated and returned by this test), so it
+/// verifies the `submit_request` → `free_page` → `drain_used_ring` reclaim
+/// integration end to end without any device I/O or late-completion simulation.
+///
+/// Returns `Err(&str)` naming the first violated invariant; on success the test
+/// leaves the PMM free-page count exactly as it found it.
+#[cfg(any(test, feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
+    use crate::mm::{dma_pin, pmm};
+
+    // Helper: record a pinned single-page buffer on a slot exactly as
+    // `submit_request` would (pin the frame, stamp the slot's DMA record).
+    fn arm_slot_pin(slot: usize, phys: u64) {
+        dma_pin::pin_range(phys, 0x1000);
+        COMPLETIONS[slot].dma_phys.store(phys, Ordering::Release);
+        COMPLETIONS[slot].dma_len.store(0x1000, Ordering::Release);
+    }
+
+    let free_before = pmm::free_page_count();
+
+    // ── Single-pin case ──────────────────────────────────────────────
+    let p = pmm::alloc_page().ok_or("alloc_page failed")?;
+    let slot = acquire_slot().ok_or("no free slot")?;
+    arm_slot_pin(slot, p);
+    // Submitter timed out: the request is still device-owned.  Quarantine it —
+    // the pin must stay held.
+    quarantine_slot(slot);
+    if !dma_pin::is_pinned(p) {
+        release_slot(slot);
+        return Err("frame not pinned after submit+quarantine");
+    }
+    // Caller's error path frees the buffer.  With the pin held this must NOT
+    // return the frame to the PMM (deferred).
+    let free_after_alloc = pmm::free_page_count();
+    pmm::free_page(p);
+    if pmm::free_page_count() != free_after_alloc {
+        // Frame was returned despite an in-flight (pinned) descriptor.
+        return Err("free_page returned a device-owned (pinned) frame — not deferred");
+    }
+    if !dma_pin::is_pinned(p) {
+        return Err("pin dropped by free_page (should only defer)");
+    }
+    // Device retires: `drain_used_ring` reclaims the quarantined slot and drops
+    // the pin, completing the deferred free.  Simulate that reclaim.
+    slot_unpin_dma(slot, true);
+    COMPLETIONS[slot].quarantined.store(false, Ordering::Release);
+    COMPLETIONS[slot].in_use.store(false, Ordering::Release);
+    if dma_pin::is_pinned(p) {
+        return Err("frame still pinned after reclaim");
+    }
+    if pmm::free_page_count() != free_after_alloc + 1 {
+        return Err("deferred free not completed on reclaim (frame leaked)");
+    }
+
+    // ── Multi-pin case (8x-retry-same-phys): two quarantined slots pin the
+    //    SAME frame; the free completes only after BOTH are reclaimed. ──
+    let q = pmm::alloc_page().ok_or("alloc_page (multi) failed")?;
+    let s1 = acquire_slot().ok_or("no free slot (multi #1)")?;
+    let s2 = acquire_slot().ok_or("no free slot (multi #2)")?;
+    arm_slot_pin(s1, q);
+    arm_slot_pin(s2, q);
+    quarantine_slot(s1);
+    quarantine_slot(s2);
+    if dma_pin::pin_count(q) != 2 {
+        release_slot(s1);
+        release_slot(s2);
+        return Err("multi-pin count != 2");
+    }
+    let free_after_q_alloc = pmm::free_page_count();
+    pmm::free_page(q); // caller frees once
+    // First reclaim: pin drops to 1, frame must NOT be freed yet.
+    slot_unpin_dma(s1, true);
+    COMPLETIONS[s1].quarantined.store(false, Ordering::Release);
+    COMPLETIONS[s1].in_use.store(false, Ordering::Release);
+    if pmm::free_page_count() != free_after_q_alloc {
+        release_slot(s2);
+        return Err("frame freed after only the first of two reclaims");
+    }
+    if !dma_pin::is_pinned(q) {
+        release_slot(s2);
+        return Err("frame unpinned after only the first reclaim");
+    }
+    // Second (last) reclaim: pin drops to 0, deferred free completes.
+    slot_unpin_dma(s2, true);
+    COMPLETIONS[s2].quarantined.store(false, Ordering::Release);
+    COMPLETIONS[s2].in_use.store(false, Ordering::Release);
+    if pmm::free_page_count() != free_after_q_alloc + 1 {
+        return Err("deferred free not completed after both reclaims");
+    }
+
+    // Net PMM accounting must balance: both frames allocated here are freed.
+    if pmm::free_page_count() != free_before {
+        return Err("PMM free-page count not restored (frame leaked or double-freed)");
     }
     Ok(())
 }
@@ -1148,8 +1311,11 @@ pub(crate) fn handle_irq() {
     } else { 0 };
 
     // 2. Walk the used ring and wake every completed slot's waiter.
+    //    `can_free = false`: this runs in hard-IRQ context, so a reclaimed
+    //    slot's due deferred free is posted to the lock-free deferred ring
+    //    rather than taking the PMM spinlock here (see `slot_unpin_dma`).
     let completed_any = if qs != 0 && vq_virt != 0 {
-        drain_used_ring(qs, vq_virt) > 0
+        drain_used_ring(qs, vq_virt, false) > 0
     } else {
         false
     };
@@ -1182,7 +1348,14 @@ pub(crate) fn handle_irq() {
 /// by exactly one caller.  This avoids the race where a stale read of
 /// a long-since-recycled ring slot would incorrectly flip a freshly-
 /// reused completion slot's `done` flag.
-fn drain_used_ring(qs: u16, vq_virt: u64) -> u32 {
+///
+/// `can_free` selects the deferred-free release context for a reclaimed
+/// quarantined slot's DMA pin (see [`slot_unpin_dma`]): thread-context callers
+/// (the waiter's poll fallback, the acquire loop) pass `true` so a due
+/// deferred free returns the frame to the PMM directly; [`handle_irq`] passes
+/// `false` so the free is posted to the lock-free deferred ring instead of
+/// taking the PMM spinlock from hard-IRQ context.
+fn drain_used_ring(qs: u16, vq_virt: u64, can_free: bool) -> u32 {
     // SAFETY: `vq_virt` is the kernel higher-half mapping of the
     // virtqueue PFN we passed to QUEUE_ADDRESS; valid until
     // `restart_device` republishes it (in which case IRQS_ARMED gating
@@ -1259,6 +1432,13 @@ fn drain_used_ring(qs: u16, vq_virt: u64) -> u32 {
             // consumed first.  Release ordering pairs with `acquire_slot`'s
             // AcqRel CAS so the next acquirer observes the cleared state.
             if COMPLETIONS[slot_idx].quarantined.load(Ordering::Acquire) {
+                // The device has retired this quarantined slot's chain, so its
+                // DMA data buffer is no longer device-owned: release the pin the
+                // submit took.  A caller that already freed the buffer on its
+                // error path had that free DEFERRED; dropping the last pin now
+                // completes it.  `can_free` routes the deferred free to a
+                // PMM-lock-safe context (see `drain_used_ring` / `slot_unpin_dma`).
+                slot_unpin_dma(slot_idx, can_free);
                 COMPLETIONS[slot_idx].quarantined.store(false, Ordering::Release);
                 COMPLETIONS[slot_idx].in_use.store(false, Ordering::Release);
                 RECLAIMED_QUARANTINES.fetch_add(1, Ordering::Relaxed);
@@ -1387,6 +1567,32 @@ fn submit_request(
     } else {
         data_virt
     };
+
+    // ── Pin the DMA data buffer for the request lifetime ────────────
+    //
+    // The descriptor programmed below exposes `data_phys` to the device.  Per
+    // VIRTIO 1.2 §2.7.13.3 the device may access that buffer at any time until
+    // it retires the chain via the used ring (§2.7.14) — including long after a
+    // stalled submitter has abandoned the request and its caller has freed the
+    // frame on an error path.  Take a DMA pin on every frame the buffer spans
+    // BEFORE exposing the descriptor: while pinned, `pmm::free_page` defers the
+    // frame's return to the allocator, so a caller's error-path free cannot
+    // hand a device-owned frame back to the pool (the DMA-buffer
+    // use-after-free).  The pin covers both directions: a device-writable
+    // (T_IN read) buffer is the corruption vector, and a device-readable
+    // (T_OUT write) buffer must equally not be reused under an in-flight device
+    // read (which would leak the new owner's bytes to disk).  The pin is
+    // released only when the device truly retires the request — `release_slot`
+    // (status-carrying completion), the `drain_used_ring` quarantine reclaim,
+    // or a device reset — via [`slot_unpin_dma`].  Record the pinned range on
+    // the slot so those paths know exactly what to unpin.
+    crate::mm::dma_pin::pin_range(data_phys, data_len);
+    // Publish the pair with `dma_phys` as the commit point: store the length
+    // first, then the base with Release ordering.  `slot_unpin_dma` reads the
+    // base with an Acquire swap as its guard, so observing a non-zero base
+    // guarantees the paired length is visible too.
+    COMPLETIONS[slot].dma_len.store(data_len as u32, Ordering::Release);
+    COMPLETIONS[slot].dma_phys.store(data_phys, Ordering::Release);
 
     // ── Fill Descriptor Table ───────────────────────────────────────
     // Descriptor offsets are 16 bytes each, indexed by the slot's
@@ -1534,9 +1740,10 @@ fn submit_request(
         }
         // Timed out before the device retired the chain — it is still device-owned
         // (published to the avail ring, no used-ring entry yet).  Quarantine, not
-        // release, so the descriptors and data buffer are not recycled under the
-        // device (VIRTIO 1.2 §2.7.13.3).  `drain_used_ring` reclaims the slot when
-        // the device finally retires it.
+        // release, so the descriptors are not recycled under the device (VIRTIO
+        // 1.2 §2.7.13.3); the data buffer stays held by its DMA pin.
+        // `drain_used_ring` reclaims the slot (and drops the pin) when the device
+        // finally retires it.
         timeout = timeout.checked_sub(1).ok_or_else(|| {
             quarantine_slot(slot);
             BlockError::IoError
@@ -1918,7 +2125,7 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
         // Walk the used ring ourselves — the completion IRQ does not deliver on
         // this host, so the waiter is the one that retires its own slot.
         if qs != 0 && vq_virt != 0 {
-            drain_used_ring(qs, vq_virt);
+            drain_used_ring(qs, vq_virt, true);
         }
         if COMPLETIONS[slot].done.load(Ordering::Acquire) {
             POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -1956,7 +2163,7 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
             // device retires a chain by appending it to the used ring; this
             // re-drain consumes exactly that.
             if qs != 0 && vq_virt != 0 {
-                drain_used_ring(qs, vq_virt);
+                drain_used_ring(qs, vq_virt, true);
             }
             if COMPLETIONS[slot].done.load(Ordering::Acquire) {
                 POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -1965,9 +2172,13 @@ fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
             crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
             // The request really is still owned by the device (it is in the avail
             // ring but the device has not retired it).  Quarantine — do NOT
-            // release — so its descriptor chain and data buffer are not recycled
-            // under the device.  Releasing here is the bug that let in-flight
-            // escape MAX_INFLIGHT and wedged the device (VIRTIO 1.2 §2.7.13.3).
+            // release — so its descriptor chain is not recycled under the device.
+            // Releasing the slot here is the bug that let in-flight escape
+            // MAX_INFLIGHT and wedged the device (VIRTIO 1.2 §2.7.13.3).  The
+            // DATA BUFFER is held separately by the DMA pin `submit_request`
+            // took (`slot_unpin_dma` is deliberately NOT called here): the frame
+            // stays device-owned and the caller's error-path `free_page` on it
+            // is deferred until `drain_used_ring` reclaims the slot.
             quarantine_slot(slot);
             return Err(BlockError::IoError);
         }
@@ -2032,7 +2243,7 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
             return Ok(yields);
         }
         if qs != 0 && vq_virt != 0 {
-            drain_used_ring(qs, vq_virt);
+            drain_used_ring(qs, vq_virt, true);
         }
         if COMPLETIONS[slot].done.load(Ordering::Acquire) {
             POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -2051,7 +2262,7 @@ fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
             // avoids needlessly quarantining (and leaking) a slot whose
             // completion has already landed.  VIRTIO 1.2 §2.7.13.
             if qs != 0 && vq_virt != 0 {
-                drain_used_ring(qs, vq_virt);
+                drain_used_ring(qs, vq_virt, true);
             }
             if COMPLETIONS[slot].done.load(Ordering::Acquire) {
                 POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -2278,7 +2489,7 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
             // Walk the used ring so quarantined slots get reclaimed promptly even
             // if no other waiter is currently draining it.
             if acq_qs != 0 && acq_vq != 0 {
-                drain_used_ring(acq_qs, acq_vq);
+                drain_used_ring(acq_qs, acq_vq, true);
             }
             let now = crate::arch::x86_64::irq::get_ticks();
             let cur_used = device_used_idx(acq_qs, acq_vq);
@@ -2562,7 +2773,17 @@ pub fn restart_device() -> bool {
     // `drain_used_ring` — the used ring restarts from 0.  Fully release all
     // slots here so they are reusable; doing this now (with no in-flight
     // requests after the reset) is safe.
+    //
+    // Releasing a slot must also drop the DMA pin `submit_request` took on its
+    // data buffer: after the reset the device owns nothing, so any buffer a
+    // stalled caller freed on its error path (a deferred free held by the pin)
+    // becomes due.  This is the bound on the "device never completes" leak — a
+    // quarantined slot whose completion never arrives is recovered here.  Unpin
+    // with `can_free = false` so no `pmm::free_page` runs while VIRTIO_BLK.lock()
+    // is held (avoids a lock-order coupling); the deferred ring is drained just
+    // after the guard is dropped, below.
     for i in 0..MAX_INFLIGHT {
+        slot_unpin_dma(i, false);
         COMPLETIONS[i].waiter_tid.store(NO_WAITER, Ordering::Release);
         COMPLETIONS[i].done.store(false, Ordering::Release);
         COMPLETIONS[i].status.store(0xFF, Ordering::Relaxed);
@@ -2581,6 +2802,9 @@ pub fn restart_device() -> bool {
     let blk_size_snap = dev.blk_size;
 
     drop(guard);
+    // Complete any deferred frees the slot-release loop posted while the device
+    // mutex was held (now in a PMM-lock-safe context, guard dropped).
+    crate::mm::dma_pin::drain_deferred();
     // Refresh the lock-free ISR snapshot — the device fields have not
     // changed but `IRQ_LAST_USED_IDX` must be reset to 0 to match the
     // post-reset device state.
