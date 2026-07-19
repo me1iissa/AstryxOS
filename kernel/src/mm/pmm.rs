@@ -653,6 +653,13 @@ unsafe fn alloc_page_locked() -> Option<u64> {
 /// once after giving the scheduler a brief window to reap the killed process.
 /// If the retry also fails, None is returned (or the caller may panic — that
 /// is preserved from whatever the caller was already doing).
+///
+/// Side effect: every call also drives [`crate::mm::dma_pin`]'s opportunistic
+/// deferred-free sweep (`dma_pin::drain_deferred_if_due`), tick-throttled to
+/// at most once per ~1 s system-wide. This is unrelated to the requested
+/// allocation itself — see that function's doc for why it lives here — and
+/// is cheap (a single relaxed load-and-compare) on every call where the
+/// interval isn't due.
 pub fn alloc_page() -> Option<u64> {
     // Opportunistic, tick-throttled sweep of the DMA-pin deferred-free ring
     // (~once/second) — closes the "device went idle right after an

@@ -921,6 +921,15 @@ pub fn test_slot_dma_pin_deferred_free() -> Result<(), &'static str> {
 pub fn test_slot_dma_pin_isr_deferred_free() -> Result<(), &'static str> {
     use crate::mm::{dma_pin, pmm};
 
+    // `pmm::alloc_page()` opportunistically calls `dma_pin::drain_deferred_if_due`
+    // on every allocation (see that function's doc), and its ~1s throttle is a
+    // single GLOBAL compare-exchange — any CPU's allocation can win it, not just
+    // this test's own calls. Consume this interval's throttle turn right here,
+    // before this test posts its own frame to the ring below, so no unrelated
+    // allocation elsewhere in the kernel can win the CAS and drain our frame out
+    // from under the "not yet drained" assertions later in this function.
+    dma_pin::drain_deferred_if_due();
+
     let free_before = pmm::free_page_count();
     let (_, deferred_freed_before, overflow_before) = dma_pin::stats();
 
