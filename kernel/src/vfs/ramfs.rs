@@ -115,6 +115,14 @@ impl FileSystemOps for RamFs {
         "ramfs"
     }
 
+    /// ramfs opts in to the VFS path cache (positive + negative dentries):
+    /// names are case-sensitive byte strings, every directory mutation flows
+    /// through the VFS helpers (which invalidate), and the namespace is not
+    /// externally synthesized.  See `FileSystemOps::lookup_cacheable`.
+    fn lookup_cacheable(&self) -> bool {
+        true
+    }
+
     fn is_in_memory(&self) -> bool {
         true
     }

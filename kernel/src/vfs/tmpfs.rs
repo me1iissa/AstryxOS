@@ -60,6 +60,13 @@ impl FileSystemOps for TmpFs {
         "tmpfs"
     }
 
+    /// tmpfs opts in to the VFS path cache (positive + negative dentries) on
+    /// the same grounds as the embedded ramfs it delegates to: case-sensitive
+    /// names, all mutations via the VFS helpers, no external synthesis.
+    fn lookup_cacheable(&self) -> bool {
+        true
+    }
+
     fn is_in_memory(&self) -> bool {
         // Backed entirely by the embedded RamFs — same dual-storage model.
         true

@@ -2545,6 +2545,14 @@ impl FileSystemOps for Ext2Fs {
         "ext2"
     }
 
+    /// ext2 opts in to the VFS path cache (positive + negative dentries):
+    /// names are case-sensitive byte strings, every directory mutation flows
+    /// through the VFS helpers (which invalidate), and the namespace is not
+    /// externally synthesized.  See `FileSystemOps::lookup_cacheable`.
+    fn lookup_cacheable(&self) -> bool {
+        true
+    }
+
     fn stat(&self, inode: u64) -> VfsResult<FileStat> {
         let ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
         let file_type = match ino.mode & S_IFMT {
