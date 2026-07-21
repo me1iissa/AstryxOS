@@ -5,7 +5,7 @@
 
 use crate::hal;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use super::apic::MAX_CPUS;
 
 // ── Watchdog counter (per-CPU) ──────────────────────────────────────────────
@@ -14,6 +14,24 @@ use super::apic::MAX_CPUS;
 
 static WATCHDOG_COUNTER: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Always-on per-CPU breadcrumb of the most recent idle-wait decision, so a
+/// future field wedge is decidable from a passive, host-side RAM read without
+/// a rebuild (0 = none yet, 1 = Halt, 2 = Spin).  One relaxed store per idle
+/// wait at each of the two check-then-halt sites (`sched_wait_quantum` and the
+/// reactor idle in `main.rs`); no `rdmsr`, no lock — observer-safe by design.
+static LAST_IDLE_DECISION: [AtomicU8; MAX_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_CPUS];
+
+/// Read the most recent idle-wait decision breadcrumb for `cpu`
+/// (0 = none, 1 = Halt, 2 = Spin).  Diagnostic-only; out-of-range → 0.
+pub fn last_idle_decision(cpu: usize) -> u8 {
+    if cpu < MAX_CPUS {
+        LAST_IDLE_DECISION[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
 /// 120 seconds at 100 Hz.  Must be generous enough for ATA PIO transfers
 /// in nested virtualisation (WSL2/KVM) which can stall a CPU for 60-90s
 /// while loading large shared libraries (e.g., Firefox's libxul.so = 194 MB).
@@ -408,6 +426,16 @@ pub fn cpu_timer_dead(cpu: usize) -> bool {
     }
 }
 
+/// Test-only: force `cpu`'s sticky dead-timer flag, so the idle-wait liveness
+/// test can simulate a wedged LAPIC deterministically (no real dead timer, no
+/// KVM dependency) and prove the spin arm advances the run queue off the TSC.
+#[cfg(feature = "test-mode")]
+pub fn test_set_cpu_timer_dead(cpu: usize, dead: bool) {
+    if cpu < super::apic::MAX_CPUS {
+        CPU_TIMER_DEAD[cpu].store(dead, Ordering::Relaxed);
+    }
+}
+
 /// Count of per-CPU LAPIC re-arms triggered by [`cpu_timer_live`] detecting a
 /// locally-wedged timer.  Diagnostic-only; a non-zero value on the BSP under
 /// SMP is the signature of the dead-CPU0-LAPIC self-heal firing.
@@ -634,6 +662,122 @@ pub fn cpu_timer_live(window_ticks: u64) -> bool {
     }
 }
 
+/// Outcome of the idle-wait decision (see [`idle_bare_hlt_ok`] /
+/// [`sched_wait_decision`]): either halt (the LAPIC timer is a trustworthy sole
+/// wake) or spin on the TSC clock (a bare `hlt` would risk an un-wakeable trap).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdleAction {
+    Halt,
+    Spin,
+}
+
+/// Should an idle wait enter a bare `hlt`, or must it spin on the TSC clock?
+///
+/// Bare `hlt` is only safe when the LAPIC timer is a trustworthy sole wake.  On
+/// a hypervisor (or any test/FF build, where CPUID.01H:ECX[31] may be hidden
+/// under nested virtualisation) with exactly ONE online CPU, the LAPIC timer
+/// can stop *delivering* mid-halt with no backstop — under KVM oversubscription
+/// a stuck in-service timer vector raises PPR and blocks the pending re-armed
+/// timer and device IRQs from ever waking the halted CPU (Intel SDM Vol. 3A
+/// §10.8.3.1 / §10.8.4).  With no sibling to send a `TIMER_WAKE` IPI (0xF3),
+/// nothing ends the halt, so we must NOT halt — we spin on `get_ticks()` (a TSC
+/// floor, Intel SDM Vol. 3B §17.17 invariant TSC), which does not depend on
+/// interrupt *delivery* at all.  SMP keeps halting: a wedged CPU is woken by the
+/// sibling `TIMER_WAKE` IPI.  Bare metal keeps halting: no hypervisor injection
+/// suppression, idle power preserved.
+///
+/// Pure, total, hardware-free — the unit-testable core of the decision.
+pub fn idle_bare_hlt_ok(timer_live: bool, cpus: u32, force_spin_uni: bool) -> bool {
+    timer_live && !(cpus == 1 && force_spin_uni)
+}
+
+/// Test-only overrides for the three idle-wait decision inputs, so
+/// [`sched_wait_decision`] can be exercised with pinned `(live, cpus, force)`
+/// without real hardware.  `LIVE`/`FORCE` are tri-state (0 = use the live
+/// value, 1 = force `false`, 2 = force `true`); `CPUS` is 0 = real
+/// [`super::apic::cpu_count`], else the forced count.  Absent in production
+/// builds — the decision reads the real inputs with zero overhead.
+#[cfg(feature = "test-mode")]
+pub(crate) mod idle_decision_test {
+    use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+    pub static LIVE: AtomicU8 = AtomicU8::new(0);
+    pub static FORCE: AtomicU8 = AtomicU8::new(0);
+    pub static CPUS: AtomicU32 = AtomicU32::new(0);
+    fn tristate(v: Option<bool>) -> u8 {
+        match v { None => 0, Some(false) => 1, Some(true) => 2 }
+    }
+    /// Pin the decision inputs; `None` on `live`/`force` means "use the live
+    /// value", `None`/`0` on `cpus` means "use the real count".
+    pub fn set(live: Option<bool>, cpus: Option<u32>, force: Option<bool>) {
+        LIVE.store(tristate(live), Ordering::Relaxed);
+        FORCE.store(tristate(force), Ordering::Relaxed);
+        CPUS.store(cpus.unwrap_or(0), Ordering::Relaxed);
+    }
+    /// Restore all three inputs to their real hardware/build values.
+    pub fn clear() {
+        LIVE.store(0, Ordering::Relaxed);
+        FORCE.store(0, Ordering::Relaxed);
+        CPUS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The `timer_live` input to the idle decision — real `cpu_timer_live(10)`,
+/// with a test-only override.
+#[inline]
+fn idle_live_input() -> bool {
+    #[cfg(feature = "test-mode")]
+    match idle_decision_test::LIVE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    cpu_timer_live(10)
+}
+
+/// The `cpus` input to the idle decision — real online count, with a test-only
+/// override.
+#[inline]
+fn idle_cpus_input() -> u32 {
+    #[cfg(feature = "test-mode")]
+    {
+        let c = idle_decision_test::CPUS.load(Ordering::Relaxed);
+        if c != 0 {
+            return c;
+        }
+    }
+    super::apic::cpu_count()
+}
+
+/// Whether the idle path must force a spin on a uniprocessor rather than halt.
+///
+/// Test/FF builds always force it (immune to a hidden CPUID.01H:ECX[31] under
+/// nested KVM/WSL2); real single-vCPU VMs pick it up at runtime from the cached
+/// hypervisor-present flag (Intel SDM Vol. 2A CPUID, AMD APM Vol. 3).  Bare
+/// metal returns false, so bare-metal uniprocessors keep halting at idle.
+#[inline]
+pub(crate) fn force_spin_uni() -> bool {
+    #[cfg(feature = "test-mode")]
+    match idle_decision_test::FORCE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    cfg!(any(feature = "test-mode", feature = "firefox-test-core"))
+        || super::apic::hypervisor_present()
+}
+
+/// The idle-wait decision actually executed by [`sched_wait_quantum`]: reads the
+/// live inputs (test-overridable) and maps them onto [`idle_bare_hlt_ok`].  The
+/// `asm` arm is chosen solely by this return, so a unit test of this function
+/// tests the exact branch the scheduler runs.
+pub(crate) fn sched_wait_decision() -> IdleAction {
+    if idle_bare_hlt_ok(idle_live_input(), idle_cpus_input(), force_spin_uni()) {
+        IdleAction::Halt
+    } else {
+        IdleAction::Spin
+    }
+}
+
 /// Idle-wait one quantum from a scheduler wait-path: sleep until the next wake,
 /// but never sleep into a dead-timer trap.
 ///
@@ -646,29 +790,60 @@ pub fn cpu_timer_live(window_ticks: u64) -> bool {
 /// effectively never — the CPU drops out of scheduling entirely (the
 /// "de-facto single core" failure mode).
 ///
-/// This helper makes the wait timer-fault-tolerant:
-///   * **Timer live** → `sti; hlt; cli` as before (cheap; the timer wakes us).
-///   * **Timer wedged** → [`cpu_timer_live`] has already re-armed the local
-///     LAPIC; drive a software scheduler tick from the TSC and spin briefly
+/// This helper makes the wait timer-fault-tolerant, deciding via
+/// [`sched_wait_decision`]:
+///   * **Halt** → `sti; hlt; cli` as before (cheap; the timer wakes us).  Chosen
+///     when the local timer is live AND (SMP, or bare-metal uniprocessor) — a
+///     wedged SMP CPU is backstopped by the sibling `TIMER_WAKE` IPI (0xF3).
+///   * **Spin** → drive a software scheduler tick from the TSC and spin briefly
 ///     (`sti; pause; cli`) WITHOUT halting, so the CPU re-enters the picker on
 ///     its own clock and any peer that becomes Ready is picked up promptly.
+///     Chosen when the local timer is wedged (as before) OR on a
+///     hypervisor/test uniprocessor, where a mid-halt LAPIC delivery failure has
+///     no backstop (see [`idle_bare_hlt_ok`]).
 ///
 /// The `sti` window in both arms lets a pending IRQ/IPI (including a TLB
 /// shootdown IPI, #643, or a future reschedule IPI, #648) land before the CPU
 /// blocks/spins, so this composes with the cross-CPU IPI paths unchanged.
 #[inline]
 pub fn sched_wait_quantum() {
-    if cpu_timer_live(10) {
-        // Healthy local timer: halt until the next tick (or any wake).  The
-        // STI shadow guarantees `hlt` executes before any pending interrupt,
-        // so this is race-free.
-        unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
-    } else {
-        // Local timer wedged (already re-armed by cpu_timer_live).  Keep the
-        // run queue moving on the TSC clock and spin instead of halting.
-        crate::sched::timer_tick_schedule();
-        unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
+    let cpu = super::apic::cpu_index();
+    match sched_wait_decision() {
+        IdleAction::Halt => {
+            if cpu < MAX_CPUS {
+                LAST_IDLE_DECISION[cpu].store(1, Ordering::Relaxed);
+            }
+            // Healthy local timer: halt until the next tick (or any wake).  The
+            // STI shadow guarantees `hlt` executes before any pending interrupt,
+            // so this is race-free.
+            unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
+        }
+        IdleAction::Spin => {
+            if cpu < MAX_CPUS {
+                LAST_IDLE_DECISION[cpu].store(2, Ordering::Relaxed);
+            }
+            // Local timer wedged, or a hypervisor/test uniprocessor with no
+            // halt backstop.  Keep the run queue moving on the TSC clock and
+            // spin instead of halting.
+            crate::sched::timer_tick_schedule();
+            unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
+        }
     }
+}
+
+/// Reactor-idle variant of the idle-halt decision (BSP poll loop, `main.rs`):
+/// the caller has already computed timer health via [`idle_tick`], so this
+/// applies the same [`idle_bare_hlt_ok`] predicate + `force_spin_uni` gate,
+/// records the `LAST_IDLE_DECISION` breadcrumb, and returns `true` if the
+/// caller may `hlt`, `false` if it must spin.  Routes the second identical
+/// check-then-halt TOCTOU through one shared predicate.
+pub fn reactor_idle_may_halt(timer_ok: bool) -> bool {
+    let halt = idle_bare_hlt_ok(timer_ok, super::apic::cpu_count(), force_spin_uni());
+    let cpu = super::apic::cpu_index();
+    if cpu < MAX_CPUS {
+        LAST_IDLE_DECISION[cpu].store(if halt { 1 } else { 2 }, Ordering::Relaxed);
+    }
+    halt
 }
 
 /// Cooperative idle step for the BSP polling/soak loop.

@@ -119,9 +119,18 @@ static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 /// when arming their first deadline.  0 before calibration.
 static LAPIC_TSC_DEADLINE_PERIOD: AtomicU64 = AtomicU64::new(0);
 
-/// True iff the CPU advertises TSC-deadline timer support
-/// (CPUID.01H:ECX[bit 24]).  Intel SDM Vol. 3A §11.5.4.1.
-fn cpuid_has_tsc_deadline() -> bool {
+/// Cached "running under a hypervisor" flag, decided once at BSP init from
+/// CPUID.01H:ECX[bit 31] (see [`hypervisor_present`]).  Cached in an AtomicBool
+/// exactly like [`TSC_DEADLINE_MODE`] so the idle-halt decision path reads it
+/// with no CPUID (a CPUID under some VMMs is an intercepted VM-exit).
+static HYPERVISOR_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// Read CPUID.01H:ECX once.  Two conventional feature bits live in this leaf:
+/// bit 24 = TSC-deadline timer (Intel SDM Vol. 3A §11.5.4.1); bit 31 =
+/// "hypervisor present" — reserved-0 on physical CPUs, set by mainstream VMMs
+/// (Intel SDM Vol. 2A CPUID, AMD APM Vol. 3).  A single CPUID feeds both
+/// probes so the (potentially intercepted) instruction runs once at init.
+fn cpuid_01h_ecx() -> u32 {
     let ecx: u32;
     // RBX is reserved by the compiler (PIC base); save/restore around CPUID.
     unsafe {
@@ -135,7 +144,29 @@ fn cpuid_has_tsc_deadline() -> bool {
             options(nostack),
         );
     }
-    (ecx & (1 << 24)) != 0
+    ecx
+}
+
+/// True iff the CPU advertises TSC-deadline timer support
+/// (CPUID.01H:ECX[bit 24]).  Intel SDM Vol. 3A §11.5.4.1.
+fn cpuid_has_tsc_deadline() -> bool {
+    (cpuid_01h_ecx() & (1 << 24)) != 0
+}
+
+/// True iff CPUID.01H:ECX[bit 31] — the conventional "hypervisor present" flag
+/// — is set.  Reserved-0 on physical CPUs; set by mainstream VMMs (KVM,
+/// Hyper-V, VMware, Xen).  Intel SDM Vol. 2A (CPUID), AMD APM Vol. 3.  Because
+/// it is a convention (not architecturally guaranteed, and can be hidden under
+/// nested virtualisation), callers that must be robust OR it with a build-time
+/// signal — see `irq::force_spin_uni`.
+fn cpuid_hypervisor_present() -> bool {
+    (cpuid_01h_ecx() & (1u32 << 31)) != 0
+}
+
+/// Cached "running under a hypervisor" flag (CPUID.01H:ECX[31]), decided once
+/// at BSP init.  Read on the idle-halt decision path with no CPUID.
+pub fn hypervisor_present() -> bool {
+    HYPERVISOR_PRESENT.load(Ordering::Acquire)
 }
 
 /// Whether the LAPIC timer is in TSC-deadline mode for this boot.
@@ -289,6 +320,12 @@ pub fn init() {
     // TCG baseline) falls back to periodic.
     let use_deadline = cpuid_has_tsc_deadline();
     TSC_DEADLINE_MODE.store(use_deadline, Ordering::Release);
+
+    // Cache the "hypervisor present" flag once, on the BSP, next to the timer-
+    // mode decision (both are CPUID.01H:ECX bits).  The idle-halt decision path
+    // (`irq::force_spin_uni`) reads this cached value with no CPUID, so a
+    // single-vCPU VM refuses the bare `hlt` at idle and self-clocks on the TSC.
+    HYPERVISOR_PRESENT.store(cpuid_hypervisor_present(), Ordering::Release);
 
     // Publish the calibrated period for APs to copy (see `ap_rust_entry`).
     // Both representations are published: the periodic initial-count and the
