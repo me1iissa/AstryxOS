@@ -25,17 +25,18 @@
 //! dispatch order, same error propagation, same mount-crossing and symlink
 //! semantics, same no-progress deadline).
 //!
-//! # Correctness: invalidation rules
+//! # Correctness: invalidation rules (bracketed)
 //!
 //! A stale **negative** entry makes a newly created file invisible
 //! (`stat(2)` keeps returning ENOENT after a successful `creat(2)` — a
 //! direct POSIX violation and an instant sqlite breaker); a stale
-//! **positive** entry resurrects an unlinked name.  Every VFS operation
-//! that can change a `(directory, name) → object` binding therefore
-//! invalidates the affected key(s) **after** the concrete-FS mutation
-//! completes:
+//! **positive** entry resurrects an unlinked name — and, worst case, under
+//! inode-number reuse resolves to a *different* file's data.  Every VFS
+//! operation that can change a `(directory, name) → object` binding
+//! therefore **brackets** the concrete-FS mutation: it invalidates the
+//! affected key(s) **before** the mutation AND again **after** it:
 //!
-//! | Operation (vfs/mod.rs helper)     | Invalidated key(s)                  |
+//! | Operation (vfs/mod.rs helper)     | Bracketed key(s)                    |
 //! |-----------------------------------|-------------------------------------|
 //! | `create_file` / `open(O_CREAT)`   | (mount, parent, name)               |
 //! | `mkdir`                           | (mount, parent, name)               |
@@ -44,13 +45,42 @@
 //! | `rename`                          | BOTH (mount, old_parent, old_name)  |
 //! |                                   | AND  (mount, new_parent, new_name)  |
 //! | `symlink`                         | (mount, parent, name)               |
-//! | `link`                            | (mount, parent, name)               |
-//! | mount-table change (mount/umount) | full flush (mount indices shift on  |
-//! |                                   | umount; new mounts shadow paths)    |
+//! | `link`                            | **NOT CURRENTLY WIRED** (see below) |
+//! | mount-table change (mount/umount) | full flush before + after (mount    |
+//! |                                   | indices shift on umount; new mounts |
+//! |                                   | shadow paths)                       |
 //!
-//! Invalidation runs *after* the FS mutation so a racing reader can never
-//! observe the old cached binding once the mutating call has returned to
-//! its caller (linearizability at the syscall boundary).
+//! **`link` / `linkat` are not wired in this tree** — syscalls 86/265 return
+//! ENOSYS and there is no `vfs::link` helper, so `FileSystemOps::link`
+//! (implemented by ext2/ramfs) is reachable only from an in-kernel unit test,
+//! never from a resolvable namespace path, and can stale no entry today.  A
+//! future `vfs::link` + syscall wiring MUST bracket-invalidate
+//! `(mount, new_parent, new_name)` exactly as `symlink` does.
+//!
+//! ## Why bracket (read-vs-mutate), not just post-invalidate
+//!
+//! A post-only invalidate leaves a window between the FS mutation landing and
+//! the invalidate executing in which a *concurrent, unsynchronized* reader on
+//! another CPU could hit the still-warm stale entry on the lock-free hit path
+//! (which consults no generation).  The bracket closes it as tightly as a
+//! lock-free dispatch allows:
+//!
+//! * the **pre**-invalidate removes the warm entry — so no reader can
+//!   short-circuit on the stale binding during the mutation — and bumps the
+//!   generation, so a reader that snapshotted before the bracket has its stale
+//!   re-insert dropped by the guard below;
+//! * the **post**-invalidate sweeps any entry a mid-window reader re-derived
+//!   from pre-mutation FS state.
+//!
+//! **Guarantee:** once the mutating call returns to its caller, no stale entry
+//! for the affected key survives, so any reader causally ordered after the
+//! mutating syscall observes the new binding.  A *genuinely concurrent*
+//! unsynchronized reader may still observe a transient pre-mutation outcome
+//! during the bracket window — but POSIX does not order such a read against the
+//! concurrent mutation, so this is a permitted race, not a stale-state bug.
+//! (Holding a lock across the FS dispatch would eliminate even the transient,
+//! but is deliberately avoided — the #82/#476 same-thread lock-recursion /
+//! deadlock class.)
 //!
 //! # Correctness: the insert/mutate race (SMP)
 //!

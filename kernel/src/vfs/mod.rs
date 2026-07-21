@@ -548,9 +548,16 @@ pub trait FileSystemOps: Send + Sync {
     /// Opt-in, default `false`.  `true` is only safe when ALL hold:
     ///
     /// 1. Every directory mutation (create / unlink / rmdir / rename /
-    ///    symlink / link) flows through the VFS helpers in this module,
-    ///    which invalidate the affected cache keys.  A filesystem whose
-    ///    namespace changes through any other channel must stay `false`.
+    ///    symlink) flows through the VFS helpers in this module, which
+    ///    bracket-invalidate the affected cache keys (before AND after the
+    ///    FS mutation).  A filesystem whose namespace changes through any
+    ///    other channel must stay `false`.
+    ///    NOTE: `link` / `linkat` are NOT CURRENTLY WIRED (ENOSYS; no
+    ///    `vfs::link` helper exists) — `FileSystemOps::link` is reachable
+    ///    only from an in-kernel unit test, never from a resolvable
+    ///    namespace path, so it stales no cache entry today.  A future
+    ///    `vfs::link` + syscall wiring MUST bracket-invalidate
+    ///    `(mount, new_parent, new_name)` exactly as `symlink` does.
     /// 2. Name lookup is case-sensitive byte-string comparison.  On a
     ///    case-insensitive filesystem (FAT32, NTFS) differently-cased
     ///    queries alias one directory entry, and exact-string invalidation
@@ -1014,6 +1021,12 @@ pub fn mount(path: &str, fs: Box<dyn FileSystemOps>, root_inode: u64) {
     // Ensure mount point directory exists in parent filesystem.
     let _ = mkdir(path);
 
+    // Bracket the mount-table mutation with a flush before AND after (see the
+    // path_cache invalidation contract): the pre-flush removes any entry a
+    // concurrent resolver could hit under the soon-to-be-shadowed path, and
+    // bumps the generation so a stale re-insert is dropped; the post-flush
+    // sweeps anything a mid-window resolver re-inserted.
+    path_cache::flush();
     MOUNTS.lock().push(Mount {
         path: String::from(path),
         fs: Arc::from(fs),
@@ -1930,9 +1943,16 @@ fn split_parent_name(path: &str) -> (&str, &str) {
 pub fn create_file(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    // Bracket the FS mutation (pre + post invalidate); see the "bracketed
+    // invalidation" contract in path_cache. The pre-invalidate removes any
+    // warm entry so a concurrent reader cannot short-circuit on the stale
+    // binding (the hit path consults no generation) and bumps the generation
+    // so a reader that snapshotted earlier has its stale re-insert dropped.
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     fs.create_file(parent_inode, &name)?;
-    // The name now exists: drop any cached (negative) lookup outcome so the
-    // next resolve observes the new file (path_cache invalidation contract).
+    // The name now exists: post-invalidate sweeps any entry a mid-window
+    // reader re-derived from pre-mutation FS state, so once this call returns
+    // no stale entry for the key survives (path_cache invalidation contract).
     path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_CREATE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
@@ -1943,11 +1963,13 @@ pub fn create_file(path: &str) -> VfsResult<()> {
 /// Create a directory.
 pub fn mkdir(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
+    // Pre-invalidate (bracket the mutation — see the create_file bracket note).
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     {
         let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
         fs.create_dir(parent_inode, &name)?;
     }
-    // The name now exists: drop any cached (negative) lookup outcome.
+    // Post-invalidate: no stale entry for the key survives once this returns.
     path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_CREATE|IN_ISDIR on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
@@ -1980,6 +2002,11 @@ pub fn remove(path: &str) -> VfsResult<()> {
         }))
     };
 
+    // Pre-invalidate (bracket the mutation — see the create_file bracket note).
+    // Critical here: a stale positive surviving an unlink could resolve under
+    // inode-number reuse to a *different* file's data, so the warm entry must
+    // be gone before the directory entry is unlinked, not only after.
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     if is_open {
         // Deferred deletion: unlink directory entry, keep inode until last close.
         fs.unlink_entry(parent_inode, &name)?;
@@ -1988,8 +2015,8 @@ pub fn remove(path: &str) -> VfsResult<()> {
         fs.remove(parent_inode, &name)?;
     }
     // The name is gone (immediately in both branches — deferred deletion only
-    // keeps the *inode* alive; the directory entry is already unlinked): drop
-    // any cached positive lookup outcome so the next resolve returns ENOENT.
+    // keeps the *inode* alive; the directory entry is already unlinked):
+    // post-invalidate so no stale positive for the key survives this return.
     path_cache::invalidate(mount_idx, parent_inode, &name);
     // Fire IN_DELETE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
@@ -2136,13 +2163,19 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
     if old_mount != new_mount {
         return Err(VfsError::Unsupported); // cross-mount rename not supported
     }
+    // Pre-invalidate BOTH names (bracket the mutation — see the create_file
+    // bracket note); rename changes both bindings, so both warm entries must
+    // be gone before the FS rename, not only after.
+    path_cache::invalidate(old_mount, old_parent, &old_name);
+    path_cache::invalidate(new_mount, new_parent, &new_name);
     {
         let fs = fs_at(old_mount).ok_or(VfsError::NotFound)?.0;
         fs.rename(old_parent, &old_name, new_parent, &new_name)?;
     }
     // Per rename(2) BOTH names changed binding: the old name no longer exists
     // (drop its positive entry) and the new name now exists, possibly
-    // replacing an earlier ENOENT probe (drop its negative entry).
+    // replacing an earlier ENOENT probe (drop its negative entry).  Post-
+    // invalidate both so no stale entry for either key survives this return.
     path_cache::invalidate(old_mount, old_parent, &old_name);
     path_cache::invalidate(new_mount, new_parent, &new_name);
     // Fire IN_MOVED_FROM / IN_MOVED_TO with a shared non-zero cookie.
@@ -2160,8 +2193,10 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
 pub fn symlink(link_path: &str, target: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(link_path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    // Pre-invalidate (bracket the mutation — see the create_file bracket note).
+    path_cache::invalidate(mount_idx, parent_inode, &name);
     fs.symlink(parent_inode, &name, target)?;
-    // The link name now exists: drop any cached (negative) lookup outcome.
+    // The link name now exists: post-invalidate so no stale negative survives.
     path_cache::invalidate(mount_idx, parent_inode, &name);
     Ok(())
 }
@@ -2501,11 +2536,15 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
             // Create the file using the (possibly redirected) lookup path.
             let (m, parent, name) = resolve_parent(lookup_path)?;
             let fs = fs_at(m).ok_or(VfsError::NotFound)?.0;
+            // Pre-invalidate (bracket the mutation — see the create_file bracket
+            // note): the failed resolve above cached a negative entry for this
+            // name; drop it before the create so a concurrent reader cannot
+            // short-circuit on the stale ENOENT during the create window.
+            path_cache::invalidate(m, parent, &name);
             let ino = fs.create_file(parent, &name)?;
-            // The failed resolve above may have cached a negative entry for
-            // this name; the create materialized it — invalidate so the next
+            // The create materialized the name — post-invalidate so the next
             // resolve (the stat-ENOENT → open(O_CREAT) → stat lifecycle) sees
-            // the file, not a stale ENOENT.
+            // the file, not a stale ENOENT, and no stale entry survives return.
             path_cache::invalidate(m, parent, &name);
             (m, ino, true)
         }
@@ -3589,6 +3628,10 @@ pub fn sys_mount(
             // Each mount gets its own fresh filesystem instance so that
             // mount("tmpfs","/a","tmpfs",0) and mount("tmpfs","/b","tmpfs",0)
             // have completely independent directory trees.
+            // Pre-flush: bracket the mount-table mutation (see the mount()
+            // bracket note) so a concurrent resolver cannot hit a cached entry
+            // under the soon-to-be-shadowed path during the push window.
+            path_cache::flush();
             if fstype == "tmpfs" {
                 let concrete = if rdonly {
                     tmpfs::TmpFs::new_rdonly()
@@ -3622,6 +3665,9 @@ pub fn sys_mount(
             let proc_fs = procfs::ProcFs::new();
             let proc_root = proc_fs.root_inode();
             let _ = mkdir(target); // ensure dir exists
+            // Pre-flush: bracket the mount-table mutation (see the mount()
+            // bracket note).
+            path_cache::flush();
             MOUNTS.lock().push(Mount {
                 path: String::from(target),
                 fs: Arc::new(proc_fs),
@@ -3696,6 +3742,15 @@ pub fn sys_umount(target: &str, _flags: u64) -> i64 {
             return -16; // EBUSY
         }
     }
+
+    // Pre-flush BEFORE the `MOUNTS` mutation (bracket — see the mount() bracket
+    // note).  This is done OUTSIDE the `MOUNTS` lock to keep the path-cache lock
+    // a leaf (never nested under `MOUNTS`).  It closes the shifted-index window:
+    // once `Vec::remove` shifts the indices, a resolver on the cache-HIT path
+    // never re-validates the mount index (the hit needs no FS handle), so a
+    // surviving entry could resolve against a *different* filesystem's index.
+    // Pre-flush removes every such entry; the post-flush sweeps re-inserts.
+    path_cache::flush();
 
     // Remove the mount.  The dropped Arc<dyn FileSystemOps> frees the FS
     // memory once the last outstanding reference (e.g. an in-flight FS

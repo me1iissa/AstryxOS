@@ -590,6 +590,8 @@ pub fn run() -> ! {
     if test_vfs_path_cache_rename_unlink() { passed += 1; }
     total += 1;
     if test_vfs_path_cache_storm() { passed += 1; }
+    total += 1;
+    if test_vfs_path_cache_smp_race() { passed += 1; }
 
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
@@ -9868,6 +9870,179 @@ fn test_vfs_path_cache_storm() -> bool {
     }
 
     test_pass!("VFS-PATHCACHE-STORM");
+    true
+}
+
+/// SMP-hazard regression for the bracketed invalidation (deterministic
+/// simulation, matching this codebase's SMP=1-friendly convention — cf.
+/// `test_ext2_smp_alloc_race`, which likewise simulates its race sequentially).
+///
+/// Hammers a working set of names with interleaved create / unlink / rename
+/// cycles and resolves, tracking a shadow model of ground truth, and asserts
+/// the path cache never leaves a PERMANENT stale entry after quiesce: no
+/// unlinked name resolving (stale positive), no created name reporting ENOENT
+/// (stale negative), and — the killer case the bracket exists for — no old
+/// name resolving under inode-number reuse to a *different* file after unlink.
+///
+/// Note on scope: sequentially, the `post`-invalidate alone already satisfies
+/// every assertion here, so this test guards the permanent-coherence invariant
+/// (and catches any missing/removed invalidation site). The `pre`-invalidate
+/// additionally narrows the transient window seen only by a *genuinely
+/// concurrent* reader on another CPU — not observable without true SMP
+/// concurrency, which this in-kernel test harness does not provide — so it is
+/// verified by construction (the bracket in each `vfs::` helper) and by the
+/// analytical argument in the `path_cache` module docs, not by this test.
+fn test_vfs_path_cache_smp_race() -> bool {
+    test_header!("VFS-PATHCACHE-SMP-RACE: mutate-vs-resolve hammer leaves no permanent stale entry");
+    use crate::vfs::{self, VfsError};
+
+    let _ = vfs::mkdir("/tmp/pc_smp");
+
+    // Shadow model: which names currently exist. After every mutation the
+    // whole working set is resolved and checked against the model — a mismatch
+    // is a stale cache entry.
+    const NAMES: usize = 8;
+    let mut exists = [false; NAMES];
+
+    const ITERS: u32 = 200;
+    let mut rng: u32 = 0x1234_5678; // xorshift32, deterministic
+    for _ in 0..ITERS {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+
+        let idx = (rng as usize) % NAMES;
+        let name = alloc::format!("/tmp/pc_smp/n{}", idx);
+
+        // Interleave a resolve of a (possibly different) name before mutating,
+        // warming entries across the mutation.
+        let probe_idx = ((rng >> 8) as usize) % NAMES;
+        let probe = alloc::format!("/tmp/pc_smp/n{}", probe_idx);
+        if vfs::stat(&probe).is_ok() != exists[probe_idx] {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "pre-mutation probe of n{} disagrees with model (model exists={})",
+                probe_idx, exists[probe_idx]);
+            return false;
+        }
+
+        if !exists[idx] {
+            // CREATE: after it returns, the name MUST resolve (no stale negative).
+            if vfs::create_file(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE", "create n{} failed", idx);
+                return false;
+            }
+            exists[idx] = true;
+            if vfs::stat(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE",
+                    "STALE NEGATIVE: n{} created but stat still fails", idx);
+                return false;
+            }
+        } else if (rng >> 16) & 0x3 == 0 {
+            // RENAME to the next free slot if any, else UNLINK.
+            let mut dst = None;
+            for j in 0..NAMES {
+                let k = (idx + 1 + j) % NAMES;
+                if !exists[k] { dst = Some(k); break; }
+            }
+            if let Some(d) = dst {
+                let dname = alloc::format!("/tmp/pc_smp/n{}", d);
+                if vfs::rename(&name, &dname).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE", "rename n{}->n{} failed", idx, d);
+                    return false;
+                }
+                exists[idx] = false;
+                exists[d] = true;
+                if vfs::stat(&name).is_ok() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE POSITIVE: n{} still resolves after rename away", idx);
+                    return false;
+                }
+                if vfs::stat(&dname).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE NEGATIVE: n{} invisible after rename in", d);
+                    return false;
+                }
+            } else {
+                if vfs::remove(&name).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE", "remove n{} failed", idx);
+                    return false;
+                }
+                exists[idx] = false;
+                if vfs::stat(&name).is_ok() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE POSITIVE: n{} still resolves after unlink", idx);
+                    return false;
+                }
+            }
+        } else {
+            // UNLINK: after it returns, the name MUST NOT resolve.
+            if vfs::remove(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE", "remove n{} failed", idx);
+                return false;
+            }
+            exists[idx] = false;
+            if vfs::stat(&name).is_ok() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE",
+                    "STALE POSITIVE: n{} still resolves after unlink", idx);
+                return false;
+            }
+        }
+    }
+
+    // The killer inode-reuse case, explicit and deterministic: create A, warm
+    // its positive entry, unlink A (frees the inode), create B (may reuse that
+    // inode number), then A MUST NOT resolve. A surviving stale positive would
+    // resolve the old name A to B's inode — a different file's data.
+    let _ = vfs::mkdir("/tmp/pc_reuse");
+    let a = "/tmp/pc_reuse/aaa";
+    let b = "/tmp/pc_reuse/bbb";
+    if vfs::create_file(a).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: create a failed");
+        return false;
+    }
+    let ina = match vfs::stat(a) {
+        Ok(s) => s.inode,
+        Err(_) => { test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: warm stat a failed"); return false; }
+    };
+    if vfs::remove(a).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: unlink a failed");
+        return false;
+    }
+    if vfs::create_file(b).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: create b failed");
+        return false;
+    }
+    let inb = match vfs::stat(b) {
+        Ok(s) => s.inode,
+        Err(_) => { test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: stat b failed"); return false; }
+    };
+    match vfs::stat(a) {
+        Err(VfsError::NotFound) => {}
+        Ok(s) => {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "WRONG-FILE RESOLUTION: unlinked 'aaa' resolves to inode {} (a was {}, b reused into {})",
+                s.inode, ina, inb);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: stat a unexpected {:?}", e);
+            return false;
+        }
+    }
+
+    // Quiesce: every name in the model must resolve exactly to its state.
+    for i in 0..NAMES {
+        let name = alloc::format!("/tmp/pc_smp/n{}", i);
+        if vfs::stat(&name).is_ok() != exists[i] {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "post-quiesce n{} disagrees with model (model exists={})", i, exists[i]);
+            return false;
+        }
+    }
+
+    test_println!("  {} mutate/resolve cycles + inode-reuse guard: no permanent stale entry, no wrong-file resolution",
+        ITERS);
+    test_pass!("VFS-PATHCACHE-SMP-RACE");
     true
 }
 
