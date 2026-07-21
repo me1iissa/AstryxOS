@@ -1128,6 +1128,38 @@ extern "C" fn timer_tick() {
         super::apic::arm_tsc_deadline_next();
     }
 
+    // ── EOI the interrupt controller BEFORE the tick body ───────────────────
+    // Acknowledge the LAPIC (clear the in-service bit for vector 32) here, right
+    // after re-arming the next deadline and *before* the bookkeeping below
+    // (TICK_COUNT CAS, timerfd ring, TLB grace-period, metrics,
+    // timer_tick_schedule).  This is the conventional "ack the interrupt
+    // controller first, run the handler body second" ordering.
+    //
+    // Why this collapses the in-service window: the CPU auto-sets the vISR bit
+    // for vector 32 on acceptance and it is cleared only by this EOI write
+    // (Intel SDM Vol. 3A §10.8.4).  While it is set, PPR is raised to class 2
+    // (SDM Vol. 3A §10.8.3.1), blocking delivery of the next same-priority
+    // timer.  Issuing the EOI here shrinks the in-service window from the whole
+    // ISR body down to ~2 instructions.
+    //
+    // Re-entrancy safety: vector 32 is installed as an interrupt gate (IDT
+    // type 0x8E), so RFLAGS.IF is cleared for the entire handler (SDM Vol. 3A
+    // §6.12.1) and no production callee re-enables interrupts.  Per SDM Vol. 3A
+    // §10.8.4, EOI only *allows* the next same-or-lower-priority interrupt to be
+    // delivered; with IF=0 that delivery cannot occur until IRETQ.  So EOI-early
+    // does NOT re-enter this ISR — the next timer is delivered only after IRETQ,
+    // the intended periodic cadence.  This is a behavior-preserving reorder of
+    // the single EOI, not an added one (the bugcheck-bail above still EOIs+
+    // returns on its own path; there is no second EOI on the normal tail).
+    if super::apic::is_enabled() {
+        super::apic::lapic_eoi();
+    } else {
+        // SAFETY: Sending EOI after accepting the timer interrupt.
+        unsafe {
+            send_eoi(0);
+        }
+    }
+
     // ── Cross-CPU dead-timer wake (SMP self-heal) ───────────────────────────
     // Our own LAPIC timer is clearly delivering (we are inside its ISR).  Poke
     // any SIBLING whose own timer ISR has gone stale — a CPU whose LAPIC
@@ -1325,17 +1357,11 @@ extern "C" fn timer_tick() {
     crate::mm::w215_crc::crc_walk_tick(cpu as u32);
 
     // Notify the scheduler about the tick.
+    // NOTE: the LAPIC has already been EOI'd near the top of this ISR (right
+    // after the TSC-deadline re-arm), so the interrupt controller is
+    // acknowledged before all of the bookkeeping above runs.  There is
+    // deliberately no EOI here — a second EOI would be a spurious write.
     crate::sched::timer_tick_schedule();
-
-    // Send EOI: use APIC if enabled, otherwise fall back to PIC.
-    if super::apic::is_enabled() {
-        super::apic::lapic_eoi();
-    } else {
-        // SAFETY: Sending EOI after handling the timer interrupt.
-        unsafe {
-            send_eoi(0);
-        }
-    }
 
     // NOTE: check_reschedule() is intentionally NOT called here.
     //
