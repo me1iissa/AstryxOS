@@ -583,6 +583,16 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_inode_cache_coherence() { passed += 1; }
 
+    // ── Test 16f: VFS path cache (positive + negative dentries) ─────────
+    total += 1;
+    if test_vfs_path_cache_negative_create() { passed += 1; }
+    total += 1;
+    if test_vfs_path_cache_rename_unlink() { passed += 1; }
+    total += 1;
+    if test_vfs_path_cache_storm() { passed += 1; }
+    total += 1;
+    if test_vfs_path_cache_smp_race() { passed += 1; }
+
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
     total += 1;
@@ -9482,6 +9492,557 @@ fn test_ext2_inode_cache_coherence() -> bool {
 
     test_println!("  write/truncate/chmod refresh + unlink invalidation all coherent");
     test_pass!("EXT2-INODE-CACHE-COHERENCE");
+    true
+}
+
+// ============================================================================
+// Test 16f: VFS path cache — positive + NEGATIVE dentry correctness + perf
+// ============================================================================
+//
+// `vfs::path_cache` memoizes per-component lookup outcomes in front of
+// `resolve_path_opts`, including negative (ENOENT) outcomes — the repeat-probe
+// pattern (e.g. sqlite hot-journal detection stat'ing `<db>-journal` /
+// `<db>-wal` before every transaction).  A stale negative entry would make a
+// newly created file invisible to stat(2)/open(2) — a direct violation of
+// POSIX pathname resolution (IEEE Std 1003.1-2017 §4.13) — so these tests
+// drive every invalidation edge through the public VFS API on the root ramfs
+// (the cache is FS-agnostic; ext2 exercises the identical VFS-layer path).
+
+/// The sqlite-journal pattern: repeat-stat a missing name (negative entry
+/// populated + hit), then CREATE the name — the very next stat MUST see it.
+/// Covers the create_file, mkdir and symlink materialization edges.
+fn test_vfs_path_cache_negative_create() -> bool {
+    test_header!("VFS-PATHCACHE-NEG-CREATE: cached ENOENT invalidated by create/mkdir/symlink");
+    use crate::vfs::{self, path_cache, VfsError};
+
+    let _ = vfs::mkdir("/tmp/pc_neg");
+
+    // 1. Probe a missing name twice: first populates the negative entry,
+    //    second must be served from it (neg-hit counter advances).
+    match vfs::stat("/tmp/pc_neg/cert9.db-journal") {
+        Err(VfsError::NotFound) => {}
+        other => {
+            test_fail!("VFS-PATHCACHE-NEG-CREATE", "cold probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+            return false;
+        }
+    }
+    let (_, neg_before, _, _, _, _) = path_cache::stats();
+    match vfs::stat("/tmp/pc_neg/cert9.db-journal") {
+        Err(VfsError::NotFound) => {}
+        other => {
+            test_fail!("VFS-PATHCACHE-NEG-CREATE", "warm probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+            return false;
+        }
+    }
+    let (_, neg_after, _, _, _, _) = path_cache::stats();
+    if neg_after <= neg_before {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE",
+            "warm ENOENT probe did not hit the negative cache (neg_hits {} -> {})",
+            neg_before, neg_after);
+        return false;
+    }
+
+    // 2. THE killer assertion: create the file; stat must now see it.
+    if let Err(e) = vfs::create_file("/tmp/pc_neg/cert9.db-journal") {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "create_file failed: {:?}", e);
+        return false;
+    }
+    match vfs::stat("/tmp/pc_neg/cert9.db-journal") {
+        Ok(_) => {}
+        Err(e) => {
+            test_fail!("VFS-PATHCACHE-NEG-CREATE",
+                "STALE NEGATIVE ENTRY: file created but stat still fails: {:?}", e);
+            return false;
+        }
+    }
+
+    // 3. mkdir materialization: probe missing dir, create, probe again.
+    let _ = vfs::stat("/tmp/pc_neg/subdir");     // populate negative
+    let _ = vfs::stat("/tmp/pc_neg/subdir");     // hit negative
+    if let Err(e) = vfs::mkdir("/tmp/pc_neg/subdir") {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "mkdir failed: {:?}", e);
+        return false;
+    }
+    if vfs::stat("/tmp/pc_neg/subdir").is_err() {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "STALE NEGATIVE ENTRY after mkdir");
+        return false;
+    }
+    // ...and resolution THROUGH the new directory must work too.
+    if let Err(e) = vfs::create_file("/tmp/pc_neg/subdir/inner") {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "create through new dir failed: {:?}", e);
+        return false;
+    }
+    if vfs::stat("/tmp/pc_neg/subdir/inner").is_err() {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "resolve through fresh dir failed");
+        return false;
+    }
+
+    // 4. symlink materialization: probe missing, symlink, lstat must see it.
+    let _ = vfs::stat("/tmp/pc_neg/ln");         // populate negative
+    if let Err(e) = vfs::symlink("/tmp/pc_neg/ln", "/tmp/pc_neg/cert9.db-journal") {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "symlink failed: {:?}", e);
+        return false;
+    }
+    match vfs::lstat("/tmp/pc_neg/ln") {
+        Ok(st) if st.file_type == crate::vfs::FileType::SymLink => {}
+        Ok(st) => {
+            test_fail!("VFS-PATHCACHE-NEG-CREATE", "lstat of new symlink wrong type {:?}", st.file_type);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("VFS-PATHCACHE-NEG-CREATE", "STALE NEGATIVE ENTRY after symlink: {:?}", e);
+            return false;
+        }
+    }
+    // Follow it: stat() through the symlink must reach the target.
+    if vfs::stat("/tmp/pc_neg/ln").is_err() {
+        test_fail!("VFS-PATHCACHE-NEG-CREATE", "stat through new symlink failed");
+        return false;
+    }
+
+    test_println!("  create/mkdir/symlink all invalidate cached ENOENT correctly");
+    test_pass!("VFS-PATHCACHE-NEG-CREATE");
+    true
+}
+
+/// Positive-entry invalidation: unlink and rename (BOTH names) must drop
+/// stale positive entries, and rename must drop the destination's negative.
+fn test_vfs_path_cache_rename_unlink() -> bool {
+    test_header!("VFS-PATHCACHE-RENAME-UNLINK: positive/negative flip on rename + unlink");
+    use crate::vfs::{self, VfsError};
+
+    let _ = vfs::mkdir("/tmp/pc_mv");
+    if vfs::create_file("/tmp/pc_mv/a").is_err() {
+        test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "setup create failed");
+        return false;
+    }
+
+    // Warm the cache on both names: "a" positive, "b" negative.
+    let _ = vfs::stat("/tmp/pc_mv/a");
+    let _ = vfs::stat("/tmp/pc_mv/a");
+    match vfs::stat("/tmp/pc_mv/b") {
+        Err(VfsError::NotFound) => {}
+        other => {
+            test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "b should not exist yet: {:?}", other.map(|s| s.inode));
+            return false;
+        }
+    }
+
+    // rename a -> b: cached positive "a" must die, cached negative "b" must die.
+    if let Err(e) = vfs::rename("/tmp/pc_mv/a", "/tmp/pc_mv/b") {
+        test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "rename failed: {:?}", e);
+        return false;
+    }
+    match vfs::stat("/tmp/pc_mv/a") {
+        Err(VfsError::NotFound) => {}
+        other => {
+            test_fail!("VFS-PATHCACHE-RENAME-UNLINK",
+                "STALE POSITIVE: old name 'a' still resolves after rename: {:?}",
+                other.map(|s| s.inode));
+            return false;
+        }
+    }
+    match vfs::stat("/tmp/pc_mv/b") {
+        Ok(_) => {}
+        Err(e) => {
+            test_fail!("VFS-PATHCACHE-RENAME-UNLINK",
+                "STALE NEGATIVE: new name 'b' invisible after rename: {:?}", e);
+            return false;
+        }
+    }
+
+    // Recreate "a" (covers negative re-populated by the post-rename stat).
+    if vfs::create_file("/tmp/pc_mv/a").is_err()
+        || vfs::stat("/tmp/pc_mv/a").is_err()
+    {
+        test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "recreate of old name 'a' invisible");
+        return false;
+    }
+
+    // unlink b: cached positive "b" must die.
+    let _ = vfs::stat("/tmp/pc_mv/b"); // ensure positive entry present
+    if let Err(e) = vfs::remove("/tmp/pc_mv/b") {
+        test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "remove failed: {:?}", e);
+        return false;
+    }
+    match vfs::stat("/tmp/pc_mv/b") {
+        Err(VfsError::NotFound) => {}
+        other => {
+            test_fail!("VFS-PATHCACHE-RENAME-UNLINK",
+                "STALE POSITIVE: 'b' still resolves after unlink: {:?}",
+                other.map(|s| s.inode));
+            return false;
+        }
+    }
+
+    // ...and the create-after-unlink round-trip (journal lifecycle).
+    if vfs::create_file("/tmp/pc_mv/b").is_err() || vfs::stat("/tmp/pc_mv/b").is_err() {
+        test_fail!("VFS-PATHCACHE-RENAME-UNLINK", "recreate after unlink invisible");
+        return false;
+    }
+
+    test_println!("  rename (both names) + unlink + recreate all coherent");
+    test_pass!("VFS-PATHCACHE-RENAME-UNLINK");
+    true
+}
+
+/// The resolve-storm microbench (the necko-deadline shape): N repeat ENOENT
+/// probes of one path.  Post-warm probes must be served entirely from the
+/// negative cache — zero FS dispatches — and the measured TSC cost must
+/// collapse relative to the flushed-cold walk.
+fn test_vfs_path_cache_storm() -> bool {
+    test_header!("VFS-PATHCACHE-STORM: repeat ENOENT probes collapse to cache hits");
+    use crate::vfs::{self, path_cache, VfsError};
+
+    #[inline]
+    fn rdtsc() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    // A directory with enough entries that a cold final-component miss does
+    // non-trivial scan work (the shape of a profile dir holding cert9.db).
+    let _ = vfs::mkdir("/tmp/pc_storm");
+    for i in 0..100u32 {
+        let name = alloc::format!("/tmp/pc_storm/filler_{:03}", i);
+        if vfs::create_file(&name).is_err() {
+            test_fail!("VFS-PATHCACHE-STORM", "setup create #{} failed", i);
+            return false;
+        }
+    }
+
+    const N: usize = 200;
+    let probe = "/tmp/pc_storm/cert9.db-wal";
+
+    // Cold loop: flush before every probe so each walk pays the full
+    // per-component dispatch cost.
+    let mut cold_tsc: u64 = 0;
+    for _ in 0..N {
+        path_cache::_test_flush();
+        let t0 = rdtsc();
+        match vfs::stat(probe) {
+            Err(VfsError::NotFound) => {}
+            other => {
+                test_fail!("VFS-PATHCACHE-STORM", "cold probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+                return false;
+            }
+        }
+        cold_tsc += rdtsc().wrapping_sub(t0);
+    }
+
+    // Warm loop: one priming probe, then N probes that must all be served
+    // from the negative cache.
+    path_cache::_test_flush();
+    let _ = vfs::stat(probe); // prime
+    let (_, neg_before, miss_before, ins_before, _, _) = path_cache::stats();
+    let mut warm_tsc: u64 = 0;
+    for _ in 0..N {
+        let t0 = rdtsc();
+        match vfs::stat(probe) {
+            Err(VfsError::NotFound) => {}
+            other => {
+                test_fail!("VFS-PATHCACHE-STORM", "warm probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+                return false;
+            }
+        }
+        warm_tsc += rdtsc().wrapping_sub(t0);
+    }
+    let (_, neg_after, miss_after, ins_after, _, _) = path_cache::stats();
+
+    // Counter proof of zero FS dispatch: every warm probe must end in a
+    // negative hit, and the warm loop must neither miss on the final
+    // component nor insert anything new.  (Each probe walks 2 cached
+    // intermediate components + the negative final component.)
+    let neg_hits = neg_after - neg_before;
+    if neg_hits < N {
+        test_fail!("VFS-PATHCACHE-STORM",
+            "warm probes not served from negative cache: neg_hits {} < {}", neg_hits, N);
+        return false;
+    }
+    if ins_after != ins_before {
+        test_fail!("VFS-PATHCACHE-STORM",
+            "warm probes re-inserted entries ({} -> {}) — final component missed",
+            ins_before, ins_after);
+        return false;
+    }
+    let _ = miss_before;
+    let _ = miss_after;
+
+    // TSC sanity on ramfs: the warm walk skips every per-component FS
+    // dispatch, but a ramfs cold walk is itself all-in-memory, so the
+    // ramfs delta only shows the dispatch overhead (~2x observed), not the
+    // disk-I/O collapse this cache exists for.  Assert strict improvement
+    // here; the orders-of-magnitude assertion runs on ext2 below.
+    let cold_avg = cold_tsc / N as u64;
+    let warm_avg = warm_tsc / N as u64;
+    test_println!("  ramfs: cold avg {} TSC/probe, warm avg {} TSC/probe ({} probes, ratio {}%)",
+        cold_avg, warm_avg, N,
+        if cold_tsc > 0 { warm_tsc.saturating_mul(100) / cold_tsc } else { 0 });
+    if warm_avg >= cold_avg {
+        test_fail!("VFS-PATHCACHE-STORM",
+            "ramfs post-warm cost did not improve: warm {} vs cold {} TSC/probe",
+            warm_avg, cold_avg);
+        return false;
+    }
+
+    // ── ext2 leg: the disk-backed collapse (the necko-deadline shape) ────
+    // A cold final-component miss on ext2 scans the directory's data
+    // blocks on virtio-blk every probe; a warm probe is a single in-memory
+    // negative-cache hit.  This is exactly the cert9.db-journal/-wal storm
+    // and the delta must be a different order of magnitude.  Skipped when
+    // /disk is not mounted (no data.img in this configuration).
+    if crate::vfs::stat("/disk").is_ok() {
+        let _ = vfs::mkdir("/disk/pc_storm");
+        let mut setup_ok = true;
+        for i in 0..40u32 {
+            let name = alloc::format!("/disk/pc_storm/filler_{:03}", i);
+            if vfs::create_file(&name).is_err() {
+                setup_ok = false;
+                break;
+            }
+        }
+        if !setup_ok {
+            test_fail!("VFS-PATHCACHE-STORM", "ext2 setup create failed");
+            return false;
+        }
+
+        const M: usize = 100;
+        let dprobe = "/disk/pc_storm/cert9.db-wal";
+
+        let mut dcold_tsc: u64 = 0;
+        for _ in 0..M {
+            path_cache::_test_flush();
+            let t0 = rdtsc();
+            match vfs::stat(dprobe) {
+                Err(VfsError::NotFound) => {}
+                other => {
+                    test_fail!("VFS-PATHCACHE-STORM",
+                        "ext2 cold probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+                    return false;
+                }
+            }
+            dcold_tsc += rdtsc().wrapping_sub(t0);
+        }
+
+        path_cache::_test_flush();
+        let _ = vfs::stat(dprobe); // prime
+        let (_, dneg_before, _, dins_before, _, _) = path_cache::stats();
+        let mut dwarm_tsc: u64 = 0;
+        for _ in 0..M {
+            let t0 = rdtsc();
+            match vfs::stat(dprobe) {
+                Err(VfsError::NotFound) => {}
+                other => {
+                    test_fail!("VFS-PATHCACHE-STORM",
+                        "ext2 warm probe: want ENOENT, got {:?}", other.map(|s| s.inode));
+                    return false;
+                }
+            }
+            dwarm_tsc += rdtsc().wrapping_sub(t0);
+        }
+        let (_, dneg_after, _, dins_after, _, _) = path_cache::stats();
+        if dneg_after - dneg_before < M || dins_after != dins_before {
+            test_fail!("VFS-PATHCACHE-STORM",
+                "ext2 warm probes not pure cache hits (neg {} -> {}, ins {} -> {})",
+                dneg_before, dneg_after, dins_before, dins_after);
+            return false;
+        }
+
+        let dcold_avg = dcold_tsc / M as u64;
+        let dwarm_avg = dwarm_tsc / M as u64;
+        test_println!("  ext2:  cold avg {} TSC/probe, warm avg {} TSC/probe ({} probes, ratio {}%)",
+            dcold_avg, dwarm_avg, M,
+            if dcold_tsc > 0 { dwarm_tsc.saturating_mul(100) / dcold_tsc } else { 0 });
+        // Conservative collapse bound: warm must be < 10% of cold.
+        if dwarm_avg.saturating_mul(10) > dcold_avg {
+            test_fail!("VFS-PATHCACHE-STORM",
+                "ext2 post-warm cost did not collapse: warm {} vs cold {} TSC/probe (want <10%)",
+                dwarm_avg, dcold_avg);
+            return false;
+        }
+    } else {
+        test_println!("  ext2 leg skipped: /disk not mounted in this configuration");
+    }
+
+    test_pass!("VFS-PATHCACHE-STORM");
+    true
+}
+
+/// SMP-hazard regression for the bracketed invalidation (deterministic
+/// simulation, matching this codebase's SMP=1-friendly convention — cf.
+/// `test_ext2_smp_alloc_race`, which likewise simulates its race sequentially).
+///
+/// Hammers a working set of names with interleaved create / unlink / rename
+/// cycles and resolves, tracking a shadow model of ground truth, and asserts
+/// the path cache never leaves a PERMANENT stale entry after quiesce: no
+/// unlinked name resolving (stale positive), no created name reporting ENOENT
+/// (stale negative), and — the killer case the bracket exists for — no old
+/// name resolving under inode-number reuse to a *different* file after unlink.
+///
+/// Note on scope: sequentially, the `post`-invalidate alone already satisfies
+/// every assertion here, so this test guards the permanent-coherence invariant
+/// (and catches any missing/removed invalidation site). The `pre`-invalidate
+/// additionally narrows the transient window seen only by a *genuinely
+/// concurrent* reader on another CPU — not observable without true SMP
+/// concurrency, which this in-kernel test harness does not provide — so it is
+/// verified by construction (the bracket in each `vfs::` helper) and by the
+/// analytical argument in the `path_cache` module docs, not by this test.
+fn test_vfs_path_cache_smp_race() -> bool {
+    test_header!("VFS-PATHCACHE-SMP-RACE: mutate-vs-resolve hammer leaves no permanent stale entry");
+    use crate::vfs::{self, VfsError};
+
+    let _ = vfs::mkdir("/tmp/pc_smp");
+
+    // Shadow model: which names currently exist. After every mutation the
+    // whole working set is resolved and checked against the model — a mismatch
+    // is a stale cache entry.
+    const NAMES: usize = 8;
+    let mut exists = [false; NAMES];
+
+    const ITERS: u32 = 200;
+    let mut rng: u32 = 0x1234_5678; // xorshift32, deterministic
+    for _ in 0..ITERS {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+
+        let idx = (rng as usize) % NAMES;
+        let name = alloc::format!("/tmp/pc_smp/n{}", idx);
+
+        // Interleave a resolve of a (possibly different) name before mutating,
+        // warming entries across the mutation.
+        let probe_idx = ((rng >> 8) as usize) % NAMES;
+        let probe = alloc::format!("/tmp/pc_smp/n{}", probe_idx);
+        if vfs::stat(&probe).is_ok() != exists[probe_idx] {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "pre-mutation probe of n{} disagrees with model (model exists={})",
+                probe_idx, exists[probe_idx]);
+            return false;
+        }
+
+        if !exists[idx] {
+            // CREATE: after it returns, the name MUST resolve (no stale negative).
+            if vfs::create_file(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE", "create n{} failed", idx);
+                return false;
+            }
+            exists[idx] = true;
+            if vfs::stat(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE",
+                    "STALE NEGATIVE: n{} created but stat still fails", idx);
+                return false;
+            }
+        } else if (rng >> 16) & 0x3 == 0 {
+            // RENAME to the next free slot if any, else UNLINK.
+            let mut dst = None;
+            for j in 0..NAMES {
+                let k = (idx + 1 + j) % NAMES;
+                if !exists[k] { dst = Some(k); break; }
+            }
+            if let Some(d) = dst {
+                let dname = alloc::format!("/tmp/pc_smp/n{}", d);
+                if vfs::rename(&name, &dname).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE", "rename n{}->n{} failed", idx, d);
+                    return false;
+                }
+                exists[idx] = false;
+                exists[d] = true;
+                if vfs::stat(&name).is_ok() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE POSITIVE: n{} still resolves after rename away", idx);
+                    return false;
+                }
+                if vfs::stat(&dname).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE NEGATIVE: n{} invisible after rename in", d);
+                    return false;
+                }
+            } else {
+                if vfs::remove(&name).is_err() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE", "remove n{} failed", idx);
+                    return false;
+                }
+                exists[idx] = false;
+                if vfs::stat(&name).is_ok() {
+                    test_fail!("VFS-PATHCACHE-SMP-RACE",
+                        "STALE POSITIVE: n{} still resolves after unlink", idx);
+                    return false;
+                }
+            }
+        } else {
+            // UNLINK: after it returns, the name MUST NOT resolve.
+            if vfs::remove(&name).is_err() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE", "remove n{} failed", idx);
+                return false;
+            }
+            exists[idx] = false;
+            if vfs::stat(&name).is_ok() {
+                test_fail!("VFS-PATHCACHE-SMP-RACE",
+                    "STALE POSITIVE: n{} still resolves after unlink", idx);
+                return false;
+            }
+        }
+    }
+
+    // The killer inode-reuse case, explicit and deterministic: create A, warm
+    // its positive entry, unlink A (frees the inode), create B (may reuse that
+    // inode number), then A MUST NOT resolve. A surviving stale positive would
+    // resolve the old name A to B's inode — a different file's data.
+    let _ = vfs::mkdir("/tmp/pc_reuse");
+    let a = "/tmp/pc_reuse/aaa";
+    let b = "/tmp/pc_reuse/bbb";
+    if vfs::create_file(a).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: create a failed");
+        return false;
+    }
+    let ina = match vfs::stat(a) {
+        Ok(s) => s.inode,
+        Err(_) => { test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: warm stat a failed"); return false; }
+    };
+    if vfs::remove(a).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: unlink a failed");
+        return false;
+    }
+    if vfs::create_file(b).is_err() {
+        test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: create b failed");
+        return false;
+    }
+    let inb = match vfs::stat(b) {
+        Ok(s) => s.inode,
+        Err(_) => { test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: stat b failed"); return false; }
+    };
+    match vfs::stat(a) {
+        Err(VfsError::NotFound) => {}
+        Ok(s) => {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "WRONG-FILE RESOLUTION: unlinked 'aaa' resolves to inode {} (a was {}, b reused into {})",
+                s.inode, ina, inb);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("VFS-PATHCACHE-SMP-RACE", "reuse: stat a unexpected {:?}", e);
+            return false;
+        }
+    }
+
+    // Quiesce: every name in the model must resolve exactly to its state.
+    for i in 0..NAMES {
+        let name = alloc::format!("/tmp/pc_smp/n{}", i);
+        if vfs::stat(&name).is_ok() != exists[i] {
+            test_fail!("VFS-PATHCACHE-SMP-RACE",
+                "post-quiesce n{} disagrees with model (model exists={})", i, exists[i]);
+            return false;
+        }
+    }
+
+    test_println!("  {} mutate/resolve cycles + inode-reuse guard: no permanent stale entry, no wrong-file resolution",
+        ITERS);
+    test_pass!("VFS-PATHCACHE-SMP-RACE");
     true
 }
 
