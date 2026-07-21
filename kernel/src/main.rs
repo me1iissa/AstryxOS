@@ -2123,7 +2123,12 @@ user_pref("security.sandbox.content.level", 0);
                 // genuinely idle, and spin instead if the timer is dead (a
                 // dead timer provides no wakeup to end the `hlt`).
                 if crate::sched::ready_depth() == 0 {
-                    if timer_ok {
+                    // Route this second check-then-halt TOCTOU through the same
+                    // idle-halt predicate as sched_wait_quantum: a hypervisor/
+                    // test uniprocessor refuses the bare `hlt` and spins on the
+                    // TSC (no injection-delivery dependency); SMP + bare metal
+                    // still `hlt` for power.  See irq::idle_bare_hlt_ok.
+                    if crate::arch::x86_64::irq::reactor_idle_may_halt(timer_ok) {
                         unsafe { core::arch::asm!("hlt"); }
                     } else {
                         core::hint::spin_loop();

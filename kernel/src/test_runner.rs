@@ -2462,6 +2462,20 @@ pub fn run() -> ! {
     total += 1;
     if test_658_tsc_deadline_cadence() { passed += 1; }
 
+    // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
+    // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
+    // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
+    // bare-metal keep halting.
+    total += 1;
+    if test_63b_idle_bare_hlt_ok() { passed += 1; }
+
+    // ── Test 63b-2: idle-wait decision wiring + spin liveness ──
+    // Non-vacuous guard: drives the exact (live, uniproc, force) state the flaky
+    // 63b bug lives in through sched_wait_decision (fails on revert), and proves
+    // the spin arm re-Readies a sleeper off get_ticks() with the timer "dead".
+    total += 1;
+    if test_63b_idle_wait_wiring_liveness() { passed += 1; }
+
     // ── Test 217: /proc/<N>/maps returns target PID's VMA table (W216) ──
     // Verifies three properties:
     //   1. open(/proc/<target>/maps) from a different caller PID succeeds
@@ -54132,6 +54146,155 @@ fn test_651_cpu_timer_live_decision() -> bool {
     test_println!("  decision: first-obs / isr-advance-recovery(+clear) / within-window-tolerate / \
 wedge-declare(+rearm) / periodic-retry-under-cap / sub-window-no-rearm / at-cap-stop / \
 cap-boundary-strict — dead-CPU-timer self-heal state machine GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ───────────
+//
+// Pins the pure, hardware-free core of the 63b idle-halt liveness fix
+// (`irq::idle_bare_hlt_ok`).  The 63b permanent hang was a bare `sti; hlt` in
+// `sched_wait_quantum` on a single KVM vCPU whose LAPIC timer stopped *waking*
+// the halted CPU (a stuck in-service timer vector raised PPR and blocked the
+// pending re-armed timer + device IRQs from delivery — Intel SDM Vol. 3A
+// §10.8.3.1 / §10.8.4).  The fix refuses the bare `hlt` in exactly that
+// configuration (hypervisor/test uniprocessor) and spins on the TSC instead
+// (Intel SDM Vol. 3B §17.17 invariant TSC), which does not depend on interrupt
+// delivery.  This table pins the decision for every mode.
+fn test_63b_idle_bare_hlt_ok() -> bool {
+    use crate::arch::x86_64::irq::idle_bare_hlt_ok;
+    const NAME: &str = "[ARCH/SCHED] idle-halt liveness predicate (Test 63b-1)";
+    test_header!(NAME);
+
+    // The 63b config: hypervisor/test uniprocessor MUST spin (false), never halt.
+    if idle_bare_hlt_ok(true, 1, true) {
+        test_fail!(NAME, "hypervisor/test uniprocessor must SPIN, not bare-halt"); return false;
+    }
+    // Bare-metal uniprocessor: halt, idle power preserved.
+    if !idle_bare_hlt_ok(true, 1, false) {
+        test_fail!(NAME, "bare-metal uniprocessor must halt"); return false;
+    }
+    // SMP under a hypervisor: halt — the sibling TIMER_WAKE IPI (0xF3) backstop
+    // is intact.  LOAD-BEARING: dropping the `cpus == 1` guard would spin here
+    // and regress SMP idle to the dead-timer fallback needlessly.
+    if !idle_bare_hlt_ok(true, 2, true) {
+        test_fail!(NAME, "SMP must keep halting (0xF3 sibling backstop)"); return false;
+    }
+    // Timer not proven live → spin regardless of CPU count (existing dead-timer arm).
+    if idle_bare_hlt_ok(false, 8, false) {
+        test_fail!(NAME, "dead timer must spin (multi-CPU)"); return false;
+    }
+    if idle_bare_hlt_ok(false, 1, true) {
+        test_fail!(NAME, "dead timer must spin (uniprocessor)"); return false;
+    }
+    // Dead timer never halts, even on bare metal.
+    if idle_bare_hlt_ok(false, 1, false) {
+        test_fail!(NAME, "dead timer must spin (bare-metal uni)"); return false;
+    }
+
+    test_println!("  (live,cpus,force): (T,1,T)->Spin / (T,1,F)->Halt / (T,2,T)->Halt / \
+(F,8,F)->Spin / (F,1,T)->Spin / (F,1,F)->Spin — idle-halt liveness predicate GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 63b-2: idle-wait decision wiring + spin liveness ───────────────────
+//
+// The NON-VACUOUS guard for the 63b spin-mitigation.  A test that only pins the
+// pure predicate, or that sets the timer dead (both old and new code spin),
+// passes with the fix reverted.  This test instead:
+//   (1) WIRING — drives the exact `(live=true, uniproc, force)` state the flaky
+//       bug lives in through `sched_wait_decision` (the function whose return
+//       selects the executed `asm` arm), asserting Spin.  Reverting the
+//       `cpus == 1 && force` branch of `idle_bare_hlt_ok` makes this return Halt
+//       → the assertion fails.  It also asserts the SMP=2 case still returns
+//       Halt, guarding against an over-broad fix regressing SMP idle.
+//   (2) LIVENESS — spawns a helper that sleeps on a TSC deadline, simulates a
+//       wedged LAPIC via `test_set_cpu_timer_dead`, forces the idle decision to
+//       Spin, and drives the real `sched_wait_quantum` idle path, asserting the
+//       helper is re-Readied and runs to flip a flag within a bounded
+//       `get_ticks()` budget — proving the spin arm advances the run queue off
+//       the TSC floor (Intel SDM Vol. 3B §17.17) with the timer "dead".
+// Mirrors the kernel-thread spawn + bounded-yield-loop pattern used by the
+// pipe wake-hook test.
+fn test_63b_idle_wait_wiring_liveness() -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::arch::x86_64::irq::{self, IdleAction, sched_wait_decision, idle_decision_test};
+    const NAME: &str = "[ARCH/SCHED] idle-wait wiring + spin liveness (Test 63b-2)";
+    test_header!(NAME);
+
+    // ── Part 1: wiring — the executed-branch decision fails on revert ──
+    idle_decision_test::set(Some(true), Some(1), Some(true)); // 63b: hyp/test uni
+    let d_uni = sched_wait_decision();
+    idle_decision_test::set(Some(true), Some(2), Some(true)); // SMP=2 must still halt
+    let d_smp = sched_wait_decision();
+    idle_decision_test::clear();
+    if d_uni != IdleAction::Spin {
+        test_fail!(NAME, "wiring: hypervisor/test uniprocessor decided {:?}, expected Spin \
+(the cpus==1&&force branch is missing — fix reverted?)", d_uni);
+        return false;
+    }
+    if d_smp != IdleAction::Halt {
+        test_fail!(NAME, "wiring: SMP=2 decided {:?}, expected Halt \
+(over-broad fix regressed SMP idle)", d_smp);
+        return false;
+    }
+    test_println!("  wiring: (live,uni,force)->Spin, (live,SMP=2,force)->Halt ✓");
+
+    // ── Part 2: liveness — the spin arm advances the run queue, timer "dead" ──
+    static LIVENESS_RAN: AtomicBool = AtomicBool::new(false);
+    LIVENESS_RAN.store(false, Ordering::SeqCst);
+
+    // Helper sleeps on a TSC deadline, then flips the flag and exits.  Re-Ready
+    // must come from the idle path's `timer_tick_schedule()` off `get_ticks()`.
+    fn helper_entry() {
+        crate::hal::enable_interrupts();
+        crate::proc::sleep_ticks(3);
+        LIVENESS_RAN.store(true, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Simulate the wedge (sticky dead LAPIC) and force every idle wait to Spin
+    // (uniprocessor + force) so no path can `hlt` — deterministic, no deadlock.
+    irq::test_set_cpu_timer_dead(cpu, true);
+    idle_decision_test::set(Some(false), Some(1), Some(true));
+
+    let helper_pid = crate::proc::create_kernel_process(
+        "idle63b_helper", helper_entry as *const () as u64);
+    let start = crate::arch::x86_64::irq::get_ticks();
+
+    // Drive the real idle path: each `sched_wait_quantum()` takes the Spin arm
+    // (timer_tick_schedule re-Readies the sleeper once get_ticks() >= wake_tick);
+    // `yield_cpu()` then lets the readied helper run to flip the flag.  Bounded
+    // by an iteration cap so a regression reports a failure, never a hang.
+    let mut ran = false;
+    for _ in 0..4000u32 {
+        crate::arch::x86_64::irq::sched_wait_quantum();
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if LIVENESS_RAN.load(Ordering::SeqCst) { ran = true; break; }
+    }
+    let elapsed = crate::arch::x86_64::irq::get_ticks().wrapping_sub(start);
+    let crumb = irq::last_idle_decision(cpu);
+
+    // Restore real inputs + timer flag; the helper self-exited via exit_thread.
+    idle_decision_test::clear();
+    irq::test_set_cpu_timer_dead(cpu, false);
+    if !was_active { crate::sched::disable(); }
+
+    if !ran {
+        test_fail!(NAME, "spin arm did not advance the run queue: helper not re-Readied+run \
+within 4000 iterations (~{} ticks) with the timer 'dead'", elapsed);
+        return false;
+    }
+
+    test_println!("  liveness: helper slept on a TSC deadline, was re-Readied+ran in {} ticks \
+with the LAPIC timer 'dead' (idle breadcrumb={} [2=Spin]) — spin self-heal GREEN", elapsed, crumb);
     test_pass!(NAME);
     true
 }
