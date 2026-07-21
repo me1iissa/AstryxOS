@@ -124,7 +124,31 @@ pub fn dispatch(
                         // stdin — read through TTY line discipline.
                         // tty.read writes directly into the supplied
                         // &mut [u8] so we bracket each spin iteration.
-                        let mut attempts = 0u32;
+                        //
+                        // LATENT arm: no in-tree caller reaches fd==0 read
+                        // today. Bound on TSC-floor get_ticks() rather than a
+                        // raw iteration counter — the LAPIC periodic timer can
+                        // stop under a wedged hypervisor (Intel SDM Vol.3A
+                        // Sec.11.5.4 / Vol.3B Sec.17.17), and a bare counter
+                        // over spin_loop() is CPU-speed-dependent (it would
+                        // collapse from ~minutes to sub-second 100%-CPU
+                        // busy-wait on a fast host). A short, fail-fast bound
+                        // is intentional here: this mirrors the sibling Linux
+                        // fd0 fallback's "don't stall for seconds in headless
+                        // test mode" intent, just expressed as a wall-clock
+                        // tick deadline instead of a raw spin-iteration count
+                        // so the bound holds regardless of host CPU speed.
+                        //
+                        // REVISIT on activation: returning 0 (EOF) on timeout
+                        // is the right default for an unattended/headless
+                        // caller, but is almost certainly WRONG once a real
+                        // interactive `orbit` `read(0)` consumer exists —
+                        // interactive stdin should block waiting for a
+                        // keypress, not spuriously EOF after ~tens of ms.
+                        // Do not treat this arm as "done" for interactive use
+                        // without revisiting the timeout/EOF semantics then.
+                        let start = crate::arch::x86_64::irq::get_ticks();
+                        const STDIN_TIMEOUT_TICKS: u64 = 2; // ~20ms @ 100 Hz — fail-fast default, latent path
                         loop {
                             {
                                 let mut tty = crate::drivers::tty::TTY0.lock();
@@ -136,11 +160,10 @@ pub fn dispatch(
                                     return n as i64;
                                 }
                             }
-                            attempts += 1;
-                            if attempts > 100_000 {
+                            if crate::arch::x86_64::irq::get_ticks().wrapping_sub(start) >= STDIN_TIMEOUT_TICKS {
                                 return 0;
                             }
-                            crate::hal::halt();
+                            core::hint::spin_loop();
                         }
                     }
                     Err(_) => -9,

@@ -235,7 +235,11 @@ pub fn launch() -> ! {
             if crate::net::arp::lookup(gateway).is_some() {
                 break;
             }
-            crate::hal::halt();
+            // Spin, not halt: the LAPIC periodic timer is this warmup's only
+            // no-reply wake and can stop under a wedged hypervisor (Intel SDM
+            // Vol.3A Sec.11.5.4); TSC-floor `get_ticks()` keeps advancing
+            // regardless, so spinning still hits the `max_ticks` deadline above.
+            core::hint::spin_loop();
         }
     }
 
@@ -1519,7 +1523,12 @@ fn cmd_ping(parts: &[&str]) {
                 break;
             }
 
-            crate::hal::halt();
+            // Spin, not halt: on packet loss the LAPIC periodic timer is this
+            // loop's only wake and can stop under a wedged hypervisor (Intel
+            // SDM Vol.3A Sec.11.5.4); TSC-floor `get_ticks()` keeps advancing
+            // regardless, so spinning still hits `timeout_ticks` and prints
+            // "Request timed out" instead of wedging forever.
+            core::hint::spin_loop();
         }
 
         if !got_reply {
@@ -1639,7 +1648,12 @@ fn cmd_ping6(parts: &[&str]) {
                 break;
             }
 
-            crate::hal::halt();
+            // Spin, not halt: on packet loss the LAPIC periodic timer is this
+            // loop's only wake and can stop under a wedged hypervisor (Intel
+            // SDM Vol.3A Sec.11.5.4); TSC-floor `get_ticks()` keeps advancing
+            // regardless, so spinning still hits `timeout_ticks` and prints
+            // "Request timed out" instead of wedging forever.
+            core::hint::spin_loop();
         }
 
         if !got_reply {
