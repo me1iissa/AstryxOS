@@ -446,7 +446,7 @@ fn wait_for_response(xid: u32, expected_type: u8, timeout_ticks: u64) -> Option<
 
         // Spin, not halt: the e1000 NIC runs IMS=0 (poll-only), so the LAPIC
         // periodic timer is the sole wake and can stop under a wedged
-        // hypervisor (Intel SDM Vol.3A Sec.10.5.4); TSC-floor `get_ticks()`
+        // hypervisor (Intel SDM Vol.3A Sec.11.5.4); TSC-floor `get_ticks()`
         // keeps advancing regardless, so spinning still hits the deadline above.
         core::hint::spin_loop();
     }
