@@ -1160,6 +1160,19 @@ extern "C" fn timer_tick() {
         }
     }
 
+    // INVARIANT: no `sti`/enable_interrupts between this EOI and IRETQ — the
+    // early EOI removes the in-service PPR interlock (which previously blocked a
+    // nested same-priority timer even with IF=1), so IF=0 is now the SOLE
+    // re-entrancy guard for the tick body below.  A future timer-path helper
+    // that re-enabled interrupts here would silently reintroduce ISR
+    // re-entrancy; this assertion catches that in debug/test builds and
+    // compiles out entirely in release (zero production cost).
+    debug_assert!(
+        !crate::hal::interrupts_enabled(),
+        "timer_tick: interrupts must stay masked after the early EOI — IF=0 is \
+         the sole re-entrancy guard once the in-service interlock is dropped"
+    );
+
     // ── Cross-CPU dead-timer wake (SMP self-heal) ───────────────────────────
     // Our own LAPIC timer is clearly delivering (we are inside its ISR).  Poke
     // any SIBLING whose own timer ISR has gone stale — a CPU whose LAPIC

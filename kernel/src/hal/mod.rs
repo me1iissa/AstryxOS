@@ -39,6 +39,23 @@ pub fn enable_interrupts() {
     }
 }
 
+/// Are maskable interrupts currently enabled? (RFLAGS.IF, bit 9.)
+///
+/// Reads RFLAGS with `PUSHFQ; POP` (Intel SDM Vol. 1 §3.4.3 EFLAGS layout;
+/// Vol. 2B PUSHF/POPF) and tests bit 9 (IF).  Intended for `debug_assert!`s
+/// that a code path runs with interrupts masked — e.g. an interrupt-gate ISR
+/// after it has EOI'd but before `IRETQ`.
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    let rflags: u64;
+    // SAFETY: PUSHFQ pushes RFLAGS and POP reads it back into a GPR; the pair
+    // is stack-balanced and does not modify flags or any observable memory.
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
+    }
+    (rflags & (1 << 9)) != 0
+}
+
 /// Read from an I/O port.
 #[inline]
 pub unsafe fn inb(port: u16) -> u8 {
