@@ -124,7 +124,16 @@ pub fn dispatch(
                         // stdin — read through TTY line discipline.
                         // tty.read writes directly into the supplied
                         // &mut [u8] so we bracket each spin iteration.
-                        let mut attempts = 0u32;
+                        //
+                        // LATENT arm: no in-tree caller reaches fd==0 read
+                        // today. Bound on TSC-floor get_ticks() rather than a
+                        // raw iteration counter — the LAPIC periodic timer can
+                        // stop under a wedged hypervisor (Intel SDM Vol.3A
+                        // Sec.10.5.4 / Vol.3B Sec.17.17) and a bare counter
+                        // over spin_loop() would collapse the timeout from
+                        // ~minutes to sub-second 100%-CPU busy-wait.
+                        let start = crate::arch::x86_64::irq::get_ticks();
+                        const STDIN_TIMEOUT_TICKS: u64 = 100; // ~1s @ 100 Hz — conservative default, latent path
                         loop {
                             {
                                 let mut tty = crate::drivers::tty::TTY0.lock();
@@ -136,11 +145,10 @@ pub fn dispatch(
                                     return n as i64;
                                 }
                             }
-                            attempts += 1;
-                            if attempts > 100_000 {
+                            if crate::arch::x86_64::irq::get_ticks().wrapping_sub(start) >= STDIN_TIMEOUT_TICKS {
                                 return 0;
                             }
-                            crate::hal::halt();
+                            core::hint::spin_loop();
                         }
                     }
                     Err(_) => -9,

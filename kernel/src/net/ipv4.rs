@@ -355,7 +355,11 @@ fn resolve_mac(dst_ip: Ipv4Address) -> MacAddress {
             let now = crate::arch::x86_64::irq::get_ticks();
             if now >= deadline { break; }
 
-            crate::hal::halt();
+            // Spin, not halt: the LAPIC periodic timer is this loop's only
+            // no-reply wake and can stop under a wedged hypervisor (Intel SDM
+            // Vol.3A Sec.10.5.4); TSC-floor `get_ticks()` keeps advancing
+            // regardless, so spinning still re-checks `deadline` and exits.
+            core::hint::spin_loop();
         }
     }
 
