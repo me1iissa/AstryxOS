@@ -3478,6 +3478,16 @@ pub fn run() -> ! {
         if test_287_wake_boost_preempts_runnable_peer() { passed += 1; }
     }
 
+    // ── Test: bell/waitlist wake_tids applies the shared wake-preemption ────
+    // boost + kick (re-land of the lost #560 latency fix). Drives the real
+    // `wake_tids` through both the direct single-TID shape and the full
+    // WaitList round trip pipe/eventfd use.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_wake_tids_bell_boost_and_kick() { passed += 1; }
+    }
+
     // ── Test 290: BSP poll reactor (PRIORITY_IDLE) not starved by a NORMAL ──
     // storm. Regression for the SMP=1 windowed-Firefox plateau — TID 0 (the
     // net/x11/compositor pump) must climb past a saturated PRIORITY_NORMAL
@@ -55860,6 +55870,145 @@ fn test_287_wake_boost_preempts_runnable_peer() -> bool {
     test_println!("  boost capped at PRIORITY_MAX {} ✓", PRIORITY_MAX);
 
     test_pass!("wake-preemption boost lets a woken futex waiter outrank its waker");
+    true
+}
+
+// ── Test: bell/waitlist `wake_tids` applies the shared wake-preemption ──────
+// boost + kick (re-land of the lost #560 latency fix) ───────────────────────
+//
+// #560 (merged 2026-06-12, orphaned by the 2026-06-10 history rewrite) gave
+// FUTEX_WAKE/_OP/REQUEUE waiters a wait-satisfied priority boost plus a
+// wakeup-preemption kick so a woken thread does not wait out a full quantum
+// before it can contend for the CPU (POSIX sched(7) sleeper fairness). A
+// 2026-07-21 content-verify pass found the futex arm had since been
+// independently re-derived (`proc::apply_wake_boost`, applied at the 3 futex
+// arms + the NT dispatcher) but the bell/waitlist `wake_tids` choke point —
+// every poll/select/epoll wake, pipe reader/writer wake, eventfd reader wake,
+// and the virtio-serial RX ISR wake all drain through it — still granted
+// ZERO boost or kick.
+//
+// This drives the REAL `wake_tids` (not a reimplementation) through both
+// call shapes it needs to support: a direct single-TID wake (the shape
+// `ring_poll_bell_for` uses after `POLL_BELL.drain_all()`) and the full
+// `WaitList::enqueue_self_blocked` -> `drain_all` -> `wake_tids` round trip
+// (the exact shape `pipe::wake_readers_all` / `eventfd::wake_readers_all`
+// use), and asserts the woken thread gets exactly the same boost
+// (`proc::apply_wake_boost`) the futex arm applies.
+//
+// `sched::is_active()` is false during the kernel test phase (see Test 651),
+// so the reschedule-flag side effect of the kick is a no-op here by
+// construction, not by a gate this test adds — which means this test also
+// proves `wake_tids` cannot panic or misbehave when called before/without a
+// live scheduler, itself a real regression surface (bell wakes can fire from
+// early-boot IPC teardown paths).
+//
+// NOTE: an earlier revision of this fix also added a per-wake cross-CPU IPI
+// poke of an idle sibling CPU (`sched::cpu_is_idle` + `sched::resched_cpu`
+// on every call). That was reverted before merge — see the `wake_tids`
+// doc comment — because it made every bell/pipe/eventfd wake pay a bounded
+// LAPIC-ICR drain-and-send, and bell/waitlist wakes fire far more often
+// than futex wakes; under TCG that measured as a ~15-min test-mode suite
+// run ballooning past 4 hours. No test here exercises that removed path.
+//
+// Cite: POSIX sched(7) (SCHED_OTHER wakeup preemption), pthread_cond_signal(3p).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_wake_tids_bell_boost_and_kick() -> bool {
+    use crate::proc::{THREAD_TABLE, ThreadState, PRIORITY_NORMAL, PRIORITY_BOOST_WAIT, PRIORITY_MAX};
+    use crate::ipc::waitlist::{WaitList, wake_tids};
+
+    const NAME: &str = "bell/waitlist wake_tids applies wake-preemption boost (re-land #560)";
+    test_header!(NAME);
+
+    // ── Part 1: real THREAD_TABLE row + direct single-TID wake_tids ──────
+    let host_pid = match crate::proc::usermode::create_user_process(
+        "wake_tids_boost_host", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!(NAME, "create_user_process: {:?}", e); return false; }
+    };
+    // `create_thread_blocked` already starts the row at
+    // (state=Blocked, priority=base_priority=PRIORITY_NORMAL).
+    let waiter_tid = match crate::proc::create_thread_blocked(host_pid, "wtb_waiter", 0) {
+        Some(t) => t,
+        None => { test_fail!(NAME, "create_thread_blocked failed"); return false; }
+    };
+    wake_tids(&[waiter_tid]);
+    let expected_boosted = (PRIORITY_NORMAL + PRIORITY_BOOST_WAIT).min(PRIORITY_MAX);
+    let (state1, prio1) = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == waiter_tid)
+            .map(|t| (t.state, t.priority)).unwrap_or((ThreadState::Dead, 0))
+    };
+    if state1 != ThreadState::Ready {
+        test_fail!(NAME, "direct wake_tids: state {:?} != Ready", state1);
+        return false;
+    }
+    if prio1 != expected_boosted {
+        test_fail!(NAME, "direct wake_tids: priority {} != boosted {} (apply_wake_boost not applied)",
+            prio1, expected_boosted);
+        return false;
+    }
+    test_println!("  direct wake_tids(&[tid]): Blocked -> Ready, priority {} -> {} (+{} boost) ✓",
+        PRIORITY_NORMAL, prio1, PRIORITY_BOOST_WAIT);
+
+    // ── Part 2: the real WaitList round trip (pipe/eventfd call shape) ───
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == waiter_tid) {
+            t.priority = PRIORITY_NORMAL; // reset for round 2
+            t.state = ThreadState::Blocked;
+        }
+    }
+    let mut wl = WaitList::new();
+    wl.enqueue_self_blocked(waiter_tid, u64::MAX);
+    if wl.len() != 1 {
+        test_fail!(NAME, "enqueue_self_blocked did not register waiter (len={})", wl.len());
+        return false;
+    }
+    let drained = wl.drain_all();
+    if drained != [waiter_tid] {
+        test_fail!(NAME, "drain_all did not return the enqueued waiter (drained={:?})", drained);
+        return false;
+    }
+    wake_tids(&drained);
+    let (state2, prio2) = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == waiter_tid)
+            .map(|t| (t.state, t.priority)).unwrap_or((ThreadState::Dead, 0))
+    };
+    if state2 != ThreadState::Ready || prio2 != expected_boosted {
+        test_fail!(NAME,
+            "WaitList round trip: state={:?} priority={} (expected Ready, {})",
+            state2, prio2, expected_boosted);
+        return false;
+    }
+    test_println!("  WaitList::enqueue_self_blocked -> drain_all -> wake_tids: same boost ✓ \
+(matches pipe::wake_readers_all / eventfd::wake_readers_all's call shape)");
+
+    // ── Part 3: idempotence — an already-Ready thread is not re-boosted, ──
+    // and an unknown TID in the same batch is silently ignored (no panic).
+    // `wake_tids` only touches `Blocked` threads, same guard the futex arm
+    // uses (`th.state == ThreadState::Blocked`).
+    wake_tids(&[waiter_tid, u64::MAX - 7]);
+    let prio_after_noop = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == waiter_tid).map(|t| t.priority).unwrap_or(0)
+    };
+    if prio_after_noop != prio2 {
+        test_fail!(NAME,
+            "wake_tids re-boosted an already-Ready thread: {} -> {} (must be Blocked-gated)",
+            prio2, prio_after_noop);
+        return false;
+    }
+    test_println!("  already-Ready thread not re-boosted; unknown TID ignored (no panic) ✓");
+
+    // ── Cleanup synthetic rows ─────────────────────────────────────────────
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.tid != waiter_tid); }
+    { let mut procs = crate::proc::PROCESS_TABLE.lock(); procs.retain(|p| p.pid != host_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != host_pid); }
+    crate::proc::proc_metrics::unregister(host_pid);
+
+    test_pass!(NAME);
     true
 }
 
