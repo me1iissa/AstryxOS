@@ -82,6 +82,17 @@
 # Usage:
 #   bash scripts/install-firefox-musl.sh           # idempotent install
 #   bash scripts/install-firefox-musl.sh --force   # rebuild rootfs + restage
+#   bash scripts/install-firefox-musl.sh --force --latest   # ignore the
+#                                                   # version lock, build
+#                                                   # against whatever
+#                                                   # ${ALPINE_VERSION} serves
+#                                                   # today (also:
+#                                                   # ASTRYXOS_FIREFOX_ALLOW_LATEST=1)
+#
+# Reproducibility: firefox-esr and the Mesa GL packages are pinned to exact
+# versions in scripts/firefox-musl-versions.lock (${ALPINE_VERSION} is a
+# rolling branch, not a frozen release, so an unpinned `apk add` is not
+# reproducible across two runs made days apart — see the lockfile header).
 #
 set -euo pipefail
 
@@ -104,6 +115,42 @@ ALPINE_KEY="alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"
 ALPINE_KEY_URL="https://alpinelinux.org/keys/${ALPINE_KEY}"
 APK_STATIC_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/main/x86_64/apk-tools-static-${APK_TOOLS_VERSION}.apk"
 
+# ── Per-package version pins (reproducibility — incident 2026-07-22) ────────
+# ${ALPINE_VERSION} above is a rolling branch alias, not a frozen release
+# tree: `apk add pkgname` fetches whatever build is current on that branch
+# *today*, so two `create-data-disk.sh` runs made days apart can silently
+# pull different transitive dependency versions even though this script's
+# own source never changed.  scripts/firefox-musl-versions.lock records the
+# exact `pkgname=version` last verified to install together; we pass those
+# pins to `apk add` so a drifted repo FAILS the build loudly (apk exits
+# non-zero on an unsatisfiable version pin) instead of silently shipping a
+# different image.  --latest / ASTRYXOS_FIREFOX_ALLOW_LATEST=1 opts out for a
+# deliberate "pull whatever Alpine has now" build.
+LOCKFILE="${ROOT_DIR}/scripts/firefox-musl-versions.lock"
+ALLOW_LATEST="${ASTRYXOS_FIREFOX_ALLOW_LATEST:-0}"
+
+# _pinned_version <pkgname> — print the pinned version for <pkgname> from
+# ${LOCKFILE}, or nothing if unpinned.  Lockfile format: `pkg=version`, one
+# per line, '#'-comments and blank lines ignored.
+_pinned_version() {
+    [ -f "${LOCKFILE}" ] || return 0
+    grep -m1 "^${1}=" "${LOCKFILE}" 2>/dev/null | cut -d= -f2- || true
+}
+
+# _apk_spec <pkgname> — print "pkgname" or "pkgname=version" per the lock,
+# honouring --latest/ASTRYXOS_FIREFOX_ALLOW_LATEST.
+_apk_spec() {
+    local pkg="$1" pin=""
+    if [ "${ALLOW_LATEST}" != "1" ] && [ "${ALLOW_LATEST}" != "true" ]; then
+        pin="$(_pinned_version "${pkg}")"
+    fi
+    if [ -n "${pin}" ]; then
+        echo "${pkg}=${pin}"
+    else
+        echo "${pkg}"
+    fi
+}
+
 # Package selection (env var + CLI override).  Default firefox-esr to preserve
 # every existing caller's behaviour.
 FIREFOX_PKG="${ASTRYXOS_FIREFOX_PACKAGE:-firefox-esr}"
@@ -113,12 +160,17 @@ for arg in "$@"; do
     case "${arg}" in
         --force) FORCE=true ;;
         --package=*) FIREFOX_PKG="${arg#--package=}" ;;
+        --latest) ALLOW_LATEST=1 ;;
         -h|--help)
             sed -n '2,60p' "$0"
             exit 0
             ;;
     esac
 done
+
+if [ "${ALLOW_LATEST}" = "1" ] || [ "${ALLOW_LATEST}" = "true" ]; then
+    echo "[FF-MUSL] --latest / ASTRYXOS_FIREFOX_ALLOW_LATEST=1: fetching whatever ${ALPINE_VERSION} currently serves (unpinned, non-reproducible)."
+fi
 
 case "${FIREFOX_PKG}" in
     firefox-esr)
@@ -173,6 +225,16 @@ esac
 # staging step unchanged.  Refs: Mesa 3D docs (gallium/llvmpipe), OpenGL/GLX
 # 1.4 spec, EGL 1.5 spec.
 FIREFOX_GL_PACKAGES="mesa-gl mesa-egl mesa-dri-gallium mesa-gbm"
+
+# Pinned apk specs ("pkg" or "pkg=version" per scripts/firefox-musl-versions.lock
+# — see _apk_spec above).  Used for the actual `apk add` invocations below; the
+# plain FIREFOX_PKG / FIREFOX_GL_PACKAGES names stay as-is for log messages.
+FIREFOX_PKG_SPEC="$(_apk_spec "${FIREFOX_PKG}")"
+FIREFOX_GL_PACKAGES_SPEC=""
+for _gl_pkg in ${FIREFOX_GL_PACKAGES}; do
+    FIREFOX_GL_PACKAGES_SPEC="${FIREFOX_GL_PACKAGES_SPEC} $(_apk_spec "${_gl_pkg}")"
+done
+FIREFOX_GL_PACKAGES_SPEC="${FIREFOX_GL_PACKAGES_SPEC# }"
 
 # Mozilla artefacts ship with DT_RUNPATH=/usr/lib/<package> baked into the
 # ELF .dynamic section (where <package> is either "firefox-esr" or "firefox"
@@ -272,7 +334,7 @@ EOF
         --arch=x86_64 \
         --no-cache \
         --initdb \
-        add "${FIREFOX_PKG}" ${FIREFOX_GL_PACKAGES} 2>&1 \
+        add "${FIREFOX_PKG_SPEC}" ${FIREFOX_GL_PACKAGES_SPEC} 2>&1 \
         | sed 's/^/[FF-MUSL apk] /' \
         | tail -40 || true
 
@@ -296,7 +358,7 @@ if [ ! -e "${ROOTFS_GL_SENTINEL}" ]; then
         --root="${ROOTFS}" \
         --arch=x86_64 \
         --no-cache \
-        add ${FIREFOX_GL_PACKAGES} 2>&1 \
+        add ${FIREFOX_GL_PACKAGES_SPEC} 2>&1 \
         | sed 's/^/[FF-MUSL apk-gl] /' \
         | tail -30 || true
     if [ ! -e "${ROOTFS_GL_SENTINEL}" ]; then
@@ -307,10 +369,52 @@ if [ ! -e "${ROOTFS_GL_SENTINEL}" ]; then
     fi
 fi
 
-INSTALLED_VERSION="$(grep -m1 "^P:${FIREFOX_PKG}\$" -A1 "${ROOTFS}/lib/apk/db/installed" 2>/dev/null | \
-                     grep '^V:' | cut -d: -f2 || echo unknown)"
+# _rootfs_installed_version <pkgname> — read the actually-installed version of
+# <pkgname> out of the bootstrapped Alpine rootfs's own apk database (works
+# whether this run just installed it or reused a cached rootfs from an
+# earlier run — either way this reflects ground truth, not what we asked for).
+_rootfs_installed_version() {
+    grep -m1 "^P:${1}\$" -A1 "${ROOTFS}/lib/apk/db/installed" 2>/dev/null | \
+        grep '^V:' | cut -d: -f2 || echo unknown
+}
+
+INSTALLED_VERSION="$(_rootfs_installed_version "${FIREFOX_PKG}")"
 echo "[FF-MUSL] Alpine rootfs contains ${FIREFOX_PKG} ${INSTALLED_VERSION}"
 echo "[FF-MUSL]   rootfs size: $(du -sh "${ROOTFS}" | cut -f1)"
+
+# ── Verify pins actually landed (reproducibility — incident 2026-07-22) ─────
+# `apk add pkg=version` fails the whole `add` transaction when the repo can't
+# satisfy the exact pin, which already surfaces as the sentinel-missing ERROR
+# above.  This is a second, explicit check across every pinned package (not
+# just the sentinel one) so a partial/silent resolver substitution is caught
+# too, and so a successful pinned build says so plainly in the log.
+if [ "${ALLOW_LATEST}" != "1" ] && [ "${ALLOW_LATEST}" != "true" ]; then
+    PIN_MISMATCH=""
+    for _pin_pkg in "${FIREFOX_PKG}" ${FIREFOX_GL_PACKAGES}; do
+        _pin_want="$(_pinned_version "${_pin_pkg}")"
+        [ -n "${_pin_want}" ] || continue
+        _pin_got="$(_rootfs_installed_version "${_pin_pkg}")"
+        if [ "${_pin_got}" = "${_pin_want}" ]; then
+            echo "[FF-MUSL] pin verified: ${_pin_pkg}=${_pin_want}"
+        else
+            echo "[FF-MUSL] ERROR: pin mismatch for ${_pin_pkg}: locked=${_pin_want} installed=${_pin_got}"
+            PIN_MISMATCH=1
+        fi
+    done
+    if [ -n "${PIN_MISMATCH}" ]; then
+        echo "[FF-MUSL]        scripts/firefox-musl-versions.lock is stale for ${ALPINE_VERSION}, or the"
+        echo "[FF-MUSL]        cached rootfs (${ROOTFS}) predates the pins.  Re-run with --force to"
+        echo "[FF-MUSL]        rebuild against the pins, or --latest / ASTRYXOS_FIREFOX_ALLOW_LATEST=1"
+        echo "[FF-MUSL]        to intentionally build unpinned and then promote the resolved versions"
+        echo "[FF-MUSL]        into the lockfile."
+        exit 1
+    fi
+else
+    echo "[FF-MUSL] unpinned build (--latest) — resolved versions for promotion into the lockfile:"
+    for _pin_pkg in "${FIREFOX_PKG}" ${FIREFOX_GL_PACKAGES}; do
+        echo "[FF-MUSL]   ${_pin_pkg}=$(_rootfs_installed_version "${_pin_pkg}")"
+    done
+fi
 
 # ── Step 3: Stage rootfs into build/disk/ ────────────────────────────────────
 # We need a clean staging layout for create-data-disk.sh.  Two requirements:

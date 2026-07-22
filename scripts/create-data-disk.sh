@@ -85,6 +85,17 @@ FIREFOX=false
 #
 # Selectable via CLI arg or env var; env var loses to explicit CLI arg.
 FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
+# Tracks whether the caller actually said which variant they want (env var or
+# --firefox-variant=...) versus silently taking the glibc default.  Used by
+# the cross-variant staging guard below (incident 2026-07-22) — see there.
+FIREFOX_VARIANT_EXPLICIT=false
+[ -n "${ASTRYXOS_FIREFOX_VARIANT:-}" ] && FIREFOX_VARIANT_EXPLICIT=true
+
+# Skip the Alpine version pins in scripts/firefox-musl-versions.lock and build
+# against whatever ${ALPINE_VERSION} (install-firefox-musl.sh) currently
+# serves.  Forwarded to install-firefox-musl.sh as --latest; off by default
+# so a plain rebuild is reproducible.  See scripts/firefox-musl-versions.lock.
+ALLOW_LATEST="${ASTRYXOS_FIREFOX_ALLOW_LATEST:-0}"
 
 # When set (env or --xeyes flag), also stage the Alpine xeyes binary + its
 # missing deps into build/disk/, and copy /usr/bin/xeyes into data.img.
@@ -215,11 +226,12 @@ for arg in "$@"; do
         --force) FORCE=true ;;
         --force-inuse) FORCE_INUSE=true ;;
         --firefox) FIREFOX=true; FORCE=true ;;
-        --firefox-variant=*) FIREFOX_VARIANT="${arg#--firefox-variant=}" ;;
+        --firefox-variant=*) FIREFOX_VARIANT="${arg#--firefox-variant=}"; FIREFOX_VARIANT_EXPLICIT=true ;;
         --firefox-variant) :;;   # next arg consumed by trailing path
         --firefox-debug=*) FIREFOX_DEBUG="${arg#--firefox-debug=}" ;;
         --firefox-debug)   FIREFOX_DEBUG=1 ;;
         --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
+        --latest) ALLOW_LATEST=1 ;;
         --output=*)    DATA_IMG_OVERRIDE="${arg#--output=}" ;;
         --build-dir=*) BUILD_DIR="${arg#--build-dir=}" ;;
         --xeyes) XEYES=1; FORCE=true ;;
@@ -241,7 +253,16 @@ case "${FIREFOX_VARIANT}" in
         exit 1
         ;;
 esac
-echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT}"
+if [ "${FIREFOX_VARIANT_EXPLICIT}" = true ]; then
+    echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT} (explicit)"
+else
+    # Loud-by-design (incident 2026-07-22): a silent glibc default staged over
+    # a musl-built tree — or vice versa — cross-contaminates the shared
+    # usr/share/glib-2.0/schemas, usr/share/mime, and usr/lib/gdk-pixbuf-2.0
+    # paths that BOTH variants write and NEITHER wipes for the other.  See the
+    # cross-variant staging guard below, which also acts on this flag.
+    echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT} (DEFAULT — ASTRYXOS_FIREFOX_VARIANT unset and no --firefox-variant=... given)"
+fi
 
 # ── Finalise the staging root + output image (after --build-dir / --output) ───
 # Export ASTRYXOS_BUILD_DIR so every install-*.sh sub-script stages into the
@@ -454,6 +475,57 @@ if [ "${FIREFOX_DEBUG_MODE}" != off ] && [ "${FIREFOX_VARIANT}" != musl ]; then
 fi
 echo "[DATA-DISK] Firefox debug-symbols: ${FIREFOX_DEBUG_MODE}"
 
+# ── Cross-variant staging contamination guard (incident 2026-07-22) ─────────
+# usr/share/glib-2.0/schemas, usr/share/mime, and usr/lib/gdk-pixbuf-2.0 are
+# written by BOTH variants — install-gtk-real-glibc.sh's Ubuntu-noble
+# gsettings-desktop-schemas/shared-mime-info/gdk-pixbuf-query-loaders closure
+# for glibc; install-firefox-musl.sh's Alpine equivalents for musl — but
+# wiped by NEITHER before the other stages over them (unlike disk/lib64 and
+# disk/lib/x86_64-linux-gnu, which the musl branch below already clears).  A
+# run that silently defaulted to FIREFOX_VARIANT=glibc (ASTRYXOS_FIREFOX_VARIANT
+# unset) followed by an explicit musl rebuild left ~30 Ubuntu
+# org.gnome.desktop.*.gschema.xml files folded into the musl image's
+# gschemas.compiled (2,732 -> 39,840 bytes, 5 -> 35 schemas) — a
+# cross-contaminated, non-reproducible artifact a clean musl-only build never
+# produces.  Two independent guards:
+#
+#   1. A silent variant DEFAULT must not switch away from what is already
+#      staged.  If build/disk was last staged for a different variant and
+#      this run did not explicitly say which variant it wants, refuse
+#      outright instead of quietly overlaying the wrong pipeline.
+#   2. The shared dirs are ALWAYS cleared before (re)staging, unconditionally
+#      — every run, same variant or not.  Both installers fully regenerate
+#      these paths from their own package sources every time (the noble
+#      overlay's gschemas.compiled/mime.cache/loaders.cache and the musl
+#      installer's Alpine equivalents), so there is no legitimate reason for
+#      ANY prior run's copy to survive into this one.  This is what actually
+#      closes the incident: guard 1 only catches a *new* silent-default
+#      regression going forward — it cannot retroactively clean a tree that
+#      was contaminated by a run that predates this guard (as build/disk
+#      itself was on 2026-07-22, from a glibc default run before an explicit
+#      musl rebuild).  Unconditional-every-run is the only version of this
+#      guard that also repairs that kind of pre-existing contamination.
+VARIANT_SENTINEL_FILE="${BUILD_DIR}/disk/.astryxos-variant"
+PRIOR_VARIANT=""
+if [ -f "${VARIANT_SENTINEL_FILE}" ]; then
+    PRIOR_VARIANT="$(grep -m1 '^variant=' "${VARIANT_SENTINEL_FILE}" 2>/dev/null | cut -d= -f2 || true)"
+fi
+if [ -n "${PRIOR_VARIANT}" ] && [ "${PRIOR_VARIANT}" != "${FIREFOX_VARIANT}" ] && [ "${FIREFOX_VARIANT_EXPLICIT}" = false ]; then
+    echo "[DATA-DISK] ERROR: ${BUILD_DIR}/disk was last staged for FIREFOX_VARIANT=${PRIOR_VARIANT}," >&2
+    echo "[DATA-DISK]        but this run would silently default to FIREFOX_VARIANT=${FIREFOX_VARIANT}" >&2
+    echo "[DATA-DISK]        (ASTRYXOS_FIREFOX_VARIANT is unset and no --firefox-variant=... was given)." >&2
+    echo "[DATA-DISK]        Mixing variants in one staging tree cross-contaminates shared paths" >&2
+    echo "[DATA-DISK]        (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0) —" >&2
+    echo "[DATA-DISK]        this exact failure mode broke the 2026-07-22 Firefox wiki test image." >&2
+    echo "[DATA-DISK]        Pass ASTRYXOS_FIREFOX_VARIANT=${FIREFOX_VARIANT} (or =${PRIOR_VARIANT} to keep" >&2
+    echo "[DATA-DISK]        the existing variant) explicitly, or wipe ${BUILD_DIR}/disk and start clean." >&2
+    exit 1
+fi
+echo "[DATA-DISK] Clearing shared cross-variant paths (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0) before staging"
+for _shared_dir in usr/share/glib-2.0/schemas usr/share/mime usr/lib/gdk-pixbuf-2.0; do
+    rm -rf "${BUILD_DIR}/disk/${_shared_dir}"
+done
+
 # ── Stage at least one TTF font for Mozilla's font-list init ─────────────────
 # Mozilla's gfxFcPlatformFontList walks the FcFontSet returned by
 # FcConfigGetFonts() and asserts that mFontFamilies.Count() > 0 at the end of
@@ -654,6 +726,9 @@ fi
 if [ -f "${ROOT_DIR}/scripts/install-firefox-musl.sh" ]; then
     MUSL_FLAGS=""
     [ "${FORCE}" = true ] && MUSL_FLAGS="--force"
+    if [ "${ALLOW_LATEST}" = "1" ] || [ "${ALLOW_LATEST}" = "true" ]; then
+        MUSL_FLAGS="${MUSL_FLAGS} --latest"
+    fi
     # ASTRYXOS_FIREFOX_PACKAGE forwarded via env so install-firefox-musl.sh
     # picks firefox-esr vs firefox-132 layout uniformly across the pipeline.
     ASTRYXOS_FIREFOX_PACKAGE="${FIREFOX_PACKAGE}" \
@@ -754,6 +829,13 @@ user_pref("geo.enabled", false);
 PREFS
 
 fi  # end FIREFOX_VARIANT branch
+
+# Record which variant this staging tree now holds (cross-variant staging
+# contamination guard, above).  Written unconditionally so the NEXT run —
+# whichever variant it asks for — can tell whether it's continuing this one
+# or switching.
+mkdir -p "${BUILD_DIR}/disk"
+printf 'variant=%s\n' "${FIREFOX_VARIANT}" > "${VARIANT_SENTINEL_FILE}"
 
 # ── Optional: stage Alpine xeyes (X11 "hello world" outside libxul) ──────────
 # Independent of FIREFOX_VARIANT — xeyes only requires the musl libc + a small
