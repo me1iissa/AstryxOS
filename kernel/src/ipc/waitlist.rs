@@ -132,18 +132,68 @@ impl WaitList {
 /// flip every drained TID.  Threads that have already transitioned out
 /// of `Blocked` (e.g. timed out via the scheduler tick at
 /// `sched/mod.rs:104`) are left alone.
+///
+/// This is the single choke point for every bell/waitlist event wake (the
+/// global poll bell's `ring_poll_bell_for` drain, pipe reader/writer wakes,
+/// the eventfd reader wake, and the virtio-serial RX ISR wake all drain into
+/// this function), so applying the shared wake-preemption treatment here
+/// covers all of them in one place instead of at each call site.
+///
+/// Mirrors the FUTEX_WAKE/_OP/REQUEUE arms in `subsys/linux/syscall.rs`
+/// exactly, in both pieces:
+///
+/// 1. **Boost** — each woken thread gets `proc::apply_wake_boost`, the same
+///    one-shot-decaying wait-satisfied priority bump (POSIX `sched(7)`
+///    sleeper fairness: a thread that just returned from a block has not
+///    spent any CPU, so it is owed a queue-jump over continuously-runnable
+///    peers).
+/// 2. **Kick** — after releasing `THREAD_TABLE` (never send an IPI, or even
+///    touch an atomic that gates one, while holding a lock the IPI path
+///    could need — the `#82`/`#476`/`#703` held-lock-vs-IPI deadlock class):
+///    if a woken thread now outranks whatever this CPU interrupted,
+///    `sched::request_reschedule()` asks THIS CPU to reschedule at its next
+///    preemption point (identical to the futex arm's `cur_prio` check).
+///
+/// A cross-CPU IPI poke of an idle sibling CPU (`sched::resched_cpu` on
+/// every wake, unconditionally) was tried and reverted: bell/waitlist wakes
+/// fire orders of magnitude more often than futex wakes (every pipe write,
+/// eventfd post, and poll-bell ring across the whole IPC surface), and
+/// `apic::send_ipi_noblock`'s bounded drain-then-send is not free under
+/// TCG — sending it unconditionally on that call frequency measured as a
+/// ~15-min test-mode suite ballooning past 4 hours. An idle CPU still
+/// notices new Ready work within one quantum via the existing per-CPU
+/// runqueue rebalance poke (`sched::percpu`, Perf P2 phase 3c), which pokes
+/// only the CPUs that actually gained work and only once per rebalance
+/// pass rather than once per wake.
 pub fn wake_tids(tids: &[u64]) {
     if tids.is_empty() {
         return;
     }
+    let cur_tid = crate::proc::current_tid();
     let mut threads = crate::proc::THREAD_TABLE.lock();
+    let cur_prio = threads
+        .iter()
+        .find(|th| th.tid == cur_tid)
+        .map(|th| th.priority)
+        .unwrap_or(0);
+    let mut max_woken_prio = 0u8;
+    let mut any_woken = false;
     for &t in tids {
         if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
             if th.state == crate::proc::ThreadState::Blocked {
                 th.state = crate::proc::ThreadState::Ready;
                 th.wake_tick = 0;
+                crate::proc::apply_wake_boost(th);
+                if th.priority > max_woken_prio {
+                    max_woken_prio = th.priority;
+                }
+                any_woken = true;
             }
         }
+    }
+    drop(threads); // release THREAD_TABLE before the reschedule request
+    if any_woken && max_woken_prio > cur_prio {
+        crate::sched::request_reschedule();
     }
 }
 
