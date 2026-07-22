@@ -8,6 +8,9 @@ from agent scripts or CI. Every subcommand prints JSON to stdout.
 Session state is stored in ~/.astryx-harness/<sid>.json.
 Events are written to ~/.astryx-harness/<sid>.events.jsonl.
 QMP socket: ~/.astryx-harness/<sid>.qmp.sock
+QEMU's own stderr (accel-init failures, device warnings, the last words before
+an abort) is persisted to ~/.astryx-harness/<sid>.qemu.stderr (append mode) —
+also in the session JSON as `qemu_stderr_path`.
 
 ## KVM default (W139 recommendation)
 
@@ -57,6 +60,9 @@ Tier 1 — session management:
                                           [--livelock-reap-sc N]
                                           [--livelock-reap-secs SECS]
                                           [--no-livelock-reap]
+                                          [--panic-snapshot-min-interval-secs SECS]
+                                          [--panic-snapshot-max-attempts N]
+                                          [--no-panic-snapshot]
         Host-side packet capture (default ON for FF-render boots): every
         Firefox-render boot (features firefox-test / firefox-test-core /
         firefox-test-trace) automatically captures its VM<->internet traffic to
@@ -84,6 +90,24 @@ Tier 1 — session management:
         a live `livelock_suspected: true` flag.  Pass --no-livelock-reap (or set
         either threshold to 0) to keep a spinning session alive for inspection
         (debugging/autopsy holds).
+        Panic snapshot (default ON, rate-limited): the watcher classifies
+        each `!!! Page Fault` banner by its companion `Flags:` line — a
+        KERNEL-mode fault falls straight into a bugcheck (kernel-fatal, same
+        as a Rust panic/AETHER bugcheck/double fault) and attempts a QMP
+        savevm; a USER-mode fault (an ordinary Firefox SIGSEGV — signal
+        delivered or the process killed, kernel unaffected) is recorded as a
+        `user_fault` event but NEVER triggers a snapshot.  Attempts are
+        additionally capped at --panic-snapshot-max-attempts (default 3) and
+        spaced at least --panic-snapshot-min-interval-secs apart (default
+        30s); the watcher also self-disables after the first
+        "does not support live migration"/"does not support snapshots" QMP
+        failure, since that error is a property of the (fixed) block-device
+        topology and every later attempt would fail identically — only a
+        `start --snapshottable` session's topology can actually savevm.  Pass
+        --no-panic-snapshot to skip the QMP call entirely (kernel-fatal
+        events are still recorded).  QEMU's own stderr is persisted to
+        <sid>.qemu.stderr regardless of these flags (see the module
+        docstring above).
     python3 scripts/qemu-harness.py stop <sid>
     python3 scripts/qemu-harness.py list
     python3 scripts/qemu-harness.py wait <sid> <regex> [--ms MS]
@@ -911,6 +935,11 @@ def _session_path(sid: str) -> Path:
 def _events_path(sid: str) -> Path:
     return HARNESS_DIR / f"{sid}.events.jsonl"
 
+def _qemu_stderr_path(sid: str) -> Path:
+    """Where QEMU's own stderr is persisted for this session (append mode —
+    survives QEMU process death, unlike the previous /dev/null sink)."""
+    return HARNESS_DIR / f"{sid}.qemu.stderr"
+
 def _normalize_pid(value):
     """Session JSONs written by older harness versions may carry the pid as
     a string, and signal sites pass it straight to os.kill — normalize at
@@ -982,11 +1011,67 @@ def _emit_event(sid: str, event: dict):
 
 # ── Background watcher thread ─────────────────────────────────────────────────
 
+
+# ── Panic watcher: kernel-fatal vs. ordinary user-mode fault ─────────────────
+#
+# The naive `page fault` substring match fires on the routine `!!! Page Fault`
+# banner the kernel prints for a Ring-3 fault it cannot resolve — which is
+# also what an ordinary Firefox SIGSEGV looks like (the fault is delivered as
+# a POSIX signal, or the process is killed with exit_group(-11); the KERNEL
+# itself is fine).  Confirmed live (2026-07-22, run 4e1a2dff55cd,
+# ffrender-artifacts/smp2-wiki-goodimg-2026-07-22/run2_smp2_4e1a2dff55cd/
+# fault_window_lines_4261-4761.log): a user-mode fault prints
+#
+#   !!! Page Fault (error_code=0x4)
+#     ...
+#     Flags: not-present READ USER
+#   [SIGNAL] sig=11 ISR delivery: PID=1 CR2=0x10 ...
+#
+# and the kernel keeps running — that single boot alone produced 70,533 such
+# "panic" events, every one triggering a doomed QMP savevm (the read-only
+# vvfat boot disk cannot snapshot: "does not support live migration").
+#
+# A genuine kernel-mode #PF (kernel/src/arch/x86_64/idt.rs, the
+# `error_code & 4 == 0` branch) prints the SAME banner but with `KERNEL` in
+# the Flags line and unconditionally falls into `ke_bugcheck` right after
+# (confirmed via kfatal_loop_onset_lines_12463-12620.log):
+#
+#   !!! Page Fault (error_code=0x2)
+#     ...
+#     Flags: not-present WRITE KERNEL
+#   [W215/KFATAL] ...
+#
+# `Flags:` is emitted from exactly one call site in idt.rs, so it is a safe,
+# unambiguous discriminator. Other unconditionally-fatal banners (a Rust
+# panic, the AETHER bugcheck banner, a double fault — which per idt.rs is
+# always taken at CPL0 in this design) still fire the snapshot path directly,
+# with no Flags lookahead needed.
+_PAGE_FAULT_OPEN_RE = re.compile(r"!!! Page Fault")
+_FAULT_FLAGS_RE = re.compile(r"Flags:.*\b(KERNEL|USER)\b")
+# Lines to wait for the companion `Flags:` line before giving up on a pending
+# `!!! Page Fault` banner (the dump is ~5 lines; generous margin for a
+# serial-mux-interleaved line from another emitter landing in between).
+_PENDING_FAULT_LINE_BUDGET = 10
+
 _PANIC_RE = re.compile(
-    r"kernel panic|double fault|page fault|PANIC",
+    r"kernel panic|double fault|AETHER KERNEL BUGCHECK|PANIC",
     re.IGNORECASE,
 )
 _IDLE_SECONDS = 30
+
+# ── Panic-snapshot capability probe / rate limit / attempt cap ──────────────
+#
+# A confirmed kernel-fatal event still triggers a QMP savevm — but the boot
+# disk topology for a plain (non `--snapshottable`) session is a read-only
+# vvfat frontend that CANNOT hold a live-migration blob, so every attempt was
+# guaranteed to fail (see the module docstring / _PANIC_RE comment above for
+# the 70,533-attempt storm this produced). These defaults keep at most a
+# handful of attempts per session and never hammer the same QMP socket other
+# consumers (screendump pollers) are also using. All three are overridable
+# via `start --panic-snapshot-min-interval-secs` /
+# `--panic-snapshot-max-attempts` / `--no-panic-snapshot`.
+PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT = 30.0
+PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT = 3
 
 # Kernel-tick regex for stamping each gate mark with the latest tick (so a
 # historical re-derivation cross-checks against the exact host stamp). Same
@@ -1275,6 +1360,56 @@ def _load_gate_marks():
         return None
 
 
+def _attempt_panic_snapshot(sid: str, qmp_sock: str, snap_state: dict):
+    """Attempt a QMP `savevm` for a confirmed kernel-fatal event, honoring the
+    capability probe / min-interval / max-attempts guards in `snap_state`
+    (mutated in place — see the `_snap_state` dict built in `_watcher_thread`).
+
+    Returns `(snap_ok, snap_name, snap_err, skipped_reason)`:
+      * a real attempt was made  -> skipped_reason is None (snap_ok/name/err
+        describe the QMP outcome, same semantics as before this change).
+      * the attempt was skipped -> snap_ok=False, snap_name=None, snap_err=None,
+        skipped_reason names why ("disabled" | "capability-known-bad" |
+        "max-attempts-reached" | "rate-limited").
+    """
+    if not snap_state["enabled"]:
+        return False, None, None, "disabled"
+    if snap_state["capability_bad"]:
+        return False, None, None, "capability-known-bad"
+    if snap_state["attempts"] >= snap_state["max_attempts"]:
+        return False, None, None, "max-attempts-reached"
+    now = time.monotonic()
+    last = snap_state["last_attempt"]
+    if last is not None and (now - last) < snap_state["min_interval"]:
+        return False, None, None, "rate-limited"
+
+    snap_state["attempts"] += 1
+    snap_state["last_attempt"] = now
+    snap_name = f"{sid}-panic-{snap_state['attempts']}"
+    snap_ok = False
+    snap_err = None
+    try:
+        resp = _qmp_command(qmp_sock,
+                            "human-monitor-command",
+                            {"command-line": f"savevm {snap_name}"},
+                            connect_timeout=2.0)
+        # An HMP savevm failure rides in the `return` string, not an `error`
+        # key — parse it so the panic event reports a TRUE snapshot, not a
+        # phantom one (same bug class as cmd_snap).
+        snap_err = _hmp_error(resp)
+        snap_ok = snap_err is None
+    except Exception as e:
+        snap_err = f"qmp-exception: {e}"
+
+    if snap_err and ("does not support live migration" in snap_err.lower()
+                      or "does not support snapshots" in snap_err.lower()):
+        # The device topology can't ever satisfy savevm this session —
+        # probe once, then stop trying (belt-and-suspenders on the caps above).
+        snap_state["capability_bad"] = True
+
+    return snap_ok, (snap_name if snap_ok else None), snap_err, None
+
+
 def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
     """
     Monitors the serial log for panic patterns and idle periods, and stamps the
@@ -1328,6 +1463,34 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
     _ll_last_suspected = None        # last value pushed to the session JSON
     _ll_last_persist = 0.0           # throttle session-JSON writes
 
+    # ── Panic-snapshot config (capability probe / rate limit / attempt cap) ──
+    # Same tolerant-of-legacy-sessions pattern as livelock_reap above.
+    # `capability_bad` latches True the first time a savevm attempt fails with
+    # a device-topology error ("does not support live migration"/"snapshots")
+    # — that error is a property of the (fixed, session-lifetime) block-device
+    # topology, so every later attempt would fail the same way; one probe is
+    # enough. Belt-and-suspenders on top of the interval/attempt cap below.
+    _snap_cfg = (_sess0.get("panic_snapshot") or {}) if isinstance(_sess0, dict) else {}
+    _snap_state = {
+        "enabled":        bool(_snap_cfg.get("enabled", True)),
+        "min_interval":   float(_snap_cfg.get(
+            "min_interval_secs", PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT)),
+        "max_attempts":   int(_snap_cfg.get(
+            "max_attempts", PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT)),
+        "attempts":       0,
+        "last_attempt":   None,
+        "capability_bad": False,
+    }
+
+    # ── Pending `!!! Page Fault` classification state ─────────────────────────
+    # See _PAGE_FAULT_OPEN_RE / _FAULT_FLAGS_RE above: a page-fault banner is
+    # NOT kernel-fatal by itself — the companion `Flags:` line (within a few
+    # lines) carries the KERNEL/USER discriminator. `_pf_pending` tracks a
+    # banner seen but not yet resolved; `_pf_pending_lines` bounds the wait so
+    # a truncated/interleaved dump can never wedge the watcher.
+    _pf_pending = False
+    _pf_pending_lines = 0
+
     while _pid_alive(pid):
         try:
             size = log_path.stat().st_size if log_path.exists() else 0
@@ -1375,31 +1538,65 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                             # disable gate stamping for the rest of this run; keep
                             # the watcher alive for panics/idles.
                             _gm = None
+                    # Unconditionally-fatal banners (Rust panic, AETHER
+                    # bugcheck, double fault — always CPL0 in this design;
+                    # see the _PANIC_RE comment above) fire the snapshot path
+                    # directly, same as before this change.
                     m = _PANIC_RE.search(line)
                     if m:
-                        snap_name = f"{sid}-panic"
-                        snap_ok = False
-                        snap_err = None
-                        try:
-                            resp = _qmp_command(qmp_sock,
-                                                "human-monitor-command",
-                                                {"command-line": f"savevm {snap_name}"},
-                                                connect_timeout=2.0)
-                            # An HMP savevm failure rides in the `return`
-                            # string, not an `error` key — parse it so the
-                            # panic event reports a TRUE snapshot, not a
-                            # phantom one (same bug class as cmd_snap).
-                            snap_err = _hmp_error(resp)
-                            snap_ok = snap_err is None
-                        except Exception:
-                            pass
+                        snap_ok, snap_name, snap_err, skip_reason = \
+                            _attempt_panic_snapshot(sid, qmp_sock, _snap_state)
                         _emit_event(sid, {
                             "event": "panic",
                             "pattern": m.group(0),
                             "line": line,
-                            "snapshot": snap_name if snap_ok else None,
+                            "snapshot": snap_name,
                             "snapshot_error": snap_err,
+                            "snapshot_skipped_reason": skip_reason,
                         })
+                    elif _PAGE_FAULT_OPEN_RE.search(line):
+                        # A page-fault banner is NOT fatal by itself — arm the
+                        # pending-classification window and wait for the
+                        # companion `Flags:` line (KERNEL vs USER).
+                        _pf_pending = True
+                        _pf_pending_lines = 0
+                    elif _pf_pending:
+                        _pf_pending_lines += 1
+                        fm = _FAULT_FLAGS_RE.search(line)
+                        if fm:
+                            _pf_pending = False
+                            if fm.group(1) == "KERNEL":
+                                # Confirmed kernel-mode #PF — idt.rs falls
+                                # straight into ke_bugcheck right after this
+                                # line, so treat it exactly like the
+                                # unconditional-fatal banners above.
+                                snap_ok, snap_name, snap_err, skip_reason = \
+                                    _attempt_panic_snapshot(sid, qmp_sock, _snap_state)
+                                _emit_event(sid, {
+                                    "event": "panic",
+                                    "pattern": "page-fault-kernel",
+                                    "line": line,
+                                    "snapshot": snap_name,
+                                    "snapshot_error": snap_err,
+                                    "snapshot_skipped_reason": skip_reason,
+                                })
+                            else:
+                                # Ordinary Ring-3 fault (delivered as a signal,
+                                # or the process is killed) — the kernel is
+                                # fine. Record it (observability parity with
+                                # before) but never savevm: this is the class
+                                # that produced the 70k-event storm.
+                                _emit_event(sid, {
+                                    "event": "user_fault",
+                                    "pattern": "page-fault-user",
+                                    "line": line,
+                                })
+                        elif _pf_pending_lines > _PENDING_FAULT_LINE_BUDGET:
+                            # Companion Flags: line never showed up (dump
+                            # truncated / heavily interleaved) — give up
+                            # silently rather than wedge classification
+                            # forever. No event: we genuinely don't know.
+                            _pf_pending = False
 
                     # ── Livelock auto-reap: advance the FF gate index + feed
                     # the detector the live pid=1 syscall count. Entirely
@@ -1839,21 +2036,34 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                 cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{ssh_host_port}-:22"
                 break
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(ROOT),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        # Detach QEMU into its own session/process-group so it survives the
-        # teardown of the (possibly short-lived) shell that invoked `start`.
-        # Without this, an agent that runs `start` as a backgrounded one-shot
-        # has QEMU reaped (SIGKILL) the moment that wrapper process tree is
-        # cleaned up — even though the session JSON/serial-log persist on disk,
-        # leaving a "no_session"/defunct-qemu mismatch.  setsid is the standard
-        # POSIX way to orphan a long-lived child from its launcher.
-        start_new_session=True,
-    )
+    # QEMU's own stderr (device-model warnings, accel-init failures, an abort
+    # right before the process disappears) previously went to /dev/null — when
+    # QEMU died, no host-side cause survived on disk. Persist it alongside the
+    # serial log/QMP socket. Append mode: harmless on the common fresh-file
+    # case and safe if this sid's QEMU is ever relaunched. The file object is
+    # only needed long enough for Popen to dup2 it into the child (which keeps
+    # its own fd across fork+exec); closing our copy right after doesn't
+    # affect the detached child — same lifetime pattern as `stub_stderr_fh`
+    # in the oracle-stub launch above.
+    qemu_stderr_fh = open(_qemu_stderr_path(sid), "a")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=qemu_stderr_fh,
+            # Detach QEMU into its own session/process-group so it survives the
+            # teardown of the (possibly short-lived) shell that invoked `start`.
+            # Without this, an agent that runs `start` as a backgrounded one-shot
+            # has QEMU reaped (SIGKILL) the moment that wrapper process tree is
+            # cleaned up — even though the session JSON/serial-log persist on disk,
+            # leaving a "no_session"/defunct-qemu mismatch.  setsid is the standard
+            # POSIX way to orphan a long-lived child from its launcher.
+            start_new_session=True,
+        )
+    finally:
+        qemu_stderr_fh.close()
     return proc
 
 
@@ -4346,6 +4556,26 @@ def cmd_start(args):
             "reap_secs": getattr(args, "livelock_reap_secs",
                                  LIVELOCK_REAP_SECS_DEFAULT),
         },
+        # Panic-snapshot config (read by the detached watcher): capability
+        # probe / rate limit / attempt cap on the QMP savevm the watcher
+        # attempts for a confirmed kernel-fatal event (`--no-panic-snapshot`
+        # disables it outright — useful when the topology is known not to
+        # support savevm, e.g. any non-`--snapshottable` session). Additive —
+        # never present on sessions started before this landed; the watcher
+        # falls back to the built-in defaults (guard ON).
+        "panic_snapshot": {
+            "enabled": not getattr(args, "no_panic_snapshot", False),
+            "min_interval_secs": getattr(
+                args, "panic_snapshot_min_interval_secs",
+                PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT),
+            "max_attempts": getattr(
+                args, "panic_snapshot_max_attempts",
+                PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT),
+        },
+        # QEMU's own stderr, persisted for the life of the process (see
+        # `_launch_qemu_harness`) — was previously /dev/null, so a QEMU death
+        # left no host-side cause on disk. Additive.
+        "qemu_stderr_path": str(_qemu_stderr_path(sid)),
         # True when data.img was absent at session start (after any auto-symlink
         # attempt). Agents inspecting this field can immediately distinguish a
         # firefox-test wedge caused by missing /disk from a real regression.
@@ -5677,6 +5907,12 @@ def cmd_status(args):
         "livelock_suspected": bool(sess.get("livelock_suspected", False)),
         "livelock_info":      sess.get("livelock_info"),
         "livelock_reap_result": sess.get("livelock_reap_result"),
+        # Panic-snapshot config the watcher is honoring for this session
+        # (capability probe / rate limit / attempt cap — see `start`'s
+        # docstring). None on sessions started before this landed. QEMU's own
+        # stderr path is included here too for convenience. Additive.
+        "panic_snapshot":    sess.get("panic_snapshot"),
+        "qemu_stderr_path":  sess.get("qemu_stderr_path"),
         # D10: Firefox variant pin.  Additive — never present on sessions
         # started before this field landed.  `kernel_chosen`/`match` are
         # filled in by the post-boot verifier once the [FFTEST] probe line
@@ -13575,6 +13811,39 @@ def main():
                           help="Disable the livelock auto-reap guard for this "
                                "session entirely. Use for a debugging/autopsy "
                                "hold you WANT to keep spinning for inspection.")
+    # Panic-snapshot capability probe / rate limit / attempt cap. A confirmed
+    # kernel-fatal event (Rust panic, AETHER bugcheck, double fault, or a
+    # classified kernel-mode #PF — see the _PANIC_RE / _FAULT_FLAGS_RE
+    # comments) triggers a QMP savevm; these flags bound how often/how many
+    # times the watcher tries, and let it be disabled outright for sessions
+    # whose device topology can never satisfy savevm (any non-`--snapshottable`
+    # boot disk is read-only vvfat, which cannot hold a live-migration blob).
+    p_start.add_argument("--panic-snapshot-min-interval-secs",
+                          dest="panic_snapshot_min_interval_secs",
+                          type=float,
+                          default=PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT,
+                          metavar="SECS",
+                          help="Minimum wall-clock gap (default "
+                               f"{int(PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT)}s) "
+                               "between panic-snapshot attempts this session.")
+    p_start.add_argument("--panic-snapshot-max-attempts",
+                          dest="panic_snapshot_max_attempts",
+                          type=int,
+                          default=PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT,
+                          metavar="N",
+                          help="Maximum panic-snapshot attempts for the whole "
+                               f"session (default {PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT}). "
+                               "The watcher also stops trying after the first "
+                               "device-topology failure (\"does not support "
+                               "live migration\"), whichever comes first.")
+    p_start.add_argument("--no-panic-snapshot", dest="no_panic_snapshot",
+                          action="store_true",
+                          help="Disable the panic-snapshot attempt entirely for "
+                               "this session. Kernel-fatal events are still "
+                               "recorded in events.jsonl; only the QMP savevm "
+                               "call is skipped. Use for any session whose "
+                               "topology cannot savevm (the common case — only "
+                               "`--snapshottable` sessions can).")
     p_start.add_argument("--ff-url", dest="ff_url", default=None, metavar="URL",
                           help="firefox-test target URL delivered to the kernel "
                                "at boot WITHOUT a rebuild.  The harness appends "
