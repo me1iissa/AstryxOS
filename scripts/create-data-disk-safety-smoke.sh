@@ -243,6 +243,123 @@ RC=$?
     && pass "resolved within-tree target replaced atomically (inode changed)" \
     || fail "resolved within-tree target inode unchanged"
 
+# ── (d) cross-variant staging contamination guard (incident 2026-07-22) ─────
+# Covers the FIREFOX_VARIANT sentinel (${BUILD_DIR}/disk/.astryxos-variant):
+# a silent default must not switch away from what's already staged, and the
+# shared paths (usr/share/glib-2.0/schemas, usr/share/mime,
+# usr/lib/gdk-pixbuf-2.0, etc/fonts) are cleared unconditionally every run —
+# including a same-variant re-run, which is what actually repairs a tree
+# contaminated by a run that predates this guard.
+echo "[d] cross-variant staging guard: refuse silent default, wipe on switch"
+D="${WORK}/d"; mkroot "${D}"; IMG_D="${D}/build/d.img"
+SENTINEL_D="${D}/build/disk/.astryxos-variant"
+
+# Fresh build dir, no sentinel yet: a silent (env-unset) glibc default must
+# succeed and stamp the sentinel — this is not the incident, it's normal use.
+run_cdd "${D}" "${IMG_D}"
+RC=$?
+[ "${RC}" -eq 0 ] && pass "fresh build dir: silent glibc default succeeds" \
+    || fail "fresh build dir: silent default rc=${RC} (expected 0)"
+grep -q '^variant=glibc$' "${SENTINEL_D}" 2>/dev/null \
+    && pass "sentinel recorded variant=glibc after default build" \
+    || fail "sentinel missing or wrong after default build"
+
+# Explicit musl switch must succeed and update the sentinel (mkroot has no
+# install-firefox-musl.sh, so the musl branch itself is a no-op — this
+# exercises the guard + sentinel write, not real Firefox staging).
+ASTRYXOS_FIREFOX_VARIANT=musl run_cdd "${D}" "${IMG_D}" --force
+RC=$?
+[ "${RC}" -eq 0 ] && pass "explicit musl switch succeeds" \
+    || fail "explicit musl switch rc=${RC} (expected 0)"
+grep -q '^variant=musl$' "${SENTINEL_D}" 2>/dev/null \
+    && pass "sentinel updated to variant=musl after explicit switch" \
+    || fail "sentinel not updated after explicit switch"
+
+# Plant contamination markers in the shared dirs, then attempt a SILENT
+# default switch back to glibc — this is the 2026-07-22 incident shape and
+# must be refused (exit 1) with the shared dirs left untouched.
+mkdir -p "${D}/build/disk/usr/share/glib-2.0/schemas" "${D}/build/disk/usr/share/mime" \
+         "${D}/build/disk/usr/lib/gdk-pixbuf-2.0" "${D}/build/disk/etc/fonts"
+touch "${D}/build/disk/usr/share/glib-2.0/schemas/leftover.gschema.xml"
+run_cdd "${D}" "${IMG_D}" --force
+RC=$?
+[ "${RC}" -eq 1 ] && pass "silent default away from staged musl refused (exit 1)" \
+    || fail "silent default away from staged musl rc=${RC} (expected 1)"
+grep -qi 'ERROR.*staged for FIREFOX_VARIANT=musl' "${D}/last.log" \
+    && pass "refusal names the staged-variant mismatch" \
+    || fail "refusal message missing the staged-variant reason"
+[ -f "${D}/build/disk/usr/share/glib-2.0/schemas/leftover.gschema.xml" ] \
+    && pass "refused switch leaves shared dirs untouched" \
+    || fail "shared dirs were modified despite the refusal"
+
+# Explicit switch (glibc) must succeed and clear the contaminated shared dir.
+ASTRYXOS_FIREFOX_VARIANT=glibc run_cdd "${D}" "${IMG_D}" --force
+RC=$?
+[ "${RC}" -eq 0 ] && pass "explicit glibc switch succeeds" \
+    || fail "explicit glibc switch rc=${RC} (expected 0)"
+[ -f "${D}/build/disk/usr/share/glib-2.0/schemas/leftover.gschema.xml" ] \
+    && fail "explicit switch did not clear the contaminated shared dir" \
+    || pass "explicit switch cleared the contaminated shared dir"
+grep -q 'Clearing shared cross-variant paths' "${D}/last.log" \
+    && pass "log records the shared-dir wipe" \
+    || fail "log missing the shared-dir wipe line"
+
+# A SAME-variant re-run (no switch at all) must ALSO wipe the shared dirs
+# unconditionally — this is what repairs pre-existing contamination that
+# predates the sentinel, not just future variant flips.
+mkdir -p "${D}/build/disk/usr/share/mime"
+touch "${D}/build/disk/usr/share/mime/leftover.cache"
+ASTRYXOS_FIREFOX_VARIANT=glibc run_cdd "${D}" "${IMG_D}" --force
+[ -f "${D}/build/disk/usr/share/mime/leftover.cache" ] \
+    && fail "same-variant re-run did not wipe shared dirs (should be unconditional)" \
+    || pass "same-variant re-run also wipes shared dirs (unconditional-every-run policy)"
+
+# ── (e) patch-gui-caches.sh honours the same variant sentinel ───────────────
+# patch-gui-caches.sh can rebuild GUI caches OUTSIDE create-data-disk.sh
+# (--stage-only). It must consult the identical sentinel file/format and
+# refuse a glibc-staged tree — it only knows how to regenerate musl caches,
+# so recompiling a glibc tree's schemas with the Alpine tool is the same
+# contamination via a different door.
+echo "[e] patch-gui-caches.sh variant sentinel guard"
+PGC="${SELF_DIR}/patch-gui-caches.sh"
+if [ ! -f "${PGC}" ]; then
+    missing_tool "patch-gui-caches.sh not found at ${PGC}" || true
+else
+    E="${WORK}/e"
+    mkdir -p "${E}/disk/usr/share/glib-2.0/schemas" "${E}/disk/usr/share/mime" \
+             "${E}/disk/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+
+    # glibc-staged tree: this musl-only tool must refuse outright.
+    printf 'variant=glibc\n' > "${E}/disk/.astryxos-variant"
+    bash "${PGC}" --disk-dir "${E}/disk" --stage-only > "${E}/pgc-glibc.log" 2>&1
+    RC=$?
+    [ "${RC}" -ne 0 ] && pass "patch-gui-caches refuses a glibc-staged tree (rc=${RC})" \
+        || fail "patch-gui-caches did not refuse a glibc-staged tree (rc=0)"
+    grep -qi 'staged for FIREFOX_VARIANT=glibc' "${E}/pgc-glibc.log" \
+        && pass "refusal names the glibc sentinel mismatch" \
+        || fail "refusal message missing the glibc sentinel reason"
+
+    # musl-staged tree: the variant guard itself must NOT block. (Whatever
+    # else happens is qemu/rootfs-availability-dependent, not this guard's
+    # concern, so we only assert on the absence of the mismatch message.)
+    printf 'variant=musl\n' > "${E}/disk/.astryxos-variant"
+    bash "${PGC}" --disk-dir "${E}/disk" --stage-only > "${E}/pgc-musl.log" 2>&1
+    grep -qi 'staged for FIREFOX_VARIANT=' "${E}/pgc-musl.log" \
+        && fail "patch-gui-caches wrongly flagged a musl-staged tree as mismatched" \
+        || pass "musl-staged tree passes the variant guard (no mismatch flagged)"
+
+    # No sentinel at all: must warn loudly, not silently guess or hard-refuse
+    # via the mismatch path (a legacy tree predating this guard).
+    rm -f "${E}/disk/.astryxos-variant"
+    bash "${PGC}" --disk-dir "${E}/disk" --stage-only > "${E}/pgc-nosentinel.log" 2>&1
+    grep -qi 'WARNING.*no variant sentinel' "${E}/pgc-nosentinel.log" \
+        && pass "missing sentinel produces a loud warning (not a silent guess)" \
+        || fail "missing sentinel: no warning emitted"
+    grep -qi 'ERROR.*staged for FIREFOX_VARIANT=' "${E}/pgc-nosentinel.log" \
+        && fail "missing sentinel wrongly hard-refused via the mismatch path" \
+        || pass "missing sentinel does not hard-refuse (proceeds with a warning)"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 echo "== summary: ${PASS} passed, ${FAIL} failed =="
 [ "${FAIL}" -eq 0 ] || exit 1

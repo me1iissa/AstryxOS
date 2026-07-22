@@ -476,18 +476,19 @@ fi
 echo "[DATA-DISK] Firefox debug-symbols: ${FIREFOX_DEBUG_MODE}"
 
 # ── Cross-variant staging contamination guard (incident 2026-07-22) ─────────
-# usr/share/glib-2.0/schemas, usr/share/mime, and usr/lib/gdk-pixbuf-2.0 are
-# written by BOTH variants — install-gtk-real-glibc.sh's Ubuntu-noble
-# gsettings-desktop-schemas/shared-mime-info/gdk-pixbuf-query-loaders closure
-# for glibc; install-firefox-musl.sh's Alpine equivalents for musl — but
-# wiped by NEITHER before the other stages over them (unlike disk/lib64 and
-# disk/lib/x86_64-linux-gnu, which the musl branch below already clears).  A
-# run that silently defaulted to FIREFOX_VARIANT=glibc (ASTRYXOS_FIREFOX_VARIANT
-# unset) followed by an explicit musl rebuild left ~30 Ubuntu
-# org.gnome.desktop.*.gschema.xml files folded into the musl image's
-# gschemas.compiled (2,732 -> 39,840 bytes, 5 -> 35 schemas) — a
-# cross-contaminated, non-reproducible artifact a clean musl-only build never
-# produces.  Two independent guards:
+# usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0, and
+# etc/fonts are written by BOTH variants — install-gtk-real-glibc.sh's
+# Ubuntu-noble gsettings-desktop-schemas/shared-mime-info/
+# gdk-pixbuf-query-loaders closure + install-fonts-real.sh's fonts.conf for
+# glibc; install-firefox-musl.sh's Alpine equivalents (incl. its own
+# etc/fonts copy) for musl — but wiped by NEITHER before the other stages
+# over them (unlike disk/lib64 and disk/lib/x86_64-linux-gnu, which the musl
+# branch below already clears).  A run that silently defaulted to
+# FIREFOX_VARIANT=glibc (ASTRYXOS_FIREFOX_VARIANT unset) followed by an
+# explicit musl rebuild left ~30 Ubuntu org.gnome.desktop.*.gschema.xml files
+# folded into the musl image's gschemas.compiled (2,732 -> 39,840 bytes, 5 ->
+# 35 schemas) — a cross-contaminated, non-reproducible artifact a clean
+# musl-only build never produces.  Two independent guards:
 #
 #   1. A silent variant DEFAULT must not switch away from what is already
 #      staged.  If build/disk was last staged for a different variant and
@@ -496,15 +497,31 @@ echo "[DATA-DISK] Firefox debug-symbols: ${FIREFOX_DEBUG_MODE}"
 #   2. The shared dirs are ALWAYS cleared before (re)staging, unconditionally
 #      — every run, same variant or not.  Both installers fully regenerate
 #      these paths from their own package sources every time (the noble
-#      overlay's gschemas.compiled/mime.cache/loaders.cache and the musl
-#      installer's Alpine equivalents), so there is no legitimate reason for
-#      ANY prior run's copy to survive into this one.  This is what actually
-#      closes the incident: guard 1 only catches a *new* silent-default
-#      regression going forward — it cannot retroactively clean a tree that
-#      was contaminated by a run that predates this guard (as build/disk
-#      itself was on 2026-07-22, from a glibc default run before an explicit
-#      musl rebuild).  Unconditional-every-run is the only version of this
-#      guard that also repairs that kind of pre-existing contamination.
+#      overlay's gschemas.compiled/mime.cache/loaders.cache/fonts.conf and
+#      the musl installer's Alpine equivalents), so there is no legitimate
+#      reason for ANY prior run's copy to survive into this one.  This is
+#      what actually closes the incident: guard 1 only catches a *new*
+#      silent-default regression going forward — it cannot retroactively
+#      clean a tree that was contaminated by a run that predates this guard
+#      (as build/disk itself was on 2026-07-22, from a glibc default run
+#      before an explicit musl rebuild).  Unconditional-every-run is the only
+#      version of this guard that also repairs that kind of pre-existing
+#      contamination.
+#
+# NOT in this wipe list (deliberate — reviewed 2026-07-22, see PR): the
+# musl-only trees under usr/lib/ (firefox-esr/, debug/, ld-musl*) and the
+# musl-only usr/share/ subdirs (icu, X11, icons, themes, dbus-1,
+# applications, gtk-3.0, fontconfig, drirc.d, alsa, libdrm, hwdata, defaults,
+# metainfo, thumbnailers, xml — see install-firefox-musl.sh's allow-list) are
+# ACCEPTED RESIDUE across a musl -> glibc switch. Unlike the four paths
+# above, the glibc runtime never reads any of them (different DT_RUNPATH /
+# distinct glibc-only paths under usr/lib/x86_64-linux-gnu and opt/firefox),
+# so leftover Alpine files there are dead weight (wasted disk / inode
+# budget), not a correctness hazard — they cannot fold into a glibc-read
+# artifact the way schemas/mime/pixbuf-loaders/fontconfig can.  A full
+# build/disk wipe on every variant switch would close this too, but costs a
+# full restage of every non-Firefox staged extra (busybox/sshd/tls/pivot-e);
+# left as a follow-up if the wasted space ever matters in practice.
 VARIANT_SENTINEL_FILE="${BUILD_DIR}/disk/.astryxos-variant"
 PRIOR_VARIANT=""
 if [ -f "${VARIANT_SENTINEL_FILE}" ]; then
@@ -515,14 +532,14 @@ if [ -n "${PRIOR_VARIANT}" ] && [ "${PRIOR_VARIANT}" != "${FIREFOX_VARIANT}" ] &
     echo "[DATA-DISK]        but this run would silently default to FIREFOX_VARIANT=${FIREFOX_VARIANT}" >&2
     echo "[DATA-DISK]        (ASTRYXOS_FIREFOX_VARIANT is unset and no --firefox-variant=... was given)." >&2
     echo "[DATA-DISK]        Mixing variants in one staging tree cross-contaminates shared paths" >&2
-    echo "[DATA-DISK]        (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0) —" >&2
+    echo "[DATA-DISK]        (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0, etc/fonts) —" >&2
     echo "[DATA-DISK]        this exact failure mode broke the 2026-07-22 Firefox wiki test image." >&2
     echo "[DATA-DISK]        Pass ASTRYXOS_FIREFOX_VARIANT=${FIREFOX_VARIANT} (or =${PRIOR_VARIANT} to keep" >&2
     echo "[DATA-DISK]        the existing variant) explicitly, or wipe ${BUILD_DIR}/disk and start clean." >&2
     exit 1
 fi
-echo "[DATA-DISK] Clearing shared cross-variant paths (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0) before staging"
-for _shared_dir in usr/share/glib-2.0/schemas usr/share/mime usr/lib/gdk-pixbuf-2.0; do
+echo "[DATA-DISK] Clearing shared cross-variant paths (usr/share/glib-2.0/schemas, usr/share/mime, usr/lib/gdk-pixbuf-2.0, etc/fonts) before staging"
+for _shared_dir in usr/share/glib-2.0/schemas usr/share/mime usr/lib/gdk-pixbuf-2.0 etc/fonts; do
     rm -rf "${BUILD_DIR}/disk/${_shared_dir}"
 done
 
