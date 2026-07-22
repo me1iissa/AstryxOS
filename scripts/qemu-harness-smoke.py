@@ -1231,6 +1231,151 @@ def run_livelock_reap_check():
     print()
 
 
+def run_panic_watcher_check():
+    """
+    Tier 1.5 host-only check: the panic-watcher kernel-fatal classifier +
+    the panic-snapshot capability probe / rate limit / attempt cap.
+
+    No QEMU launched (< 1s). Confirmed defect (2026-07-22): the old bare
+    `page fault` match fired the QMP savevm path on every ordinary Firefox
+    SIGSEGV (a Ring-3 fault the kernel resolves by signal delivery or
+    exit_group — the kernel itself is fine), producing a 70,533-event storm
+    in a single boot, every savevm doomed to fail ("does not support live
+    migration"). Locks down:
+
+      * `_PANIC_RE` no longer bare-matches a `!!! Page Fault` banner, but
+        still matches the unconditionally-fatal banners (Rust panic, AETHER
+        bugcheck, double fault).
+      * `_FAULT_FLAGS_RE` extracts KERNEL vs USER from the real `Flags:` line
+        idt.rs prints (kernel/src/arch/x86_64/idt.rs:755) for both classes.
+      * `_attempt_panic_snapshot` honors disabled / capability-known-bad /
+        max-attempts / rate-limit, and self-latches capability_bad on a
+        "does not support live migration" QMP failure.
+      * `start --help` advertises the three new flags.
+    """
+    print("=== Tier 1.5: panic-watcher classifier + snapshot guard (host-only) ===")
+    print()
+
+    import importlib.util
+    h_path = Path(__file__).resolve().parent / "qemu-harness.py"
+    spec = importlib.util.spec_from_file_location("qemu_harness_smoke_panic", h_path)
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    PANIC_RE = getattr(mod, "_PANIC_RE", None)
+    OPEN_RE = getattr(mod, "_PAGE_FAULT_OPEN_RE", None)
+    FLAGS_RE = getattr(mod, "_FAULT_FLAGS_RE", None)
+    check("_PANIC_RE present", PANIC_RE is not None, "")
+    check("_PAGE_FAULT_OPEN_RE present", OPEN_RE is not None, "")
+    check("_FAULT_FLAGS_RE present", FLAGS_RE is not None, "")
+    if PANIC_RE is None or OPEN_RE is None or FLAGS_RE is None:
+        return
+
+    # ── A bare page-fault banner must NOT be an unconditional match ─────────
+    user_pf_line = "!!! Page Fault (error_code=0x4)"
+    check("bare page-fault banner: not unconditionally fatal",
+          PANIC_RE.search(user_pf_line) is None, user_pf_line)
+    check("page-fault banner: matches the open regex",
+          bool(OPEN_RE.search(user_pf_line)), user_pf_line)
+
+    # ── Unconditionally-fatal banners still match ────────────────────────────
+    check("kernel panic: still fatal",
+          bool(PANIC_RE.search("!!! KERNEL PANIC !!!")), "")
+    check("AETHER bugcheck: still fatal",
+          bool(PANIC_RE.search("*** AETHER KERNEL BUGCHECK ***")), "")
+    check("double fault: still fatal",
+          bool(PANIC_RE.search("!!! Exception #8: Double Fault (error_code=0x0) cpu=0 tid=0")), "")
+
+    # ── Flags-line discriminator on REAL captured serial-log lines ──────────
+    # (ffrender-artifacts/smp2-wiki-goodimg-2026-07-22/run2_smp2_4e1a2dff55cd/
+    #  fault_window_lines_4261-4761.log and kfatal_loop_onset_lines_12463-12620.log)
+    user_flags = "  Flags: not-present READ USER "
+    kernel_flags = "  Flags: not-present WRITE KERNEL "
+    ifetch_flags = "  Flags: not-present READ KERNEL IFETCH"
+    m_user = FLAGS_RE.search(user_flags)
+    m_kernel = FLAGS_RE.search(kernel_flags)
+    m_ifetch = FLAGS_RE.search(ifetch_flags)
+    check("Flags line: USER classified",   bool(m_user) and m_user.group(1) == "USER",
+          str(m_user.groups() if m_user else None))
+    check("Flags line: KERNEL classified", bool(m_kernel) and m_kernel.group(1) == "KERNEL",
+          str(m_kernel.groups() if m_kernel else None))
+    check("Flags line: KERNEL+IFETCH classified",
+          bool(m_ifetch) and m_ifetch.group(1) == "KERNEL",
+          str(m_ifetch.groups() if m_ifetch else None))
+
+    # ── _attempt_panic_snapshot guard state machine (QMP calls monkeypatched) ─
+    ATTEMPT = getattr(mod, "_attempt_panic_snapshot", None)
+    check("_attempt_panic_snapshot present", ATTEMPT is not None, "")
+    if ATTEMPT is not None:
+        orig_qmp = mod._qmp_command
+        try:
+            # disabled
+            st = {"enabled": False, "min_interval": 30.0, "max_attempts": 3,
+                  "attempts": 0, "last_attempt": None, "capability_bad": False}
+            ok, name, err, reason = ATTEMPT("sid", "sock", st)
+            check("snapshot: disabled -> skipped", (ok, name, err, reason) == (False, None, None, "disabled"), str(reason))
+
+            # capability known bad
+            st2 = {"enabled": True, "min_interval": 0.0, "max_attempts": 3,
+                   "attempts": 1, "last_attempt": None, "capability_bad": True}
+            ok, name, err, reason = ATTEMPT("sid", "sock", st2)
+            check("snapshot: capability-bad -> skipped", reason == "capability-known-bad", str(reason))
+
+            # max attempts reached
+            st3 = {"enabled": True, "min_interval": 0.0, "max_attempts": 2,
+                   "attempts": 2, "last_attempt": None, "capability_bad": False}
+            ok, name, err, reason = ATTEMPT("sid", "sock", st3)
+            check("snapshot: max-attempts -> skipped", reason == "max-attempts-reached", str(reason))
+
+            # rate limited (last attempt just now, min_interval huge)
+            st4 = {"enabled": True, "min_interval": 10_000.0, "max_attempts": 3,
+                   "attempts": 0, "last_attempt": __import__("time").monotonic(),
+                   "capability_bad": False}
+            ok, name, err, reason = ATTEMPT("sid", "sock", st4)
+            check("snapshot: rate-limited -> skipped", reason == "rate-limited", str(reason))
+
+            # real attempt: success (monkeypatch qmp to report no error)
+            mod._qmp_command = lambda *a, **k: {"return": ""}
+            st5 = {"enabled": True, "min_interval": 0.0, "max_attempts": 3,
+                   "attempts": 0, "last_attempt": None, "capability_bad": False}
+            ok, name, err, reason = ATTEMPT("sid1", "sock", st5)
+            check("snapshot: success attempt", ok is True and name is not None and reason is None,
+                  str((ok, name, err, reason)))
+            check("snapshot: attempts incremented", st5["attempts"] == 1, str(st5["attempts"]))
+
+            # real attempt: device-topology failure -> latches capability_bad
+            mod._qmp_command = lambda *a, **k: {
+                "return": "Error: block device 'block0' does not support live migration"}
+            st6 = {"enabled": True, "min_interval": 0.0, "max_attempts": 3,
+                   "attempts": 0, "last_attempt": None, "capability_bad": False}
+            ok, name, err, reason = ATTEMPT("sid2", "sock", st6)
+            check("snapshot: device-topology failure -> not ok", ok is False, str(err))
+            check("snapshot: capability_bad latched", st6["capability_bad"] is True, str(st6))
+            # a second attempt on the same state must now be skipped
+            ok2, name2, err2, reason2 = ATTEMPT("sid2", "sock", st6)
+            check("snapshot: subsequent attempt skipped after capability latch",
+                  reason2 == "capability-known-bad", str(reason2))
+        finally:
+            mod._qmp_command = orig_qmp
+
+    # ── start --help advertises the new flags ────────────────────────────────
+    _, raw, _ = _h("start", "--help")
+    check("start --panic-snapshot-min-interval-secs advertised",
+          "--panic-snapshot-min-interval-secs" in raw, "")
+    check("start --panic-snapshot-max-attempts advertised",
+          "--panic-snapshot-max-attempts" in raw, "")
+    check("start --no-panic-snapshot advertised",
+          "--no-panic-snapshot" in raw, "")
+    print()
+
+
 def run_blk_trace_argv_check():
     """
     Tier 1.5 host-only check: blk-trace drain/flush CLI + `start --build-only`.
@@ -1717,6 +1862,7 @@ def main():
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
     run_livelock_reap_check()
+    run_panic_watcher_check()
     run_pcap_argv_check()
     run_scrings_parse_check()
 
