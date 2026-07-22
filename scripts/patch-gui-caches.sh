@@ -93,6 +93,41 @@ LOADERS_CACHE="${GDKP_DIR}/loaders.cache"
 GSCHEMA_CACHE="${GSCHEMA_DIR}/gschemas.compiled"
 MIME_CACHE="${MIME_DIR}/mime.cache"
 
+# ── Variant sentinel guard (shared contract with create-data-disk.sh) ───────
+# create-data-disk.sh stamps ${BUILD_DIR}/disk/.astryxos-variant with
+# "variant=<glibc|musl>" (one line) every time it stages Firefox — see its
+# cross-variant staging contamination guard.  This tool only knows how to
+# regenerate the MUSL-flavoured caches: it drives Alpine's own
+# gdk-pixbuf-query-loaders / glib-compile-schemas / update-mime-database
+# under qemu-x86_64 against ${ROOTFS} (the Alpine musl rootfs by default).
+# Running --stage-only / a full regen against a glibc-staged tree would
+# recompile Ubuntu-noble's schema/mime sources with the Alpine tool — exactly
+# the kind of cross-variant mixing the 2026-07-22 incident was, just via this
+# tool instead of create-data-disk.sh.  MUST stay byte-for-byte in sync with
+# create-data-disk.sh's sentinel path ("${BUILD_DIR}/disk/.astryxos-variant")
+# and format ("variant=<name>") — create-data-disk-safety-smoke.sh asserts
+# both scripts agree on this contract, so a drift here fails CI rather than
+# silently reintroducing the bug.
+VARIANT_SENTINEL_FILE="${DISK_DIR}/.astryxos-variant"
+SENTINEL_VARIANT=""
+if [ -f "${VARIANT_SENTINEL_FILE}" ]; then
+    SENTINEL_VARIANT="$(grep -m1 '^variant=' "${VARIANT_SENTINEL_FILE}" 2>/dev/null | cut -d= -f2 || true)"
+fi
+if [ -n "${SENTINEL_VARIANT}" ] && [ "${SENTINEL_VARIANT}" != "musl" ]; then
+    echo "[GUI-CACHE] ERROR: ${DISK_DIR} is staged for FIREFOX_VARIANT=${SENTINEL_VARIANT}, but this tool only" >&2
+    echo "[GUI-CACHE]        knows how to regenerate the musl-flavoured caches (Alpine's own tools under" >&2
+    echo "[GUI-CACHE]        qemu-x86_64 against ${ROOTFS}).  Recompiling a ${SENTINEL_VARIANT}-staged tree's" >&2
+    echo "[GUI-CACHE]        schemas/mime with the Alpine tool is exactly the cross-variant contamination" >&2
+    echo "[GUI-CACHE]        the 2026-07-22 incident was.  Refusing." >&2
+    exit 1
+fi
+if [ -z "${SENTINEL_VARIANT}" ]; then
+    echo "[GUI-CACHE] WARNING: no variant sentinel at ${VARIANT_SENTINEL_FILE} -- proceeding on the" >&2
+    echo "[GUI-CACHE]          assumption this is a musl staging tree (this tool cannot regenerate" >&2
+    echo "[GUI-CACHE]          glibc's caches).  Run create-data-disk.sh at least once to establish the" >&2
+    echo "[GUI-CACHE]          sentinel, or pass --disk-dir at a tree you know is musl-staged." >&2
+fi
+
 have_qemu() { command -v qemu-x86_64 >/dev/null 2>&1; }
 
 # The staged Alpine tool binaries (gdk-pixbuf-query-loaders, glib-compile-schemas,

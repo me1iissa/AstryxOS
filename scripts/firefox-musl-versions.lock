@@ -1,0 +1,33 @@
+# firefox-musl-versions.lock — exact Alpine package versions for the musl
+# Firefox test image (install-firefox-musl.sh), pinned so
+# create-data-disk.sh ASTRYXOS_FIREFOX_VARIANT=musl reproduces the same
+# package set on every rebuild instead of pulling whatever is current on
+# the ${ALPINE_VERSION} branch at fetch time.
+#
+# ${ALPINE_VERSION} (see install-firefox-musl.sh) is a Alpine "vX.Y" branch
+# alias, not a frozen release tree -- it keeps receiving package rebuilds for
+# the life of that release, so an unpinned `apk add pkgname` is not
+# reproducible across two runs made days apart.  These versions were last
+# confirmed installable together on 2026-07-22 (Alpine v3.20, x86_64).
+#
+# Format: one `package=version` pin per line. Blank lines and lines
+# starting with '#' are ignored. A package with no pin recorded here is
+# fetched unpinned (apk resolves whatever is current) -- add its pin here
+# once it has actually been used, rather than guessing ahead of use.
+#
+# Regenerate/extend after a deliberate, verified package bump:
+#   awk -v p="firefox-esr" '$0=="P:"p{f=1} f&&/^V:/{print;f=0}' \
+#       ~/.cache/astryxos-firefox-musl/rootfs/lib/apk/db/installed
+#
+# Bumping a pin is a deliberate act (mirrors the ALPINE_VERSION /
+# APK_TOOLS_VERSION comment in install-firefox-musl.sh) -- do not
+# auto-update. Pass --latest (or ASTRYXOS_FIREFOX_ALLOW_LATEST=1) to
+# intentionally build against whatever the Alpine repo currently serves;
+# that path still prints the resolved versions so a maintainer can promote
+# them into this file.
+
+firefox-esr=115.24.0-r0
+mesa-gl=24.0.9-r1
+mesa-egl=24.0.9-r1
+mesa-dri-gallium=24.0.9-r1
+mesa-gbm=24.0.9-r1
