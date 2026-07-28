@@ -1887,13 +1887,20 @@ fn load_elf_dyn(
                 // each interpreter page's (pid, interp-VA, phys, rc_before) so a
                 // crash victim phys can be correlated back to the load that
                 // wrote it, and rc_before>0 directly names a PMM non-free reuse.
+                // `current_pid_lockless()` (not `current_pid()`): this loop runs
+                // in the loader path and must not take THREAD_TABLE per page --
+                // review F2, matching the alias detector's own choice in
+                // `mm::w215_diag::alias_install_check`.
                 #[cfg(feature = "firefox-test-core")]
                 {
                     let n = W215_INTERP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-                    if n <= 4096 && (_rc_before != 0 || n <= 4096) {
+                    // review F3: `n <= 4096` alone would silently drop the
+                    // rc_before!=0 signal (the whole point of this probe) once
+                    // 4096 interpreter pages have been logged.
+                    if n <= 4096 || _rc_before != 0 {
                         crate::serial_println!(
                             "[W215/INTERP] pid={} va={:#x} phys={:#x} rc_before={} n={}",
-                            crate::proc::current_pid(), page_vaddr, phys, _rc_before, n,
+                            crate::proc::current_pid_lockless(), page_vaddr, phys, _rc_before, n,
                         );
                     }
                 }
