@@ -291,7 +291,6 @@ pub fn init() {
     let mmio_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_CACHE
                    | PAGE_WRITE_THROUGH | PAGE_GLOBAL;
     crate::mm::vmm::map_page(lapic_virt, base_phys, mmio_flags);
-    LAPIC_BASE.store(lapic_virt, Ordering::Relaxed);
 
     // Disable legacy PIC before enabling APIC
     disable_pic();
@@ -300,6 +299,15 @@ pub fn init() {
     unsafe {
         wrmsr(IA32_APIC_BASE_MSR, apic_base_msr | (1 << 11));
     }
+
+    // Publish the register base only once the APIC is hardware-enabled.
+    // A non-zero `LAPIC_BASE` is what every lazy accessor treats as "these
+    // registers are safe to touch", and touching the register page while
+    // IA32_APIC_BASE.EN is clear raises #GP (Intel SDM Vol. 3A §11.4.3).
+    // Publishing after the enabling `wrmsr` removes that window outright,
+    // rather than resting on the argument that nothing can be accepted
+    // across the two statements.
+    LAPIC_BASE.store(lapic_virt, Ordering::Relaxed);
 
     // Set spurious interrupt vector register (SVR) — enable APIC + vector 0xFF
     lapic_write(LAPIC_SVR, 0x1FF); // Enable (bit 8) + vector 0xFF
@@ -343,6 +351,40 @@ pub fn init() {
     LAPIC_TIMER_PERIOD.store(timer_count, Ordering::Release);
     LAPIC_TSC_DEADLINE_PERIOD.store(tsc_per_10ms, Ordering::Release);
 
+    // Publish "the LAPIC is the interrupt controller" BEFORE arming anything
+    // that can deliver through it.
+    //
+    // `timer_tick` routes its acknowledgement on this flag: while it is false
+    // the handler EOIs the 8259 — correct in the PIC era, where vector 32 is
+    // the PIT through the remapped master PIC — and only once it is true does
+    // it EOI the LAPIC.  Arming the LAPIC timer while the flag is still false
+    // therefore opens a window in which a LAPIC-delivered interrupt is
+    // acknowledged to the wrong controller, and an EOI that never reaches the
+    // LAPIC leaves vector 32's in-service bit set permanently.  That bit holds
+    // PPR at the vector's priority class and blocks delivery of every vector
+    // 32..47 — the timer plus every device IRQ — for the rest of the boot
+    // (Intel SDM Vol. 3A §10.8.3.1 / §10.8.4).
+    //
+    // The window was not theoretical.  The first deadline is armed ~10 ms out,
+    // and the diagnostic lines that previously sat between the arm and this
+    // store take longer than that to clock out of a 115200-baud UART, so the
+    // very first timer interrupt of every boot landed inside it — and was
+    // accepted rather than left pending, which is what sets the in-service
+    // bit.  Interrupts are enabled here: `hal::init` masks them at the top of
+    // boot, but `ke::init` re-enables them a few phases later when
+    // `ke::irql::init` sets the initial IRQL to Passive and `sync_hw_interrupts`
+    // takes its `sti` arm, and nothing raises back to Dispatch or above before
+    // this function runs.
+    //
+    // Publishing before the arm is safe, and for a stronger reason than the
+    // timer merely being unarmed: both 8259s were masked by `disable_pic`
+    // earlier in this function, the I/O APIC is not initialised, no AP has
+    // been started, and the LAPIC timer is not yet armed.  No interrupt of any
+    // vector can be delivered between here and the arm, so no reader of this
+    // flag can run in the gap.  The flag means "acknowledge to the LAPIC from
+    // now on", which is true from this instruction onward.
+    APIC_ENABLED.store(true, Ordering::Relaxed);
+
     // Program this CPU's LAPIC timer in the chosen mode and arm it.
     arm_lapic_timer();
 
@@ -357,7 +399,6 @@ pub fn init() {
     // Try to initialize I/O APIC
     init_ioapic();
 
-    APIC_ENABLED.store(true, Ordering::Relaxed);
     crate::serial_println!("[APIC] APIC subsystem fully initialized");
 }
 
@@ -537,6 +578,27 @@ pub fn highest_in_service_vector(isr: &[u32; 8]) -> Option<u8> {
     None
 }
 
+/// Acknowledge the LAPIC only if it actually holds `vector` in service.
+///
+/// For the interrupt-controller boundary: a vector can be delivered by the
+/// 8259 or by the LAPIC, and acknowledging the wrong one leaves the other's
+/// state stuck.  Testing the in-service bit resolves which one accepted it.
+/// `vector` must be the highest-priority vector that can be in service on this
+/// path, since an EOI retires the highest in-service bit rather than a named
+/// one (Intel SDM Vol. 3A §10.8.4).
+///
+/// Returns whether an EOI was issued.  No-op before the LAPIC base is mapped.
+pub fn lapic_eoi_if_vector_in_service(vector: u8) -> bool {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if !vector_in_service(vector) {
+        return false;
+    }
+    lapic_eoi();
+    true
+}
+
 /// Snapshot this CPU's 8-word In-Service Register bank.
 fn read_isr() -> [u32; 8] {
     let mut isr = [0u32; 8];
@@ -546,18 +608,18 @@ fn read_isr() -> [u32; 8] {
     isr
 }
 
-/// Is the timer vector's own in-service bit set?  One MMIO read of the single
-/// ISR word that can hold it, as the cheap reject for
-/// [`clear_stale_timer_in_service`].
+/// Is `vector`'s own in-service bit set?  One MMIO read of the single ISR word
+/// that can hold it.
 ///
-/// The recovery cannot fire unless this bit is set, so on the hot degraded path
-/// — where the BSP reactor calls the recovery once per loop iteration, not once
-/// per tick — this replaces the full eight-word scan with a single read.  Under
-/// a hypervisor each LAPIC access is a VM exit, and single-CPU reactor bandwidth
-/// is a measured-sensitive quantity.
-fn timer_vector_in_service() -> bool {
-    let word = (TIMER_VECTOR as u32) / 32;
-    let bit  = (TIMER_VECTOR as u32) % 32;
+/// Used as the cheap reject on the hot degraded path — the BSP reactor reaches
+/// [`clear_stale_timer_in_service`] once per loop iteration, not once per tick,
+/// and the recovery cannot fire unless this bit is set, so this replaces the
+/// full eight-word priority scan with a single read.  Under a hypervisor each
+/// LAPIC access is a VM exit and single-CPU reactor bandwidth is a
+/// measured-sensitive quantity.
+fn vector_in_service(vector: u8) -> bool {
+    let word = (vector as u32) / 32;
+    let bit  = (vector as u32) % 32;
     lapic_read(LAPIC_ISR_BASE + word * 0x10) & (1 << bit) != 0
 }
 
@@ -611,7 +673,7 @@ pub fn clear_stale_timer_in_service() -> bool {
     }
     // Cheap reject before masking: if the timer vector is not in service at all
     // the gate below cannot fire.
-    if !timer_vector_in_service() {
+    if !vector_in_service(TIMER_VECTOR) {
         return false;
     }
 
@@ -688,7 +750,7 @@ pub fn rearm_timer() {
 }
 
 /// Mode-aware LAPIC-timer re-arm body, callable before `APIC_ENABLED` is
-/// published (the boot `init` path arms the timer before flipping the flag).
+/// published.
 fn rearm_timer_inner() {
     if tsc_deadline_mode() {
         // TSC-deadline: re-establish the LVT mode (10b) and arm a fresh
@@ -728,7 +790,28 @@ fn rearm_timer_inner() {
 /// deadline of `rdtsc() + period` cycles (Intel SDM Vol. 3A §11.5.4.1).  The
 /// divide-configuration register is irrelevant in TSC-deadline mode (the timer
 /// is clocked off the TSC, not the LAPIC bus divisor).
+///
+/// # Ordering requirement
+///
+/// `APIC_ENABLED` must already be published when this runs.  It is what routes
+/// the timer ISR's acknowledgement, so arming the timer first means the first
+/// interrupt is EOI'd to the 8259 while the LAPIC holds it in service — and an
+/// in-service bit nothing retires blocks every vector in its priority class
+/// (Intel SDM Vol. 3A §10.8.3.1 / §10.8.4).  The invariant is asserted rather
+/// than merely documented because the two live in different functions and the
+/// resulting failure is silent: the machine keeps running, just without a
+/// timer.  It is a real `assert!` rather than a `debug_assert!` because the
+/// release profile carries no debug assertions and every kernel that is booted,
+/// soaked or run in CI is built with it — a `debug_assert!` here would exist in
+/// no configuration that runs.  It costs one relaxed load, once per CPU at
+/// bringup.
 pub fn arm_lapic_timer() {
+    assert!(
+        is_enabled(),
+        "arm_lapic_timer: APIC_ENABLED must be published before the timer is \
+         armed — otherwise the first tick is acknowledged to the wrong \
+         interrupt controller and the LAPIC in-service bit is never retired"
+    );
     if tsc_deadline_mode() {
         // Establish TSC-deadline mode before the first deadline write — the
         // LVT mode field must be 10b for the IA32_TSC_DEADLINE write to take

@@ -2479,6 +2479,13 @@ pub fn run() -> ! {
     total += 1;
     if test_740_stale_timer_in_service_decode() { passed += 1; }
 
+    // ── Test 741: no timer EOI was lost during this boot ──
+    // Boot invariant guarding the init ordering: the LAPIC timer LVT is armed
+    // only after APIC_ENABLED routes the tick's acknowledgement to the LAPIC,
+    // so the stale-in-service recovery must not have needed to fire at all.
+    total += 1;
+    if test_741_no_timer_eoi_lost_this_boot() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -54789,6 +54796,63 @@ fn test_740_stale_timer_in_service_decode() -> bool {
 
     test_println!("  decode: empty / lone-timer / same-class-higher-vector-wins / \
 higher-class-wins / vector-255 / all-256-single-bit round-trip — lost-EOI recovery gate GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 741: no timer EOI was lost during this boot ───────────────────────
+//
+// The stale-in-service recovery is a safety net, not a place to live.  Every
+// boot used to spend one: `apic::init` armed the LAPIC timer ~10 ms before it
+// published `APIC_ENABLED`, and the diagnostic lines in between took longer
+// than that to clock out of the UART, so the first tick of every boot was
+// acknowledged to the 8259 while the LAPIC held vector 32 in service.  That
+// bit then held PPR at the vector's priority class and blocked every vector
+// 32..47 until the recovery retired it (Intel SDM Vol. 3A §10.8.3.1/§10.8.4).
+//
+// Publishing the flag before the arm closes the window, so a healthy boot now
+// reaches this point having recovered exactly zero stale vectors.  A non-zero
+// count here is not a test artefact — it means this machine really did lose a
+// timer EOI, which is worth surfacing even though the recovery keeps the boot
+// alive.
+//
+// What it does NOT pin is *why* the EOI went missing.  The invariant is "no
+// timer EOI was lost, for any reason", not "the initialisation order is
+// right": an EOI can also be lost host-side, on a hypervisor whose vCPUs are
+// oversubscribed, and a red on a hardware-accelerated soak is not by itself a
+// reason to bisect the APIC initialisation path.
+//
+// How well it guards the ordering bug it was written alongside depends on how
+// the kernel is being run.  That bug needs the two diagnostic lines between
+// the timer arm and the flag publish to take longer to clock out of the UART
+// than the ~10 ms first deadline.  Under hardware acceleration each UART
+// access is an exit to the host and they do, so a pre-fix tree loses the EOI
+// and this test goes red — measured.  Under emulation they do not, the window
+// never opens, and a pre-fix tree passes this test — also measured.  Since CI
+// runs emulated, the assertion in `arm_lapic_timer` rather than this test is
+// what stops the ordering being reintroduced there.
+fn test_741_no_timer_eoi_lost_this_boot() -> bool {
+    use core::sync::atomic::Ordering;
+    use crate::arch::x86_64::apic::{TIMER_STALE_EOI_COUNT, is_enabled};
+    const NAME: &str = "[ARCH/APIC] no timer EOI lost during boot (Test 741)";
+    test_header!(NAME);
+
+    // The routing flag must be live by the time anything can tick.
+    if !is_enabled() {
+        test_fail!(NAME, "APIC_ENABLED not published");
+        return false;
+    }
+
+    let stale = TIMER_STALE_EOI_COUNT.load(Ordering::Relaxed);
+    if stale != 0 {
+        test_println!("  recovered {} stale in-service timer vector(s) — a timer \
+EOI was lost this boot", stale);
+        test_fail!(NAME, "timer EOI lost during boot");
+        return false;
+    }
+
+    test_println!("  0 stale in-service timer vectors recovered — the timer LVT \
+is armed only after the LAPIC is the acknowledged controller");
     test_pass!(NAME);
     true
 }
