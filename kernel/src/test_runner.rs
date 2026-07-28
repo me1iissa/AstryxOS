@@ -2472,6 +2472,13 @@ pub fn run() -> ! {
     total += 1;
     if test_658_tsc_deadline_cadence() { passed += 1; }
 
+    // ── Test 740: stale in-service timer vector — ISR priority decode ──
+    // Hardware-free core of the lost-timer-EOI recovery: the gate that lets
+    // the dead-timer path retire a stale vector-32 in-service bit only when
+    // nothing higher-priority is genuinely in service.
+    total += 1;
+    if test_740_stale_timer_in_service_decode() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -54717,6 +54724,71 @@ fn test_651_cpu_timer_live_decision() -> bool {
     test_println!("  decision: first-obs / isr-advance-recovery(+clear) / within-window-tolerate / \
 wedge-declare(+rearm) / periodic-retry-under-cap / sub-window-no-rearm / at-cap-stop / \
 cap-boundary-strict — dead-CPU-timer self-heal state machine GREEN");
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 740: stale in-service timer vector — ISR priority decode ──────────
+//
+// Hardware-free core of the lost-timer-EOI recovery.  When an EOI for the
+// LAPIC timer vector is lost, vector 32's in-service bit stays set, PPR stays
+// raised to its priority class, and every same-or-lower-priority vector
+// (the timer plus all device IRQs 32..47) is blocked from delivery — Intel
+// SDM Vol. 3A §10.8.3.1 / §10.8.4.  Re-arming the timer cannot recover from
+// that; the in-service bit must be retired with an EOI.  Because EOI clears
+// the *highest-priority* in-service bit rather than a caller-named one, the
+// recovery is gated on the highest in-service vector being exactly the timer
+// vector — anything higher means a genuinely nested handler we must not
+// disturb.  This test pins that decode.
+fn test_740_stale_timer_in_service_decode() -> bool {
+    use crate::arch::x86_64::apic::{highest_in_service_vector, TIMER_VECTOR};
+    const NAME: &str = "[ARCH/APIC] stale in-service timer vector decode (Test 740)";
+    test_header!(NAME);
+
+    // Nothing in service → no recovery.
+    if highest_in_service_vector(&[0u32; 8]).is_some() {
+        test_fail!(NAME, "empty ISR reported an in-service vector"); return false;
+    }
+
+    // The observed wedge: ONLY the timer vector in service.  Vector 32 lives
+    // in word 1, bit 0.
+    let mut isr = [0u32; 8];
+    isr[1] = 1 << 0;
+    if highest_in_service_vector(&isr) != Some(TIMER_VECTOR) {
+        test_fail!(NAME, "lone timer vector not decoded as vector 32"); return false;
+    }
+
+    // A device IRQ of the SAME priority class but a higher vector (45, word 1
+    // bit 13) outranks the timer: the timer bit is not the highest, so the
+    // recovery must decline and leave that handler alone.
+    isr[1] |= 1 << 13;
+    if highest_in_service_vector(&isr) != Some(45) {
+        test_fail!(NAME, "vector 45 did not outrank vector 32"); return false;
+    }
+
+    // A higher priority class (vector 0xF3, word 7 bit 19 — the timer-wake
+    // IPI) outranks both.
+    isr[7] |= 1 << (0xF3 % 32);
+    if highest_in_service_vector(&isr) != Some(0xF3) {
+        test_fail!(NAME, "vector 0xF3 did not outrank lower classes"); return false;
+    }
+
+    // Highest representable vector decodes exactly (word 7, bit 31).
+    if highest_in_service_vector(&{ let mut a = [0u32; 8]; a[7] = 1 << 31; a }) != Some(255) {
+        test_fail!(NAME, "vector 255 mis-decoded"); return false;
+    }
+
+    // Every vector round-trips when it is the only bit set.
+    for v in 0u32..=255 {
+        let mut one = [0u32; 8];
+        one[(v / 32) as usize] = 1 << (v % 32);
+        if highest_in_service_vector(&one) != Some(v as u8) {
+            test_fail!(NAME, "single-bit round-trip failed"); return false;
+        }
+    }
+
+    test_println!("  decode: empty / lone-timer / same-class-higher-vector-wins / \
+higher-class-wins / vector-255 / all-256-single-bit round-trip — lost-EOI recovery gate GREEN");
     test_pass!(NAME);
     true
 }
