@@ -21,6 +21,15 @@ const LAPIC_TIMER_INIT: u32    = 0x380;
 const LAPIC_TIMER_CURRENT: u32 = 0x390;
 const LAPIC_TIMER_DIVIDE: u32  = 0x3E0;
 
+/// Base of the 8×32-bit In-Service Register bank (Intel SDM Vol. 3A §10.8.4).
+/// `ISR[n]` lives at `0x100 + n * 0x10`; vector `v`'s bit is `1 << (v % 32)`
+/// in word `v / 32`.  A bit is set when the CPU *accepts* the interrupt and is
+/// cleared only by an EOI write.
+const LAPIC_ISR_BASE: u32 = 0x100;
+
+/// The vector the LAPIC timer is programmed to deliver on, on every CPU.
+pub const TIMER_VECTOR: u8 = 32;
+
 /// LVT Timer register mode field (bits 18:17), Intel SDM Vol. 3A §11.5.1 /
 /// §11.5.4.1.  `00b` one-shot, `01b` periodic (bit 17), `10b` TSC-deadline
 /// (bit 18).  We use periodic by default and TSC-deadline when the CPU
@@ -504,6 +513,137 @@ pub fn lapic_eoi() {
     lapic_write(LAPIC_EOI, 0);
 }
 
+/// Count of stale in-service timer vectors cleared by
+/// [`clear_stale_timer_in_service`].  Non-zero means this machine has hit at
+/// least one lost timer EOI; each increment corresponds to one recovered
+/// timer.  Diagnostic-only.
+pub static TIMER_STALE_EOI_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Highest-priority in-service vector encoded in an ISR snapshot, or `None`
+/// when nothing is in service.
+///
+/// Pure and hardware-free so the bit-scan can be unit-tested.  Word `n` covers
+/// vectors `32n..32n+31`; higher word index and higher bit index both mean
+/// higher priority (Intel SDM Vol. 3A §10.8.4).
+pub fn highest_in_service_vector(isr: &[u32; 8]) -> Option<u8> {
+    for word in (0..8).rev() {
+        let bits = isr[word];
+        if bits != 0 {
+            // 31 - leading_zeros = index of the most significant set bit.
+            let bit = 31 - bits.leading_zeros();
+            return Some((word as u32 * 32 + bit) as u8);
+        }
+    }
+    None
+}
+
+/// Snapshot this CPU's 8-word In-Service Register bank.
+fn read_isr() -> [u32; 8] {
+    let mut isr = [0u32; 8];
+    for (n, slot) in isr.iter_mut().enumerate() {
+        *slot = lapic_read(LAPIC_ISR_BASE + (n as u32) * 0x10);
+    }
+    isr
+}
+
+/// Is the timer vector's own in-service bit set?  One MMIO read of the single
+/// ISR word that can hold it, as the cheap reject for
+/// [`clear_stale_timer_in_service`].
+///
+/// The recovery cannot fire unless this bit is set, so on the hot degraded path
+/// — where the BSP reactor calls the recovery once per loop iteration, not once
+/// per tick — this replaces the full eight-word scan with a single read.  Under
+/// a hypervisor each LAPIC access is a VM exit, and single-CPU reactor bandwidth
+/// is a measured-sensitive quantity.
+fn timer_vector_in_service() -> bool {
+    let word = (TIMER_VECTOR as u32) / 32;
+    let bit  = (TIMER_VECTOR as u32) % 32;
+    lapic_read(LAPIC_ISR_BASE + word * 0x10) & (1 << bit) != 0
+}
+
+/// Clear a *stale* in-service LAPIC timer vector, returning whether one was
+/// cleared.
+///
+/// # The failure this recovers from
+///
+/// The CPU sets vector 32's in-service bit when it accepts the timer
+/// interrupt; only an EOI write clears it (Intel SDM Vol. 3A §10.8.4).  While
+/// that bit is set the processor-priority register is raised to the vector's
+/// priority class (§10.8.3.1), which blocks delivery of every same-or-lower
+/// priority vector — for vector 32 that is the timer itself plus every device
+/// IRQ in 32..47.  If an EOI is ever lost, the LAPIC therefore latches into a
+/// state where re-arming the timer is futile: the re-armed timer fires and
+/// sets its request bit, but acceptance is blocked forever.  Observed in the
+/// field as ISR={32}, IRR={32,...}, PPR=0x20 with the timer ISR counter
+/// frozen while the re-arm counter kept climbing.
+///
+/// # Why this is safe to call from the recovery path
+///
+/// EOI clears the *highest-priority* in-service bit, not a caller-named one,
+/// so a blind EOI could retire an unrelated interrupt that is legitimately
+/// nested.  We therefore act only when the highest in-service vector is
+/// exactly the timer vector: any higher-priority in-service bit means we are
+/// genuinely nested inside that handler and must not interfere.
+///
+/// A live (non-stale) vector-32 in-service bit cannot be observed here: the
+/// timer ISR acknowledges the LAPIC at the very top of the handler, before it
+/// runs any of the tick body, so no code reachable from the tick — including
+/// the scheduler paths that lead back to the dead-timer recovery — can see its
+/// own interrupt still in service.  Any vector-32 bit found by a caller is
+/// therefore an interrupt nothing is going to retire.
+///
+/// # Why the decision and the write are made with interrupts masked
+///
+/// The snapshot that authorises the EOI and the EOI itself must describe the
+/// same in-service state.  Between them, an interrupt accepted on this CPU sets
+/// its own in-service bit; if such a handler could return with that bit still
+/// set, our EOI would retire *its* vector instead of the timer's — cancelling
+/// another handler's in-service state and leaving the timer wedged.  No handler
+/// in this kernel behaves that way (each acknowledges before `IRETQ`), but that
+/// is a property of every current handler rather than of this function, and the
+/// acknowledge-early-then-run-a-long-body shape is exactly what would break it.
+/// Masking interrupts across the read-decide-write sequence makes the function
+/// correct on its own terms.  Callers need not be in any particular interrupt
+/// state; the entry state is restored on exit.
+pub fn clear_stale_timer_in_service() -> bool {
+    if !is_enabled() {
+        return false;
+    }
+    // Cheap reject before masking: if the timer vector is not in service at all
+    // the gate below cannot fire.
+    if !timer_vector_in_service() {
+        return false;
+    }
+
+    let if_was_set = crate::hal::interrupts_enabled();
+    crate::hal::disable_interrupts();
+    let cleared = if highest_in_service_vector(&read_isr()) == Some(TIMER_VECTOR) {
+        lapic_eoi();
+        true
+    } else {
+        false
+    };
+    if if_was_set {
+        crate::hal::enable_interrupts();
+    }
+    if !cleared {
+        return false;
+    }
+
+    // Logged outside the masked region — the serial path is far too long to run
+    // with interrupts off.
+    let n = TIMER_STALE_EOI_COUNT.fetch_add(1, Ordering::Relaxed);
+    // One line every 64 recoveries (starting with the first), so a machine that
+    // hits this repeatedly is visible without flooding the log.
+    if n % 64 == 0 {
+        crate::serial_println!(
+            "[APIC/TIMER] cleared stale in-service vector {} (count={})",
+            TIMER_VECTOR, n + 1,
+        );
+    }
+    true
+}
+
 /// Re-arm the calling CPU's LAPIC periodic timer.
 ///
 /// Rewrites the timer LVT (periodic | vector 32) and the initial-count
@@ -537,6 +677,13 @@ pub fn rearm_timer() {
     if !is_enabled() {
         return;
     }
+    // Retire a stale in-service timer vector FIRST.  A lost EOI leaves vector
+    // 32's in-service bit set, which holds PPR at its priority class and
+    // blocks the interrupt this function is about to arm from ever being
+    // accepted (Intel SDM Vol. 3A §10.8.3.1 / §10.8.4).  Without this the
+    // re-arm below is a no-op recovery: the timer fires, sets its request
+    // bit, and waits forever behind the stale in-service bit.
+    clear_stale_timer_in_service();
     rearm_timer_inner();
 }
 
@@ -549,7 +696,7 @@ fn rearm_timer_inner() {
         // counter (the periodic failure mode this whole path exists for)
         // cannot occur — but re-asserting the LVT is cheap and keeps the
         // recovery semantics identical for both modes.
-        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | 32);
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
         arm_tsc_deadline_next();
         return;
     }
@@ -561,14 +708,14 @@ fn rearm_timer_inner() {
     // from a known-quiescent state (Intel SDM Vol. 3A §11.5.4: an initial-count
     // write of 0 stops the timer).
     lapic_write(LAPIC_TIMER_INIT, 0);
-    lapic_write(LAPIC_TIMER_LVT, 0x10000 | 32); // masked (bit 16) | vector 32
+    lapic_write(LAPIC_TIMER_LVT, 0x10000 | TIMER_VECTOR as u32); // masked (bit 16)
     // Re-establish the divide configuration (divide by 16) — the step a bare
     // LVT+init re-arm omitted (§11.5.1: the count is clocked through this
     // register; a stale divisor latch prevents a wedged counter from resuming).
     lapic_write(LAPIC_TIMER_DIVIDE, 0x03);
     // Fresh periodic, unmasked LVT, then start the counter with the calibrated
     // period — order per §11.5.4 (mode/divide before the count that starts it).
-    lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32); // periodic | vec 32
+    lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | TIMER_VECTOR as u32); // periodic
     lapic_write(LAPIC_TIMER_INIT, period);
 }
 
@@ -586,12 +733,12 @@ pub fn arm_lapic_timer() {
         // Establish TSC-deadline mode before the first deadline write — the
         // LVT mode field must be 10b for the IA32_TSC_DEADLINE write to take
         // effect (§11.5.4.1: in other modes a write to the MSR is ignored).
-        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | 32);
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
         arm_tsc_deadline_next();
     } else {
         let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
         lapic_write(LAPIC_TIMER_DIVIDE, 0x03); // divide by 16
-        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32);
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
         lapic_write(LAPIC_TIMER_INIT, period);
     }
 }
@@ -1350,7 +1497,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // timer firing rather than leaving the AP without any preemption).
     if LAPIC_TIMER_PERIOD.load(Ordering::Acquire) == 0 && !tsc_deadline_mode() {
         lapic_write(LAPIC_TIMER_DIVIDE, 0x03);
-        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | 32);
+        lapic_write(LAPIC_TIMER_LVT, LAPIC_LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
         lapic_write(LAPIC_TIMER_INIT, 100_000);
     } else {
         arm_lapic_timer();

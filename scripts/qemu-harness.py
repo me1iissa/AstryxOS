@@ -3933,12 +3933,31 @@ def cmd_start(args):
         # Replace the worktree symlink/file so all downstream machinery
         # (build_qemu_cmd, snap topology) uses the override transparently.
         _data_img_path.parent.mkdir(parents=True, exist_ok=True)
-        if _data_img_path.is_symlink() or _data_img_path.exists():
+        # A symlink carries no data — drop it.  A REGULAR FILE is somebody's
+        # multi-GiB image and must never be deleted to make room for the
+        # override: move it aside and say where it went, so `--data-img` can
+        # never silently destroy the canonical disk.
+        _preserved_data_img = None
+        if _data_img_path.is_symlink():
             try:
                 _data_img_path.unlink()
             except Exception:
                 pass
+        elif _data_img_path.exists():
+            _preserved_data_img = _data_img_path.with_name(
+                _data_img_path.name + ".pre-data-img-override")
+            _n = 1
+            while _preserved_data_img.exists():
+                _preserved_data_img = _data_img_path.with_name(
+                    f"{_data_img_path.name}.pre-data-img-override.{_n}")
+                _n += 1
+            _data_img_path.rename(_preserved_data_img)
         _data_img_path.symlink_to(_ovr.resolve())
+        if _preserved_data_img is not None:
+            print(f"[harness] --data-img: preserved the previous real "
+                  f"{_data_img_path} as {_preserved_data_img} "
+                  f"(restore it when you are done with the override)",
+                  file=sys.stderr)
         print(
             "╔══════════════════════════════════════════════════════════════╗\n"
             "║  --data-img OVERRIDE (no-regen forced)                       ║\n"
@@ -10130,6 +10149,22 @@ def _parse_info_registers(text: str) -> list:
     return cpus
 
 
+def cmd_qmp_hmp(args):
+    """Run one arbitrary HMP command via QMP and return its text.
+
+    General-purpose escape hatch for the QEMU monitor introspection that has
+    no dedicated subcommand yet — `info lapic`, `info irq`, `info pic`,
+    `info mtree`, `info tlb`.  `info lapic` in particular is the only way to
+    read the guest LAPIC LVT/ISR/IRR state (it is MMIO-emulated, so the GDB
+    stub's memory reads cannot see it).
+    """
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    resp = _hmp(qmp_sock, args.command)
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    _out({"ok": True, "command": args.command, "text": text})
+
+
 def cmd_qmp_regs(args):
     """Pause via QMP, read `info registers -a`, parse, resume.  No GDB needed."""
     sess = _load_session(args.sid)
@@ -14727,6 +14762,12 @@ def main():
                         help="Disk staging root for symbol lookup")
 
     # qmp-regs / qmp-xv / qmp-xp — QEMU monitor introspection (no GDB needed)
+    p_qmp_hmp = sub.add_parser(
+        "qmp-hmp",
+        help="Run one arbitrary QEMU HMP monitor command (e.g. 'info lapic')")
+    p_qmp_hmp.add_argument("sid")
+    p_qmp_hmp.add_argument("command", help="HMP command line, e.g. 'info lapic'")
+
     p_qmp_regs = sub.add_parser(
         "qmp-regs",
         help="Read all CPU registers via QMP `info registers -a` (pauses VM)")
@@ -15154,6 +15195,7 @@ def main():
         "stack-prov-summary": cmd_stack_prov_summary,
         "rip-sample": cmd_rip_sample,
         "rip-trace-sym": cmd_rip_trace_sym,
+        "qmp-hmp": cmd_qmp_hmp,
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,

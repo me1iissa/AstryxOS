@@ -641,6 +641,18 @@ pub fn cpu_timer_live(window_ticks: u64) -> bool {
             if !already_dead {
                 CPU_TIMER_DEAD[cpu].store(true, Ordering::Relaxed);
             }
+            // Retire a stale in-service timer vector on EVERY dead observation,
+            // outside the bounded-re-arm budget below.  That budget exists
+            // because re-*arming* a host-suppressed timer is futile and should
+            // not churn LAPIC MMIO forever; clearing a stale in-service bit is
+            // the opposite — it is the single action that can end the wedge, and
+            // it succeeds at most once per loss.  Leaving it inside the budget
+            // would mean a CPU that had already spent its 32 re-arms on an
+            // earlier, unrelated stall could never recover from a later lost
+            // EOI, because the counter only resets on an ISR advance that the
+            // raised priority makes impossible.  Cheap when there is nothing to
+            // do: a single ISR-word read rejects the common case.
+            super::apic::clear_stale_timer_in_service();
             if rearm {
                 super::apic::rearm_timer();
                 PERCPU_TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
