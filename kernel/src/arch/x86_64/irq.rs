@@ -1166,10 +1166,22 @@ extern "C" fn timer_tick() {
     if super::apic::is_enabled() {
         super::apic::lapic_eoi();
     } else {
+        // Pre-APIC era: vector 32 is the PIT through the remapped master 8259,
+        // so the 8259 is the controller to acknowledge.
+        //
         // SAFETY: Sending EOI after accepting the timer interrupt.
         unsafe {
             send_eoi(0);
         }
+        // Belt and braces for the boundary: if the LAPIC nonetheless holds
+        // vector 32 in service, this interrupt was LAPIC-delivered and the
+        // 8259 EOI above cannot retire it — an unretired in-service bit would
+        // hold PPR at that vector's priority class and block every vector
+        // 32..47 indefinitely (Intel SDM Vol. 3A §10.8.3.1 / §10.8.4).  The
+        // in-service test makes this exact: it acknowledges the LAPIC only
+        // when the LAPIC actually accepted the interrupt, so a genuine PIC-era
+        // tick is unaffected.
+        super::apic::lapic_eoi_if_vector_in_service(super::apic::TIMER_VECTOR);
     }
 
     // INVARIANT: no `sti`/enable_interrupts between this EOI and IRETQ — the
