@@ -1746,3 +1746,115 @@ pub fn fontpath_install_check(phys: u64, install_va: u64, install_rip: u64, site
 /// Counters for kdb introspection / harness assertion.
 pub fn font_recycle_hits() -> u64 { FONT_RECYCLE_HITS.load(Ordering::Relaxed) }
 pub fn font_recycle_scans() -> u64 { FONT_RECYCLE_SCANS.load(Ordering::Relaxed) }
+
+// ── W215 dispatch-6: uncounted live-double-map (alias) install detector ──────
+//
+// Per-pfn shadow of the most-recent USER PTE install (va_page, cr3, pid).  On
+// each user install of `phys`, if the shadow holds a DIFFERENT (va,cr3) AND a
+// lock-free re-walk confirms that prior mapping STILL maps `phys` (present),
+// the frame is LIVE-double-mapped: this install aliases a still-live mapping of
+// the same physical frame.  This names the UNCOUNTED aliasing double-map that
+// the refcount guards cannot see — `page_ref_count` may read 0 for an uncounted
+// alias (dispatch-4 measured rc_before=0 at the load_elf_dyn alloc), so an
+// rc-based check would miss it; only actual per-VA tracking catches it.
+//
+// `virt_to_phys_in` is lock-free (pure direct-map PTE reads), so the re-walk is
+// safe under the caller's VMM_LOCK.  The re-walk runs ONLY when the shadow
+// (va,cr3) differs from this install, so fresh frames and same-mapping
+// re-installs cost two atomic loads + two stores; the walk is rare.  ~16 MiB
+// leaked (2 × u64 × MAX_PAGES), initialised once at boot after the heap is up.
+// Cite: Intel SDM Vol. 3A §4.5 (4-level paging), §4.10.5 (TLB/alias coherence).
+
+const ALIAS_SHADOW_PAGES: usize = 1024 * 1024; // == pmm::MAX_PAGES (4 GiB)
+
+static ALIAS_SHADOW_VA: spin::Once<&'static [AtomicU64]> = spin::Once::new();
+static ALIAS_SHADOW_META: spin::Once<&'static [AtomicU64]> = spin::Once::new();
+static W215_ALIAS_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate the per-pfn alias shadow (call once after the heap is ready, next
+/// to `refcount::init`).  No-op unless `firefox-test-core`.
+pub fn alias_shadow_init() {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        fn make() -> &'static [AtomicU64] {
+            let mut v = alloc::vec::Vec::with_capacity(ALIAS_SHADOW_PAGES);
+            for _ in 0..ALIAS_SHADOW_PAGES {
+                v.push(AtomicU64::new(0));
+            }
+            alloc::boxed::Box::leak(v.into_boxed_slice())
+        }
+        ALIAS_SHADOW_VA.call_once(make);
+        ALIAS_SHADOW_META.call_once(make);
+    }
+}
+
+/// Read the cumulative `[W215/ALIAS]` fire count (kdb / harness assertion).
+pub fn alias_fire_count() -> u64 { W215_ALIAS_FIRES.load(Ordering::Relaxed) }
+
+/// Detect an uncounted live double-map at USER PTE install time.
+/// `va` = install VA, `phys` = frame phys, `cr3` = target PML4 phys.
+#[cfg(feature = "firefox-test-core")]
+pub fn alias_install_check(va: u64, phys: u64, cr3: u64, caller_rip: u64) {
+    // User installs only; skip kernel-half VAs and null frames.
+    if va >= 0xFFFF_8000_0000_0000 || phys == 0 {
+        return;
+    }
+    let pfn = (phys >> 12) as usize;
+    if pfn >= ALIAS_SHADOW_PAGES {
+        return;
+    }
+    let (sva, smeta) = match (ALIAS_SHADOW_VA.get(), ALIAS_SHADOW_META.get()) {
+        (Some(a), Some(b)) => (*a, *b),
+        _ => return, // pre-init
+    };
+    let va_page = va & !0xFFFu64;
+    let new_cr3 = cr3 & !0xFFFu64;
+    let pid = crate::proc::current_pid_lockless() as u64;
+    let new_meta = new_cr3 | (pid & 0xFFF); // cr3 is page-aligned; pack pid low
+
+    let old_va = sva[pfn].load(Ordering::Relaxed);
+    let old_meta = smeta[pfn].load(Ordering::Relaxed);
+    let old_cr3 = old_meta & !0xFFFu64;
+    let old_pid = old_meta & 0xFFF;
+
+    // Fire ONLY on a DIFFERENT virtual address mapping the same frame.  Two
+    // mappings at the SAME va across different cr3s are ordinary fork() CoW
+    // sharing (parent+child at one va, refcounted rc>=2) — not the W215 bug.
+    // The W215 aliasing double-map is one phys reachable at TWO DISTINCT VAs
+    // (e.g. an interpreter page at 0x7f.. AND a data page at 0x7eff6..), the
+    // frame dual-purposed and (dispatch-4) the second mapping uncounted.
+    if old_va != 0 && old_va != va_page {
+        // Prior mapping recorded at a DIFFERENT va.  Confirm it is STILL live
+        // via a lock-free re-walk: if (old_va, old_cr3) still maps `phys`, this
+        // install aliases a live mapping of the same frame at another VA.
+        if let Some(p) = crate::mm::vmm::virt_to_phys_in(old_cr3, old_va) {
+            if (p & !0xFFFu64) == (phys & !0xFFFu64) {
+                // UNCOUNTED double-map only.  A legitimate shared mapping (shared
+                // library, SysV-SHM, MAP_SHARED) is refcounted — two live PTEs
+                // give rc>=2.  The W215 corruption victim crashes with rc=1 yet is
+                // double-mapped: 2+ live PTEs but rc<=1 because the second mapping
+                // was never page_ref_inc'd.  Gating on rc<=1 cuts the shared-map
+                // torrent and isolates the undercount.  (rc read before the
+                // counter so filtered fires cost nothing on the serial path.)
+                let rc = crate::mm::refcount::page_ref_count(phys);
+                if rc <= 1 {
+                    let n = W215_ALIAS_FIRES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 128 || n % 64 == 0 {
+                    let sc = crate::mm::refcount::pte_share_count(phys);
+                    crate::serial_println!(
+                        "[W215/ALIAS] phys={:#x} rc={} sc={} LIVE-DOUBLE-MAP \
+                         old(va={:#x} cr3={:#x} pid={}) new(va={:#x} cr3={:#x} pid={}) \
+                         installer_rip={:#x} n={}",
+                        phys & !0xFFFu64, rc, sc,
+                        old_va, old_cr3, old_pid,
+                        va_page, new_cr3, pid,
+                        caller_rip, n,
+                    );
+                    }
+                }
+            }
+        }
+    }
+    sva[pfn].store(va_page, Ordering::Relaxed);
+    smeta[pfn].store(new_meta, Ordering::Relaxed);
+}

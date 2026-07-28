@@ -665,14 +665,18 @@ fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) 
     // the underlying TLB-coherence invariant whose violation produces the
     // F3 fingerprint.
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        phys_addr & ADDR_MASK,
-        old_phys_for_ring,
-        crate::mm::w215_diag::PTE_KIND_MAP,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            old_phys_for_ring,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        crate::mm::w215_diag::alias_install_check(
+            virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+    }
 
     true
 }
@@ -758,14 +762,18 @@ pub fn map_page_in_if_absent(
     }
 
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        phys_addr & ADDR_MASK,
-        0,
-        crate::mm::w215_diag::PTE_KIND_MAP,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            0,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        crate::mm::w215_diag::alias_install_check(
+            virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+    }
 
     true
 }
@@ -854,14 +862,18 @@ pub fn map_page_in_cow_if_unchanged(
     }
 
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        phys_addr & ADDR_MASK,
-        expected_phys & ADDR_MASK,
-        crate::mm::w215_diag::PTE_KIND_MAP,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            expected_phys & ADDR_MASK,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        crate::mm::w215_diag::alias_install_check(
+            virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+    }
 
     true
 }

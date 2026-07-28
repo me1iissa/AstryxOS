@@ -404,3 +404,39 @@ presets:
         reg: rsp
         offset: 0
         len: 32
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # w215-fault-slot
+  # ───────────────────────────────────────────────────────────────────────────
+  # For a HW-break at deliver_fault_signal_from_isr (SysV arg5 = frame ptr in
+  # r8; InterruptFrame = {rip@0, cs@8, rflags@16, rsp@24, ss@40-1}).  Captures
+  # the InterruptFrame and the faulting user instruction window (via a single
+  # pointer-deref of *(r8) -> user_rip) while paused in the faulting process's
+  # CR3, so the user VA resolves.  Used to read the displacement O of the
+  # pointer-load feeding the CR2=0x10 NULL+0x10 deref.
+  w215-fault-slot:
+    description: |
+      Registers + InterruptFrame at r8 + 48B of user code around the
+      faulting RIP (*(r8)).  Names the slot-load displacement O.
+    steps:
+      - name: regs
+        kind: regs
+      - name: interrupt_frame
+        kind: mem_via_reg
+        reg: r8
+        offset: 0
+        len: 40
+      - name: fault_code
+        kind: mem_indirect
+        reg: r8
+        ptr_offset: 0
+        offset: -16
+        len: 48
+      # Saved user GPRs below the InterruptFrame: r15@r8-0x80 .. rax@r8-0x10
+      # (idt.rs isr_no_error! / read_gprs_from_frame). 15 qwords, order (low->
+      # high addr): r15,r14,r13,r12,rbp,rbx,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rax.
+      - name: gpr_block
+        kind: mem_via_reg
+        reg: r8
+        offset: -128
+        len: 120

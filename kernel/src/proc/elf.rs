@@ -1732,6 +1732,11 @@ pub fn parse_dynamic_test(data: &[u8]) -> (usize, usize, bool) {
 /// Pages are pushed into `allocated_pages` so the caller can free them on exit.
 /// VMAs for each loaded segment are pushed into `vmas` so the process's VmSpace
 /// covers interpreter pages and can free them via the VMA walk on exit.
+/// W215 dispatch-4 probe: bounded emission counter for `[W215/INTERP]` lines.
+#[cfg(feature = "firefox-test-core")]
+static W215_INTERP_LOG: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 fn load_elf_dyn(
     data: &[u8],
     cr3: u64,
@@ -1832,14 +1837,24 @@ fn load_elf_dyn(
         });
 
         for page_vaddr in (page_start..page_end).step_by(pmm::PAGE_SIZE) {
-            let (phys, already) = if let Some(&(_, p)) =
+            let (phys, already, _rc_before) = if let Some(&(_, p)) =
                 mapped_pages.iter().find(|&&(va, _)| va == page_vaddr) {
-                (p, true)
+                (p, true, 0u16)
             } else {
                 let p = pmm::alloc_page().ok_or(ElfError::OutOfMemory)?;
+                // W215 dispatch-4 probe (firefox-test-core gated, additive): the
+                // refcount of the frame the PMM just handed us, read BEFORE the
+                // page_ref_set(phys,1) below.  A non-free (already-referenced)
+                // frame here = the PMM recycled a still-mapped page into an
+                // interpreter load, which the write_bytes(0) below then clobbers.
+                // Gated so the read costs nothing on the default build.
+                #[cfg(feature = "firefox-test-core")]
+                let _rc_before = crate::mm::refcount::page_ref_count(p);
+                #[cfg(not(feature = "firefox-test-core"))]
+                let _rc_before = 0u16;
                 allocated_pages.push(p);
                 unsafe { core::ptr::write_bytes(phys_to_virt(p), 0, pmm::PAGE_SIZE); }
-                (p, false)
+                (p, false, _rc_before)
             };
 
             // Copy file content into the page.
@@ -1867,6 +1882,20 @@ fn load_elf_dyn(
             if !already {
                 if !vmm::map_page_in(cr3, page_vaddr, phys, flags) {
                     return Err(ElfError::OutOfMemory);
+                }
+                // W215 dispatch-4 probe (firefox-test-core gated, additive): log
+                // each interpreter page's (pid, interp-VA, phys, rc_before) so a
+                // crash victim phys can be correlated back to the load that
+                // wrote it, and rc_before>0 directly names a PMM non-free reuse.
+                #[cfg(feature = "firefox-test-core")]
+                {
+                    let n = W215_INTERP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 4096 && (_rc_before != 0 || n <= 4096) {
+                        crate::serial_println!(
+                            "[W215/INTERP] pid={} va={:#x} phys={:#x} rc_before={} n={}",
+                            crate::proc::current_pid(), page_vaddr, phys, _rc_before, n,
+                        );
+                    }
                 }
                 crate::mm::refcount::page_ref_set(phys, 1);
                 mapped_pages.push((page_vaddr, phys));
