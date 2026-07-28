@@ -6926,6 +6926,7 @@ def cmd_watch(args):
 
     fires = []
     armed = False
+    user_fire_count = 0
     try:
         # If the caller wants us to break at a symbol/addr first (so the watch
         # is armed only after the stack region is mapped), honour --break.
@@ -6949,6 +6950,7 @@ def cmd_watch(args):
             return
 
         hit_count = 0
+        kernel_only = bool(getattr(args, "kernel_only", False))
         # We allow (skip + 1) fires total; the (skip+1)-th is the one we report.
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -6956,7 +6958,6 @@ def cmd_watch(args):
             stop = gdb.wait_for_stop(max(1.0, deadline - time.monotonic()))
             if stop is None:
                 break  # timed out with no fire
-            hit_count += 1
             try:
                 regs = gdb.read_regs()
             except Exception:
@@ -6964,6 +6965,13 @@ def cmd_watch(args):
             rip = int(regs.get("rip", "0x0"), 0)
             # x86-64 canonical kernel half-space: high bit set (0xffff8.. and up).
             is_kernel = rip >= 0xFFFF_8000_0000_0000
+            # In --kernel-only mode, USER-mode stores to this slot are the
+            # legitimate userspace writes; step past them without counting.
+            # Only kernel-mode stores (the out-of-band writer) count.
+            if kernel_only and not is_kernel:
+                user_fire_count += 1
+                continue
+            hit_count += 1
             # Read the watched slot's current value + the instruction bytes at RIP.
             try:
                 slot_val = gdb.read_mem(addr, length).hex()
@@ -6980,6 +6988,7 @@ def cmd_watch(args):
                 "slot_now":   slot_val,
                 "code_at_rip": code,
                 "regs":       regs,
+                "user_fires_before": user_fire_count,
             }
             fires.append(fire)
             if hit_count > skip:
@@ -7004,6 +7013,8 @@ def cmd_watch(args):
         "skip":      skip,
         "armed":     armed,
         "fire_count": len(fires),
+        "kernel_only": bool(getattr(args, "kernel_only", False)),
+        "user_fires_passed": user_fire_count,
         "writer":    reported,
         "all_fires": fires,
     })
@@ -7144,8 +7155,13 @@ def cmd_watch_set(args):
             if getattr(args, "corrupt_only", False) and not corrupt_hit:
                 # benign live-stack write — keep watching for the corruptor.
                 continue
+            if getattr(args, "kernel_only", False) and not is_kernel:
+                # user-mode store (via a user PTE alias) — not the out-of-band
+                # kernel direct-map writer we hunt; keep watching.
+                continue
             fires.append(fire)
-            break  # report the first (matching) fire on any watched addr
+            if len(fires) > int(getattr(args, "skip", 0) or 0):
+                break  # this is the (skip+1)-th matching fire — report it
         for a in armed:
             try:
                 gdb.del_watch(a, length, "write")
@@ -7156,14 +7172,24 @@ def cmd_watch_set(args):
     finally:
         gdb.close()
 
-    _out({
+    result = {
         "ok": True,
         "armed_addrs": [hex(a) for a in armed],
         "length": length,
+        "kernel_only": bool(getattr(args, "kernel_only", False)),
+        "skip": int(getattr(args, "skip", 0) or 0),
         "fire_count": len(fires),
-        "writer": fires[0] if fires else None,
+        "writer": fires[-1] if fires else None,
         "all_fires": fires,
-    })
+    }
+    outp = getattr(args, "output", None)
+    if outp:
+        try:
+            with open(outp, "w") as fh:
+                json.dump(result, fh, indent=2)
+        except Exception:
+            pass
+    _out(result)
 
 
 def cmd_pause(args):
@@ -7404,6 +7430,39 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
                     "kind": kind, "reg": reg, "offset": offset,
                     "addr": hex(addr), "error": str(e),
                 }
+
+        if kind == "mem_indirect":
+            # Read an 8-byte pointer at (reg + ptr_offset), then read `len`
+            # bytes at (that pointer + offset).  Single-deref pointer chase,
+            # e.g. capture the faulting user instruction bytes at
+            # *(InterruptFrame*)r8 -> .rip while paused in the faulting
+            # process's CR3 context.
+            reg = step["reg"].lower()
+            if reg not in regs:
+                return {"kind": kind, "error": f"unknown register {reg!r}"}
+            base = int(regs[reg], 16) if isinstance(regs[reg], str) \
+                   else int(regs[reg])
+            ptr_offset = int(step.get("ptr_offset", 0))
+            ptr_addr = (base + ptr_offset) & 0xFFFF_FFFF_FFFF_FFFF
+            try:
+                ptr_bytes = gdb.read_mem(ptr_addr, 8)
+                ptr_val = int.from_bytes(ptr_bytes, "little")
+            except Exception as e:
+                return {"kind": kind, "reg": reg, "ptr_addr": hex(ptr_addr),
+                        "error": f"ptr read: {e}"}
+            offset = int(step.get("offset", 0))
+            length = min(int(step["len"]), per_step_cap)
+            addr = (ptr_val + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            try:
+                data = gdb.read_mem(addr, length)
+                return {
+                    "kind": kind, "reg": reg, "ptr_addr": hex(ptr_addr),
+                    "ptr_val": hex(ptr_val), "offset": offset,
+                    "addr": hex(addr), "len": len(data), "bytes": data.hex(),
+                }
+            except Exception as e:
+                return {"kind": kind, "reg": reg, "ptr_val": hex(ptr_val),
+                        "offset": offset, "addr": hex(addr), "error": str(e)}
 
         if kind == "mem_via_seg":
             seg = step["seg"].lower()
@@ -14056,6 +14115,13 @@ def main():
                                "is armed only after the stack is mapped)")
     p_watch.add_argument("--timeout-ms", type=int, default=120000,
                           help="Overall budget for catching the writer")
+    p_watch.add_argument("--kernel-only", action="store_true",
+                          dest="kernel_only",
+                          help="Continue past USER-mode fires (RIP < kernel "
+                               "half) without counting them; only kernel-mode "
+                               "stores count toward --skip and the report. "
+                               "Names an out-of-band KERNEL writer of a slot "
+                               "that userspace also legitimately writes.")
 
     # watch-set (multi-DR region watch; #655 double-map test)
     p_watch_set = sub.add_parser(
@@ -14075,6 +14141,15 @@ def main():
                              help="Skip benign pointer writes; report only a "
                                   "fire that left a small (<0x10000) value in a "
                                   "watched slot (the saved-RIP corruptor sig).")
+    p_watch_set.add_argument("--kernel-only", dest="kernel_only",
+                             action="store_true",
+                             help="Continue past USER-mode fires; only kernel "
+                                  "direct-map stores count toward --skip/report.")
+    p_watch_set.add_argument("--skip", type=int, default=0,
+                             help="Let the first N matching fires pass before "
+                                  "reporting (skip alloc-time zero/copy writes).")
+    p_watch_set.add_argument("--output", default=None,
+                             help="Also write the structured JSON to this path.")
 
     # pause
     p_pause = sub.add_parser("pause", help="[Tier2] Pause QEMU via QMP stop")

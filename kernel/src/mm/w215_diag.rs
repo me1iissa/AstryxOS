@@ -1746,3 +1746,246 @@ pub fn fontpath_install_check(phys: u64, install_va: u64, install_rip: u64, site
 /// Counters for kdb introspection / harness assertion.
 pub fn font_recycle_hits() -> u64 { FONT_RECYCLE_HITS.load(Ordering::Relaxed) }
 pub fn font_recycle_scans() -> u64 { FONT_RECYCLE_SCANS.load(Ordering::Relaxed) }
+
+// ── W215 dispatch-6: uncounted live-double-map (alias) install detector ──────
+//
+// Per-pfn shadow of the most-recent USER PTE install (va_page, cr3, pid).  On
+// each user install of `phys`, if the shadow holds a DIFFERENT (va,cr3) AND a
+// lock-free re-walk confirms that prior mapping STILL maps `phys` (present),
+// the frame is LIVE-double-mapped: this install aliases a still-live mapping of
+// the same physical frame.  This names the UNCOUNTED aliasing double-map that
+// the refcount guards cannot see — `page_ref_count` may read 0 for an uncounted
+// alias (dispatch-4 measured rc_before=0 at the load_elf_dyn alloc), so an
+// rc-based check would miss it; only actual per-VA tracking catches it.
+//
+// The re-walk is lock-free (pure direct-map PTE reads), so it is safe under
+// the caller's VMM_LOCK from a lock-ORDERING standpoint.  It is NOT safe from
+// a MEMORY-SAFETY standpoint unless `old_cr3` still names a live address
+// space: `old_cr3` is read out of the shadow with no expiry, so if the owning
+// process exited and its PML4 frame was freed (and possibly reallocated to
+// something else entirely) since the shadow entry was written, walking it
+// dereferences arbitrary recycled bytes as page-table entries.  See
+// `live_cr3_is_live` below / `kfatal_walk_to_phys` (this file's existing
+// direct-map-bounded walk) for the two-part fix (liveness gate + bounds-
+// checked walk) — both are required: liveness alone still risks reading a
+// *different* live process's page tables if the frame was already handed to
+// a new VmSpace, and bounds-checking alone still lets a torn-down cr3's
+// now-garbage content produce a false phys match.  The
+// walk runs ONLY when the shadow (va,cr3) differs from this install, so
+// fresh frames and same-mapping re-installs cost two atomic loads + two
+// stores; a differing-VA install is common under churn, so treat the walk as
+// routine, not rare.  ~16 MiB leaked (2 × u64 × MAX_PAGES), initialised once
+// at boot after the heap is up.
+// Cite: Intel SDM Vol. 3A §4.5 (4-level paging), §4.10.5 (TLB/alias coherence).
+
+const ALIAS_SHADOW_PAGES: usize = 1024 * 1024; // == pmm::MAX_PAGES (4 GiB)
+
+static ALIAS_SHADOW_VA: spin::Once<&'static [AtomicU64]> = spin::Once::new();
+static ALIAS_SHADOW_META: spin::Once<&'static [AtomicU64]> = spin::Once::new();
+static W215_ALIAS_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate the per-pfn alias shadow (call once after the heap is ready, next
+/// to `refcount::init`).  No-op unless `firefox-test-core`.
+pub fn alias_shadow_init() {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        fn make() -> &'static [AtomicU64] {
+            let mut v = alloc::vec::Vec::with_capacity(ALIAS_SHADOW_PAGES);
+            for _ in 0..ALIAS_SHADOW_PAGES {
+                v.push(AtomicU64::new(0));
+            }
+            alloc::boxed::Box::leak(v.into_boxed_slice())
+        }
+        ALIAS_SHADOW_VA.call_once(make);
+        ALIAS_SHADOW_META.call_once(make);
+        live_cr3_init();
+    }
+}
+
+/// Read the cumulative `[W215/ALIAS]` fire count (kdb / harness assertion).
+pub fn alias_fire_count() -> u64 { W215_ALIAS_FIRES.load(Ordering::Relaxed) }
+
+// ── review F1: live-cr3 liveness registry + bounds-checked re-walk ─────────
+//
+// `alias_install_check`'s re-walk of `old_cr3` is only safe if `old_cr3`
+// still names a LIVE address space (see the module comment above for the
+// failure scenario this closes).  This is a small, best-effort, LOCK-FREE
+// record of "cr3 values currently backing a live VmSpace", fed from
+// `kernel/src/mm/vma.rs`:
+//   * `live_cr3_mark`   — called from `VmSpace::new_user()` at creation.
+//   * `live_cr3_forget` — called from `Drop for VmSpace`, exactly where
+//     `MM_REGISTRY`'s own entry is evicted (true last-owner teardown), so
+//     vfork siblings sharing one cr3 are handled identically to the
+//     existing mm_sem/generation bookkeeping — a sibling's drop does NOT
+//     forget the cr3 while another owner still holds it.
+//
+// Best-effort, NOT authoritative: a saturated table or a losing CAS race
+// silently drops a mark/forget update.  Every such failure degrades toward
+// FEWER walks (a live cr3 read back as "unknown" is treated as not-live), so
+// the failure mode this registry can have is a missed detector fire — never
+// a walk of a torn-down address space, which is the property the fix needs.
+// The same asymmetry applies to open-addressed lookup after a deletion: a
+// `live_cr3_forget` that clears an earlier slot in another live entry's
+// probe chain can make that later entry unreachable until re-marked (no
+// tombstones here) — again, only a false "not live", never a false "live".
+
+const LIVE_CR3_SLOTS: usize = 1024; // generous bound on concurrently-live address spaces
+
+static LIVE_CR3_TABLE: spin::Once<&'static [AtomicU64]> = spin::Once::new();
+
+/// Allocate the live-cr3 table.  Called from `alias_shadow_init`; no-op
+/// unless `firefox-test-core`.
+fn live_cr3_init() {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let mut v = alloc::vec::Vec::with_capacity(LIVE_CR3_SLOTS);
+        for _ in 0..LIVE_CR3_SLOTS {
+            v.push(AtomicU64::new(0));
+        }
+        LIVE_CR3_TABLE.call_once(|| alloc::boxed::Box::leak(v.into_boxed_slice()));
+    }
+}
+
+/// cr3 is page-aligned; fold the frame number with a cheap multiplicative
+/// hash (Knuth's constant) to spread entries across the table.
+fn live_cr3_slot(cr3: u64) -> usize {
+    (((cr3 >> 12).wrapping_mul(2654435761)) as usize) % LIVE_CR3_SLOTS
+}
+
+/// Record that `cr3` now backs a live `VmSpace`.  Linear-probes for an empty
+/// or already-matching slot; gives up silently if the table is saturated
+/// (see the module comment above — that only costs a missed detector fire).
+pub fn live_cr3_mark(cr3: u64) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if cr3 == 0 { return; }
+        let Some(table) = LIVE_CR3_TABLE.get() else { return; };
+        let start = live_cr3_slot(cr3);
+        for i in 0..LIVE_CR3_SLOTS {
+            let idx = (start + i) % LIVE_CR3_SLOTS;
+            let cur = table[idx].load(Ordering::Relaxed);
+            if cur == cr3 {
+                return; // already marked
+            }
+            if cur == 0
+                && table[idx]
+                    .compare_exchange(0, cr3, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+        }
+        // Table saturated — degrade to "unknown" for this cr3.
+    }
+}
+
+/// Record that `cr3` no longer backs any live `VmSpace` (true last-owner
+/// teardown).  Clears the first slot found holding `cr3`.
+pub fn live_cr3_forget(cr3: u64) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if cr3 == 0 { return; }
+        let Some(table) = LIVE_CR3_TABLE.get() else { return; };
+        let start = live_cr3_slot(cr3);
+        for i in 0..LIVE_CR3_SLOTS {
+            let idx = (start + i) % LIVE_CR3_SLOTS;
+            if table[idx]
+                .compare_exchange(cr3, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Best-effort liveness check: `true` only if `cr3` is currently recorded as
+/// live.  Pre-init, not-found, and a broken probe chain (see module comment)
+/// all return `false` — the conservative default for a walk that must never
+/// touch a torn-down address space.
+#[cfg(feature = "firefox-test-core")]
+fn live_cr3_is_live(cr3: u64) -> bool {
+    let Some(table) = LIVE_CR3_TABLE.get() else { return false; };
+    let start = live_cr3_slot(cr3);
+    for i in 0..LIVE_CR3_SLOTS {
+        let idx = (start + i) % LIVE_CR3_SLOTS;
+        let cur = table[idx].load(Ordering::Relaxed);
+        if cur == cr3 { return true; }
+        if cur == 0 { return false; } // empty slot terminates the probe chain
+    }
+    false
+}
+
+/// Detect an uncounted live double-map at USER PTE install time.
+/// `va` = install VA, `phys` = frame phys, `cr3` = target PML4 phys.
+#[cfg(feature = "firefox-test-core")]
+pub fn alias_install_check(va: u64, phys: u64, cr3: u64, caller_rip: u64) {
+    // User installs only; skip kernel-half VAs and null frames.
+    if va >= 0xFFFF_8000_0000_0000 || phys == 0 {
+        return;
+    }
+    let pfn = (phys >> 12) as usize;
+    if pfn >= ALIAS_SHADOW_PAGES {
+        return;
+    }
+    let (sva, smeta) = match (ALIAS_SHADOW_VA.get(), ALIAS_SHADOW_META.get()) {
+        (Some(a), Some(b)) => (*a, *b),
+        _ => return, // pre-init
+    };
+    let va_page = va & !0xFFFu64;
+    let new_cr3 = cr3 & !0xFFFu64;
+    let pid = crate::proc::current_pid_lockless() as u64;
+    let new_meta = new_cr3 | (pid & 0xFFF); // cr3 is page-aligned; pack pid low
+
+    let old_va = sva[pfn].load(Ordering::Relaxed);
+    let old_meta = smeta[pfn].load(Ordering::Relaxed);
+    let old_cr3 = old_meta & !0xFFFu64;
+    let old_pid = old_meta & 0xFFF;
+
+    // Fire ONLY on a DIFFERENT virtual address mapping the same frame.  Two
+    // mappings at the SAME va across different cr3s are ordinary fork() CoW
+    // sharing (parent+child at one va, refcounted rc>=2) — not the W215 bug.
+    // The W215 aliasing double-map is one phys reachable at TWO DISTINCT VAs
+    // (e.g. an interpreter page at 0x7f.. AND a data page at 0x7eff6..), the
+    // frame dual-purposed and (dispatch-4) the second mapping uncounted.
+    if old_va != 0 && old_va != va_page && live_cr3_is_live(old_cr3) {
+        // Prior mapping recorded at a DIFFERENT va.  Confirm it is STILL live
+        // via a lock-free re-walk: if (old_va, old_cr3) still maps `phys`, this
+        // install aliases a live mapping of the same frame at another VA.
+        // `live_cr3_is_live` (just checked) rules out a torn-down `old_cr3`
+        // whose PML4 frame may already be recycled; `kfatal_walk_to_phys`
+        // (this file's existing direct-map-bounded walk, not the plain
+        // `vmm::virt_to_phys_in`) additionally bounds-checks every
+        // intermediate table phys, so even a live-but-stale read still can't
+        // walk off the direct map (review F1 — both gates required).
+        if let Some(p) = kfatal_walk_to_phys(old_cr3, old_va) {
+            if (p & !0xFFFu64) == (phys & !0xFFFu64) {
+                // UNCOUNTED double-map only.  A legitimate shared mapping (shared
+                // library, SysV-SHM, MAP_SHARED) is refcounted — two live PTEs
+                // give rc>=2.  The W215 corruption victim crashes with rc=1 yet is
+                // double-mapped: 2+ live PTEs but rc<=1 because the second mapping
+                // was never page_ref_inc'd.  Gating on rc<=1 cuts the shared-map
+                // torrent and isolates the undercount.  (rc read before the
+                // counter so filtered fires cost nothing on the serial path.)
+                let rc = crate::mm::refcount::page_ref_count(phys);
+                if rc <= 1 {
+                    let n = W215_ALIAS_FIRES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 128 || n % 64 == 0 {
+                    let sc = crate::mm::refcount::pte_share_count(phys);
+                    crate::serial_println!(
+                        "[W215/ALIAS] phys={:#x} rc={} sc={} LIVE-DOUBLE-MAP \
+                         old(va={:#x} cr3={:#x} pid={}) new(va={:#x} cr3={:#x} pid={}) \
+                         installer_rip={:#x} n={}",
+                        phys & !0xFFFu64, rc, sc,
+                        old_va, old_cr3, old_pid,
+                        va_page, new_cr3, pid,
+                        caller_rip, n,
+                    );
+                    }
+                }
+            }
+        }
+    }
+    sva[pfn].store(va_page, Ordering::Relaxed);
+    smeta[pfn].store(new_meta, Ordering::Relaxed);
+}

@@ -152,6 +152,11 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 3: Memory management init...");
     mm::init(info);
     mm::refcount::init();
+    // W215 dispatch-6 alias detector: per-pfn install shadow (~16 MiB, only
+    // compiled at all under firefox-test-core — the whole w215_diag module is
+    // `#![cfg(feature = "firefox-test-core")]`).  After the heap is up.
+    #[cfg(feature = "firefox-test-core")]
+    mm::w215_diag::alias_shadow_init();
     // Note: `mm::init()` above already calls `dma_pin::init()` internally
     // (see mm/mod.rs) — no separate call needed here (Once-guarded, but the
     // duplicate call was dead weight; removed per #727 review follow-up).

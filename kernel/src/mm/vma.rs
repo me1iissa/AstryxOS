@@ -754,6 +754,13 @@ impl VmSpace {
         register_mm_sem(new_pml4, mm_sem.clone());
         let generation = Arc::new(AtomicU64::new(0));
         register_mm_generation(new_pml4, generation.clone());
+        // W215 review F1: record this cr3 as a live address space in the
+        // alias detector's lock-free liveness registry (paired with the
+        // `live_cr3_forget` call in `Drop` below), so a later re-walk of a
+        // torn-down process's recorded cr3 is refused instead of
+        // dereferencing a freed/recycled PML4 frame.
+        #[cfg(feature = "firefox-test-core")]
+        crate::mm::w215_diag::live_cr3_mark(new_pml4);
         // Record that a user address space (and thus a user CR3) now exists.
         // The BSP stack-pivot in `main.rs` asserts this is zero before it runs,
         // so a boot-phase reorder that spawns a user process before the pivot
@@ -1573,6 +1580,12 @@ impl Drop for VmSpace {
             // versa) still holds a clone — leave the registry entry intact.
             if Arc::ptr_eq(slot, &self.mm_sem) && Arc::strong_count(&self.mm_sem) == 2 {
                 reg.remove(&self.cr3);
+                // W215 review F1: true last-owner teardown — forget this cr3
+                // in the alias detector's liveness registry (paired with the
+                // `live_cr3_mark` call in `new_user` above).  Lock-free, so
+                // safe to call while `reg` (MM_REGISTRY) is still held.
+                #[cfg(feature = "firefox-test-core")]
+                crate::mm::w215_diag::live_cr3_forget(self.cr3);
                 // Generation registry tracks the same lifecycle (per-cr3,
                 // shared with from_existing_cr3 vfork siblings).  Remove the
                 // entry only when the sem entry was also removed so the two
