@@ -5,6 +5,17 @@ edition.workspace = true
 
 [features]
 default = []
+# `frame-pointers` — assert that the kernel is being built with
+# `-C force-frame-pointers=yes`, which lets the RBP frame-walk helpers
+# (`vmm::ring_caller_rip` and friends) report a real return address.  The
+# release profile omits frame pointers, so without this feature RBP is a
+# scratch register at the call site and a walk through it yields a
+# plausible-looking WRONG address rather than a detectable failure.  The
+# helpers therefore return 0 unless this is on, and their consumers report the
+# field as `unavailable`.  `scripts/qemu-harness.py` enables the feature and the
+# codegen flag together (`ASTRYX_FORCE_FRAME_POINTERS=1`); setting one without
+# the other is what this feature exists to prevent.
+frame-pointers = []
 # `sched-pick-xcheck` — Perf P2 phase 2b live pick-equivalence cross-check. On
 # every scheduling pass (SMP=1 only) the per-CPU runqueue pick is computed
 # alongside the authoritative legacy table-scan pick and any divergence is

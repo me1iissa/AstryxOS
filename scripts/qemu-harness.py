@@ -1765,6 +1765,16 @@ def _build(features: str) -> bool:
             'profile.release.package."astryx-kernel".rustflags = '
             '["-C","force-frame-pointers=yes"]',
         ]
+        # Pair the codegen flag with the cargo feature that unlocks the RBP
+        # frame-walk helpers.  They return 0 without it, precisely so a build
+        # that lacks frame pointers cannot report a garbage caller-RIP; setting
+        # the flag without the feature would leave the walk compiled out.
+        if "--features" in kernel_cmd:
+            i = kernel_cmd.index("--features")
+            kernel_cmd[i + 1] = (kernel_cmd[i + 1] + ",frame-pointers"
+                                 if kernel_cmd[i + 1] else "frame-pointers")
+        else:
+            kernel_cmd += ["--features", "frame-pointers"]
 
     r2 = subprocess.run(kernel_cmd, cwd=ROOT, env=env)
     if r2.returncode != 0:
