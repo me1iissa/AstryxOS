@@ -3855,11 +3855,22 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                     // address, so there is nowhere else to put it.  Re-picking
                     // is only meaningful for a kernel-chosen placement.
                     if !is_fixed
-                        && attempts < 8
                         && crate::mm::vma::teardown_conflict(
                             space.cr3, cur_base, cur_base.saturating_add(length),
                         ).is_some()
                     {
+                        // Out of re-picks with a conflict still standing: fail
+                        // here, do NOT fall through to the insert.  The bound
+                        // must be tested inside the branch rather than as part
+                        // of the guard above: as part of the guard it would
+                        // SKIP the check once the budget was spent and return a
+                        // base inside a range whose entries are being cleared —
+                        // exactly what this check exists to prevent.  The
+                        // overlap arm below degrades to ENOMEM the same way, so
+                        // every check in this loop now fails closed.
+                        if attempts >= 8 {
+                            break Step::Done(None);
+                        }
                         attempts += 1;
                         let repick = if is_stack_alloc {
                             space.find_free_stack_range(length)
