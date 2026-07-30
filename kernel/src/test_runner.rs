@@ -2486,6 +2486,14 @@ pub fn run() -> ! {
     total += 1;
     if test_741_no_timer_eoi_lost_this_boot() { passed += 1; }
 
+    // ── Test 744: a range whose teardown is in flight is not handed out ──
+    // munmap removes the VMA records under the process lock and clears the
+    // page-table entries after releasing it.  The reservation keeps the range
+    // accounted for in between, so placement cannot hand it to a concurrent
+    // mmap whose entries the clear would then wipe.
+    total += 1;
+    if test_744_teardown_reservation_blocks_placement() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -61981,5 +61989,99 @@ fn test_optrace_freeze_gate_and_depth() -> bool {
 
     ring::drop_ring(pid);
     test_pass!("optrace freeze gate skips begin() + per-pid depth resize (W101 Phase 0)");
+    true
+}
+
+// ── Test 744: a range whose teardown is in flight is not handed out ────────
+//
+// Unmapping is two steps that cannot share one critical section: the VMA
+// records are removed under the process lock, then the page-table entries are
+// cleared without it (the clear performs a cross-CPU TLB shootdown, and holding
+// the lock across that reintroduces the shootdown deadlock the split exists to
+// avoid).  In between, the range is described by no VMA.
+//
+// Address placement consults the VMA list.  So without a reservation the
+// placement search treats a range under teardown as free and hands it to a
+// concurrent `mmap` in the same address space; the teardown then clears the new
+// mapping's entries, and because a later access to an anonymous page is served
+// with a fresh zero-filled frame (mmap(2): MAP_ANONYMOUS memory is
+// zero-initialised) the loss is silent — userspace reads back zeroes where it
+// wrote data.
+//
+// This pins the invariant that closes it: while a teardown is published for a
+// range, no placement may return an address inside it, and once retired the
+// range becomes available again.  Without `teardown_publish` / the
+// `teardown_conflict` check in `find_free_range` the first assertion below
+// fails, because the search returns the top of the freed gap.
+fn test_744_teardown_reservation_blocks_placement() -> bool {
+    use crate::mm::vma::{
+        teardown_publish, teardown_retire, teardown_conflict, TEARDOWN_NO_SLOT,
+    };
+    const NAME: &str =
+        "[MM/VMA] in-flight teardown range is not handed out (Test 744)";
+    test_header!(NAME);
+
+    // A cr3 value no live address space uses, so the reservation table entry
+    // cannot collide with a real process's placement.
+    const FAKE_CR3: u64 = 0xDEAD_0000;
+    const LO: u64 = 0x0000_7000_0000_0000;
+    const HI: u64 = 0x0000_7000_0100_0000; // 16 MiB
+
+    // Nothing reserved yet: the range must look clear.
+    if teardown_conflict(FAKE_CR3, LO, HI).is_some() {
+        test_fail!(NAME, "range reported in-flight before any publish");
+        return false;
+    }
+
+    let slot = teardown_publish(FAKE_CR3, LO, HI);
+    if slot == TEARDOWN_NO_SLOT {
+        test_fail!(NAME, "no reservation slot available");
+        return false;
+    }
+
+    // Fully inside, straddling each edge, and exactly coincident must all be
+    // reported — a partial overlap is still a mapping the teardown will clear.
+    let inside = teardown_conflict(FAKE_CR3, LO + 0x1000, LO + 0x2000);
+    let low_edge = teardown_conflict(FAKE_CR3, LO - 0x1000, LO + 0x1000);
+    let high_edge = teardown_conflict(FAKE_CR3, HI - 0x1000, HI + 0x1000);
+    let exact = teardown_conflict(FAKE_CR3, LO, HI);
+    if inside.is_none() || low_edge.is_none() || high_edge.is_none() || exact.is_none() {
+        teardown_retire(slot);
+        test_fail!(NAME, "overlap with a published teardown not reported");
+        return false;
+    }
+    // The reported base is what the placement search descends below.
+    if inside != Some(LO) {
+        teardown_retire(slot);
+        test_fail!(NAME, "conflict did not report the reservation base");
+        return false;
+    }
+
+    // Ranges that merely abut must NOT conflict: [LO,HI) is half-open, so a
+    // mapping ending exactly at LO or starting exactly at HI is untouched.
+    if teardown_conflict(FAKE_CR3, LO - 0x1000, LO).is_some()
+        || teardown_conflict(FAKE_CR3, HI, HI + 0x1000).is_some()
+    {
+        teardown_retire(slot);
+        test_fail!(NAME, "abutting range reported as overlapping");
+        return false;
+    }
+
+    // A different address space is unaffected — reservations are per-cr3.
+    if teardown_conflict(FAKE_CR3 + 0x1000, LO, HI).is_some() {
+        teardown_retire(slot);
+        test_fail!(NAME, "reservation leaked across address spaces");
+        return false;
+    }
+
+    // Retiring restores availability, so a completed teardown does not
+    // permanently withhold address space.
+    teardown_retire(slot);
+    if teardown_conflict(FAKE_CR3, LO, HI).is_some() {
+        test_fail!(NAME, "range still reported in-flight after retire");
+        return false;
+    }
+
+    test_pass!(NAME);
     true
 }

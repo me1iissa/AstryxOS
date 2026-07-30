@@ -421,6 +421,105 @@ const STACK_ASLR_BITS: u32 = 16;
 /// lock only long enough to clone the `Arc` out of the map.
 static MM_REGISTRY: Mutex<BTreeMap<u64, Arc<RwLock<()>>>> = Mutex::new(BTreeMap::new());
 
+// ── In-flight teardown reservations ────────────────────────────────────────
+//
+// Removing a mapping is two steps: drop the records that describe it, then
+// clear the page-table entries that back it.  The second step performs a
+// cross-CPU TLB shootdown and must therefore run without the record lock held,
+// so the two steps cannot share one critical section.
+//
+// That leaves a window in which the range is described by nothing — and an
+// address the records do not describe is an address the placement search will
+// hand to the next `mmap`.  The new mapping is then created inside a range the
+// teardown is still walking, and the teardown clears its entries.  Because a
+// later access to an anonymous page is served with a fresh zero-filled frame
+// (mmap(2): MAP_ANONYMOUS memory is zero-initialised), the loss is silent:
+// userspace reads back zeroes where it wrote data.
+//
+// A reservation closes the window without reintroducing a lock held across the
+// shootdown.  The teardown publishes its range before releasing the records and
+// retires it once the entries are clear; placement treats a published range as
+// occupied.  The range is therefore continuously accounted for — first by its
+// records, then by its reservation — with no interval in which it looks free
+// while it is not.
+//
+// Fixed capacity and allocation-free: consulted from the mmap path and
+// published from the munmap path, neither of which may allocate here.
+const TEARDOWN_SLOTS: usize = 64;
+/// `0` = free.  Published last on begin, cleared first on retire.
+static TEARDOWN_CR3: [AtomicU64; TEARDOWN_SLOTS] =
+    [const { AtomicU64::new(0) }; TEARDOWN_SLOTS];
+static TEARDOWN_LO: [AtomicU64; TEARDOWN_SLOTS] =
+    [const { AtomicU64::new(0) }; TEARDOWN_SLOTS];
+static TEARDOWN_HI: [AtomicU64; TEARDOWN_SLOTS] =
+    [const { AtomicU64::new(0) }; TEARDOWN_SLOTS];
+/// Teardowns that ran unreserved because every slot was taken.  Non-zero means
+/// the window was open for that teardown, so this is a correctness-relevant
+/// statistic rather than a debug counter.
+static TEARDOWN_UNRESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Token returned when no reservation slot could be claimed.
+pub const TEARDOWN_NO_SLOT: usize = usize::MAX;
+
+/// Publish `[lo, hi)` in `cr3` as having a teardown in flight.
+///
+/// Call with the record lock still held, after the records for the range have
+/// been removed, so the range is never unaccounted for.  Retire with
+/// [`teardown_retire`] once the page-table entries are clear.
+///
+/// Returns [`TEARDOWN_NO_SLOT`] when every slot is in use; the caller then
+/// proceeds unreserved — the pre-existing behaviour — rather than stalling a
+/// teardown behind a fixed-size table.
+pub fn teardown_publish(cr3: u64, lo: u64, hi: u64) -> usize {
+    if cr3 == 0 || hi <= lo {
+        return TEARDOWN_NO_SLOT;
+    }
+    for i in 0..TEARDOWN_SLOTS {
+        if TEARDOWN_CR3[i]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            TEARDOWN_LO[i].store(lo, Ordering::Relaxed);
+            TEARDOWN_HI[i].store(hi, Ordering::Relaxed);
+            // Publish last: a reader that sees the cr3 also sees the bounds.
+            TEARDOWN_CR3[i].store(cr3, Ordering::Release);
+            return i;
+        }
+    }
+    TEARDOWN_UNRESERVED.fetch_add(1, Ordering::Relaxed);
+    TEARDOWN_NO_SLOT
+}
+
+/// Retire a reservation published by [`teardown_publish`].
+pub fn teardown_retire(slot: usize) {
+    if slot < TEARDOWN_SLOTS {
+        TEARDOWN_CR3[slot].store(0, Ordering::Release);
+    }
+}
+
+/// Lowest base among in-flight teardowns in `cr3` overlapping `[lo, hi)`.
+///
+/// `None` means the range is clear of any teardown and may be handed out.
+pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
+    let mut lowest: Option<u64> = None;
+    for i in 0..TEARDOWN_SLOTS {
+        if TEARDOWN_CR3[i].load(Ordering::Acquire) != cr3 {
+            continue;
+        }
+        let t_lo = TEARDOWN_LO[i].load(Ordering::Relaxed);
+        let t_hi = TEARDOWN_HI[i].load(Ordering::Relaxed);
+        if lo < t_hi && hi > t_lo {
+            lowest = Some(lowest.map_or(t_lo, |c: u64| c.min(t_lo)));
+        }
+    }
+    lowest
+}
+
+/// Number of teardowns that ran without a reservation (slot table full).
+pub fn teardown_unreserved_count() -> u64 {
+    TEARDOWN_UNRESERVED.load(Ordering::Relaxed)
+}
+
 /// Insert (cr3 → mm_sem) into the registry.
 ///
 /// Idempotent: if a different sem is already registered under this cr3 (e.g.
@@ -1367,7 +1466,13 @@ impl VmSpace {
             let max_base = STACK_ASLR_MAX.saturating_sub(size);
             let candidate = raw.min(max_base).max(STACK_ASLR_MIN);
 
-            let overlaps = self.areas.iter().any(|vma| vma.overlaps(candidate, size));
+            // A range whose teardown is still in flight is not free — see
+            // `teardown_publish` — so it disqualifies a candidate exactly as
+            // an existing mapping does.
+            let overlaps = self.areas.iter().any(|vma| vma.overlaps(candidate, size))
+                || teardown_conflict(
+                    self.cr3, candidate, candidate.saturating_add(size),
+                ).is_some();
             if !overlaps {
                 return Some(candidate);
             }
@@ -1381,7 +1486,29 @@ impl VmSpace {
 
     /// Find a free virtual address range of the given size.
     /// Searches from `mmap_hint` downward (top-down allocation like Linux).
+    /// Top-down search for a free gap, skipping ranges whose page-table
+    /// teardown is still in flight.
+    ///
+    /// A range that has had its records removed but not yet its entries
+    /// cleared is not free: handing it out would create a mapping that the
+    /// in-flight teardown then unmaps.  Each conflict lowers the ceiling below
+    /// the offending reservation and the search is retried, so a candidate is
+    /// returned only once it is clear of every teardown.  The retry count is
+    /// bounded by the reservation table size.
     pub fn find_free_range(&self, size: u64) -> Option<u64> {
+        let mut ceiling = MMAP_BASE;
+        for _ in 0..=TEARDOWN_SLOTS {
+            let cand = self.find_free_range_below(size, ceiling)?;
+            match teardown_conflict(self.cr3, cand, cand.saturating_add(size)) {
+                None => return Some(cand),
+                Some(t_lo) => ceiling = t_lo,
+            }
+        }
+        None
+    }
+
+    /// Body of [`find_free_range`], searching only below `ceiling`.
+    fn find_free_range_below(&self, size: u64, start_ceiling: u64) -> Option<u64> {
         let size = page_align_up(size);
 
         // Top-down search for the highest free gap >= size, starting from the
@@ -1424,7 +1551,7 @@ impl VmSpace {
         // ASLR window, which starts at STACK_ASLR_MIN == MMAP_BASE) lie outside
         // the search window and are simply skipped — `ceiling` is already capped
         // at MMAP_BASE so they never constrain a candidate.
-        let mut ceiling = MMAP_BASE;
+        let mut ceiling = start_ceiling.min(MMAP_BASE);
         for vma in self.areas.iter().rev() {
             // Skip mappings entirely above the ceiling (stack-window VMAs, or any
             // VMA already above the descended ceiling): they cannot bound a gap
