@@ -9204,6 +9204,14 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
         let sa_flags    = u64::from_le_bytes(inp[8..16].try_into().unwrap());
         let sa_restorer = u64::from_le_bytes(inp[16..24].try_into().unwrap());
         let sa_mask     = u64::from_le_bytes(inp[24..32].try_into().unwrap());
+        // The handler address is loaded into the RIP/RCX slot of the syscall
+        // return frame at delivery time and consumed by a Ring-0 control
+        // transfer, so it must be inside the canonical user half before it can
+        // be installed.  Returning here leaves the prior disposition in place
+        // (nothing has been mutated yet).  See `signal::is_installable_handler`.
+        if !crate::signal::is_installable_handler(handler_addr) {
+            return -14; // EFAULT
+        }
         let restorer = if sa_flags & SA_RESTORER != 0 && sa_restorer != 0 {
             sa_restorer
         } else {

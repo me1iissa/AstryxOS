@@ -5150,6 +5150,13 @@ pub(crate) fn sys_sigaction(sig: u8, handler_addr: u64) -> i64 {
         return -22; // EINVAL — can't change SIGKILL/SIGSTOP
     }
 
+    // A handler address is consumed by a Ring-0 control transfer at delivery
+    // time; reject anything outside the canonical user half before it can be
+    // installed.  See `signal::is_installable_handler`.
+    if !crate::signal::is_installable_handler(handler_addr) {
+        return -crate::subsys::linux::errno::EFAULT;
+    }
+
     let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -5280,8 +5287,10 @@ pub(crate) fn sys_sigreturn() -> i64 {
     // userspace could otherwise use to force a kernel fault — CWE-617
     // (reachable assertion) via a crafted signal frame.  Reject the frame
     // instead; the caller resumes at the trampoline's trap instruction.
-    const USER_VA_END: u64 = 0x0000_8000_0000_0000;
-    if saved_rip >= USER_VA_END || saved_rsp >= USER_VA_END {
+    // Same bound as `signal::is_installable_handler` applies at sigaction(2)
+    // registration time — together they keep every value that can reach
+    // SYSRETQ/IRETQ inside the canonical user half.
+    if saved_rip >= USER_VA_LIMIT || saved_rsp >= USER_VA_LIMIT {
         crate::serial_println!(
             "[SIGNAL] sigreturn: rejecting frame with non-user rip={:#x} rsp={:#x}",
             saved_rip, saved_rsp

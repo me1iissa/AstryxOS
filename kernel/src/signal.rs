@@ -642,6 +642,40 @@ pub fn check_signals() -> bool {
 /// Stored in SignalState::action_flags[]; value matches Linux x86_64 ABI.
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 
+// ── sigaction(2) handler-address bound ──────────────────────────────────────
+
+/// `SIG_DFL` as encoded in `sigaction.sa_handler` (POSIX.1-2017 `<signal.h>`).
+pub const SIG_DFL: u64 = 0;
+/// `SIG_IGN` as encoded in `sigaction.sa_handler` (POSIX.1-2017 `<signal.h>`).
+pub const SIG_IGN: u64 = 1;
+
+/// Is `handler` an address the kernel may install as a `sigaction(2)`
+/// disposition?
+///
+/// A registered handler address is not merely dereferenced.  Signal delivery
+/// writes it into the RIP (and RCX) slot of the syscall-return frame, where a
+/// Ring-0 control transfer consumes it — and both SYSRETQ and IRETQ raise #GP
+/// **at CPL 0** on a non-canonical target (Intel SDM Vol. 2B `SYSRET`;
+/// Vol. 3A §6.14.4), with the user RSP already loaded and no IST stack on
+/// vector 13.  An unbounded handler address is therefore a kernel fault
+/// reachable by any process that calls `sigaction(2)` — CWE-617, the
+/// CVE-2012-0217 shape.
+///
+/// Bounding the address at registration establishes the invariant that
+/// whatever reaches those instructions is always canonical user space.
+/// `sys_sigreturn` enforces the same bound, from the same constant, on the
+/// resume RIP it reads back out of the (user-writable) signal frame, so the
+/// invariant holds end to end.
+///
+/// The `SIG_DFL` / `SIG_IGN` sentinels are dispositions rather than code
+/// addresses and never reach a control transfer, so they are always accepted.
+#[inline]
+pub fn is_installable_handler(handler: u64) -> bool {
+    handler == SIG_DFL
+        || handler == SIG_IGN
+        || handler < crate::syscall::USER_VA_LIMIT
+}
+
 // ── ucontext_t layout (x86_64 System V ABI / POSIX.1-2017) ─────────────────
 //
 // Per the x86_64 System V psABI §3.4 and POSIX.1-2017 <ucontext.h>:

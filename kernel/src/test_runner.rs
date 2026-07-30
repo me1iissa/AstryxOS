@@ -2661,6 +2661,16 @@ pub fn run() -> ! {
         if test_250_sigreturn_preserves_rcx_r11() { passed += 1; }
     }
 
+    // ── Test 251: sigaction rejects out-of-range handler addresses ─────────
+    // A registered handler reaches SYSRETQ/IRETQ as the return RIP, and both
+    // fault at CPL 0 on a non-canonical target — so an unbounded handler is a
+    // kernel fault reachable from any process that calls sigaction(2).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_251_sigaction_rejects_out_of_range_handler() { passed += 1; }
+    }
+
     // ── Test 228: auto-reap doubly-orphaned zombie children on parent exit ─
     // Verifies that exit_group_inner sweeps any Zombie child of the dying
     // process from PROCESS_TABLE in-line (rather than leaving it to leak
@@ -49050,6 +49060,153 @@ fn test_250_sigreturn_preserves_rcx_r11() -> bool {
         return false;
     }
     test_pass!("RCX/R11 and their ucontext values survive a fault-delivered signal");
+    true
+}
+
+/// Test 251 — `sigaction(2)` refuses a handler outside the canonical user half.
+///
+/// A registered handler address is not merely dereferenced: signal delivery
+/// writes it into the RIP (and RCX) slot of the syscall-return frame, and the
+/// epilogue's SYSRETQ/IRETQ consumes it.  Both fault with #GP **at CPL 0** on a
+/// non-canonical target (Intel SDM Vol. 2B `SYSRET`; Vol. 3A §6.14.4), with the
+/// user RSP already loaded and no IST stack on vector 13 — the CVE-2012-0217
+/// shape, reachable by any process that calls sigaction(2).  This is
+/// pre-existing; it is closed alongside the RCX/R11 fix because that change
+/// establishes the matching bound on the `sys_sigreturn` side, so the two
+/// together make the invariant hold end to end.
+///
+/// Covers both registration entry points — the native `sys_sigaction` and the
+/// Linux `rt_sigaction` (nr 13) — and asserts the rejected call leaves the
+/// prior disposition installed, not a partially applied one.  The `SIG_DFL` /
+/// `SIG_IGN` sentinels are dispositions rather than addresses and must still be
+/// accepted.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_251_sigaction_rejects_out_of_range_handler() -> bool {
+    test_header!("sigaction rejects out-of-range handler addresses (CWE-617)");
+    use crate::signal::{SigAction, SignalState, SIGUSR1};
+    const EFAULT: i64 = -14;
+    const GOOD_HANDLER: u64 = 0x0000_0000_0040_0078; // plausible user .text VA
+
+    // The test-runner thread's process may have no signal_state (kernel
+    // processes do not get one); install a scratch one for the duration and
+    // put back whatever was there.
+    let pid = crate::proc::current_pid_lockless();
+    let had_state = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let had = p.signal_state.is_some();
+                if !had {
+                    p.signal_state = Some(SignalState::new());
+                }
+                had
+            }
+            None => {
+                test_fail!("sigaction handler bound", "no PROCESS_TABLE entry for pid {}", pid);
+                return false;
+            }
+        }
+    };
+
+    // Read back the disposition currently installed for SIGUSR1.
+    let disposition = || -> Option<(u64, u64)> {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| p.signal_state.as_ref())
+            .map(|s| match s.actions[SIGUSR1 as usize] {
+                SigAction::Default => (0u64, 0u64),
+                SigAction::Ignore  => (1u64, 0u64),
+                SigAction::Handler { addr, restorer } => (addr, restorer),
+            })
+    };
+
+    let mut failed: u32 = 0;
+
+    // ── Out-of-range addresses must be refused by BOTH entry points ────────
+    // The first non-canonical address, an address inside the non-canonical
+    // hole, the kernel base, and the top of the address space.
+    let bad: [(&str, u64); 4] = [
+        ("first non-canonical", 0x0000_8000_0000_0000),
+        ("non-canonical hole",  0x0000_9000_0000_0000),
+        ("kernel base",         0xFFFF_8000_0010_0000),
+        ("all-ones",            0xFFFF_FFFF_FFFF_FFFF),
+    ];
+
+    for (name, addr) in bad.iter() {
+        // Start from a known disposition so "did not install" is checkable.
+        let _ = crate::syscall::sys_sigaction(SIGUSR1, 0);
+
+        let r_native = crate::syscall::sys_sigaction(SIGUSR1, *addr);
+        let after_native = disposition();
+        let native_ok = r_native == EFAULT && after_native == Some((0, 0));
+
+        // Linux rt_sigaction(nr 13): struct kernel_sigaction is
+        // { handler, flags, restorer, mask } — 32 bytes.  Dispatched through
+        // the kernel-bypass wrapper so the kernel-resident `act` pointer is
+        // accepted; the handler bound under test is independent of that.
+        let mut act = [0u8; 32];
+        act[0..8].copy_from_slice(&addr.to_le_bytes());
+        let r_linux = crate::syscall::dispatch_linux_kernel(
+            13, SIGUSR1 as u64, act.as_ptr() as u64, 0, 8, 0, 0);
+        let after_linux = disposition();
+        let linux_ok = r_linux == EFAULT && after_linux == Some((0, 0));
+
+        crate::serial_println!(
+            "[TEST/SIGACT-BOUND] case=\"{}\" addr={:#x} native_rc={} linux_rc={} \
+             installed_after={:?} {}",
+            name, addr, r_native, r_linux, after_native,
+            if native_ok && linux_ok { "OK" } else { "FAIL" },
+        );
+        if !native_ok {
+            test_fail!("sigaction handler bound",
+                "native sys_sigaction({:#x}) returned {} (expected {}), disposition now {:?}",
+                addr, r_native, EFAULT, after_native);
+            failed += 1;
+        }
+        if !linux_ok {
+            test_fail!("sigaction handler bound",
+                "rt_sigaction({:#x}) returned {} (expected {}), disposition now {:?}",
+                addr, r_linux, EFAULT, after_linux);
+            failed += 1;
+        }
+    }
+
+    // ── An in-range handler and both sentinels must still be accepted ──────
+    let r_good = crate::syscall::sys_sigaction(SIGUSR1, GOOD_HANDLER);
+    if r_good != 0 || disposition() != Some((GOOD_HANDLER, 0)) {
+        test_fail!("sigaction handler bound",
+            "in-range handler {:#x} rejected: rc={} disposition={:?}",
+            GOOD_HANDLER, r_good, disposition());
+        failed += 1;
+    }
+    for (name, sentinel) in [("SIG_IGN", 1u64), ("SIG_DFL", 0u64)] {
+        let rc = crate::syscall::sys_sigaction(SIGUSR1, sentinel);
+        if rc != 0 || disposition() != Some((sentinel, 0)) {
+            test_fail!("sigaction handler bound",
+                "{} rejected: rc={} disposition={:?}", name, rc, disposition());
+            failed += 1;
+        }
+    }
+
+    // Restore the pre-test signal_state.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if had_state {
+                if let Some(ref mut s) = p.signal_state {
+                    s.actions[SIGUSR1 as usize] = SigAction::Default;
+                }
+            } else {
+                p.signal_state = None;
+            }
+        }
+    }
+
+    if failed > 0 {
+        return false;
+    }
+    test_pass!("out-of-range sigaction handlers rejected with EFAULT at both entry points");
     true
 }
 
