@@ -486,7 +486,18 @@ pub fn teardown_publish(cr3: u64, lo: u64, hi: u64) -> usize {
             return i;
         }
     }
-    TEARDOWN_UNRESERVED.fetch_add(1, Ordering::Relaxed);
+    // Slot exhaustion silently reopens the window this table exists to close,
+    // so say so once rather than only incrementing a counter nobody reads.
+    // Once, because the condition is self-similar and the report must not
+    // become the reason the table stays full.
+    if TEARDOWN_UNRESERVED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::serial_println!(
+            "[MM/TEARDOWN] WARNING: all {} reservation slots in use; this \
+             teardown of [{:#x},{:#x}) runs UNRESERVED — a concurrent mmap may \
+             be placed inside it.  Further occurrences counted, not logged.",
+            TEARDOWN_SLOTS, lo, hi,
+        );
+    }
     TEARDOWN_NO_SLOT
 }
 
@@ -505,10 +516,11 @@ pub fn teardown_retire(slot: usize) {
 ///
 /// `None` means the range is clear of any teardown and may be handed out.
 pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
-    // `0` marks a free slot, so it can never identify an address space —
-    // `teardown_publish` refuses it for the same reason.  Matching on it here
-    // would make every free slot a hit for any caller whose `cr3` is 0.
-    if cr3 == 0 {
+    // Neither sentinel can identify an address space: `0` marks a free slot
+    // (`teardown_publish` refuses it for the same reason) and `u64::MAX` marks
+    // a slot claimed by the CAS but not yet published.  Matching on either
+    // would make free or half-written slots a hit for a caller carrying it.
+    if cr3 == 0 || cr3 == u64::MAX {
         return None;
     }
     let mut lowest: Option<u64> = None;
@@ -526,8 +538,24 @@ pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
 }
 
 /// Number of teardowns that ran without a reservation (slot table full).
+///
+/// Non-zero means the placement window described in `teardown_publish` was
+/// open for that many teardowns.  Surfaced by the `mm-teardown` kdb op.
 pub fn teardown_unreserved_count() -> u64 {
     TEARDOWN_UNRESERVED.load(Ordering::Relaxed)
+}
+
+/// Reservations currently published (claimed slots, including mid-publish).
+pub fn teardown_in_flight_count() -> usize {
+    TEARDOWN_CR3
+        .iter()
+        .filter(|c| c.load(Ordering::Relaxed) != 0)
+        .count()
+}
+
+/// Total reservation slots — the ceiling `teardown_in_flight_count` saturates at.
+pub fn teardown_slot_count() -> usize {
+    TEARDOWN_SLOTS
 }
 
 /// Insert (cr3 → mm_sem) into the registry.
@@ -1506,6 +1534,9 @@ impl VmSpace {
     /// returned only once it is clear of every teardown.  The retry count is
     /// bounded by the reservation table size.
     pub fn find_free_range(&self, size: u64) -> Option<u64> {
+        // Align first: the placement below reserves the rounded-up extent, so
+        // an unaligned request would have its tail checked against nothing.
+        let size = page_align_up(size);
         let mut ceiling = MMAP_BASE;
         for _ in 0..=TEARDOWN_SLOTS {
             let cand = self.find_free_range_below(size, ceiling)?;

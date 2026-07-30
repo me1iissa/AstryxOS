@@ -62100,6 +62100,68 @@ fn test_744_teardown_reservation_blocks_placement() -> bool {
         return false;
     }
 
+    // ── The placement search itself must honour a reservation ────────────
+    //
+    // Everything above exercises the registry.  This exercises the
+    // integration the registry exists for: `find_free_range` must descend
+    // BELOW a reserved range instead of returning it, and must recover the
+    // original placement once the reservation retires.  It needs a VmSpace
+    // whose cr3 is NOT the free-slot sentinel, since a space carrying 0 is
+    // (correctly) exempt from the check.
+    {
+        use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                             PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+        // Mirrors the private MMAP_BASE in mm/vma.rs, as Test 308 does.
+        const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+        const PAGE: u64 = 0x1000;
+        const SPACE_CR3: u64 = 0xBEEF_0000;
+        const WANT: u64 = 0x10 * PAGE;
+
+        let sp = VmSpace {
+            cr3: SPACE_CR3,
+            mm_sem: crate::mm::vma::make_mm_sem_for_test(),
+            generation: crate::mm::vma::make_generation_for_test(),
+            areas: alloc::vec![VmArea {
+                base: MMAP_BASE - PAGE, length: PAGE,
+                prot: PROT_READ | PROT_WRITE,
+                flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                backing: VmBacking::Anonymous, name: "[mmap-anon]",
+            }],
+            mmap_hint: MMAP_BASE, stack_aslr_base: 0, brk: 0, brk_start: 0,
+        };
+
+        // Unreserved, the top-down search lands flush below the one mapping.
+        let unreserved = MMAP_BASE - PAGE - WANT;
+        if sp.find_free_range(WANT) != Some(unreserved) {
+            test_fail!(NAME, "unreserved placement moved: expected {:#x}, got {:?}",
+                       unreserved, sp.find_free_range(WANT));
+            return false;
+        }
+
+        // Reserve exactly where it would have gone; the search must move below.
+        let s2 = teardown_publish(SPACE_CR3, unreserved, MMAP_BASE - PAGE);
+        if s2 == TEARDOWN_NO_SLOT {
+            test_fail!(NAME, "no slot for the placement case");
+            return false;
+        }
+        match sp.find_free_range(WANT) {
+            Some(b) if b.saturating_add(WANT) <= unreserved => {}
+            other => {
+                teardown_retire(s2);
+                test_fail!(NAME, "reserved range handed out (or no fit): {:?}", other);
+                return false;
+            }
+        }
+
+        // Retiring restores the original placement — a completed teardown must
+        // not withhold the address range permanently.
+        teardown_retire(s2);
+        if sp.find_free_range(WANT) != Some(unreserved) {
+            test_fail!(NAME, "placement not restored after retire");
+            return false;
+        }
+    }
+
     test_pass!(NAME);
     true
 }
