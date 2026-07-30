@@ -493,6 +493,10 @@ pub fn teardown_publish(cr3: u64, lo: u64, hi: u64) -> usize {
 /// Retire a reservation published by [`teardown_publish`].
 pub fn teardown_retire(slot: usize) {
     if slot < TEARDOWN_SLOTS {
+        // Clear the bounds as well, so a free slot can never hand a reader the
+        // stale extent of the teardown that last occupied it.
+        TEARDOWN_LO[slot].store(0, Ordering::Relaxed);
+        TEARDOWN_HI[slot].store(0, Ordering::Relaxed);
         TEARDOWN_CR3[slot].store(0, Ordering::Release);
     }
 }
@@ -501,6 +505,12 @@ pub fn teardown_retire(slot: usize) {
 ///
 /// `None` means the range is clear of any teardown and may be handed out.
 pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
+    // `0` marks a free slot, so it can never identify an address space —
+    // `teardown_publish` refuses it for the same reason.  Matching on it here
+    // would make every free slot a hit for any caller whose `cr3` is 0.
+    if cr3 == 0 {
+        return None;
+    }
     let mut lowest: Option<u64> = None;
     for i in 0..TEARDOWN_SLOTS {
         if TEARDOWN_CR3[i].load(Ordering::Acquire) != cr3 {

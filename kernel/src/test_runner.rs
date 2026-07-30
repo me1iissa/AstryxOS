@@ -62074,11 +62074,29 @@ fn test_744_teardown_reservation_blocks_placement() -> bool {
         return false;
     }
 
+    // cr3 == 0 is the free-slot marker, not an address space.  Matching on it
+    // would make every free slot a hit — which is exactly how this first went
+    // wrong: `VmSpace` values built for tests carry cr3 0, so `find_free_range`
+    // saw a conflict against the stale bounds of every retired slot and placed
+    // an allocation a page low.
+    if teardown_conflict(0, LO, HI).is_some() {
+        teardown_retire(slot);
+        test_fail!(NAME, "cr3 0 matched a slot");
+        return false;
+    }
+
     // Retiring restores availability, so a completed teardown does not
     // permanently withhold address space.
     teardown_retire(slot);
     if teardown_conflict(FAKE_CR3, LO, HI).is_some() {
         test_fail!(NAME, "range still reported in-flight after retire");
+        return false;
+    }
+
+    // Retiring must clear the bounds too, not just the owner, so the slot
+    // cannot present the previous occupant's extent to a later reader.
+    if teardown_conflict(FAKE_CR3, 0, u64::MAX).is_some() {
+        test_fail!(NAME, "retired slot still carries its old bounds");
         return false;
     }
 
