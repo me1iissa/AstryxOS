@@ -1437,6 +1437,22 @@ pub unsafe fn deliver_fault_signal_from_isr(
         isr_r14, isr_rbp, isr_rbx, isr_rsi
     );
     emit_signal_vma_banner(pid, user_rip, cr2, &vma_snapshot);
+    // A tiny fault address is the signature of dereferencing a metadata
+    // pointer that read back as zero.  Check the registers that could hold the
+    // object the pointer was read OUT of against the recorded range advices —
+    // an advice covering that page explains the zero without any kernel bug,
+    // and the absence of one is equally informative.
+    {
+        let cr3_now: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3_now,
+                             options(nomem, nostack, preserves_flags));
+        }
+        emit_metadata_fault_attribution(
+            pid, cr3_now, cr2,
+            &[("rcx", isr_rcx), ("rsi", isr_rsi), ("rbx", isr_rbx)],
+        );
+    }
 
     // ── [FAULT/PHYS] + [FAULT/RIP-CONTENT] — physical-frame identity ─────────
     // Aliasing-detection diagnostic.  Two fault deliveries with the same
@@ -1899,6 +1915,282 @@ pub fn emit_fault_gpr_phys_for_fatal(
     }
     #[cfg(not(feature = "firefox-test-core"))]
     let _ = (pid, cr3, candidates);
+}
+
+/// Recent `MADV_DONTNEED` / `MADV_FREE` ranges, per address space.
+///
+/// Those advices are served by clearing page-table entries and letting each
+/// page re-fault, so an anonymous page inside a recently advised range comes
+/// back ZERO-FILLED (madvise(2): "subsequent accesses ... will succeed, but
+/// will result in ... zero-fill-on-demand pages").  That is indistinguishable,
+/// after the fact, from memory whose contents were destroyed by a kernel bug —
+/// unless the advice itself is on record.  This ring puts it on record, so a
+/// fault caused by an allocator reading back its own lost metadata can be
+/// attributed to (or cleared of) an advice that covered the address.
+///
+/// Lock-free by construction: a monotonically increasing slot counter and
+/// relaxed stores.  A torn read across a wrapped slot can only produce a
+/// spurious miss or a stale hit, both of which are visible in the emitted
+/// tick, so no diagnostic conclusion rests on a single racy slot.
+#[cfg(feature = "firefox-test-core")]
+mod madv_ring {
+    use core::sync::atomic::AtomicU64;
+    pub const SLOTS: usize = 128;
+    pub static CR3:   [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static START: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static END:   [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static TICK:  [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static NEXT:  AtomicU64 = AtomicU64::new(0);
+}
+
+/// Record one `MADV_DONTNEED` / `MADV_FREE` range that actually cleared PTEs.
+pub fn madv_note_range(cr3: u64, start: u64, end: u64) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::sync::atomic::Ordering;
+        let i = (madv_ring::NEXT.fetch_add(1, Ordering::Relaxed) as usize)
+            % madv_ring::SLOTS;
+        let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        madv_ring::START[i].store(start, Ordering::Relaxed);
+        madv_ring::END[i].store(end, Ordering::Relaxed);
+        madv_ring::TICK[i].store(tick, Ordering::Relaxed);
+        // CR3 last: a reader that sees a non-zero CR3 has the rest.
+        madv_ring::CR3[i].store(cr3, Ordering::Release);
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (cr3, start, end);
+}
+
+/// Most recent recorded advice covering `va` in `cr3`, as `(start, end, tick)`.
+#[cfg(feature = "firefox-test-core")]
+fn madv_lookup(cr3: u64, va: u64) -> Option<(u64, u64, u64)> {
+    use core::sync::atomic::Ordering;
+    let mut best: Option<(u64, u64, u64)> = None;
+    for i in 0..madv_ring::SLOTS {
+        if madv_ring::CR3[i].load(Ordering::Acquire) != cr3 {
+            continue;
+        }
+        let start = madv_ring::START[i].load(Ordering::Relaxed);
+        let end = madv_ring::END[i].load(Ordering::Relaxed);
+        if va < start || va >= end {
+            continue;
+        }
+        let tick = madv_ring::TICK[i].load(Ordering::Relaxed);
+        if best.map_or(true, |(_, _, t)| tick > t) {
+            best = Some((start, end, tick));
+        }
+    }
+    best
+}
+
+/// Attribute an allocator-metadata fault to a recent range advice, if any.
+///
+/// The shape this targets: an allocator reads a back-pointer out of an in-band
+/// header, gets zero because the page it lives on was re-faulted zero-filled,
+/// and then dereferences it at a small fixed offset — so the fault address is
+/// a tiny constant rather than a plausible pointer.  Reports, for each
+/// candidate register, whether its page is currently mapped and whether a
+/// recorded advice covered it.
+pub fn emit_metadata_fault_attribution(
+    pid: u64,
+    cr3: u64,
+    cr2: u64,
+    candidates: &[(&'static str, u64)],
+) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+        // Only the "dereferenced a zeroed metadata pointer" shape.
+        if cr2 == 0 || cr2 >= 0x1000 {
+            return;
+        }
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 && n % 256 != 0 {
+            return;
+        }
+        for (name, val) in candidates.iter() {
+            let v = *val;
+            if v < 0x1000 || v >= KERNEL_BASE {
+                continue;
+            }
+            let page = v & !0xFFF;
+            let mapped = crate::mm::vmm::virt_to_phys_in(cr3, page);
+            let advice = madv_lookup(cr3, page);
+            match (mapped, advice) {
+                (m, Some((s, e, t))) => crate::serial_println!(
+                    "[B12/ATTR] #{} pid={} cr2={:#x} reg={} val={:#x} \
+                     phys={:#x} ADVISED range=[{:#x},{:#x}) tick={}",
+                    n, pid, cr2, name, v, m.unwrap_or(0), s, e, t,
+                ),
+                (Some(phys), None) => crate::serial_println!(
+                    "[B12/ATTR] #{} pid={} cr2={:#x} reg={} val={:#x} \
+                     phys={:#x} no-advice-on-record",
+                    n, pid, cr2, name, v, phys,
+                ),
+                (None, None) => crate::serial_println!(
+                    "[B12/ATTR] #{} pid={} cr2={:#x} reg={} val={:#x} \
+                     phys=UNMAPPED no-advice-on-record",
+                    n, pid, cr2, name, v,
+                ),
+            }
+            // This face — a small constant fault address, reached by
+            // dereferencing a back-pointer that read back as zero — is the
+            // most common one, and it carries the header's own address in a
+            // register.  Ask the clear-provenance record who cleared that
+            // page's entry, and follow the record -> header indirection too,
+            // since which register holds which depends on the assertion.
+            crate::mm::w215_diag::dump_clear_stamp_for_va(name, page);
+            if v & 0x7 == 0 {
+                if let Some(grp) = read_user_word_via_cr3(cr3, v + 0x10, 8) {
+                    if grp >= 0x1000 && grp < KERNEL_BASE && grp & 0xF == 0 {
+                        crate::mm::w215_diag::dump_clear_stamp_for_va(
+                            "via_mem", grp & !0xFFF,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (pid, cr3, cr2, candidates);
+}
+
+/// Read up to 8 bytes of user memory through an explicit CR3.
+///
+/// Resolves the page with a software walk of the target page tables and reads
+/// through the kernel's higher-half physical window, so it is safe to call from
+/// ISR context on a dying process: an unmapped page yields `None` rather than a
+/// nested fault.  Intel SDM Vol. 3A §4.5 (4-level paging).
+#[cfg(feature = "firefox-test-core")]
+fn read_user_word_via_cr3(cr3: u64, va: u64, len: usize) -> Option<u64> {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    if len == 0 || len > 8 {
+        return None;
+    }
+    // Refuse a read that would straddle a page boundary — the second page can
+    // have a different (or absent) translation.
+    if (va & 0xFFF) + len as u64 > 0x1000 {
+        return None;
+    }
+    let phys = crate::mm::vmm::virt_to_phys_in(cr3, va & !0xFFF)?;
+    let src = (PHYS_OFF + phys + (va & 0xFFF)) as *const u8;
+    let mut buf = [0u8; 8];
+    // SAFETY: `virt_to_phys_in` just proved the page is present in `cr3`, and
+    // the higher-half window maps all managed RAM, so `src .. src+len` is
+    // readable kernel memory.  The read is bounded to one page above.
+    unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len) };
+    Some(u64::from_le_bytes(buf))
+}
+
+/// Physical provenance of the allocator "group" page behind a Ring-3 `hlt`.
+///
+/// A `hlt` executed at CPL 3 raises #GP (Intel SDM Vol. 2B, HLT), so a libc
+/// whose integrity assertions compile to `hlt` reports a failed allocator
+/// invariant as a fatal #GP.  In the mallocng-style layout used by the musl
+/// build in the Firefox image, the failing invariants read a 16-byte in-band
+/// header at the head of an anonymous mapping, reached from a metadata record
+/// at `record + 0x10`.  When that header reads back as something the allocator
+/// never wrote, the question that decides the class is not *what* it holds but
+/// *which physical frame* now backs the page:
+///
+///   * a frame allocated LONG BEFORE the fault, contemporaneous with the
+///     metadata record, means the mapping kept its frame and the frame's
+///     contents were destroyed in place;
+///   * a RECENTLY allocated frame means a second frame was installed for the
+///     virtual address after the allocator wrote the header, so reads now go
+///     to different memory than the writes did;
+///   * a recent FREE before that allocation means the frame was recycled while
+///     the mapping still pointed at it.
+///
+/// Emits `[B12/GROUP]` and `[B12/RECORD]` plus the existing alloc/free shadow
+/// lines, so the three cases are separable from the serial log alone.  Reads
+/// only, bounded to the supplied candidates, `firefox-test-core` only.
+pub fn emit_acrash_group_provenance(
+    pid: u64,
+    cr3: u64,
+    user_rip: u64,
+    records: &[(&'static str, u64)],
+) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+        // Only for the assertion-trap shape: the faulting instruction must be
+        // a `hlt` (opcode F4).  A #GP raised by a non-canonical effective
+        // address is a different failure and must not be dressed up as this
+        // one — the two share an exit status and have been conflated before.
+        if read_user_word_via_cr3(cr3, user_rip, 1) != Some(0xF4) {
+            return;
+        }
+        let tid = crate::proc::current_tid();
+        for (name, rec) in records.iter() {
+            let rec = *rec;
+            // A metadata record is a naturally-aligned user pointer.  The
+            // earlier 16-byte requirement here was measurably too strict:
+            // records are packed at a stride that leaves many of them only
+            // 8-byte aligned, and every such fault was silently skipped.
+            if rec < 0x1000 || rec >= KERNEL_BASE || rec & 0x7 != 0 {
+                continue;
+            }
+            let grp = match read_user_word_via_cr3(cr3, rec + 0x10, 8) {
+                Some(g) => g,
+                None => continue,
+            };
+            // A group that owns a whole mapping starts at a page boundary, but
+            // a small group nested inside a larger one does not — requiring
+            // page alignment here discarded the nested case entirely.  Accept
+            // any plausibly-aligned user pointer and resolve the page it lives
+            // on; `grp_aligned` records which of the two shapes this is.
+            if grp < 0x1000 || grp >= KERNEL_BASE || grp & 0xF != 0 {
+                continue;
+            }
+            let grp_page = grp & !0xFFFu64;
+            let hdr_lo = read_user_word_via_cr3(cr3, grp, 8).unwrap_or(0);
+            let hdr_hi = read_user_word_via_cr3(cr3, grp + 8, 8).unwrap_or(0);
+            match crate::mm::vmm::virt_to_phys_in(cr3, grp_page) {
+                Some(phys) => {
+                    crate::serial_println!(
+                        "[B12/GROUP] pid={} tid={} via={} rec={:#x} grp={:#x} \
+                         grp_aligned={} phys={:#x} hdr0={:#018x} hdr8={:#018x} \
+                         back_ptr_ok={}",
+                        pid, tid, name, rec, grp,
+                        (grp & 0xFFF == 0) as u8, phys, hdr_lo, hdr_hi,
+                        (hdr_lo == rec) as u8,
+                    );
+                    crate::mm::w215_diag::dump_free_shadow_for_phys(phys);
+                    crate::mm::w215_diag::dump_alloc_shadow_for_phys(phys);
+                }
+                None => {
+                    crate::serial_println!(
+                        "[B12/GROUP] pid={} tid={} via={} rec={:#x} grp={:#x} \
+                         grp_aligned={} phys=UNMAPPED",
+                        pid, tid, name, rec, grp, (grp & 0xFFF == 0) as u8,
+                    );
+                }
+            }
+            // Absent or present-but-zeroed, the question is the same: was this
+            // page's entry cleared, and by which call site.  A recorded site
+            // names the path directly; no record at all means the entry was
+            // never cleared, which moves the question to how it was installed.
+            crate::mm::w215_diag::dump_clear_stamp_for_va("group", grp_page);
+            // The record's own frame is the control: it is allocated in the
+            // same era as the group and is known-healthy here, so its alloc
+            // tick is the reference the group's tick is compared against.
+            if let Some(rec_phys) =
+                crate::mm::vmm::virt_to_phys_in(cr3, rec & !0xFFF)
+            {
+                crate::serial_println!(
+                    "[B12/RECORD] pid={} tid={} via={} rec={:#x} phys={:#x}",
+                    pid, tid, name, rec, rec_phys,
+                );
+                crate::mm::w215_diag::dump_alloc_shadow_for_phys(rec_phys);
+            }
+        }
+        let _ = (pid, cr3, tid);
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (pid, cr3, user_rip, records);
 }
 
 pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {

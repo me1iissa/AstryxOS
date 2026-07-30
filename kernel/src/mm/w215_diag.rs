@@ -1158,6 +1158,387 @@ pub fn pte_change_displaced_count() -> u64 {
     PTE_CHANGE_DISPLACED.load(Ordering::Relaxed)
 }
 
+// ── CLEAR_STAMP — "last cleared by" provenance for one user page ────────────
+//
+// A page-table entry that is cleared while its mapping is still live makes
+// the next access re-fault, and an anonymous re-fault is served with a fresh
+// zero-filled frame (mmap(2): MAP_ANONYMOUS memory reads as zero).  Userspace
+// therefore observes its own writes vanish, with nothing in the register dump
+// or the page contents to say who cleared the entry.
+//
+// This ring answers that question directly.  Every site that clears a user
+// entry stamps the page with the CALL SITE that did it, so a later fault on
+// the same page can name the clearing path in one boot instead of testing one
+// candidate at a time.
+//
+// ## Why the site is a `Location`, not a return address
+//
+// The neighbouring [`PTE_CHANGE_RING`] records `caller_rip` by reading
+// `[rbp+8]`.  That is only meaningful when the kernel is built with frame
+// pointers; a release build omits them, leaving RBP a scratch register at the
+// call site, so the recorded RIP can be arbitrary.  `#[track_caller]` instead
+// has the compiler thread the caller's `file:line` through at zero runtime
+// cost and independently of inlining or codegen flags, which makes the stamp
+// trustworthy in exactly the build the bug reproduces in.
+//
+// ## Two rings, deliberately
+//
+// * `RING` is direct-addressed by `(va >> 12)` and has a long memory but is
+//   lossy: an unrelated page whose PFN aliases the same slot evicts the entry.
+//   The full VA is stored, so an evicted entry reports a MISS rather than a
+//   wrong answer.
+// * `LOG` is a plain most-recent-N record of every clear, in order.  It cannot
+//   be displaced by aliasing, so it distinguishes the two readings of a miss
+//   in `RING` — "this page was cleared, but the slot was reused" versus "this
+//   page was never cleared at all".  That distinction is the whole point of
+//   the probe, so it must not rest on a hash.
+//
+// Counters are exported so the saturation of both structures is reportable
+// alongside any conclusion drawn from them.
+//
+// Cite: Intel SDM Vol. 3A §4.5 (4-level paging), §4.10.4-5 (TLB and
+// paging-structure caches); mmap(2), madvise(2) (man7.org).
+
+#[cfg(feature = "firefox-test-core")]
+mod clear_stamp {
+    use core::sync::atomic::AtomicU64;
+
+    /// Direct-addressed slots. 32 Ki × 40 B = 1.25 MiB BSS, in the same order
+    /// as the existing ALLOC/FREE shadows.
+    pub const SLOTS: usize = 32768;
+    /// Undisplaceable most-recent-clear record.
+    pub const RECENT: usize = 4096;
+
+    pub struct Entry {
+        /// Page-aligned user VA whose entry was cleared. `0` = slot unused, and
+        /// also the "write in progress" marker (written first, published last).
+        pub va: AtomicU64,
+        pub tick: AtomicU64,
+        /// Physical frame the entry mapped immediately before the clear.
+        pub old_phys: AtomicU64,
+        /// `&'static Location` of the clearing call site, as a raw pointer.
+        pub site: AtomicU64,
+        /// `[63:32] tid`, `[31:16] cr3>>12 & 0xFFFF`, `[15:8] cpu`, `[7:0] kind`.
+        pub packed: AtomicU64,
+        /// Range the caller asked to unmap, when the clearing site supplied one.
+        pub req_lo: AtomicU64,
+        pub req_hi: AtomicU64,
+        /// Union extent of the mappings the caller actually owned in that range,
+        /// as measured before they were removed. `req_hi == 0` means the site
+        /// supplied no context.
+        pub rm_lo: AtomicU64,
+        pub rm_hi: AtomicU64,
+    }
+
+    impl Entry {
+        pub const fn new() -> Self {
+            Self {
+                va: AtomicU64::new(0),
+                tick: AtomicU64::new(0),
+                old_phys: AtomicU64::new(0),
+                site: AtomicU64::new(0),
+                packed: AtomicU64::new(0),
+                req_lo: AtomicU64::new(0),
+                req_hi: AtomicU64::new(0),
+                rm_lo: AtomicU64::new(0),
+                rm_hi: AtomicU64::new(0),
+            }
+        }
+    }
+
+    pub static RING: [Entry; SLOTS] = [const { Entry::new() }; SLOTS];
+    pub static LOG: [Entry; RECENT] = [const { Entry::new() }; RECENT];
+    pub static NEXT: AtomicU64 = AtomicU64::new(0);
+    pub static RECORDED: AtomicU64 = AtomicU64::new(0);
+    pub static DISPLACED: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Stamp one user page with the call site that cleared its page-table entry.
+///
+/// `old_phys` is the frame the entry mapped immediately before the clear, `0`
+/// if it was already absent. `kind` is one of the `PTE_KIND_*` codes above.
+/// No-op for non-user addresses and in builds without the diagnostic feature.
+#[inline]
+pub fn clear_stamp_record(
+    va: u64,
+    old_phys: u64,
+    cr3: u64,
+    kind: u8,
+    site: &'static core::panic::Location<'static>,
+    ctx: Option<crate::mm::vmm::ClearCtx>,
+) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if va < USER_STACK_RING_LO || va >= USER_STACK_RING_HI {
+            return;
+        }
+        let va_page = va & !0xFFFu64;
+        let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
+        let tid = crate::proc::current_tid() as u64;
+        let packed = (tid << 32)
+            | (((cr3 >> 12) & 0xFFFF) << 16)
+            | (cpu << 8)
+            | (kind as u64);
+        let site_ptr = site as *const _ as u64;
+        let old = old_phys & !0xFFFu64;
+
+        // Publish protocol for both structures: blank the VA, fill the body,
+        // then store the VA last with Release. A concurrent reader therefore
+        // sees either a consistent entry or no entry — never a body belonging
+        // to a different page. Diagnostic-only; a racing reader may miss.
+        let (req_lo, req_hi, rm_lo, rm_hi) = match ctx {
+            Some(c) => (c.req_lo, c.req_hi, c.rm_lo, c.rm_hi),
+            None => (0, 0, 0, 0),
+        };
+        let write = |e: &clear_stamp::Entry| {
+            e.va.store(0, Ordering::Relaxed);
+            e.tick.store(tick, Ordering::Relaxed);
+            e.old_phys.store(old, Ordering::Relaxed);
+            e.site.store(site_ptr, Ordering::Relaxed);
+            e.packed.store(packed, Ordering::Relaxed);
+            e.req_lo.store(req_lo, Ordering::Relaxed);
+            e.req_hi.store(req_hi, Ordering::Relaxed);
+            e.rm_lo.store(rm_lo, Ordering::Relaxed);
+            e.rm_hi.store(rm_hi, Ordering::Relaxed);
+            e.va.store(va_page, Ordering::Release);
+        };
+
+        let slot = &clear_stamp::RING[((va_page >> 12) as usize) & (clear_stamp::SLOTS - 1)];
+        let prev = slot.va.load(Ordering::Relaxed);
+        if prev != 0 && prev != va_page {
+            clear_stamp::DISPLACED.fetch_add(1, Ordering::Relaxed);
+        }
+        write(slot);
+
+        let i = (clear_stamp::NEXT.fetch_add(1, Ordering::Relaxed) as usize)
+            % clear_stamp::RECENT;
+        write(&clear_stamp::LOG[i]);
+
+        clear_stamp::RECORDED.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (va, old_phys, cr3, kind, site, ctx);
+}
+
+/// Emit the recorded clearing site for `va` as one `[UNMAP/STAMP]` line.
+///
+/// Consults the direct-addressed ring and the undisplaceable recent log, and
+/// reports whichever holds the newer clear (`src=direct` / `src=recent`), so a
+/// miss in the hash alone is never mistaken for "never cleared". A miss prints
+/// the totals and the VA that currently occupies the slot, which is what makes
+/// the negative result interpretable.
+pub fn dump_clear_stamp_for_va(tag: &str, va: u64) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let va_page = va & !0xFFFu64;
+        let recorded = clear_stamp::RECORDED.load(Ordering::Relaxed);
+        let displaced = clear_stamp::DISPLACED.load(Ordering::Relaxed);
+
+        let read = |e: &clear_stamp::Entry| -> Option<(u64, u64, u64, u64, [u64; 4])> {
+            if e.va.load(Ordering::Acquire) != va_page {
+                return None;
+            }
+            Some((
+                e.tick.load(Ordering::Relaxed),
+                e.old_phys.load(Ordering::Relaxed),
+                e.site.load(Ordering::Relaxed),
+                e.packed.load(Ordering::Relaxed),
+                [
+                    e.req_lo.load(Ordering::Relaxed),
+                    e.req_hi.load(Ordering::Relaxed),
+                    e.rm_lo.load(Ordering::Relaxed),
+                    e.rm_hi.load(Ordering::Relaxed),
+                ],
+            ))
+        };
+
+        let slot = &clear_stamp::RING[((va_page >> 12) as usize) & (clear_stamp::SLOTS - 1)];
+        let direct = read(slot);
+        let mut recent: Option<(u64, u64, u64, u64, [u64; 4])> = None;
+        for e in clear_stamp::LOG.iter() {
+            if let Some(v) = read(e) {
+                if recent.map_or(true, |(t, _, _, _, _)| v.0 > t) {
+                    recent = Some(v);
+                }
+            }
+        }
+
+        let (src, best) = match (direct, recent) {
+            (Some(d), Some(r)) if r.0 > d.0 => ("recent", Some(r)),
+            (Some(d), _) => ("direct", Some(d)),
+            (None, Some(r)) => ("recent", Some(r)),
+            (None, None) => ("none", None),
+        };
+
+        match best {
+            Some((tick, old_phys, site_ptr, packed, ctx)) => {
+                let [req_lo, req_hi, rm_lo, rm_hi] = ctx;
+                // Classify the clear against the caller's own request, so the
+                // two remaining readings are separated by the record itself
+                // rather than by argument:
+                //   owned    — the page was inside a mapping the caller held
+                //              and this call removed, so for it to be live
+                //              again something re-established it afterwards;
+                //   overrun  — the page was inside the requested range but
+                //              outside everything the caller owned in it, so
+                //              the clear reached past the caller's mappings.
+                let scope = if req_hi == 0 {
+                    "no-ctx"
+                } else if rm_hi > rm_lo && va_page >= rm_lo && va_page < rm_hi {
+                    "owned"
+                } else {
+                    "overrun"
+                };
+                let kind = (packed & 0xFF) as u8;
+                let cpu = (packed >> 8) & 0xFF;
+                let cr3_low16 = (packed >> 16) & 0xFFFF;
+                let tid = packed >> 32;
+                let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+                // SAFETY: the stored pointer is a `&'static Location` produced
+                // by `#[track_caller]`, so it points into the kernel image and
+                // outlives every reader. A zero pointer means the body was not
+                // published and is filtered above.
+                let (file, line) = if site_ptr != 0 {
+                    let loc = unsafe { &*(site_ptr as *const core::panic::Location<'static>) };
+                    (loc.file(), loc.line())
+                } else {
+                    ("?", 0)
+                };
+                crate::serial_println!(
+                    "[UNMAP/STAMP] tag={} va={:#x} hit=1 src={} site={}:{} kind={} \
+                     scope={} req=[{:#x},{:#x}) removed=[{:#x},{:#x}) \
+                     tick={} age_ticks={} old_phys={:#x} tid={} cpu={} cr3_low16={:#x} \
+                     totals=(recorded={},displaced={})",
+                    tag, va_page, src, file, line, pte_kind_str(kind),
+                    scope, req_lo, req_hi, rm_lo, rm_hi,
+                    tick, now.saturating_sub(tick), old_phys, tid, cpu, cr3_low16,
+                    recorded, displaced,
+                );
+            }
+            None => {
+                crate::serial_println!(
+                    "[UNMAP/STAMP] tag={} va={:#x} hit=0 slot_va={:#x} \
+                     totals=(recorded={},displaced={},log={})",
+                    tag, va_page, slot.va.load(Ordering::Relaxed),
+                    recorded, displaced, clear_stamp::RECENT,
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (tag, va);
+}
+
+// ── In-flight bulk-unmap registry ──────────────────────────────────────────
+//
+// `sys_munmap` removes the VMA records under one lock, releases it, and only
+// then clears the page-table entries. Address placement for a new mapping
+// consults the VMA records alone. So between those two steps the range is
+// simultaneously "free to hand out" and "about to have its entries cleared" —
+// and for a multi-gigabyte range the clearing pass is long.
+//
+// This registry makes that window directly observable: the clearing pass
+// publishes its range while it runs, and the placement path checks the address
+// it is about to hand out against it. A hit is a positive observation of a
+// mapping being created inside a range whose entries are still being cleared,
+// which no after-the-fact reasoning about contents can substitute for.
+#[cfg(feature = "firefox-test-core")]
+mod inflight {
+    use core::sync::atomic::AtomicU64;
+    pub const SLOTS: usize = 16;
+    /// `0` = slot free. Published last on begin, cleared first on end.
+    pub static CR3: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static LO: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static HI: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static TID: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    pub static TICK: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+}
+
+/// Publish a bulk-unmap range as in flight. Returns a slot token for
+/// [`inflight_unmap_end`], or `usize::MAX` if no slot was free.
+pub fn inflight_unmap_begin(cr3: u64, lo: u64, hi: u64) -> usize {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if cr3 == 0 || hi <= lo {
+            return usize::MAX;
+        }
+        for i in 0..inflight::SLOTS {
+            if inflight::CR3[i]
+                .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                inflight::LO[i].store(lo, Ordering::Relaxed);
+                inflight::HI[i].store(hi, Ordering::Relaxed);
+                inflight::TID[i].store(crate::proc::current_tid() as u64, Ordering::Relaxed);
+                inflight::TICK[i].store(
+                    crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                inflight::CR3[i].store(cr3, Ordering::Release);
+                return i;
+            }
+        }
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (cr3, lo, hi);
+    usize::MAX
+}
+
+/// Retire a range published by [`inflight_unmap_begin`].
+pub fn inflight_unmap_end(slot: usize) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if slot < inflight::SLOTS {
+            inflight::CR3[slot].store(0, Ordering::Release);
+        }
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = slot;
+}
+
+/// Report an in-flight bulk unmap in `cr3` overlapping `[base, base+len)`.
+///
+/// Returns `(lo, hi, tid, tick)` of the overlapping unmap.
+pub fn inflight_unmap_check(cr3: u64, base: u64, len: u64) -> Option<(u64, u64, u64, u64)> {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let end = base.saturating_add(len);
+        for i in 0..inflight::SLOTS {
+            if inflight::CR3[i].load(Ordering::Acquire) != cr3 {
+                continue;
+            }
+            let lo = inflight::LO[i].load(Ordering::Relaxed);
+            let hi = inflight::HI[i].load(Ordering::Relaxed);
+            if base < hi && end > lo {
+                return Some((
+                    lo, hi,
+                    inflight::TID[i].load(Ordering::Relaxed),
+                    inflight::TICK[i].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        None
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        let _ = (cr3, base, len);
+        None
+    }
+}
+
+/// Read CLEAR_STAMP counters for kdb introspection.
+pub fn clear_stamp_recorded_count() -> u64 {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        clear_stamp::RECORDED.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        0
+    }
+}
+
 // ── ALLOC_SHADOW (symmetric to FREE_SHADOW) ─────────────────────────────────
 //
 // Direct-addressed by `pfn % ALLOC_SHADOW_SIZE`; records the most recent

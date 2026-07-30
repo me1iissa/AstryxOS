@@ -3532,6 +3532,24 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
+        // Is this address inside a range whose page-table entries are, right
+        // now, still being cleared by an unmap that has already dropped its
+        // VMA records?  If so, the mapping about to be created here will have
+        // its entries cleared out from under it by that pass.  Rare by
+        // construction; the serial write under the lock is the price of
+        // observing the window at the moment it opens.
+        #[cfg(feature = "firefox-test-core")]
+        if let Some((lo, hi, u_tid, u_tick)) =
+            crate::mm::w215_diag::inflight_unmap_check(space.cr3, chosen_base, length)
+        {
+            crate::serial_println!(
+                "[UNMAP/RACE] pid={} tid={} place=[{:#x},{:#x}) inside \
+                 in-flight unmap=[{:#x},{:#x}) by tid={} since_tick={}",
+                pid, crate::proc::current_tid(), chosen_base,
+                chosen_base.saturating_add(length), lo, hi, u_tid, u_tick,
+            );
+        }
+
         // Resolve backing type while we still hold the lock (fd lookup needs
         // proc.file_descriptors).
         let is_anon = flags & MAP_ANONYMOUS as u32 != 0
@@ -3921,8 +3939,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
 ///
 /// For each mapped page the reference count is decremented.  When it
 /// reaches zero the physical frame is returned to the PMM.
+/// `#[track_caller]` so the clear-provenance stamp names where the unmap was
+/// requested — the `munmap(2)` dispatch, or one of the `mremap(2)` shrink/move
+/// paths that reuse this routine — rather than this function's own body.
+#[track_caller]
 pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     use crate::mm::vma::page_align_up;
+    let from = core::panic::Location::caller();
 
     if length == 0 || addr & 0xFFF != 0 {
         return -22; // EINVAL
@@ -3945,7 +3968,7 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     // unmapping a large region (e.g. ld-linux's libxul placeholder during
     // execve teardown) doesn't stall every other CPU's page-fault handler
     // or freeze kdb introspection.
-    let cr3 = {
+    let (cr3, owned_lo, owned_hi) = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter_mut().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -3956,8 +3979,46 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
             None => return 0, // No address space — nothing to unmap.
         };
         let cr3 = space.cr3;
+        // Diagnostic only: sample the union extent of the caller's own
+        // mappings inside the requested range, before they are removed, so a
+        // later fault on a page this call cleared can tell whether that page
+        // was one the caller actually held.  Read-only; does not affect what
+        // is removed or cleared.
+        #[cfg(feature = "firefox-test-core")]
+        let (owned_lo, owned_hi) = {
+            let end = addr.saturating_add(length);
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            let mut n = 0u64;
+            let mut covered = 0u64;
+            for vma in space.areas.iter() {
+                let (vb, ve) = (vma.base, vma.base.saturating_add(vma.length));
+                if vb < end && ve > addr {
+                    lo = lo.min(vb.max(addr));
+                    hi = hi.max(ve.min(end));
+                    n += 1;
+                    covered += ve.min(end) - vb.max(addr);
+                }
+            }
+            // An unmap spanning far more address space than the mappings it
+            // actually covers is worth seeing in full: it is the shape that
+            // would sweep an unrelated live mapping placed in one of the holes.
+            // Rare by construction, so the serial cost is bounded.
+            if length >= (64u64 << 20) {
+                crate::serial_println!(
+                    "[UNMAP/HUGE] pid={} tid={} from={}:{} addr={:#x} len={:#x} \
+                     n_vmas={} covered={:#x} hole={:#x} extent=[{:#x},{:#x})",
+                    pid, crate::proc::current_tid(), from.file(), from.line(),
+                    addr, length, n, covered, length.saturating_sub(covered),
+                    if hi > lo { lo } else { 0 }, if hi > lo { hi } else { 0 },
+                );
+            }
+            if hi > lo { (lo, hi) } else { (0, 0) }
+        };
+        #[cfg(not(feature = "firefox-test-core"))]
+        let (owned_lo, owned_hi) = (0u64, 0u64);
         let _ = space.remove_range(addr, length);
-        cr3
+        (cr3, owned_lo, owned_hi)
     }; // PROCESS_TABLE released here
 
     // remove_range above (run under PROCESS_TABLE) may have dropped the last pin
@@ -3968,7 +4029,26 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     crate::vfs::reap_pending_inodes();
 
     // ── Phase 2 (lock-free) — clear PTEs and release backing frames. ──────
-    crate::mm::vmm::unmap_and_free_range_in(cr3, addr, length);
+    // Publish the range while it is being cleared so the placement path can
+    // observe an address being handed out inside it.
+    #[cfg(feature = "firefox-test-core")]
+    let inflight_slot = crate::mm::w215_diag::inflight_unmap_begin(
+        cr3, addr, addr.saturating_add(length),
+    );
+    crate::mm::vmm::unmap_and_free_range_in_ctx(
+        cr3,
+        addr,
+        length,
+        Some(crate::mm::vmm::ClearCtx {
+            req_lo: addr,
+            req_hi: addr.saturating_add(length),
+            rm_lo: owned_lo,
+            rm_hi: owned_hi,
+        }),
+        from,
+    );
+    #[cfg(feature = "firefox-test-core")]
+    crate::mm::w215_diag::inflight_unmap_end(inflight_slot);
 
     0
 }
