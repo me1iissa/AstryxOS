@@ -3842,6 +3842,46 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 // so find→insert stays atomic.
                 let mut attempts = 0u32;
                 loop {
+                    // A range whose teardown is in flight is not free, and a
+                    // reservation is not a VMA — so `insert_vma` will happily
+                    // accept it.  The Phase-1 placement check cannot settle
+                    // this on its own: PROCESS_TABLE is dropped between there
+                    // and here, and a munmap may publish a reservation
+                    // covering `cur_base` in that gap.  This check is exact,
+                    // because a reservation is published under the same lock
+                    // this phase holds.
+                    //
+                    // MAP_FIXED is excluded deliberately: the caller named the
+                    // address, so there is nowhere else to put it.  Re-picking
+                    // is only meaningful for a kernel-chosen placement.
+                    if !is_fixed
+                        && crate::mm::vma::teardown_conflict(
+                            space.cr3, cur_base, cur_base.saturating_add(length),
+                        ).is_some()
+                    {
+                        // Out of re-picks with a conflict still standing: fail
+                        // here, do NOT fall through to the insert.  The bound
+                        // must be tested inside the branch rather than as part
+                        // of the guard above: as part of the guard it would
+                        // SKIP the check once the budget was spent and return a
+                        // base inside a range whose entries are being cleared —
+                        // exactly what this check exists to prevent.  The
+                        // overlap arm below degrades to ENOMEM the same way, so
+                        // every check in this loop now fails closed.
+                        if attempts >= 8 {
+                            break Step::Done(None);
+                        }
+                        attempts += 1;
+                        let repick = if is_stack_alloc {
+                            space.find_free_stack_range(length)
+                        } else {
+                            space.find_free_range(length)
+                        };
+                        match repick {
+                            Some(nb) => { cur_base = nb; continue; }
+                            None => break Step::Done(None),
+                        }
+                    }
                     let vma = VmArea {
                         base: cur_base,
                         length,
@@ -3968,7 +4008,7 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     // unmapping a large region (e.g. ld-linux's libxul placeholder during
     // execve teardown) doesn't stall every other CPU's page-fault handler
     // or freeze kdb introspection.
-    let (cr3, owned_lo, owned_hi) = {
+    let (cr3, owned_lo, owned_hi, teardown_slot) = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter_mut().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -4018,7 +4058,17 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
         #[cfg(not(feature = "firefox-test-core"))]
         let (owned_lo, owned_hi) = (0u64, 0u64);
         let _ = space.remove_range(addr, length);
-        (cr3, owned_lo, owned_hi)
+        // Reserve the range before the lock is released.  From here until the
+        // Phase 2 clear below, no VMA describes these addresses, so without a
+        // reservation `find_free_range` would hand them to a concurrent mmap
+        // in this same address space — and Phase 2 would then clear the new
+        // mapping's entries.  See `vma::teardown_publish`.
+        let slot = crate::mm::vma::teardown_publish(
+            cr3,
+            addr,
+            addr.saturating_add(length),
+        );
+        (cr3, owned_lo, owned_hi, slot)
     }; // PROCESS_TABLE released here
 
     // remove_range above (run under PROCESS_TABLE) may have dropped the last pin
@@ -4049,6 +4099,8 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     );
     #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::inflight_unmap_end(inflight_slot);
+    // The entries are clear: the range is now genuinely free and may be placed.
+    crate::mm::vma::teardown_retire(teardown_slot);
 
     0
 }

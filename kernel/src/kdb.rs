@@ -373,6 +373,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         // A full table makes socket(AF_UNIX)/socketpair(2) return EMFILE,
         // which surfaces to X clients (libxcb) as "cannot open display".
         "unix-table"     => op_unix_table(out),
+        // mm-teardown: in-flight munmap teardown reservations.  `unreserved`
+        // counts teardowns that ran with the slot table full, each of which
+        // reopened the placement window (see vma::teardown_publish).
+        "mm-teardown"    => op_mm_teardown(out),
         "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
@@ -560,6 +564,17 @@ fn try_lock_brief<'a, T>(m: &'a Mutex<T>) -> Option<spin::MutexGuard<'a, T>> {
         core::hint::spin_loop();
     }
     None
+}
+
+fn op_mm_teardown(out: &mut String) {
+    use core::fmt::Write;
+    let _ = write!(
+        out,
+        r#"{{"ok":true,"in_flight":{},"slots":{},"unreserved":{}}}"#,
+        crate::mm::vma::teardown_in_flight_count(),
+        crate::mm::vma::teardown_slot_count(),
+        crate::mm::vma::teardown_unreserved_count(),
+    );
 }
 
 fn op_proc_list(out: &mut String) {

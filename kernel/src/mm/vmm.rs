@@ -44,16 +44,42 @@ unsafe fn p2v(phys: u64) -> *mut u64 {
 /// VMM lock.
 static VMM_LOCK: Mutex<()> = Mutex::new(());
 
-/// Best-effort caller-RIP capture for the Track K PTE-change ring (Phase D
-/// follow-up, 2026-05-20).  Walks one frame up via RBP — if the upstream
-/// caller was built with `-fomit-frame-pointer` this returns 0 and the
-/// ring entry simply lacks a usable caller-RIP.  Direct-map range guard
-/// matches `mm/pmm.rs::caller_rip` (KERNEL_VIRT_OFFSET .. +4 GiB).  Diag-
-/// nostic only, gated on the `firefox-test` feature so default builds are
-/// byte-identical.
+/// Caller-RIP capture for the Track K PTE-change ring, by walking one frame
+/// up through RBP.
+///
+/// ## This is only meaningful in a frame-pointer build — read before using it
+///
+/// `[rbp+8]` holds a return address only when the caller maintains a frame
+/// pointer.  This kernel's release profile does NOT emit them; RBP is an
+/// ordinary scratch register at the call site, so it holds whatever the caller
+/// last put there.  The direct-map range guard below does not save us: a
+/// scratch RBP frequently holds a kernel pointer that passes the guard, so the
+/// failure mode is a plausible-looking WRONG address, not a detectable zero.
+///
+/// An earlier version of this comment claimed the omit-frame-pointer case
+/// simply "returns 0".  That was wrong, and every caller-RIP this helper has
+/// ever reported in a default build should be treated as noise — including the
+/// `installer_rip` field of the per-pfn alias detector.
+///
+/// So the walk is now compiled only when the `frame-pointers` feature is on,
+/// which `scripts/qemu-harness.py` enables together with
+/// `-C force-frame-pointers=yes` (`ASTRYX_FORCE_FRAME_POINTERS=1`).  Otherwise
+/// it returns 0, and every consumer reports the field as `unavailable` rather
+/// than printing a number that cannot be trusted.
+///
+/// Prefer `#[track_caller]` for new call-site provenance: it is exact,
+/// independent of codegen flags, and costs nothing at runtime.
 #[cfg(feature = "firefox-test-core")]
 #[inline(never)]
 fn ring_caller_rip() -> u64 {
+    // Without frame pointers there is no frame to walk; report "unknown" (0)
+    // rather than a number a reader would take at face value.
+    #[cfg(not(feature = "frame-pointers"))]
+    {
+        return 0;
+    }
+    #[cfg(feature = "frame-pointers")]
+    {
     let rbp: u64;
     // SAFETY: reading the frame pointer is always safe; the subsequent
     // dereference is guarded by the alignment + range checks below.
@@ -81,6 +107,7 @@ fn ring_caller_rip() -> u64 {
     // ensures the symbol resolves cleanly.
     // SAFETY: rbp+8 is within the higher-half direct map.
     unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
+    }
 }
 
 /// The kernel's primary page table CR3, captured during VMM init.

@@ -1751,20 +1751,42 @@ def _build(features: str) -> bool:
     # at call sites and `[rbp+8]` does not hold the return address.  Scoped
     # to the astryx-kernel crate so `core`/`alloc`/`compiler_builtins` keep
     # their normal codegen.  Additive; default builds are unaffected.
-    if os.environ.get("ASTRYX_FORCE_FRAME_POINTERS") == "1":
+    # The pairing is enforced in BOTH directions.  The env var implies the
+    # feature (below), and requesting the feature implies the codegen flag —
+    # otherwise `--features frame-pointers` without the env var would compile
+    # the RBP walk into a build that has no frame pointers, reinstating the
+    # garbage-caller-RIP hazard behind a feature name that reads as a
+    # guarantee.  A build is either trustworthy on both counts or neither.
+    _requested_feats = [f.strip() for f in (features or "").split(",") if f.strip()]
+    _want_fp = ("frame-pointers" in _requested_feats
+                or os.environ.get("ASTRYX_FORCE_FRAME_POINTERS") == "1")
+    if _want_fp:
         if coverage_extra:
             # coverage already added a --config for the same key; cargo would
             # reject a duplicate.  Not a combination this probe needs, so fail
             # loudly rather than silently dropping one flag.
-            print("[HARNESS] ERROR: ASTRYX_FORCE_FRAME_POINTERS=1 is not "
-                  "compatible with the `coverage` feature (duplicate per-crate "
-                  "rustflags config). Build one at a time.", file=sys.stderr)
+            print("[HARNESS] ERROR: frame pointers (ASTRYX_FORCE_FRAME_POINTERS=1 "
+                  "or --features frame-pointers) are not compatible with the "
+                  "`coverage` feature (duplicate per-crate rustflags config). "
+                  "Build one at a time.", file=sys.stderr)
             return False
         kernel_cmd += [
             "--config",
             'profile.release.package."astryx-kernel".rustflags = '
             '["-C","force-frame-pointers=yes"]',
         ]
+        # Pair the codegen flag with the cargo feature that unlocks the RBP
+        # frame-walk helpers.  They return 0 without it, precisely so a build
+        # that lacks frame pointers cannot report a garbage caller-RIP; setting
+        # the flag without the feature would leave the walk compiled out.
+        if "frame-pointers" in _requested_feats:
+            pass  # already requested by the caller
+        elif "--features" in kernel_cmd:
+            i = kernel_cmd.index("--features")
+            kernel_cmd[i + 1] = (kernel_cmd[i + 1] + ",frame-pointers"
+                                 if kernel_cmd[i + 1] else "frame-pointers")
+        else:
+            kernel_cmd += ["--features", "frame-pointers"]
 
     r2 = subprocess.run(kernel_cmd, cwd=ROOT, env=env)
     if r2.returncode != 0:

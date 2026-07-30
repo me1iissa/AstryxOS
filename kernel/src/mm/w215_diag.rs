@@ -2353,15 +2353,30 @@ pub fn alias_install_check(va: u64, phys: u64, cr3: u64, caller_rip: u64) {
                     let n = W215_ALIAS_FIRES.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 128 || n % 64 == 0 {
                     let sc = crate::mm::refcount::pte_share_count(phys);
-                    crate::serial_println!(
-                        "[W215/ALIAS] phys={:#x} rc={} sc={} LIVE-DOUBLE-MAP \
-                         old(va={:#x} cr3={:#x} pid={}) new(va={:#x} cr3={:#x} pid={}) \
-                         installer_rip={:#x} n={}",
-                        phys & !0xFFFu64, rc, sc,
-                        old_va, old_cr3, old_pid,
-                        va_page, new_cr3, pid,
-                        caller_rip, n,
-                    );
+                    // `caller_rip` comes from an RBP frame walk, which is
+                    // only meaningful in a frame-pointer build — see
+                    // `vmm::ring_caller_rip`.  Report it as unavailable rather
+                    // than printing a number a reader would trust.
+                    if caller_rip != 0 {
+                        crate::serial_println!(
+                            "[W215/ALIAS] phys={:#x} rc={} sc={} LIVE-DOUBLE-MAP \
+                             old(va={:#x} cr3={:#x} pid={}) new(va={:#x} cr3={:#x} pid={}) \
+                             installer_rip={:#x} n={}",
+                            phys & !0xFFFu64, rc, sc,
+                            old_va, old_cr3, old_pid,
+                            va_page, new_cr3, pid,
+                            caller_rip, n,
+                        );
+                    } else {
+                        crate::serial_println!(
+                            "[W215/ALIAS] phys={:#x} rc={} sc={} LIVE-DOUBLE-MAP \
+                             old(va={:#x} cr3={:#x} pid={}) new(va={:#x} cr3={:#x} pid={}) \
+                             installer_rip=unavailable n={}",
+                            phys & !0xFFFu64, rc, sc,
+                            old_va, old_cr3, old_pid,
+                            va_page, new_cr3, pid, n,
+                        );
+                    }
                     }
                 }
             }
