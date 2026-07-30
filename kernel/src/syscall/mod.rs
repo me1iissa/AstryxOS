@@ -3842,6 +3842,35 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 // so find→insert stays atomic.
                 let mut attempts = 0u32;
                 loop {
+                    // A range whose teardown is in flight is not free, and a
+                    // reservation is not a VMA — so `insert_vma` will happily
+                    // accept it.  The Phase-1 placement check cannot settle
+                    // this on its own: PROCESS_TABLE is dropped between there
+                    // and here, and a munmap may publish a reservation
+                    // covering `cur_base` in that gap.  This check is exact,
+                    // because a reservation is published under the same lock
+                    // this phase holds.
+                    //
+                    // MAP_FIXED is excluded deliberately: the caller named the
+                    // address, so there is nowhere else to put it.  Re-picking
+                    // is only meaningful for a kernel-chosen placement.
+                    if !is_fixed
+                        && attempts < 8
+                        && crate::mm::vma::teardown_conflict(
+                            space.cr3, cur_base, cur_base.saturating_add(length),
+                        ).is_some()
+                    {
+                        attempts += 1;
+                        let repick = if is_stack_alloc {
+                            space.find_free_stack_range(length)
+                        } else {
+                            space.find_free_range(length)
+                        };
+                        match repick {
+                            Some(nb) => { cur_base = nb; continue; }
+                            None => break Step::Done(None),
+                        }
+                    }
                     let vma = VmArea {
                         base: cur_base,
                         length,
