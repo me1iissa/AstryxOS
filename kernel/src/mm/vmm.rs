@@ -968,10 +968,56 @@ pub fn flip_writable_if_sole_owner(
     true
 }
 
+/// Reason a user page-table entry was cleared.
+///
+/// Mirrors the `PTE_KIND_*` codes the diagnostic ring records, but lives here
+/// so the clearing primitives' signatures do not depend on a module that is
+/// compiled out of default builds.
+pub const CLEAR_KIND_UNMAP: u8 = 2;
+pub const CLEAR_KIND_WRITE: u8 = 3;
+pub const CLEAR_KIND_BULK_UNMAP: u8 = 4;
+
+/// Range context for a clear performed on behalf of an explicit user request.
+///
+/// `req` is the range the caller asked to unmap; `rm` is the union extent of
+/// the caller's own mappings inside it, sampled before they were removed.
+/// Purely descriptive — it is recorded, never acted on.
+#[derive(Clone, Copy)]
+pub struct ClearCtx {
+    pub req_lo: u64,
+    pub req_hi: u64,
+    pub rm_lo: u64,
+    pub rm_hi: u64,
+}
+
 /// Unmap a virtual page in an arbitrary page table.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
+///
+/// `#[track_caller]` so the diagnostic clear-stamp records the call site that
+/// requested the unmap rather than this function's own location; see
+/// [`crate::mm::w215_diag::clear_stamp_record`].
+#[track_caller]
 pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
+    unmap_page_in_at(
+        pml4_phys,
+        virt_addr,
+        CLEAR_KIND_UNMAP,
+        core::panic::Location::caller(),
+        None,
+    )
+}
+
+/// Body of [`unmap_page_in`], with the originating call site passed in
+/// explicitly so a bulk caller can attribute each page it clears to itself
+/// instead of to the loop inside `unmap_and_free_range_in`.
+fn unmap_page_in_at(
+    pml4_phys: u64,
+    virt_addr: u64,
+    kind: u8,
+    site: &'static core::panic::Location<'static>,
+    ctx: Option<ClearCtx>,
+) {
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
     let _lock = VMM_LOCK.lock();
@@ -1005,14 +1051,26 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     }
 
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        0,
-        old_phys_for_ring,
-        crate::mm::w215_diag::PTE_KIND_UNMAP,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            0,
+            old_phys_for_ring,
+            kind,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        crate::mm::w215_diag::clear_stamp_record(
+            virt_addr,
+            old_phys_for_ring,
+            pml4_phys,
+            kind,
+            site,
+            ctx,
+        );
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (kind, site, ctx);
 }
 
 /// Unmap every present page in `[base, base+length)` from an arbitrary page
@@ -1052,7 +1110,30 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
 ///
 /// Returns the number of frames actually freed (rc reached zero).  Pages
 /// that were never demand-paged are skipped.
+#[track_caller]
 pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize {
+    unmap_and_free_range_in_ctx(
+        pml4_phys, base, length, None, core::panic::Location::caller(),
+    )
+}
+
+/// [`unmap_and_free_range_in`] with diagnostic range context attached.
+///
+/// Callers that know which of the user's own mappings the range covered pass
+/// it here, so the clear-provenance record can distinguish clearing a page the
+/// caller owned from clearing past everything it owned. Behaviourally
+/// identical to [`unmap_and_free_range_in`].
+pub fn unmap_and_free_range_in_ctx(
+    pml4_phys: u64,
+    base: u64,
+    length: u64,
+    ctx: Option<ClearCtx>,
+    site: &'static core::panic::Location<'static>,
+) -> usize {
+    // Attribute every entry this range clears to the caller of the range, not
+    // to the per-page loop below — the loop is the same line for munmap, brk
+    // shrink, MAP_FIXED replacement and teardown alike, so it names nothing.
+    let _ = &ctx;
     // Maximum physical addresses to defer per shootdown round.
     //
     // Sized to bound on-stack pressure on the brk-shrink / munmap path, which
@@ -1104,7 +1185,10 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
 
         while pg < end && n < BATCH {
             if let Some(phys) = virt_to_phys_in(pml4_phys, pg) {
-                unmap_page_in(pml4_phys, pg);
+                unmap_page_in_at(
+                    pml4_phys, pg,
+                    CLEAR_KIND_BULK_UNMAP, site, ctx,
+                );
                 let new_rc = crate::mm::refcount::page_ref_dec(phys);
                 if new_rc == 0 {
                     to_free[n] = phys;
@@ -1180,10 +1264,12 @@ pub fn read_pte(pml4_phys: u64, virt_addr: u64) -> u64 {
 /// Does NOT create intermediate table levels — the mapping must already exist.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
+#[track_caller]
 pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
+    let site = core::panic::Location::caller();
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
-    write_pte_impl(pml4_phys, virt_addr, pte)
+    write_pte_impl(pml4_phys, virt_addr, pte, site)
 }
 
 /// `#PF`-fast-path variant of [`write_pte`] — identical semantics, used by the
@@ -1193,17 +1279,24 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
 /// shootdown reentrancy deadlock this avoids.  The `ptrace` POKETEXT/POKEDATA
 /// path and the other IF=1 `write_pte` callers run with interrupts enabled and
 /// stay on the plain `write_pte` above.
+#[track_caller]
 pub fn write_pte_fault_path(pml4_phys: u64, virt_addr: u64, pte: u64) {
+    let site = core::panic::Location::caller();
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()
         .map(|s| crate::mm::vma::mm_sem_read_draining(s));
-    write_pte_impl(pml4_phys, virt_addr, pte)
+    write_pte_impl(pml4_phys, virt_addr, pte, site)
 }
 
 /// Shared body of [`write_pte`] / [`write_pte_fault_path`] — everything after
 /// the `mm_sem` acquisition, which the two wrappers perform differently.
-fn write_pte_impl(pml4_phys: u64, virt_addr: u64, pte: u64) {
+fn write_pte_impl(
+    pml4_phys: u64,
+    virt_addr: u64,
+    pte: u64,
+    site: &'static core::panic::Location<'static>,
+) {
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
@@ -1231,14 +1324,32 @@ fn write_pte_impl(pml4_phys: u64, virt_addr: u64, pte: u64) {
     }
 
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        pte & ADDR_MASK,
-        old_phys_for_ring,
-        crate::mm::w215_diag::PTE_KIND_WRITE,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            pte & ADDR_MASK,
+            old_phys_for_ring,
+            crate::mm::w215_diag::PTE_KIND_WRITE,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        // A rewrite that leaves the entry not-present destroys the mapping just
+        // as an unmap does, and is served the same way on the next access, so
+        // it belongs in the clear-provenance record. Flag-only rewrites (CoW
+        // write-protect, accessed/dirty) keep the frame and are not stamped.
+        if pte & PAGE_PRESENT == 0 && old_phys_for_ring != 0 {
+            crate::mm::w215_diag::clear_stamp_record(
+                virt_addr,
+                old_phys_for_ring,
+                pml4_phys,
+                crate::mm::w215_diag::PTE_KIND_WRITE,
+                site,
+                None,
+            );
+        }
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = site;
 }
 
 /// Switch the active page table (CR3).
