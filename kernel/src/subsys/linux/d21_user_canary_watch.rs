@@ -242,10 +242,10 @@ fn claim_arm() -> Result<(), ()> {
 ///
 /// Per the `syscall_entry` save layout in `kernel/src/syscall/mod.rs`
 /// (frame slots `[rdi, rsi, rdx, r8, r9, r10, r15, r14, r13, r12, rbx,
-/// rbp, r11, rcx, user_rsp]`):
+/// rbp, r11, rcx, user_rsp, rip, rflags]`):
 ///
-///   kstack_top - 1*8  = saved user_rsp
-///   kstack_top - 4*8  = saved user_rbp
+///   kstack_top - 3*8  = saved user_rsp
+///   kstack_top - 6*8  = saved user_rbp
 ///
 /// Stable across pre-block and post-wake because `schedule()` does not
 /// modify the saved syscall frame.  Returns `(0, 0)` if the thread is
@@ -263,11 +263,11 @@ fn get_parent_user_rsp_rbp(parent_tid: u64) -> (u64, u64) {
     }
     // SAFETY: the kernel stack is in the kernel's virtual address space
     // (always present, always writable from CPL 0).  The two reads are
-    // from `kstack_top - 8` and `kstack_top - 32`, both inside the
-    // bottom 15 qwords pushed by `syscall_entry` — i.e. within the
+    // from `kstack_top - 24` and `kstack_top - 48`, both inside the
+    // 17 qwords pushed by `syscall_entry` — i.e. within the
     // thread's own kernel stack span.  No user-memory access.
-    let user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
-    let user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    let user_rsp = unsafe { *((kstack_top - 24) as *const u64) };
+    let user_rbp = unsafe { *((kstack_top - 48) as *const u64) };
     (user_rsp, user_rbp)
 }
 

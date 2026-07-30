@@ -203,7 +203,7 @@ pub fn snapshot_canaries(label: &str, parent_pid: u64, parent_tid: u64) {
     // on that CPU (so by the time the POST snapshot runs after
     // `schedule()` the slot may belong to an unrelated sibling syscall).
     // Per `syscall_entry`'s save layout, the user_rsp slot is at
-    // `kstack_top - 8` and user_rbp is at `kstack_top - 32`; both are
+    // `kstack_top - 24` and user_rbp is at `kstack_top - 48`; both are
     // stable across pre-block and post-wake because the scheduler does
     // not modify the saved syscall frame.
     //
@@ -347,12 +347,12 @@ fn read_userland_qword_raw(addr: u64) -> Option<(u64, u64)> {
 // the requested `parent_tid` and reading from the saved syscall frame at
 // the top of that thread's kernel stack:
 //
-//   kstack_top - 1*8  = saved user_rsp   (frame slot 14)
-//   kstack_top - 4*8  = saved user_rbp   (frame slot 11)
+//   kstack_top - 3*8  = saved user_rsp   (frame slot 14)
+//   kstack_top - 6*8  = saved user_rbp   (frame slot 11)
 //
 // Per the `syscall_entry` save layout in `kernel/src/syscall/mod.rs`
 // (frame slots [rdi, rsi, rdx, r8, r9, r10, r15, r14, r13, r12, rbx,
-// rbp, r11, rcx, user_rsp]).  Stable across pre-block and post-wake
+// rbp, r11, rcx, user_rsp, rip, rflags]).  Stable across pre-block and post-wake
 // because `schedule()` does not modify the saved syscall frame.
 fn get_parent_user_rsp_rbp(parent_tid: u64) -> (u64, u64) {
     let kstack_top = {
@@ -366,11 +366,11 @@ fn get_parent_user_rsp_rbp(parent_tid: u64) -> (u64, u64) {
     }
     // SAFETY: the kernel stack is in the kernel's virtual address space
     // (always present, always writable from CPL 0).  The two reads are
-    // from `kstack_top - 8` and `kstack_top - 32` which are both within
-    // the bottom 15 qwords pushed by `syscall_entry` — i.e. within the
+    // from `kstack_top - 24` and `kstack_top - 48` which are both within
+    // the 17 qwords pushed by `syscall_entry` — i.e. within the
     // thread's own kernel stack span.  No user-memory access.
-    let user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
-    let user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    let user_rsp = unsafe { *((kstack_top - 24) as *const u64) };
+    let user_rbp = unsafe { *((kstack_top - 48) as *const u64) };
     (user_rsp, user_rbp)
 }
 

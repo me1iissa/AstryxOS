@@ -207,13 +207,13 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
             label, pid, parent_tid);
         return;
     }
-    let parent_user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
-    // Wave 14 R-A: saved user_rbp lives at `kstack_top - 32` (frame slot
+    let parent_user_rsp = unsafe { *((kstack_top - 24) as *const u64) };
+    // Wave 14 R-A: saved user_rbp lives at `kstack_top - 48` (frame slot
     // 11 per `syscall_entry` layout: rdi, rsi, rdx, r8, r9, r10, r15, r14,
-    // r13, r12, rbx, rbp, r11, rcx, user_rsp — RBP is the 12th save, four
-    // qwords from the top).  Read from the same kernel-stack frame as the
-    // user_rsp read above; same SAFETY justification.
-    let parent_user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    // r13, r12, rbx, rbp, r11, rcx, user_rsp, rip, rflags — RBP is the 12th
+    // save, six qwords from the top).  Read from the same kernel-stack frame
+    // as the user_rsp read above; same SAFETY justification.
+    let parent_user_rbp = unsafe { *((kstack_top - 48) as *const u64) };
 
     // FS_BASE MSR (Intel SDM Vol. 3A §3.4.4.1, IA32_FS_BASE = 0xC000_0100).
     // Captures the live FS_BASE for the currently-running thread, which —

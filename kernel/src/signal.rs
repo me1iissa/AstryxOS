@@ -114,8 +114,16 @@ pub struct SignalFrame {
     pub saved_r12: u64,
     pub saved_rbx: u64,
     pub saved_rbp: u64,
-    pub saved_r11: u64,     // original RFLAGS
-    pub saved_rcx: u64,     // original user RIP
+    // The interrupted thread's TRUE R11 and RCX.  These are *not* the saved
+    // RIP/RFLAGS: on the SYSCALL entry path the two pairs happen to coincide
+    // (the SYSCALL instruction itself copies RIP into RCX and RFLAGS into R11,
+    // and the psABI therefore lets the kernel treat both as dead), but a
+    // signal delivered from a fault or interrupt interrupts arbitrary user
+    // code where RCX and R11 hold live values.  Conflating the two pairs made
+    // every fault-delivered signal destroy the interrupted RCX/R11 on return.
+    // See `saved_rip` / `saved_rflags` below.
+    pub saved_r11: u64,     // original user R11
+    pub saved_rcx: u64,     // original user RCX
     pub saved_rax: u64,     // syscall return value
     // Caller-saved argument registers.  A signal is asynchronous: it can
     // interrupt user code at ANY instruction, where these registers may
@@ -140,11 +148,20 @@ pub struct SignalFrame {
     // YMM/XMM/x87 state.  The x86-64 psABI signal-return contract requires the
     // full FPU register file be restored on handler return, the same as the
     // GPRs above.  Restored via XRSTOR/FXRSTOR in `sys_sigreturn`.
-    pub fpstate: u64,       // keeps the struct at 20 × 8 = 160 bytes (16-aligned)
+    pub fpstate: u64,
+    // Interrupted RIP and RFLAGS, carried independently of `saved_rcx` /
+    // `saved_r11`.  POSIX.1-2017 sigaction(2) requires the interrupted context
+    // to be restored when the handler returns, and the x86-64 System V psABI
+    // §3.2.3 places RCX and R11 in the saved general-register set, so the two
+    // pairs must round-trip separately.  `saved_rflags` is the value the
+    // kernel will reinstate as EFLAGS (sanitised in `sys_sigreturn`);
+    // `saved_r11` is a plain general register and is restored verbatim.
+    pub saved_rip: u64,
+    pub saved_rflags: u64,  // keeps the struct at 22 × 8 = 176 bytes (16-aligned)
 }
 
 const _SIGNAL_FRAME_SIZE_CHECK: () = {
-    assert!(core::mem::size_of::<SignalFrame>() == 160);
+    assert!(core::mem::size_of::<SignalFrame>() == 176);
 };
 
 /// Verify every 4 KiB page in `[base, base+len)` is mapped as a
@@ -699,10 +716,17 @@ pub const UCONTEXT_SIZE_EXPORT: u64 = UCONTEXT_SIZE;
 /// frame[10] = saved R12
 /// frame[11] = saved RBX
 /// frame[12] = saved RBP
-/// frame[13] = saved R11 (user RFLAGS — SYSCALL instruction stores these)
-/// frame[14] = saved RCX (user RIP — SYSCALL instruction stores return address here)
+/// frame[13] = saved R11 (user R11)
+/// frame[14] = saved RCX (user RCX)
 /// frame[15] = saved user RSP
+/// frame[16] = interrupted RIP
+/// frame[17] = interrupted RFLAGS
 /// ```
+///
+/// Slots 13/14 and 16/17 are independent even though the SYSCALL instruction
+/// leaves them pairwise equal on entry (it copies RIP→RCX and RFLAGS→R11 per
+/// Intel SDM Vol. 2B).  `sys_sigreturn` can reinstate a context in which they
+/// differ; `syscall_entry`'s epilogue selects SYSRETQ or IRETQ accordingly.
 ///
 /// If a pending signal has a user handler, this function builds a `SignalFrame`
 /// on the user stack and rewrites `frame[14]` (RIP → handler) and `frame[15]`
@@ -803,7 +827,8 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             //   frame[4]=r8   frame[5]=r9   frame[6]=r10
             //   frame[7]=r15  frame[8]=r14  frame[9]=r13  frame[10]=r12
             //   frame[11]=rbx frame[12]=rbp
-            //   frame[13]=r11(RFLAGS)  frame[14]=rcx(user_RIP)  frame[15]=user_RSP
+            //   frame[13]=r11 frame[14]=rcx frame[15]=user_RSP
+            //   frame[16]=user_RIP  frame[17]=user_RFLAGS
 
             let saved_rax = unsafe { *frame.add(0) };
             let saved_rdi = unsafe { *frame.add(1) };
@@ -818,9 +843,11 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             let saved_r12 = unsafe { *frame.add(10) };
             let saved_rbx = unsafe { *frame.add(11) };
             let saved_rbp = unsafe { *frame.add(12) };
-            let saved_r11 = unsafe { *frame.add(13) }; // RFLAGS
-            let saved_rcx = unsafe { *frame.add(14) }; // user RIP
+            let saved_r11 = unsafe { *frame.add(13) }; // user R11
+            let saved_rcx = unsafe { *frame.add(14) }; // user RCX
             let saved_rsp = unsafe { *frame.add(15) }; // user RSP
+            let saved_rip = unsafe { *frame.add(16) }; // interrupted RIP
+            let saved_rflags = unsafe { *frame.add(17) }; // interrupted RFLAGS
             let saved_mask = sig_state.blocked;
 
             let action_flags = sig_state.action_flags[sig as usize];
@@ -941,6 +968,10 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 // XRSTORs it.  Runs under the active SMAP UserGuard (AC=1) so
                 // the supervisor XSAVE store to the user page is permitted.
                 (*sig_frame_ptr).fpstate    = fpstate_va;
+                // Interrupted RIP/RFLAGS, carried separately from RCX/R11 so
+                // that sigreturn restores all four (psABI §3.2.3).
+                (*sig_frame_ptr).saved_rip    = saved_rip;
+                (*sig_frame_ptr).saved_rflags = saved_rflags;
                 crate::arch::x86_64::fpu_save(fpstate_va as *mut u8);
             }
 
@@ -961,7 +992,7 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                     uc.gregs[0]  = saved_r8;
                     uc.gregs[1]  = saved_r9;
                     uc.gregs[2]  = saved_r10;
-                    uc.gregs[3]  = saved_r11; // RFLAGS at syscall entry (saved in r11 by SYSCALL)
+                    uc.gregs[3]  = saved_r11; // REG_R11 = user R11
                     uc.gregs[4]  = saved_r12;
                     uc.gregs[5]  = saved_r13;
                     uc.gregs[6]  = saved_r14;
@@ -972,10 +1003,10 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                     uc.gregs[11] = saved_rbx;
                     uc.gregs[12] = saved_rdx;
                     uc.gregs[13] = saved_rax;
-                    uc.gregs[14] = saved_rcx; // user RIP (saved in rcx by SYSCALL)
+                    uc.gregs[14] = saved_rcx; // REG_RCX = user RCX
                     uc.gregs[15] = saved_rsp;
-                    uc.gregs[16] = saved_rcx; // REG_RIP = user RIP
-                    uc.gregs[17] = saved_r11; // REG_EFL = user RFLAGS
+                    uc.gregs[16] = saved_rip;    // REG_RIP = interrupted RIP
+                    uc.gregs[17] = saved_rflags; // REG_EFL = interrupted RFLAGS
                     // REG_CSGSFS (18): CS=0x33 for user; GS/FS managed by kernel
                     uc.gregs[18] = 0x33;
                     // REG_ERR (19) = 0 (no hardware error code for syscall path)
@@ -1002,13 +1033,18 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 }
             }
 
-            // Rewrite the kernel stack frame so sysretq enters the handler.
-            // frame[14] = RCX = user RIP (restored by SYSRETQ as RIP)
-            // frame[15] = user RSP (restored from kernel stack slot by syscall_entry epilogue)
+            // Rewrite the kernel stack frame so the epilogue enters the handler.
+            // Both the RIP slot and the RCX slot are set: keeping them equal
+            // keeps this return on the cheap SYSRETQ path (which takes RIP
+            // from RCX — Intel SDM Vol. 2B).  RCX/R11 at handler *entry* are
+            // caller-saved and therefore undefined per the psABI, so pointing
+            // RCX at the handler costs nothing; the handler's own return goes
+            // through sigreturn, which reinstates the true values.
             unsafe {
                 *frame.add(1)  = sig as u64;   // RDI = signo (first arg)
                 *frame.add(14) = handler_addr; // RCX → handler RIP
                 *frame.add(15) = new_rsp;      // user RSP → signal frame
+                *frame.add(16) = handler_addr; // RIP  → handler
             }
 
             // Block the current signal during handler execution.
@@ -1258,8 +1294,12 @@ pub unsafe fn deliver_fault_signal_from_isr(
     (*sig_frame_ptr).saved_r12   = isr_r12;
     (*sig_frame_ptr).saved_rbx   = isr_rbx;
     (*sig_frame_ptr).saved_rbp   = isr_rbp;
-    (*sig_frame_ptr).saved_r11   = user_rflags;
-    (*sig_frame_ptr).saved_rcx   = user_rip;
+    // A fault/interrupt interrupts arbitrary user code, so RCX and R11 hold
+    // live values here — unlike the SYSCALL path, where the SYSCALL
+    // instruction has already overwritten them with RIP/RFLAGS.  Carry the
+    // true registers; the interrupted RIP/RFLAGS go in their own slots below.
+    (*sig_frame_ptr).saved_r11   = isr_r11;
+    (*sig_frame_ptr).saved_rcx   = isr_rcx;
     (*sig_frame_ptr).saved_rax   = isr_rax;
     // Caller-saved args — a fault-delivered signal interrupts arbitrary user
     // code where these are live; restore the full set on return (psABI §3.2.3).
@@ -1273,6 +1313,8 @@ pub unsafe fn deliver_fault_signal_from_isr(
     // 64-aligned area (under the active SMAP UserGuard) and record its VA;
     // sys_sigreturn XRSTORs it — the FPU analogue of the GPR save above.
     (*sig_frame_ptr).fpstate     = fpstate_va;
+    (*sig_frame_ptr).saved_rip    = user_rip;
+    (*sig_frame_ptr).saved_rflags = user_rflags;
     crate::arch::x86_64::fpu_save(fpstate_va as *mut u8);
 
     // ── Write ucontext_t (SA_SIGINFO handlers only) ───────────────────────────

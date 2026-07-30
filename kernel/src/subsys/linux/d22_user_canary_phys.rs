@@ -231,8 +231,8 @@ fn get_parent_user_rsp_rbp(parent_tid: u64) -> (u64, u64) {
     }
     // SAFETY: reads are inside the thread's own kernel stack — always
     // mapped, always present at CPL 0.  See d21_user_canary_watch.
-    let user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
-    let user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    let user_rsp = unsafe { *((kstack_top - 24) as *const u64) };
+    let user_rbp = unsafe { *((kstack_top - 48) as *const u64) };
     (user_rsp, user_rbp)
 }
 
