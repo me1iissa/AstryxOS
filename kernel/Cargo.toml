@@ -12,9 +12,18 @@ default = []
 # scratch register at the call site and a walk through it yields a
 # plausible-looking WRONG address rather than a detectable failure.  The
 # helpers therefore return 0 unless this is on, and their consumers report the
-# field as `unavailable`.  `scripts/qemu-harness.py` enables the feature and the
-# codegen flag together (`ASTRYX_FORCE_FRAME_POINTERS=1`); setting one without
-# the other is what this feature exists to prevent.
+# field as `unavailable`.
+#
+# `scripts/qemu-harness.py` binds the feature and the codegen flag together in
+# BOTH directions: `ASTRYX_FORCE_FRAME_POINTERS=1` adds the feature, and
+# `--features frame-pointers` adds the flag.  Enabling one without the other is
+# what this feature exists to prevent, because the resulting build looks
+# instrumented and reports addresses that are not real.
+#
+# CAVEAT: a raw `cargo build --features frame-pointers` bypasses both
+# directions — cargo has no way to require a codegen flag from a feature.  Build
+# through the harness; a hand-rolled cargo invocation must pass
+# `-C force-frame-pointers=yes` for the astryx-kernel crate itself.
 frame-pointers = []
 # `sched-pick-xcheck` — Perf P2 phase 2b live pick-equivalence cross-check. On
 # every scheduling pass (SMP=1 only) the per-CPU runqueue pick is computed
