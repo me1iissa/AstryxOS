@@ -440,3 +440,95 @@ presets:
         reg: r8
         offset: -128
         len: 120
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # musl-acrash-group
+  # ───────────────────────────────────────────────────────────────────────────
+  # Break at isr_general_protection ENTRY (vector 13 stub, before any push), so
+  # every GPR still holds the faulting Ring-3 value and RSP points at the
+  # CPU-pushed frame [error_code, RIP, CS, RFLAGS, RSP, SS].
+  #
+  # Aimed at the musl mallocng a_crash class: an intentional `hlt` reached when
+  # one of the allocator's integrity assertions fails.  At the dominant site
+  # (enframe's check on the byte below the slot) RAX holds the slot pointer `p`
+  # and R15 the owning metadata record, so (RAX-16) is the 16-byte in-band group
+  # header and *(RAX-16) is the back-pointer to that record.
+  musl-acrash-group:
+    description: |
+      musl mallocng a_crash context at the #GP stub: user GPRs, the CPU
+      exception frame, the faulting user instruction bytes, the in-band
+      group header at RAX-16, and both reachable copies of the metadata
+      record (via the header back-pointer and via R15).
+    steps:
+      - name: regs
+        kind: regs
+      - name: exc_frame
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 48
+      - name: fault_insn
+        kind: mem_indirect
+        reg: rsp
+        ptr_offset: 8
+        offset: 0
+        len: 16
+      - name: group_header_and_slot
+        kind: mem_via_reg
+        reg: rax
+        offset: -16
+        len: 64
+      - name: meta_via_header_backptr
+        kind: mem_indirect
+        reg: rax
+        ptr_offset: -16
+        offset: 0
+        len: 48
+      - name: meta_via_r15
+        kind: mem_via_reg
+        reg: r15
+        offset: 0
+        len: 48
+      - name: slot_end_window
+        kind: mem_via_reg
+        reg: rsi
+        offset: -16
+        len: 32
+      # ── try_avail / get_meta sites (RSI = the metadata record) ────────────
+      # At the `assert(mask)` site the failing comparison is
+      # `freed_mask & ((2<<group->active_idx)-1)`, so the decisive value lives
+      # in the GROUP's in-band header, one indirection away: record+0x10 is the
+      # pointer to the group, and the group's first 16 bytes are
+      # [0x0 back-pointer to the record][0x8 active_idx][0xc must-be-zero].
+      # Capture the record and then the group it names, so a mismatch between
+      # the two (or a stale byte inside the group header) is directly visible.
+      - name: meta_record_via_rsi
+        kind: mem_via_reg
+        reg: rsi
+        offset: 0
+        len: 48
+      - name: group_via_rsi_mem
+        kind: mem_indirect
+        reg: rsi
+        ptr_offset: 16
+        offset: 0
+        len: 64
+      # Same pair for the enframe site, where R15 holds the record instead.
+      - name: group_via_r15_mem
+        kind: mem_indirect
+        reg: r15
+        ptr_offset: 16
+        offset: 0
+        len: 64
+      # Name the FRAME behind the group page (and behind the record itself), so
+      # the content finding can be cross-checked against physical provenance.
+      - name: group_phys_via_rsi_mem
+        kind: gva2gpa
+        reg: rsi
+        ptr_offset: 16
+      - name: record_phys_via_rsi
+        kind: gva2gpa
+        reg: rsi
+      - name: slot_phys_via_rax
+        kind: gva2gpa
+        reg: rax

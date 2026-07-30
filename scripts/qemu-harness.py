@@ -7483,6 +7483,49 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
                 return {"kind": kind, "reg": reg, "ptr_val": hex(ptr_val),
                         "offset": offset, "addr": hex(addr), "error": str(e)}
 
+        if kind == "gva2gpa":
+            # Resolve a guest VIRTUAL address to its guest PHYSICAL address by
+            # walking the guest's own page tables (QEMU HMP `gva2gpa`, which
+            # uses the selected vCPU's CR3).  Naming the frame behind a user VA
+            # is what turns "this page holds the wrong bytes" into "this FRAME
+            # holds the wrong bytes", which is the only form a physical-
+            # provenance cross-check (alloc/free shadow, refcount) can consume.
+            #
+            # `reg` names the register holding the address; with `ptr_offset`
+            # the address is instead read from memory at (reg + ptr_offset)
+            # first, so a pointer field inside a structure can be resolved in
+            # one step.  The translation is attempted on every vCPU because the
+            # monitor's "current CPU" need not be the one that faulted; results
+            # are reported per CPU so a disagreement is visible rather than
+            # silently resolved.
+            reg = step["reg"].lower()
+            if reg not in regs:
+                return {"kind": kind, "error": f"unknown register {reg!r}"}
+            base = int(regs[reg], 16) if isinstance(regs[reg], str) \
+                   else int(regs[reg])
+            out = {"kind": kind, "reg": reg}
+            if "ptr_offset" in step:
+                ptr_addr = (base + int(step["ptr_offset"])) \
+                           & 0xFFFF_FFFF_FFFF_FFFF
+                out["ptr_addr"] = hex(ptr_addr)
+                try:
+                    base = int.from_bytes(gdb.read_mem(ptr_addr, 8), "little")
+                except Exception as e:
+                    out["error"] = f"ptr read: {e}"
+                    return out
+            va = (base + int(step.get("offset", 0))) & 0xFFFF_FFFF_FFFF_FFFF
+            out["va"] = hex(va)
+            per_cpu = {}
+            for cpu_idx in range(int(step.get("max_cpus", 4))):
+                sel = _hmp(qmp_sock, f"cpu {cpu_idx}")
+                if _hmp_error(sel):
+                    break
+                resp = _hmp(qmp_sock, f"gva2gpa {va:#x}")
+                text = resp.get("return", "") if isinstance(resp, dict) else ""
+                per_cpu[f"cpu{cpu_idx}"] = str(text).strip()
+            out["gva2gpa"] = per_cpu
+            return out
+
         if kind == "mem_via_seg":
             seg = step["seg"].lower()
             if seg not in ("fs", "gs"):
@@ -7683,6 +7726,7 @@ def cmd_autopsy(args):
 
     hits: list[dict] = []
     timed_out = False
+    duplicate_stops = 0
     captured_error: Optional[str] = None
     started_at = time.time()
 
@@ -7719,7 +7763,23 @@ def cmd_autopsy(args):
             wait_budget = timeout_ms / 1000.0
 
             # The breakpoint loop: resume → wait → snapshot → repeat.
-            for hit_index in range(once_n):
+            #
+            # A HARDWARE execution breakpoint (Z1) can re-report the SAME stop
+            # more than once — the guest has not retired an instruction between
+            # the reports, so every register and every captured window is
+            # byte-identical.  Counting those against `--once N` burns the whole
+            # budget on a single fault (observed: 16/16 hits identical).  Fold
+            # them instead: an identical consecutive stop bumps `repeat_count`
+            # on the hit already recorded and does NOT consume a distinct slot.
+            # `duplicate_stops` reports how many were folded, so the collapse is
+            # never silent.  Bounded by `max_stops` so a stop that repeats
+            # forever still terminates.
+            hit_index = 0
+            last_sig = None
+            max_stops = once_n * 64
+            for _stop_n in range(max_stops):
+                if hit_index >= once_n:
+                    break
                 # Resume.  QMP cont is the canonical "let it run" command;
                 # we then poll the GDB stub's stop-reply channel.
                 cont_resp = _qmp_command(qmp_sock, "cont",
@@ -7771,6 +7831,25 @@ def cmd_autopsy(args):
                     "symbol": _autopsy_resolve_kernel_rip(rip),
                 }
 
+                # Identical consecutive stop (same RIP and same full register
+                # file) ⇒ the guest did not advance; fold it into the previous
+                # hit rather than spending a `--once` slot on it.
+                sig = (rip, tuple(sorted(regs.items())))
+                if last_sig is not None and sig == last_sig and hits:
+                    duplicate_stops += 1
+                    hits[-1]["repeat_count"] = hits[-1].get("repeat_count", 1) + 1
+                    wait_budget = max(
+                        0.1,
+                        timeout_ms / 1000.0 - (time.time() - started_at),
+                    )
+                    if wait_budget <= 0:
+                        timed_out = True
+                        break
+                    if not args.continue_after:
+                        break
+                    continue
+                last_sig = sig
+
                 # Run the preset's capture steps.
                 seg_base_cache: dict = {}
                 captures: dict = {}
@@ -7785,8 +7864,10 @@ def cmd_autopsy(args):
                     "hit_index": hit_index,
                     "breakpoint": bp_record,
                     "stop_reply": stop_reply,
+                    "repeat_count": 1,
                     "captures": captures,
                 })
+                hit_index += 1
 
                 # Budget renewal for the next hit (subtract elapsed).
                 wait_budget = max(
@@ -7831,6 +7912,7 @@ def cmd_autopsy(args):
         "sid":         args.sid,
         "preset":      preset_name,
         "preset_desc": preset.get("description", "").strip(),
+        "duplicate_stops": duplicate_stops,
         "breakpoints": [
             {"label": b["label"], "addr": hex(b["addr"]),
              "armed": b.get("armed", False)}
