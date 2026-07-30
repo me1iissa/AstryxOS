@@ -457,6 +457,10 @@ static TEARDOWN_HI: [AtomicU64; TEARDOWN_SLOTS] =
 /// the window was open for that teardown, so this is a correctness-relevant
 /// statistic rather than a debug counter.
 static TEARDOWN_UNRESERVED: AtomicU64 = AtomicU64::new(0);
+/// Reservations currently published.  Lets the read side — which sits on the
+/// mmap path — skip the scan entirely in the overwhelmingly common case where
+/// no teardown is in flight, so consulting the table costs one relaxed load.
+static TEARDOWN_LIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Token returned when no reservation slot could be claimed.
 pub const TEARDOWN_NO_SLOT: usize = usize::MAX;
@@ -483,6 +487,7 @@ pub fn teardown_publish(cr3: u64, lo: u64, hi: u64) -> usize {
             TEARDOWN_HI[i].store(hi, Ordering::Relaxed);
             // Publish last: a reader that sees the cr3 also sees the bounds.
             TEARDOWN_CR3[i].store(cr3, Ordering::Release);
+            TEARDOWN_LIVE.fetch_add(1, Ordering::Release);
             return i;
         }
     }
@@ -509,6 +514,7 @@ pub fn teardown_retire(slot: usize) {
         TEARDOWN_LO[slot].store(0, Ordering::Relaxed);
         TEARDOWN_HI[slot].store(0, Ordering::Relaxed);
         TEARDOWN_CR3[slot].store(0, Ordering::Release);
+        TEARDOWN_LIVE.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -521,6 +527,13 @@ pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
     // a slot claimed by the CAS but not yet published.  Matching on either
     // would make free or half-written slots a hit for a caller carrying it.
     if cr3 == 0 || cr3 == u64::MAX {
+        return None;
+    }
+    // Fast path: nothing is being torn down anywhere, so nothing can conflict.
+    // This is the state almost every mmap sees, and it keeps the reservation
+    // off the placement hot path.  Acquire pairs with the Release on publish,
+    // so a reservation visible to the publisher is visible here.
+    if TEARDOWN_LIVE.load(Ordering::Acquire) == 0 {
         return None;
     }
     let mut lowest: Option<u64> = None;
@@ -547,10 +560,7 @@ pub fn teardown_unreserved_count() -> u64 {
 
 /// Reservations currently published (claimed slots, including mid-publish).
 pub fn teardown_in_flight_count() -> usize {
-    TEARDOWN_CR3
-        .iter()
-        .filter(|c| c.load(Ordering::Relaxed) != 0)
-        .count()
+    TEARDOWN_LIVE.load(Ordering::Relaxed) as usize
 }
 
 /// Total reservation slots — the ceiling `teardown_in_flight_count` saturates at.
