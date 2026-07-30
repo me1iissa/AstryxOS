@@ -891,13 +891,13 @@ pub fn get_user_rsp_rbp() -> (u64, u64) {
     let kstack_top = pcs.kernel_rsp;
     if rsp == 0 { return (0, 0); }
 
-    // The frame must occupy 15 u64 slots starting at `rsp`, so the entire
-    // window [rsp, rsp + 15*8) must lie within the current thread's
+    // The frame must occupy 17 u64 slots starting at `rsp`, so the entire
+    // window [rsp, rsp + 17*8) must lie within the current thread's
     // kernel stack [kstack_top - KERNEL_STACK_SIZE_BYTES, kstack_top).
     // Reject anything outside that window as a stale pointer left behind
     // by a prior syscall on a different thread (or by a context that did
     // not pass through `syscall_entry` at all).
-    const FRAME_TOP_OFF: u64 = 15 * 8;
+    const FRAME_TOP_OFF: u64 = 17 * 8;
     let stack_low = kstack_top.saturating_sub(KERNEL_STACK_SIZE_BYTES);
     if kstack_top == 0
         || rsp < stack_low
@@ -1188,7 +1188,7 @@ pub fn dispatch_aether(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg
 /// Frame layout (u64 slots from frame_rsp, low → high):
 ///   [0]=rdi  [1]=rsi  [2]=rdx  [3]=r8  [4]=r9  [5]=r10
 ///   [6]=r15  [7]=r14  [8]=r13  [9]=r12  [10]=rbx  [11]=rbp
-///   [12]=r11  [13]=rcx  [14]=user_rsp
+///   [12]=r11  [13]=rcx  [14]=user_rsp  [15]=rip  [16]=rflags
 pub(crate) fn read_fork_user_regs() -> crate::proc::ForkUserRegs {
     let cpu = cpu_index();
     let pcs = unsafe { &PER_CPU_SYSCALL[cpu as usize] };
@@ -1201,9 +1201,9 @@ pub(crate) fn read_fork_user_regs() -> crate::proc::ForkUserRegs {
     // saved-frame pointer that does not lie inside the current thread's
     // kernel stack, which would otherwise risk a kernel #PF if the page
     // were unmapped or returning garbage if it had been overwritten by
-    // unrelated kernel work since the prior syscall.  The 15-slot frame
+    // unrelated kernel work since the prior syscall.  The 17-slot frame
     // span matches the syscall_entry pushes (see layout comment above).
-    const FRAME_TOP_OFF: u64 = 15 * 8;
+    const FRAME_TOP_OFF: u64 = 17 * 8;
     let stack_low = kstack_top.saturating_sub(KERNEL_STACK_SIZE_BYTES);
     if kstack_top == 0
         || rsp < stack_low
@@ -1245,10 +1245,17 @@ extern "C" fn syscall_entry() {
         "mov gs:[16], rcx",              // per_cpu.user_rip = user RIP
 
         // ── Step 2: Save user context on kernel stack ───────────────
-        // These are restored on SYSRETQ.
+        // The interrupted RIP/RFLAGS and the user's RCX/R11 get one slot
+        // each.  SYSCALL leaves them pairwise equal on entry (RIP→RCX,
+        // RFLAGS→R11 — Intel SDM Vol. 2B), but `sys_sigreturn` reinstates
+        // contexts captured from a fault, where RCX and R11 were live and
+        // are unrelated to RIP/RFLAGS.  Keeping four independent slots is
+        // what lets the epilogue restore all four (psABI §3.2.3).
+        "push r11",                      // interrupted RFLAGS
+        "push rcx",                      // interrupted RIP
         "push qword ptr gs:[8]",         // saved user RSP
-        "push rcx",                      // return RIP
-        "push r11",                      // return RFLAGS
+        "push rcx",                      // user RCX
+        "push r11",                      // user R11
         // Done with GS-relative accesses; swap back so kernel code
         // runs with the user's GS (harmless — kernel never uses GS).
         // This also ensures KERNEL_GS_BASE is back to the per-CPU
@@ -1264,17 +1271,17 @@ extern "C" fn syscall_entry() {
         // Linux syscall ABI: ALL registers except RAX/RCX/R11 must be preserved.
         // Caller-saved in C ABI (RDX, R8, R9, R10) are clobbered by our arg
         // rearrangement and by the dispatch Rust function, so save them here.
-        // 4 extra pushes → 13 total × 8 = 104 bytes; 104 % 16 = 8, so
-        // RSP % 16 == 8 before call ✓ (same alignment as without these saves).
+        // 17 pushes total × 8 = 136 bytes; 136 % 16 = 8, so RSP % 16 == 8
+        // here and the `sub rsp, 8` below restores 16-byte alignment for the
+        // `call` (System V AMD64 ABI §3.2.2).
         // These are kept on the stack THROUGH signal_check so that signal_check
         // (a Rust function that follows the C ABI) cannot clobber r8/r9/r10/rdx.
-        // The signal handler frame layout is therefore:
+        // The frame signal_check sees (after `push rax`) is therefore:
         //   frame[0]  = rax (syscall result)
-        //   frame[1]  = rdx (user rdx)
-        //   frame[2]  = r8  (user r8)
-        //   frame[3]  = r9  (user r9)
-        //   frame[4]  = r10 (user r10)
-        //   frame[5]  = r15 … frame[13] = user RSP
+        //   frame[1]  = rdi … frame[6] = r10
+        //   frame[7]  = r15 … frame[12] = rbp
+        //   frame[13] = r11  frame[14] = rcx  frame[15] = user RSP
+        //   frame[16] = interrupted RIP   frame[17] = interrupted RFLAGS
         "push r10",
         "push r9",
         "push r8",
@@ -1289,7 +1296,8 @@ extern "C" fn syscall_entry() {
         // callee-saved regs.  At this point GS → user_gs_base (post-swapgs above),
         // so we must swapgs→kernel_gs, write, swapgs→user_gs.
         // Interrupts are still disabled (no sti yet), so the swapgs sequence is safe.
-        // RSP points to: [rdi,rsi,rdx,r8,r9,r10,r15,r14,r13,r12,rbx,rbp,r11,rcx,user_rsp]
+        // RSP points to:
+        //   [rdi,rsi,rdx,r8,r9,r10,r15,r14,r13,r12,rbx,rbp,r11,rcx,user_rsp,rip,rflags]
         "swapgs",              // GS → KERNEL_GS_BASE (per-CPU struct)
         "mov gs:[24], rsp",    // per_cpu.frame_rsp = frame RSP
         "swapgs",              // GS → user_gs_base (restore)
@@ -1345,6 +1353,29 @@ extern "C" fn syscall_entry() {
         // ── Step 6: Disable interrupts before touching user state ───
         "cli",
 
+        // ── Step 6b: Choose the Ring-3 return instruction ───────────
+        // SYSRETQ takes RIP from RCX and RFLAGS from R11 (Intel SDM Vol. 2B,
+        // SYSRET), so it can only express a context in which the RCX/R11
+        // slots equal the RIP/RFLAGS slots.  That holds for every ordinary
+        // syscall return (SYSCALL made them equal on entry) and for signal
+        // delivery (which writes both RIP and RCX), but not for a
+        // `sigreturn` reinstating a context captured from a fault, where
+        // RCX and R11 were live user data.  Those return through IRETQ
+        // (Intel SDM Vol. 3A §6.14), which sources RIP/RFLAGS/RSP from a
+        // stack frame and leaves every general register to us.
+        //
+        // r11/rcx are free scratch until the pops below reload them.  The
+        // verdict is parked in ZF and consumed after the pops — POP does not
+        // write flags — which is why this sits after the CLI: with interrupts
+        // masked, nothing between the compare and the branch can disturb ZF.
+        // Frame offsets from RSP (which points at the R15 slot):
+        //   +48 R11  +56 RCX  +64 user RSP  +72 RIP  +80 RFLAGS
+        "mov r11, [rsp + 56]",      // user RCX slot
+        "xor r11, [rsp + 72]",      //   ^ interrupted RIP
+        "mov rcx, [rsp + 48]",      // user R11 slot
+        "xor rcx, [rsp + 80]",      //   ^ interrupted RFLAGS
+        "or  r11, rcx",             // ZF = 1 iff both pairs coincide
+
         // ── Step 7: Restore user context ────────────────────────────
         "pop r15",
         "pop r14",
@@ -1352,15 +1383,41 @@ extern "C" fn syscall_entry() {
         "pop r12",
         "pop rbx",
         "pop rbp",
+        // RSP now points at the R11 slot; the remaining five slots are
+        //   [rsp]=R11  [rsp+8]=RCX  [rsp+16]=user RSP  [rsp+24]=RIP
+        //   [rsp+32]=RFLAGS
+        "jnz 4f",           // RCX/R11 diverge from RIP/RFLAGS → IRETQ
+
+        // ── Step 8a: Return to Ring 3 via SYSRETQ (fast path) ───────
         "pop r11",          // RFLAGS for SYSRETQ
         "pop rcx",          // RIP for SYSRETQ
         "pop rsp",          // Restore user RSP (switches back to user stack)
-
-        // ── Step 8: Return to Ring 3 ────────────────────────────────
         "sysretq",
+
+        // ── Step 8b: Return to Ring 3 via IRETQ ─────────────────────
+        // Build the interrupt-return frame (RIP, CS, RFLAGS, RSP, SS —
+        // Intel SDM Vol. 3A §6.14.4) in the 40 bytes below the saved
+        // context, so the five source slots stay readable while we write.
+        // Interrupts are already masked and GS already holds the user base
+        // (the entry stub swapped it back), exactly as for SYSRETQ.
+        "4:",
+        "sub rsp, 40",
+        "mov r11, [rsp + 64]",                  // interrupted RIP
+        "mov [rsp], r11",
+        "mov qword ptr [rsp + 8], {user_cs}",   // CS
+        "mov r11, [rsp + 72]",                  // interrupted RFLAGS
+        "mov [rsp + 16], r11",
+        "mov r11, [rsp + 56]",                  // user RSP
+        "mov [rsp + 24], r11",
+        "mov qword ptr [rsp + 32], {user_ss}",  // SS
+        "mov r11, [rsp + 40]",                  // user R11 (restored verbatim)
+        "mov rcx, [rsp + 48]",                  // user RCX (restored verbatim)
+        "iretq",
 
         dispatch = sym dispatch,
         signal_check = sym crate::signal::signal_check_on_syscall_return,
+        user_cs = const crate::arch::x86_64::gdt::USER_CODE_SELECTOR as u64,
+        user_ss = const crate::arch::x86_64::gdt::USER_DATA_SELECTOR as u64,
     );
 }
 
@@ -2055,25 +2112,34 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //    we return through syscall_entry's epilogue, SYSRETQ jumps to the
     //    new entry point with the new stack.
     //    Layout (from syscall_entry):
-    //      kstack_top - 8  = user RSP
-    //      kstack_top - 16 = RCX (user RIP)
-    //      kstack_top - 24 = R11 (RFLAGS)
-    //      kstack_top - 32 = RBP
-    //      kstack_top - 40 = RBX
-    //      kstack_top - 48 = R12
-    //      kstack_top - 56 = R13
-    //      kstack_top - 64 = R14
-    //      kstack_top - 72 = R15
+    //      kstack_top - 8  = RFLAGS
+    //      kstack_top - 16 = RIP
+    //      kstack_top - 24 = user RSP
+    //      kstack_top - 32 = RCX
+    //      kstack_top - 40 = R11
+    //      kstack_top - 48 = RBP
+    //      kstack_top - 56 = RBX
+    //      kstack_top - 64 = R12
+    //      kstack_top - 72 = R13
+    //      kstack_top - 80 = R14
+    //      kstack_top - 88 = R15
+    //
+    //    RIP is written to both the RIP slot and the RCX slot (and RFLAGS to
+    //    both its slot and R11) so the two pairs coincide and the epilogue
+    //    takes the SYSRETQ path; a fresh process image has no interrupted
+    //    RCX/R11 to preserve.
     unsafe {
-        *((kstack_top - 8)  as *mut u64) = entry_rsp;   // user RSP
-        *((kstack_top - 16) as *mut u64) = entry_rip;   // user RIP (via RCX → SYSRETQ)
-        *((kstack_top - 24) as *mut u64) = 0x202;       // RFLAGS (IF set)
-        *((kstack_top - 32) as *mut u64) = 0;           // RBP
-        *((kstack_top - 40) as *mut u64) = 0;           // RBX
-        *((kstack_top - 48) as *mut u64) = 0;           // R12
-        *((kstack_top - 56) as *mut u64) = 0;           // R13
-        *((kstack_top - 64) as *mut u64) = 0;           // R14
-        *((kstack_top - 72) as *mut u64) = 0;           // R15
+        *((kstack_top - 8)  as *mut u64) = 0x202;       // RFLAGS (IF set)
+        *((kstack_top - 16) as *mut u64) = entry_rip;   // user RIP
+        *((kstack_top - 24) as *mut u64) = entry_rsp;   // user RSP
+        *((kstack_top - 32) as *mut u64) = entry_rip;   // RCX
+        *((kstack_top - 40) as *mut u64) = 0x202;       // R11
+        *((kstack_top - 48) as *mut u64) = 0;           // RBP
+        *((kstack_top - 56) as *mut u64) = 0;           // RBX
+        *((kstack_top - 64) as *mut u64) = 0;           // R12
+        *((kstack_top - 72) as *mut u64) = 0;           // R13
+        *((kstack_top - 80) as *mut u64) = 0;           // R14
+        *((kstack_top - 88) as *mut u64) = 0;           // R15
     }
 
     crate::serial_println!("[SYSCALL] exec: process image replaced, returning to new entry");
@@ -5084,6 +5150,13 @@ pub(crate) fn sys_sigaction(sig: u8, handler_addr: u64) -> i64 {
         return -22; // EINVAL — can't change SIGKILL/SIGSTOP
     }
 
+    // A handler address is consumed by a Ring-0 control transfer at delivery
+    // time; reject anything outside the canonical user half before it can be
+    // installed.  See `signal::is_installable_handler`.
+    if !crate::signal::is_installable_handler(handler_addr) {
+        return -crate::subsys::linux::errno::EFAULT;
+    }
+
     let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -5144,7 +5217,8 @@ pub(crate) fn sys_sigprocmask(how: u32, new_mask: u64) -> i64 {
 /// Linux's rt_sigreturn (15), the user RSP points into the signal frame
 /// (past the popped restorer address).  We read the saved registers from
 /// the frame, write them back onto the kernel stack so that the normal
-/// `sysretq` epilogue restores the original user context.
+/// epilogue restores the original user context (via SYSRETQ when the
+/// restored RCX/R11 coincide with RIP/RFLAGS, via IRETQ otherwise).
 ///
 /// Returns the original `saved_rax` value which dispatch() puts into RAX.
 pub(crate) fn sys_sigreturn() -> i64 {
@@ -5172,6 +5246,8 @@ pub(crate) fn sys_sigreturn() -> i64 {
     let (sig_num, saved_mask, saved_rsp, saved_r15, saved_r14, saved_r13,
          saved_r12, saved_rbx, saved_rbp, saved_r11, saved_rcx, saved_rax,
          saved_rdi, saved_rsi, saved_rdx, saved_r8, saved_r9, saved_r10);
+    let saved_rip: u64;
+    let saved_rflags: u64;
     let fpstate: u64;
     // SMAP bracket — frame_base has already been range-validated by
     // validate_user_ptr above so the UserGuard is safe to lift AC.
@@ -5199,6 +5275,27 @@ pub(crate) fn sys_sigreturn() -> i64 {
         saved_r9  = (*frame_ptr).saved_r9;
         saved_r10 = (*frame_ptr).saved_r10;
         fpstate   = (*frame_ptr).fpstate;
+        // Interrupted RIP/RFLAGS — independent of the RCX/R11 above.
+        saved_rip    = (*frame_ptr).saved_rip;
+        saved_rflags = (*frame_ptr).saved_rflags;
+    }
+
+    // The resume RIP and RSP come from a user-writable stack frame and are
+    // consumed by a control transfer that runs in Ring 0 (SYSRETQ or IRETQ).
+    // Both instructions raise #GP *in the kernel* on a non-canonical target
+    // (Intel SDM Vol. 2B SYSRET, Vol. 3A §6.14.4), which unprivileged
+    // userspace could otherwise use to force a kernel fault — CWE-617
+    // (reachable assertion) via a crafted signal frame.  Reject the frame
+    // instead; the caller resumes at the trampoline's trap instruction.
+    // Same bound as `signal::is_installable_handler` applies at sigaction(2)
+    // registration time — together they keep every value that can reach
+    // SYSRETQ/IRETQ inside the canonical user half.
+    if saved_rip >= USER_VA_LIMIT || saved_rsp >= USER_VA_LIMIT {
+        crate::serial_println!(
+            "[SIGNAL] sigreturn: rejecting frame with non-user rip={:#x} rsp={:#x}",
+            saved_rip, saved_rsp
+        );
+        return -crate::subsys::linux::errno::EFAULT;
     }
 
     // Restore the interrupted FPU/SSE/AVX register file that signal delivery
@@ -5214,8 +5311,8 @@ pub(crate) fn sys_sigreturn() -> i64 {
     }
 
     crate::serial_println!(
-        "[SIGNAL] sigreturn: restoring context for signal {} (rip={:#x}, rsp={:#x})",
-        sig_num, saved_rcx, saved_rsp
+        "[SIGNAL] sigreturn: restoring context for signal {} (rip={:#x}, rsp={:#x}, rcx={:#x}, r11={:#x})",
+        sig_num, saved_rip, saved_rsp, saved_rcx, saved_r11
     );
 
     // Restore the blocked-signal mask.
@@ -5232,23 +5329,25 @@ pub(crate) fn sys_sigreturn() -> i64 {
     }
 
     // Write the original registers back onto the kernel stack frame.
-    // The kernel stack frame layout (from syscall_entry's 15 pushes)
+    // The kernel stack frame layout (from syscall_entry's 17 pushes)
     // relative to the per-CPU kernel_rsp:
-    //   ksp -   8 = user RSP
-    //   ksp -  16 = RCX (user RIP)
-    //   ksp -  24 = R11 (user RFLAGS)
-    //   ksp -  32 = RBP
-    //   ksp -  40 = RBX
-    //   ksp -  48 = R12
-    //   ksp -  56 = R13
-    //   ksp -  64 = R14
-    //   ksp -  72 = R15
-    //   ksp -  80 = R10   ┐ caller-saved argument registers — restored so
-    //   ksp -  88 = R9    │ the SYSRETQ epilogue reinstates the FULL
-    //   ksp -  96 = R8    │ interrupted register set (psABI §3.2.3).  These
-    //   ksp - 104 = RDX   │ slots are the last six syscall_entry pushes
-    //   ksp - 112 = RSI   │ (rdi lowest); the epilogue pops them in Step 4b.
-    //   ksp - 120 = RDI   ┘
+    //   ksp -   8 = interrupted RFLAGS ┐ consumed by the epilogue's return
+    //   ksp -  16 = interrupted RIP    ┘ instruction (SYSRETQ or IRETQ)
+    //   ksp -  24 = user RSP
+    //   ksp -  32 = RCX   ┐ true user registers, independent of RIP/RFLAGS
+    //   ksp -  40 = R11   ┘ above (psABI §3.2.3)
+    //   ksp -  48 = RBP
+    //   ksp -  56 = RBX
+    //   ksp -  64 = R12
+    //   ksp -  72 = R13
+    //   ksp -  80 = R14
+    //   ksp -  88 = R15
+    //   ksp -  96 = R10   ┐ caller-saved argument registers — restored so
+    //   ksp - 104 = R9    │ the epilogue reinstates the FULL interrupted
+    //   ksp - 112 = R8    │ register set (psABI §3.2.3).  These slots are
+    //   ksp - 120 = RDX   │ the last six syscall_entry pushes (rdi lowest);
+    //   ksp - 128 = RSI   │ the epilogue pops them in Step 4b.
+    //   ksp - 136 = RDI   ┘
     let ksp = unsafe { PER_CPU_SYSCALL[cpu_index()].kernel_rsp };
     // Sanitise RFLAGS before restoring it as the user's EFLAGS via SYSRETQ.
     // The signal frame is user-controlled memory; a crafted handler can
@@ -5264,24 +5363,31 @@ pub(crate) fn sys_sigreturn() -> i64 {
                                   | (1u64 << 16)     // RF
                                   | (1u64 << 17)     // VM
                                   | (1u64 << 18));   // AC
-    let sanitised_rflags = (saved_r11 & RFLAGS_USER_MASK) | (1u64 << 9); // force IF
+    // The sanitiser applies to the RFLAGS the CPU will load, never to R11.
+    // R11 is an ordinary general register whose value carries no privilege,
+    // and the psABI requires it to round-trip through the handler unchanged.
+    let sanitised_rflags = (saved_rflags & RFLAGS_USER_MASK)
+        | (1u64 << 9)   // force IF
+        | (1u64 << 1);  // reserved bit 1 reads as 1 (Intel SDM Vol. 1 §3.4.3)
     unsafe {
-        *((ksp -  8) as *mut u64) = saved_rsp;
-        *((ksp - 16) as *mut u64) = saved_rcx;  // user RIP
-        *((ksp - 24) as *mut u64) = sanitised_rflags;
-        *((ksp - 32) as *mut u64) = saved_rbp;
-        *((ksp - 40) as *mut u64) = saved_rbx;
-        *((ksp - 48) as *mut u64) = saved_r12;
-        *((ksp - 56) as *mut u64) = saved_r13;
-        *((ksp - 64) as *mut u64) = saved_r14;
-        *((ksp - 72) as *mut u64) = saved_r15;
+        *((ksp -   8) as *mut u64) = sanitised_rflags;
+        *((ksp -  16) as *mut u64) = saved_rip;
+        *((ksp -  24) as *mut u64) = saved_rsp;
+        *((ksp -  32) as *mut u64) = saved_rcx;  // true user RCX
+        *((ksp -  40) as *mut u64) = saved_r11;  // true user R11
+        *((ksp -  48) as *mut u64) = saved_rbp;
+        *((ksp -  56) as *mut u64) = saved_rbx;
+        *((ksp -  64) as *mut u64) = saved_r12;
+        *((ksp -  72) as *mut u64) = saved_r13;
+        *((ksp -  80) as *mut u64) = saved_r14;
+        *((ksp -  88) as *mut u64) = saved_r15;
         // Caller-saved argument registers (see layout comment above).
-        *((ksp -  80) as *mut u64) = saved_r10;
-        *((ksp -  88) as *mut u64) = saved_r9;
-        *((ksp -  96) as *mut u64) = saved_r8;
-        *((ksp - 104) as *mut u64) = saved_rdx;
-        *((ksp - 112) as *mut u64) = saved_rsi;
-        *((ksp - 120) as *mut u64) = saved_rdi;
+        *((ksp -  96) as *mut u64) = saved_r10;
+        *((ksp - 104) as *mut u64) = saved_r9;
+        *((ksp - 112) as *mut u64) = saved_r8;
+        *((ksp - 120) as *mut u64) = saved_rdx;
+        *((ksp - 128) as *mut u64) = saved_rsi;
+        *((ksp - 136) as *mut u64) = saved_rdi;
     }
 
     // Return original RAX — dispatch() returns this, the asm puts it

@@ -207,13 +207,13 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
             label, pid, parent_tid);
         return;
     }
-    let parent_user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
-    // Wave 14 R-A: saved user_rbp lives at `kstack_top - 32` (frame slot
+    let parent_user_rsp = unsafe { *((kstack_top - 24) as *const u64) };
+    // Wave 14 R-A: saved user_rbp lives at `kstack_top - 48` (frame slot
     // 11 per `syscall_entry` layout: rdi, rsi, rdx, r8, r9, r10, r15, r14,
-    // r13, r12, rbx, rbp, r11, rcx, user_rsp — RBP is the 12th save, four
-    // qwords from the top).  Read from the same kernel-stack frame as the
-    // user_rsp read above; same SAFETY justification.
-    let parent_user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    // r13, r12, rbx, rbp, r11, rcx, user_rsp, rip, rflags — RBP is the 12th
+    // save, six qwords from the top).  Read from the same kernel-stack frame
+    // as the user_rsp read above; same SAFETY justification.
+    let parent_user_rbp = unsafe { *((kstack_top - 48) as *const u64) };
 
     // FS_BASE MSR (Intel SDM Vol. 3A §3.4.4.1, IA32_FS_BASE = 0xC000_0100).
     // Captures the live FS_BASE for the currently-running thread, which —
@@ -9204,6 +9204,14 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
         let sa_flags    = u64::from_le_bytes(inp[8..16].try_into().unwrap());
         let sa_restorer = u64::from_le_bytes(inp[16..24].try_into().unwrap());
         let sa_mask     = u64::from_le_bytes(inp[24..32].try_into().unwrap());
+        // The handler address is loaded into the RIP/RCX slot of the syscall
+        // return frame at delivery time and consumed by a Ring-0 control
+        // transfer, so it must be inside the canonical user half before it can
+        // be installed.  Returning here leaves the prior disposition in place
+        // (nothing has been mutated yet).  See `signal::is_installable_handler`.
+        if !crate::signal::is_installable_handler(handler_addr) {
+            return -14; // EFAULT
+        }
         let restorer = if sa_flags & SA_RESTORER != 0 && sa_restorer != 0 {
             sa_restorer
         } else {

@@ -23,6 +23,9 @@ pub mod hello_win32_pe;
 pub mod native_hello_elf;
 pub mod orbit_elf;
 pub mod pe;
+// Ring-3 probe for the sigaction(2) register-restore contract; test-only.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+pub mod sigreturn_regs_elf;
 pub mod proc_metrics;
 #[cfg(feature = "qga")]
 pub mod qga_elf;
@@ -3638,10 +3641,10 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
             let tls = parent_thread.tls_base;
             if parent_thread.kernel_stack_base > 0 && parent_thread.kernel_stack_size > 0 {
                 let kstack_top = parent_thread.kernel_stack_base + parent_thread.kernel_stack_size;
-                // syscall_entry layout: offset -16 = RCX (user RIP), offset -8 = user RSP
+                // syscall_entry layout: offset -16 = user RIP, -24 = user RSP
                 unsafe {
                     let rip = *((kstack_top - 16) as *const u64);
-                    let rsp = *((kstack_top - 8) as *const u64);
+                    let rsp = *((kstack_top - 24) as *const u64);
                     (rip, rsp, tls)
                 }
             } else {
@@ -3907,9 +3910,10 @@ pub fn fork_process_share_vm(
             let tls = parent_thread.tls_base;
             if parent_thread.kernel_stack_base > 0 && parent_thread.kernel_stack_size > 0 {
                 let kstack_top = parent_thread.kernel_stack_base + parent_thread.kernel_stack_size;
+                // syscall_entry layout: offset -16 = user RIP, -24 = user RSP
                 unsafe {
                     let rip = *((kstack_top - 16) as *const u64);
-                    let rsp = *((kstack_top - 8) as *const u64);
+                    let rsp = *((kstack_top - 24) as *const u64);
                     (rip, rsp, tls)
                 }
             } else { (0u64, 0u64, tls) }
@@ -4612,9 +4616,10 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         if let Some(pt) = threads.iter().find(|t| t.tid == parent_tid) {
             if pt.kernel_stack_base > 0 && pt.kernel_stack_size > 0 {
                 let kstack_top = pt.kernel_stack_base + pt.kernel_stack_size;
+                // syscall_entry layout: offset -16 = user RIP, -24 = user RSP
                 unsafe {
                     let rip = *((kstack_top - 16) as *const u64);
-                    let rsp = *((kstack_top - 8) as *const u64);
+                    let rsp = *((kstack_top - 24) as *const u64);
                     (rip, rsp)
                 }
             } else { (0, 0) }

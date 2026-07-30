@@ -2651,6 +2651,26 @@ pub fn run() -> ! {
         if test_249_signalframe_caller_saved_roundtrip() { passed += 1; }
     }
 
+    // ── Test 250: sigreturn restores the interrupted RCX and R11 ───────────
+    // End-to-end Ring-3 round trip through a fault-delivered SIGSEGV.  Guards
+    // the psABI §3.2.3 / POSIX.1-2017 sigaction(2) requirement that RCX and
+    // R11 survive a handler return, which SYSRETQ alone cannot express.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_250_sigreturn_preserves_rcx_r11() { passed += 1; }
+    }
+
+    // ── Test 251: sigaction rejects out-of-range handler addresses ─────────
+    // A registered handler reaches SYSRETQ/IRETQ as the return RIP, and both
+    // fault at CPL 0 on a non-canonical target — so an unbounded handler is a
+    // kernel fault reachable from any process that calls sigaction(2).
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_251_sigaction_rejects_out_of_range_handler() { passed += 1; }
+    }
+
     // ── Test 228: auto-reap doubly-orphaned zombie children on parent exit ─
     // Verifies that exit_group_inner sweeps any Zombie child of the dying
     // process from PROCESS_TABLE in-line (rather than leaving it to leak
@@ -10243,11 +10263,11 @@ fn test_signal_subsystem() -> bool {
     // 5. Signal frame size sanity
     test_println!("  Testing SignalFrame layout...");
     let frame_size = core::mem::size_of::<crate::signal::SignalFrame>();
-    if frame_size != 160 {
-        test_fail!("Signal subsystem", "SignalFrame size = {} (expected 160)", frame_size);
+    if frame_size != 176 {
+        test_fail!("Signal subsystem", "SignalFrame size = {} (expected 176)", frame_size);
         return false;
     }
-    test_println!("  SignalFrame size = {} bytes (20 × 8) ✓", frame_size);
+    test_println!("  SignalFrame size = {} bytes (22 × 8) ✓", frame_size);
 
     // 6. Trampoline virtual address constant
     if crate::signal::TRAMPOLINE_VADDR != 0x0000_7FFF_FFFF_F000 {
@@ -24354,13 +24374,13 @@ fn test_sigsegv_handler() -> bool {
         }
     }
 
-    // 3. SignalFrame size is 160 bytes (static assert in signal.rs already
+    // 3. SignalFrame size is 176 bytes (static assert in signal.rs already
     //    catches this at compile time, but let's print it for the log)
     {
         let sz = core::mem::size_of::<crate::signal::SignalFrame>();
-        test_println!("  SignalFrame size = {} bytes (expected 160) {}", sz,
-            if sz == 160 { "✓" } else { "FAIL" });
-        if sz != 160 { ok = false; }
+        test_println!("  SignalFrame size = {} bytes (expected 176) {}", sz,
+            if sz == 176 { "✓" } else { "FAIL" });
+        if sz != 176 { ok = false; }
     }
 
     // 4. TRAMPOLINE_VADDR is accessible (non-zero constant)
@@ -48874,7 +48894,7 @@ fn test_227_sigreturn_frame_base_ptr_validation() -> bool {
 /// destination pointer (silent cross-allocator memory corruption).
 ///
 /// This guards the two invariants the fix depends on:
-///   1. SignalFrame is 160 bytes and each of the six fields is independently
+///   1. SignalFrame is 176 bytes and each of the six fields is independently
 ///      addressable (a reorder/removal that aliased two slots would fail the
 ///      round-trip).
 ///   2. `restorer` remains at offset 0 — the handler's `ret` pops it, and
@@ -48886,10 +48906,10 @@ fn test_249_signalframe_caller_saved_roundtrip() -> bool {
     test_header!("SignalFrame preserves caller-saved arg regs (rdi/rsi/rdx/r8/r9/r10)");
     use crate::signal::SignalFrame;
 
-    // Invariant 1a: size is exactly 20 × 8 = 160 bytes.
+    // Invariant 1a: size is exactly 22 × 8 = 176 bytes.
     let sz = core::mem::size_of::<SignalFrame>();
-    if sz != 160 {
-        test_fail!("SignalFrame caller-saved", "size = {} (expected 160)", sz);
+    if sz != 176 {
+        test_fail!("SignalFrame caller-saved", "size = {} (expected 176)", sz);
         return false;
     }
 
@@ -48934,14 +48954,259 @@ fn test_249_signalframe_caller_saved_roundtrip() -> bool {
     // Structural note: the register→kernel-slot mapping itself cannot be
     // exercised here without userspace execution (a real signal delivery +
     // handler-return round-trip), so it is verified by the asm layout instead:
-    // sys_sigreturn writes the six regs to ksp-{80,88,96,104,112,120}, which
-    // are — in reverse push order — the last six of syscall_entry's 15 register
-    // pushes (rdi lowest at ksp-120 … r10 at ksp-80), contiguous with the
-    // existing ksp-{8..72} callee-saved slots. If syscall_entry's push order
+    // sys_sigreturn writes the six regs to ksp-{96,104,112,120,128,136}, which
+    // are — in reverse push order — the last six of syscall_entry's 17 register
+    // pushes (rdi lowest at ksp-136 … r10 at ksp-96), contiguous with the
+    // existing ksp-{8..88} callee-saved slots. If syscall_entry's push order
     // ever changes, these offsets (and this cross-reference) must change with
     // it. See `syscall_entry` in kernel/src/syscall/mod.rs (Step 2 pushes) and
     // its Step 4b/Step 7 pop epilogue.
     test_pass!("SignalFrame carries + round-trips all six caller-saved arg regs");
+    true
+}
+
+/// Test 250 — a returning signal handler leaves RCX and R11 intact.
+///
+/// POSIX.1-2017 sigaction(2) requires the interrupted context to be restored
+/// when a handler returns, and the x86-64 System V psABI §3.2.3 places RCX and
+/// R11 in the saved general-register set.  Those two registers are the ones a
+/// SYSCALL-shaped return cannot preserve: SYSRETQ takes RIP from RCX and
+/// RFLAGS from R11 (Intel SDM Vol. 2B), so a `sigreturn` that returns that way
+/// necessarily hands the thread back RCX == RIP and R11 == RFLAGS.  That is
+/// invisible on the syscall-delivery path (SYSCALL had already overwritten
+/// both, so the psABI treats them as dead) but destroys live user data on the
+/// fault-delivery path, where the signal interrupts arbitrary code.
+///
+/// Unlike Test 249, which can only check the frame's shape, this exercises the
+/// real path: a Ring-3 program installs a SIGSEGV handler, loads a sentinel
+/// into RCX and R11, and stores through an unmapped pointer.  The handler
+/// records `gregs[REG_RCX]` / `gregs[REG_R11]` from its `ucontext_t`, maps the
+/// page so the faulting store can be retried, and returns.  The program then
+/// compares both live registers and both ucontext values against the
+/// sentinels, and exits with a code naming the first divergence (see
+/// `proc::sigreturn_regs_elf`).  Exit code 1 is the signature of the bug this
+/// test was written for.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_250_sigreturn_preserves_rcx_r11() -> bool {
+    test_header!("sigreturn preserves the interrupted RCX/R11 (psABI §3.2.3)");
+
+    let elf = &crate::proc::sigreturn_regs_elf::SIGRETURN_REGS_ELF;
+    let user_pid = match crate::proc::usermode::create_user_process("sigret_regs", elf) {
+        Ok(pid) => pid,
+        Err(e) => {
+            test_fail!("sigreturn RCX/R11", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // The probe uses the Linux syscall numbering (rt_sigaction 13, mmap 9,
+    // exit 60), so it must run under the Linux personality.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+    let mut exit_code: Option<i32> = None;
+    for _ in 0..400 {
+        crate::sched::yield_cpu();
+        {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == user_pid) {
+                Some(p) if p.state == crate::proc::ProcessState::Zombie => {
+                    exit_code = Some(p.exit_code);
+                }
+                // Reaped before we looked: treat as "no verdict available".
+                None => exit_code = Some(i32::MIN),
+                Some(_) => {}
+            }
+        }
+        if exit_code.is_some() { break; }
+        crate::hal::enable_interrupts();
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    let code = match exit_code {
+        Some(c) => c,
+        None => {
+            test_fail!("sigreturn RCX/R11", "probe did not exit within 400 yields");
+            return false;
+        }
+    };
+
+    let why = match code {
+        0 => "all preserved",
+        1 => "RCX clobbered by the handler return (SYSRETQ RIP→RCX leak)",
+        2 => "R11 clobbered by the handler return (SYSRETQ RFLAGS→R11 leak)",
+        3 => "ucontext gregs[REG_RCX] did not report the interrupted RCX",
+        4 => "ucontext gregs[REG_R11] did not report the interrupted R11",
+        5 => "the faulting store was not retried after the handler returned",
+        6 => "rt_sigaction(SIGSEGV) failed",
+        _ => "probe died without reporting (killed, or reaped before inspection)",
+    };
+    test_println!("  probe exit_code = {} — {}", code, why);
+
+    if code != 0 {
+        test_fail!("sigreturn RCX/R11", "exit {} — {}", code, why);
+        return false;
+    }
+    test_pass!("RCX/R11 and their ucontext values survive a fault-delivered signal");
+    true
+}
+
+/// Test 251 — `sigaction(2)` refuses a handler outside the canonical user half.
+///
+/// A registered handler address is not merely dereferenced: signal delivery
+/// writes it into the RIP (and RCX) slot of the syscall-return frame, and the
+/// epilogue's SYSRETQ/IRETQ consumes it.  Both fault with #GP **at CPL 0** on a
+/// non-canonical target (Intel SDM Vol. 2B `SYSRET`; Vol. 3A §6.14.4), with the
+/// user RSP already loaded and no IST stack on vector 13 — the CVE-2012-0217
+/// shape, reachable by any process that calls sigaction(2).  This is
+/// pre-existing; it is closed alongside the RCX/R11 fix because that change
+/// establishes the matching bound on the `sys_sigreturn` side, so the two
+/// together make the invariant hold end to end.
+///
+/// Covers both registration entry points — the native `sys_sigaction` and the
+/// Linux `rt_sigaction` (nr 13) — and asserts the rejected call leaves the
+/// prior disposition installed, not a partially applied one.  The `SIG_DFL` /
+/// `SIG_IGN` sentinels are dispositions rather than addresses and must still be
+/// accepted.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_251_sigaction_rejects_out_of_range_handler() -> bool {
+    test_header!("sigaction rejects out-of-range handler addresses (CWE-617)");
+    use crate::signal::{SigAction, SignalState, SIGUSR1};
+    const EFAULT: i64 = -14;
+    const GOOD_HANDLER: u64 = 0x0000_0000_0040_0078; // plausible user .text VA
+
+    // The test-runner thread's process may have no signal_state (kernel
+    // processes do not get one); install a scratch one for the duration and
+    // put back whatever was there.
+    let pid = crate::proc::current_pid_lockless();
+    let had_state = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let had = p.signal_state.is_some();
+                if !had {
+                    p.signal_state = Some(SignalState::new());
+                }
+                had
+            }
+            None => {
+                test_fail!("sigaction handler bound", "no PROCESS_TABLE entry for pid {}", pid);
+                return false;
+            }
+        }
+    };
+
+    // Read back the disposition currently installed for SIGUSR1.
+    let disposition = || -> Option<(u64, u64)> {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| p.signal_state.as_ref())
+            .map(|s| match s.actions[SIGUSR1 as usize] {
+                SigAction::Default => (0u64, 0u64),
+                SigAction::Ignore  => (1u64, 0u64),
+                SigAction::Handler { addr, restorer } => (addr, restorer),
+            })
+    };
+
+    let mut failed: u32 = 0;
+
+    // ── Out-of-range addresses must be refused by BOTH entry points ────────
+    // The first non-canonical address, an address inside the non-canonical
+    // hole, the kernel base, and the top of the address space.
+    let bad: [(&str, u64); 4] = [
+        ("first non-canonical", 0x0000_8000_0000_0000),
+        ("non-canonical hole",  0x0000_9000_0000_0000),
+        ("kernel base",         0xFFFF_8000_0010_0000),
+        ("all-ones",            0xFFFF_FFFF_FFFF_FFFF),
+    ];
+
+    for (name, addr) in bad.iter() {
+        // Start from a known disposition so "did not install" is checkable.
+        let _ = crate::syscall::sys_sigaction(SIGUSR1, 0);
+
+        let r_native = crate::syscall::sys_sigaction(SIGUSR1, *addr);
+        let after_native = disposition();
+        let native_ok = r_native == EFAULT && after_native == Some((0, 0));
+
+        // Linux rt_sigaction(nr 13): struct kernel_sigaction is
+        // { handler, flags, restorer, mask } — 32 bytes.  Dispatched through
+        // the kernel-bypass wrapper so the kernel-resident `act` pointer is
+        // accepted; the handler bound under test is independent of that.
+        let mut act = [0u8; 32];
+        act[0..8].copy_from_slice(&addr.to_le_bytes());
+        let r_linux = crate::syscall::dispatch_linux_kernel(
+            13, SIGUSR1 as u64, act.as_ptr() as u64, 0, 8, 0, 0);
+        let after_linux = disposition();
+        let linux_ok = r_linux == EFAULT && after_linux == Some((0, 0));
+
+        crate::serial_println!(
+            "[TEST/SIGACT-BOUND] case=\"{}\" addr={:#x} native_rc={} linux_rc={} \
+             installed_after={:?} {}",
+            name, addr, r_native, r_linux, after_native,
+            if native_ok && linux_ok { "OK" } else { "FAIL" },
+        );
+        if !native_ok {
+            test_fail!("sigaction handler bound",
+                "native sys_sigaction({:#x}) returned {} (expected {}), disposition now {:?}",
+                addr, r_native, EFAULT, after_native);
+            failed += 1;
+        }
+        if !linux_ok {
+            test_fail!("sigaction handler bound",
+                "rt_sigaction({:#x}) returned {} (expected {}), disposition now {:?}",
+                addr, r_linux, EFAULT, after_linux);
+            failed += 1;
+        }
+    }
+
+    // ── An in-range handler and both sentinels must still be accepted ──────
+    let r_good = crate::syscall::sys_sigaction(SIGUSR1, GOOD_HANDLER);
+    if r_good != 0 || disposition() != Some((GOOD_HANDLER, 0)) {
+        test_fail!("sigaction handler bound",
+            "in-range handler {:#x} rejected: rc={} disposition={:?}",
+            GOOD_HANDLER, r_good, disposition());
+        failed += 1;
+    }
+    for (name, sentinel) in [("SIG_IGN", 1u64), ("SIG_DFL", 0u64)] {
+        let rc = crate::syscall::sys_sigaction(SIGUSR1, sentinel);
+        if rc != 0 || disposition() != Some((sentinel, 0)) {
+            test_fail!("sigaction handler bound",
+                "{} rejected: rc={} disposition={:?}", name, rc, disposition());
+            failed += 1;
+        }
+    }
+
+    // Restore the pre-test signal_state.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if had_state {
+                if let Some(ref mut s) = p.signal_state {
+                    s.actions[SIGUSR1 as usize] = SigAction::Default;
+                }
+            } else {
+                p.signal_state = None;
+            }
+        }
+    }
+
+    if failed > 0 {
+        return false;
+    }
+    test_pass!("out-of-range sigaction handlers rejected with EFAULT at both entry points");
     true
 }
 
