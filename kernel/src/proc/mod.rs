@@ -4305,37 +4305,142 @@ pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option
 /// fresh image) and from the vfork-child exit path.
 ///
 /// The caller passes the `(base, length)` previously recorded on
-/// `Thread.vfork_isolated_stack` plus the parent's `cr3`.  The VMA's pages
-/// are unmapped via `unmap_and_free_range_in` (which decrements refcounts
-/// and frees frames whose ref reaches zero) and the VmSpace entry is
-/// removed via `remove_range`.
+/// `Thread.vfork_isolated_stack` plus the parent's `cr3`.  The VmSpace entry is
+/// removed via `remove_range` and the range's pages are then unmapped via
+/// `unmap_and_free_range_in` (which decrements refcounts and frees frames whose
+/// ref reaches zero) — in that order, with the range reserved in between.  See
+/// [`teardown_range_in_parent`] for why the order and the reservation matter.
 ///
 /// Safe to call multiple times — repeated calls on the same `(base, length)`
 /// are no-ops because the VMA / PTEs have already been removed.
 pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
-    // First unmap the PTEs and free the physical frames in the parent's CR3.
-    let parent_cr3 = {
-        let procs = PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    let Some((parent_cr3, unmapped)) = teardown_range_in_parent(parent_pid, base, length)
+    else {
+        return;
     };
-    if parent_cr3 == 0 { return; }
-
-    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
-
-    // Then remove the VMA entry from the parent's VmSpace.
-    {
-        let mut procs = PROCESS_TABLE.lock();
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
-            if let Some(space) = p.vm_space.as_mut() {
-                let _ = space.remove_range(base, length);
-            }
-        }
-    }
 
     crate::serial_println!(
         "[VFORK-STACK] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
         parent_pid, parent_cr3, base, length, unmapped
     );
+}
+
+/// Remove the records for `[base, base+length)` from `parent_pid`'s address
+/// space and then clear the range's page-table entries, keeping the range
+/// accounted for throughout.  Returns `(cr3, pages_unmapped)`, or `None` when
+/// the process is gone or has no address space.
+///
+/// # Why the records must go first
+///
+/// With the entries cleared first, a stale record still describes the range
+/// while the clear is in flight.  A concurrent demand fault on another CPU then
+/// finds a covering VMA, allocates a frame, and installs an entry — which the
+/// in-flight clear wipes a moment later.  Because a later access to an
+/// anonymous page is served with a fresh zero-filled frame, as mmap(2)
+/// specifies for MAP_ANONYMOUS, that loss is silent.  With the records removed
+/// first the same fault finds nothing covering the address and takes the
+/// SIGSEGV an unmapped address is supposed to produce.  The page-fault
+/// handler's lookup runs under `PROCESS_TABLE`, so the removal commits before
+/// any fault can observe a half-torn-down range.
+///
+/// # Why the lock is dropped between them, and what covers the gap
+///
+/// `unmap_and_free_range_in` performs a synchronous cross-CPU TLB shootdown
+/// (Intel SDM Vol. 3A 4.10.4-5) and takes `mm_sem` internally; holding
+/// `PROCESS_TABLE` across it reintroduces the lock-across-shootdown stall the
+/// two-phase split exists to avoid.  But once the records are gone and the lock
+/// is released, nothing describes the range — and address placement consults
+/// the records alone, so a concurrent `mmap` in this same address space would be
+/// handed a base inside it and have its entries cleared by the sweep still
+/// running.  A teardown reservation covers exactly that gap: published under
+/// the lock after the removal, retired once the entries are clear, and treated
+/// as occupied by placement in between.
+fn teardown_range_in_parent(parent_pid: Pid, base: u64, length: u64) -> Option<(u64, usize)> {
+    // ── Phase 1 (lock) — drop the records, then reserve the range they
+    // described, before the lock is released.
+    let (parent_cr3, teardown_slot) = {
+        let mut procs = PROCESS_TABLE.lock();
+        let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
+        let cr3 = p.cr3;
+        if cr3 == 0 {
+            return None;
+        }
+        let space = p.vm_space.as_mut()?;
+        let _ = space.remove_range(base, length);
+        let slot = crate::mm::vma::teardown_publish(
+            space.cr3, base, base.saturating_add(length),
+        );
+        (cr3, slot)
+    }; // PROCESS_TABLE released here
+
+    // ── Phase 2 (lock-free) — clear the entries and release the frames.
+    #[cfg(feature = "test-mode")]
+    teardown_gap_observe(parent_pid, parent_cr3, base, length);
+    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
+    crate::mm::vma::teardown_retire(teardown_slot);
+
+    Some((parent_cr3, unmapped))
+}
+
+/// Teardowns that were about to clear entries while a record still described the
+/// range — i.e. that ran the phases in the inverse order.
+#[cfg(feature = "test-mode")]
+static TEARDOWN_STALE_RECORD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Teardowns that were about to clear entries with the range described by
+/// neither a record nor a reservation — the window placement can be handed.
+#[cfg(feature = "test-mode")]
+static TEARDOWN_UNACCOUNTED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Sample the "continuously accounted for" invariant at the only moment it is
+/// falsifiable: entries are about to be cleared, so the range must be described
+/// by a reservation and NOT by a record.
+///
+/// This exists because the end state cannot distinguish the two orders — both
+/// finish with no record and no entry.  Only this instant separates them, so
+/// only a sample taken here can be red on the inverse order.
+///
+/// `PROCESS_TABLE` is taken and released here; it is never held across the clear
+/// that follows, which would reintroduce the lock-across-shootdown stall.
+///
+/// A reservation is absent legitimately when the slot table was full, which
+/// `vma::teardown_unreserved_count` records separately — compare the two before
+/// reading a non-zero `TEARDOWN_UNACCOUNTED` as an ordering defect.
+#[cfg(feature = "test-mode")]
+fn teardown_gap_observe(parent_pid: Pid, cr3: u64, base: u64, length: u64) {
+    use core::sync::atomic::Ordering;
+    let still_described = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|s| s.find_vma(base).is_some())
+            .unwrap_or(false)
+    };
+    if still_described {
+        TEARDOWN_STALE_RECORD.fetch_add(1, Ordering::Relaxed);
+    }
+    let reserved = crate::mm::vma::teardown_conflict(
+        cr3, base, base.saturating_add(length),
+    ).is_some();
+    if !still_described && !reserved {
+        TEARDOWN_UNACCOUNTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Times a vfork-range teardown was about to clear entries while a record still
+/// described the range — the inverse-order signature.  Must stay zero.
+#[cfg(feature = "test-mode")]
+pub fn teardown_stale_record_count() -> u64 {
+    TEARDOWN_STALE_RECORD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Times a vfork-range teardown was about to clear entries with the range
+/// described by nothing at all.  Must stay zero unless the reservation table
+/// was full (see `vma::teardown_unreserved_count`).
+#[cfg(feature = "test-mode")]
+pub fn teardown_unaccounted_count() -> u64 {
+    TEARDOWN_UNACCOUNTED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Allocate a **minimal per-vfork-child TLS page** so that the child's
@@ -4509,25 +4614,13 @@ pub fn alloc_vfork_child_tls(parent_pid: Pid) -> Option<u64> {
 }
 
 /// Tear down the per-vfork-child TLS page from the parent's address space.
-/// Symmetric to `vfork_isolated_stack_cleanup`; safe to call multiple
-/// times.
+/// Symmetric to `vfork_isolated_stack_cleanup` — same ordering and the same
+/// reservation, via [`teardown_range_in_parent`]; safe to call multiple times.
 pub fn vfork_isolated_tls_cleanup(parent_pid: Pid, base: u64, length: u64) {
-    let parent_cr3 = {
-        let procs = PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    let Some((parent_cr3, unmapped)) = teardown_range_in_parent(parent_pid, base, length)
+    else {
+        return;
     };
-    if parent_cr3 == 0 { return; }
-
-    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
-
-    {
-        let mut procs = PROCESS_TABLE.lock();
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
-            if let Some(space) = p.vm_space.as_mut() {
-                let _ = space.remove_range(base, length);
-            }
-        }
-    }
 
     crate::serial_println!(
         "[VFORK-TLS] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
