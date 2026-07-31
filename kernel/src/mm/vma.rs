@@ -1210,6 +1210,21 @@ impl VmSpace {
                             *parent_pt.add(pt_idx) = entry;
                             *child_pt.add(pt_idx)  = entry;
 
+                            // The child's entry is an install like any other,
+                            // and it is the only one for every address the
+                            // child inherits — omitting it would make a forked
+                            // address space read as "never installed".  The
+                            // record is keyed by CR3, so stamping here cannot
+                            // displace the parent's own entry for the same VA.
+                            #[cfg(feature = "firefox-test-core")]
+                            crate::mm::w215_diag::install_stamp_record(
+                                va,
+                                phys,
+                                child_pml4_phys,
+                                crate::mm::w215_diag::PTE_KIND_FORK_CLONE,
+                                core::panic::Location::caller(),
+                            );
+
                             // Take a reference to keep the page alive until both
                             // mappings are gone — EXCEPT for a kernel identity
                             // leaf (never covered by a VMA) or an SHM `Device`

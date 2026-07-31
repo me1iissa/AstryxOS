@@ -2041,12 +2041,22 @@ pub fn emit_metadata_fault_attribution(
             // register.  Ask the clear-provenance record who cleared that
             // page's entry, and follow the record -> header indirection too,
             // since which register holds which depends on the assertion.
+            // Both halves of the record, always together.  A clear stamp on
+            // its own dates only the LAST clear of the address, which may
+            // predate the mapping under investigation entirely; it is the
+            // ordering against the install that decides whether anything was
+            // unmapped at all.  This face is ~3x more common than the `hlt`,
+            // so it is the one that accumulates instances.
             crate::mm::w215_diag::dump_clear_stamp_for_va(name, page);
+            crate::mm::w215_diag::dump_install_stamp_for_va(name, page, cr3);
             if v & 0x7 == 0 {
                 if let Some(grp) = read_user_word_via_cr3(cr3, v + 0x10, 8) {
                     if grp >= 0x1000 && grp < KERNEL_BASE && grp & 0xF == 0 {
                         crate::mm::w215_diag::dump_clear_stamp_for_va(
                             "via_mem", grp & !0xFFF,
+                        );
+                        crate::mm::w215_diag::dump_install_stamp_for_va(
+                            "via_mem", grp & !0xFFF, cr3,
                         );
                     }
                 }
@@ -2174,6 +2184,13 @@ pub fn emit_acrash_group_provenance(
             // names the path directly; no record at all means the entry was
             // never cleared, which moves the question to how it was installed.
             crate::mm::w215_diag::dump_clear_stamp_for_va("group", grp_page);
+            // The other half: when, and by which path, the mapping that is
+            // live NOW was established.  An install newer than the last clear
+            // means nothing was unmapped out from under this page, and moves
+            // the question to whether the allocator's write ever reached the
+            // frame the address resolves to.  The previous generation in the
+            // same record names the frame it would have reached before.
+            crate::mm::w215_diag::dump_install_stamp_for_va("group", grp_page, cr3);
             // The record's own frame is the control: it is allocated in the
             // same era as the group and is known-healthy here, so its alloc
             // tick is the reference the group's tick is compared against.

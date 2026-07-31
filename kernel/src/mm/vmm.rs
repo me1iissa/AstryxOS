@@ -361,7 +361,10 @@ pub fn get_cr3() -> u64 {
 ///
 /// # Returns
 /// `true` if the mapping was successful, `false` on failure (e.g., out of memory).
+#[track_caller]
 pub fn map_page(virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+    #[cfg(feature = "firefox-test-core")]
+    let site = core::panic::Location::caller();
     let _lock = VMM_LOCK.lock();
 
     let pml4_phys = get_cr3();
@@ -397,6 +400,19 @@ pub fn map_page(virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
         let entry_ptr = pt_ptr.add(pt_idx);
         *entry_ptr = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
+
+    // Stamped for completeness of the install record.  This variant edits the
+    // *current* CR3 and its callers are kernel bring-up paths, so the user-VA
+    // filter inside makes it a no-op in practice; recording it anyway means the
+    // inventory has no unstamped member to argue about.
+    #[cfg(feature = "firefox-test-core")]
+    crate::mm::w215_diag::install_stamp_record(
+        virt_addr,
+        phys_addr & ADDR_MASK,
+        pml4_phys,
+        crate::mm::w215_diag::PTE_KIND_MAP,
+        site,
+    );
 
     true
 }
@@ -617,14 +633,16 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid PML4 page table.
+#[track_caller]
 pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+    let site = core::panic::Location::caller();
     // Acquire the per-VmSpace address-space read lock if this `cr3` is
     // registered.  Kernel-only CR3s, the bootstrap CR3, and the AP idle
     // path may invoke `map_page_in` without a registered VmSpace; the
     // `None` arm is a no-op (no concurrent fork to serialise against).
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
-    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags)
+    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags, site)
 }
 
 /// `#PF`-fast-path variant of [`map_page_in`] — identical semantics, used by
@@ -639,19 +657,27 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
 ///
 /// # Safety
 /// `pml4_phys` must point to a valid PML4 page table.
+#[track_caller]
 pub fn map_page_in_fault_path(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+    let site = core::panic::Location::caller();
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()
         .map(|s| crate::mm::vma::mm_sem_read_draining(s));
-    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags)
+    map_page_in_impl(pml4_phys, virt_addr, phys_addr, flags, site)
 }
 
 /// Shared body of [`map_page_in`] / [`map_page_in_fault_path`] — everything
 /// after the `mm_sem` acquisition, which the two wrappers perform differently.
 /// Takes `VMM_LOCK` itself, preserving the `mm_sem` (outer) → `VMM_LOCK`
 /// (inner) ordering documented on `VmSpace::mm_sem`.
-fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+fn map_page_in_impl(
+    pml4_phys: u64,
+    virt_addr: u64,
+    phys_addr: u64,
+    flags: u64,
+    site: &'static core::panic::Location<'static>,
+) -> bool {
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -703,7 +729,16 @@ fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) 
         );
         crate::mm::w215_diag::alias_install_check(
             virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+        crate::mm::w215_diag::install_stamp_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            pml4_phys,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            site,
+        );
     }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = site;
 
     true
 }
@@ -739,12 +774,14 @@ fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) 
 /// §4.10.4.3, no cross-CPU invalidation is required for the not-present →
 /// present transition itself; the hazard here is the second *frame*, which this
 /// guard prevents.
+#[track_caller]
 pub fn map_page_in_if_absent(
     pml4_phys: u64,
     virt_addr: u64,
     phys_addr: u64,
     flags: u64,
 ) -> bool {
+    let site = core::panic::Location::caller();
     // mm_sem/shootdown reentrancy: the hot callers of this function run inside
     // `handle_page_fault` (IF=0), so the plain `RwLock::read()` used elsewhere
     // in this file risks the mm_sem-vs-shootdown-ACK deadlock documented on
@@ -800,7 +837,16 @@ pub fn map_page_in_if_absent(
         );
         crate::mm::w215_diag::alias_install_check(
             virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+        crate::mm::w215_diag::install_stamp_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            pml4_phys,
+            crate::mm::w215_diag::PTE_KIND_MAP_ABSENT,
+            site,
+        );
     }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = site;
 
     true
 }
@@ -837,6 +883,7 @@ pub fn map_page_in_if_absent(
 /// Per Intel SDM Vol. 3A 4.10.4.3 the not-present -> present invalidation of the
 /// other CPUs is handled by the caller's TLB shootdown; the hazard this guard
 /// prevents is the second *frame*.
+#[track_caller]
 pub fn map_page_in_cow_if_unchanged(
     pml4_phys: u64,
     virt_addr: u64,
@@ -844,6 +891,7 @@ pub fn map_page_in_cow_if_unchanged(
     flags: u64,
     expected_phys: u64,
 ) -> bool {
+    let site = core::panic::Location::caller();
     // mm_sem/shootdown reentrancy: the hot caller of this function is the
     // write-fault CoW arm inside `handle_page_fault` (IF=0) — see
     // `mm::vma::mm_sem_read_draining` for the deadlock this closes.  The draining
@@ -900,7 +948,16 @@ pub fn map_page_in_cow_if_unchanged(
         );
         crate::mm::w215_diag::alias_install_check(
             virt_addr, phys_addr & ADDR_MASK, pml4_phys, ring_caller_rip());
+        crate::mm::w215_diag::install_stamp_record(
+            virt_addr,
+            phys_addr & ADDR_MASK,
+            pml4_phys,
+            crate::mm::w215_diag::PTE_KIND_COW_COPY,
+            site,
+        );
     }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = site;
 
     true
 }
@@ -935,12 +992,14 @@ pub fn map_page_in_cow_if_unchanged(
 /// exclusion is the actual W216 fork-vs-faulter invariant.  Per Intel SDM
 /// Vol. 3A §4.10.4.3 the read-only → writable change needs a caller-side
 /// shootdown of sibling CPUs, which the caller performs on `true`.
+#[track_caller]
 pub fn flip_writable_if_sole_owner(
     pml4_phys: u64,
     virt_addr: u64,
     expected_phys: u64,
     flags: u64,
 ) -> bool {
+    let site = core::panic::Location::caller();
     // Same shootdown-draining acquire as the sibling CAS primitives; superset-
     // safe from the IF=1 CLEARTID caller.  See `mm_sem_read_draining`.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
@@ -983,14 +1042,28 @@ pub fn flip_writable_if_sole_owner(
     }
 
     #[cfg(feature = "firefox-test-core")]
-    crate::mm::w215_diag::pte_change_record(
-        virt_addr,
-        expected_phys & ADDR_MASK,
-        expected_phys & ADDR_MASK,
-        crate::mm::w215_diag::PTE_KIND_MAP,
-        ring_caller_rip(),
-        pml4_phys,
-    );
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            expected_phys & ADDR_MASK,
+            expected_phys & ADDR_MASK,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        // Same frame, writable — recorded because it is a PTE write on the
+        // address, and its absence from the record would otherwise read as
+        // "nothing touched this entry".
+        crate::mm::w215_diag::install_stamp_record(
+            virt_addr,
+            expected_phys & ADDR_MASK,
+            pml4_phys,
+            crate::mm::w215_diag::PTE_KIND_COW_FLIP,
+            site,
+        );
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = site;
 
     true
 }
@@ -1372,6 +1445,18 @@ fn write_pte_impl(
                 crate::mm::w215_diag::PTE_KIND_WRITE,
                 site,
                 None,
+            );
+        }
+        // The mirror image: a rewrite that leaves the entry PRESENT decides
+        // which frame the address resolves to from here on, whether or not it
+        // changed the frame, so it belongs in the install record.
+        if pte & PAGE_PRESENT != 0 {
+            crate::mm::w215_diag::install_stamp_record(
+                virt_addr,
+                pte & ADDR_MASK,
+                pml4_phys,
+                crate::mm::w215_diag::PTE_KIND_WRITE,
+                site,
             );
         }
     }

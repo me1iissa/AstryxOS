@@ -977,6 +977,9 @@ pub const PTE_KIND_UNMAP: u8     = 2; // unmap_page_in cleared the PTE
 pub const PTE_KIND_WRITE: u8     = 3; // write_pte rewrote PTE flags (CoW etc.)
 pub const PTE_KIND_BULK_UNMAP: u8 = 4; // unmap_and_free_range_in cleared the PTE
 pub const PTE_KIND_FORK_CLONE: u8 = 5; // clone_for_fork installed a CoW PTE
+pub const PTE_KIND_MAP_ABSENT: u8 = 6; // map_page_in_if_absent won the install
+pub const PTE_KIND_COW_COPY: u8   = 7; // map_page_in_cow_if_unchanged replaced
+pub const PTE_KIND_COW_FLIP: u8   = 8; // flip_writable_if_sole_owner, same frame
 
 #[repr(C)]
 struct PteChangeEntry {
@@ -1093,6 +1096,9 @@ fn pte_kind_str(k: u8) -> &'static str {
         PTE_KIND_WRITE => "WRITE",
         PTE_KIND_BULK_UNMAP => "BULK_UNMAP",
         PTE_KIND_FORK_CLONE => "FORK_CLONE",
+        PTE_KIND_MAP_ABSENT => "MAP_ABSENT",
+        PTE_KIND_COW_COPY => "COW_COPY",
+        PTE_KIND_COW_FLIP => "COW_FLIP",
         _ => "?",
     }
 }
@@ -1428,6 +1434,279 @@ pub fn dump_clear_stamp_for_va(tag: &str, va: u64) {
     }
     #[cfg(not(feature = "firefox-test-core"))]
     let _ = (tag, va);
+}
+
+// ── INSTALL_STAMP — "last installed by" provenance for one user page ────────
+//
+// The clear-side stamp above answers "who removed this mapping".  It cannot,
+// on its own, decide the remaining question.  A stamp records only the LAST
+// clear of a page, so a stamp whose tick long predates the mapping under
+// investigation is not an accusation — it may describe an earlier tenant of
+// the same address.  Distinguishing the two readings needs the other half of
+// the record: when, and by which path, the mapping that is live NOW was put
+// there.
+//
+// With both halves the fault becomes decidable from one observation:
+//
+//   * clear NEWER than install — the entry was removed after the mapping was
+//     established, so the page userspace is reading is a re-fault of a
+//     destroyed mapping.  An unmap story, with the clearing site named.
+//   * install NEWER than clear, yet the page reads as though it were never
+//     written — the mapping was NOT removed, so nothing was lost to an unmap.
+//     The question moves to whether the write ever reached the frame that is
+//     mapped now: a lost or misdirected write, or an install that pointed the
+//     address at the wrong frame.
+//
+// ## Keyed by (VA, CR3), unlike the clear ring
+//
+// The clear ring hashes the VA alone and carries `cr3_low16` for the reader to
+// check.  That is tolerable at clear volumes, but installs are orders of
+// magnitude more frequent and `clone_for_fork` installs an entire address
+// space at one address per page — so a VA-only key would let a fork overwrite
+// the parent's stamp for every address it copies.  Hashing and storing both
+// halves of the key makes a hit unambiguous; a collision reports a MISS rather
+// than another address space's answer.
+//
+// ## Two generations per slot
+//
+// Each slot keeps the current install and the one immediately before it for
+// the same key.  That is what makes "was the write ever on this frame?"
+// answerable: if the mapping was re-pointed, the PREVIOUS generation names the
+// frame the earlier writes went to, and its physical address can then be put
+// to the alloc/free shadows.  One generation would only say where reads go
+// now, which is the half already visible in the page tables.
+//
+// ## No recent-N log, deliberately
+//
+// The clear side pairs its hash with an undisplaceable most-recent-N log,
+// because there "never cleared at all" is a meaningful answer that must not
+// rest on a hash.  On the install side it is not: a page that faulted was
+// necessarily installed at some point, so the corresponding answer carries no
+// information.  A log sized to be affordable would in any case cover a small
+// fraction of a second at install volumes.  The displacement counter is
+// exported instead, so the ring's saturation is reportable alongside any
+// conclusion drawn from it.
+//
+// Cite: Intel SDM Vol. 3A §4.5 (4-level paging), §4.10.4-5 (TLB and
+// paging-structure caches); mmap(2) (man7.org).
+
+#[cfg(feature = "firefox-test-core")]
+mod install_stamp {
+    use core::sync::atomic::AtomicU64;
+
+    /// Direct-addressed slots, sized to match the neighbouring clear ring.
+    /// 32 Ki × 80 B = 2.5 MiB BSS.
+    pub const SLOTS: usize = 32768;
+
+    pub struct Entry {
+        /// Page-aligned user VA. `0` = slot unused, and also the
+        /// "write in progress" marker (blanked first, published last).
+        pub va: AtomicU64,
+        /// Address space the install was made in. Part of the key.
+        pub cr3: AtomicU64,
+        /// Frame this install pointed the address at.
+        pub phys: AtomicU64,
+        pub tick: AtomicU64,
+        /// `&'static Location` of the installing call site, as a raw pointer.
+        pub site: AtomicU64,
+        /// `[63:32] tid`, `[15:8] cpu`, `[7:0] kind`.
+        pub packed: AtomicU64,
+        /// The install immediately preceding this one for the same key — the
+        /// frame earlier writes to this address went to.
+        pub prev_phys: AtomicU64,
+        pub prev_tick: AtomicU64,
+        pub prev_site: AtomicU64,
+        pub prev_packed: AtomicU64,
+    }
+
+    impl Entry {
+        pub const fn new() -> Self {
+            Self {
+                va: AtomicU64::new(0),
+                cr3: AtomicU64::new(0),
+                phys: AtomicU64::new(0),
+                tick: AtomicU64::new(0),
+                site: AtomicU64::new(0),
+                packed: AtomicU64::new(0),
+                prev_phys: AtomicU64::new(0),
+                prev_tick: AtomicU64::new(0),
+                prev_site: AtomicU64::new(0),
+                prev_packed: AtomicU64::new(0),
+            }
+        }
+    }
+
+    pub static RING: [Entry; SLOTS] = [const { Entry::new() }; SLOTS];
+    pub static RECORDED: AtomicU64 = AtomicU64::new(0);
+    pub static DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold both halves of the key in, so an install in one address space
+    /// cannot silently answer for the same address in another.
+    #[inline]
+    pub fn slot_of(va_page: u64, cr3: u64) -> usize {
+        (((va_page >> 12) ^ (cr3 >> 12).wrapping_mul(0x9E37_79B9)) as usize) & (SLOTS - 1)
+    }
+}
+
+/// Stamp one user page with the call site that installed its page-table entry.
+///
+/// `phys` is the frame the entry now maps. `kind` is one of the `PTE_KIND_*`
+/// codes above. No-op for non-user addresses and in builds without the
+/// diagnostic feature.
+#[inline]
+pub fn install_stamp_record(
+    va: u64,
+    phys: u64,
+    cr3: u64,
+    kind: u8,
+    site: &'static core::panic::Location<'static>,
+) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        if va < USER_STACK_RING_LO || va >= USER_STACK_RING_HI {
+            return;
+        }
+        let va_page = va & !0xFFFu64;
+        let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
+        let tid = crate::proc::current_tid() as u64;
+        let packed = (tid << 32) | (cpu << 8) | (kind as u64);
+        let site_ptr = site as *const _ as u64;
+        let new_phys = phys & !0xFFFu64;
+
+        let slot = &install_stamp::RING[install_stamp::slot_of(va_page, cr3)];
+
+        // Carry the outgoing generation forward only when it belongs to this
+        // exact key; otherwise the slot held an unrelated page and its frame
+        // would be reported as this address's history.
+        let prev_va = slot.va.load(Ordering::Acquire);
+        let same_key = prev_va == va_page && slot.cr3.load(Ordering::Relaxed) == cr3;
+        let (prev_phys, prev_tick, prev_site, prev_packed) = if same_key {
+            (
+                slot.phys.load(Ordering::Relaxed),
+                slot.tick.load(Ordering::Relaxed),
+                slot.site.load(Ordering::Relaxed),
+                slot.packed.load(Ordering::Relaxed),
+            )
+        } else {
+            if prev_va != 0 {
+                install_stamp::DISPLACED.fetch_add(1, Ordering::Relaxed);
+            }
+            (0, 0, 0, 0)
+        };
+
+        // Publish protocol, as on the clear side: blank the VA, fill the body,
+        // store the VA last with Release, so a concurrent reader sees either a
+        // consistent entry or no entry — never a body belonging to another
+        // page. Diagnostic-only; a racing reader may miss.
+        slot.va.store(0, Ordering::Relaxed);
+        slot.cr3.store(cr3, Ordering::Relaxed);
+        slot.phys.store(new_phys, Ordering::Relaxed);
+        slot.tick.store(tick, Ordering::Relaxed);
+        slot.site.store(site_ptr, Ordering::Relaxed);
+        slot.packed.store(packed, Ordering::Relaxed);
+        slot.prev_phys.store(prev_phys, Ordering::Relaxed);
+        slot.prev_tick.store(prev_tick, Ordering::Relaxed);
+        slot.prev_site.store(prev_site, Ordering::Relaxed);
+        slot.prev_packed.store(prev_packed, Ordering::Relaxed);
+        slot.va.store(va_page, Ordering::Release);
+
+        install_stamp::RECORDED.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (va, phys, cr3, kind, site);
+}
+
+/// Emit the recorded installing site for `va` in `cr3` as one
+/// `[INSTALL/STAMP]` line, with the preceding install of the same address.
+///
+/// A miss prints the totals and the key that currently occupies the slot,
+/// which is what makes the negative result interpretable: it distinguishes
+/// "the ring is cold" from "this address's entry was displaced".
+pub fn dump_install_stamp_for_va(tag: &str, va: u64, cr3: u64) {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let va_page = va & !0xFFFu64;
+        let recorded = install_stamp::RECORDED.load(Ordering::Relaxed);
+        let displaced = install_stamp::DISPLACED.load(Ordering::Relaxed);
+        let slot = &install_stamp::RING[install_stamp::slot_of(va_page, cr3)];
+
+        // SAFETY (both `site` reads below): the stored pointer is a
+        // `&'static Location` produced by `#[track_caller]`, so it points into
+        // the kernel image and outlives every reader. A zero pointer means the
+        // body was never published, and is reported as `?:0`.
+        let loc = |p: u64| -> (&'static str, u32) {
+            if p == 0 {
+                ("?", 0)
+            } else {
+                let l = unsafe { &*(p as *const core::panic::Location<'static>) };
+                (l.file(), l.line())
+            }
+        };
+
+        if slot.va.load(Ordering::Acquire) != va_page
+            || slot.cr3.load(Ordering::Relaxed) != cr3
+        {
+            crate::serial_println!(
+                "[INSTALL/STAMP] tag={} va={:#x} cr3={:#x} hit=0 slot_va={:#x} \
+                 slot_cr3={:#x} totals=(recorded={},displaced={},slots={})",
+                tag, va_page, cr3, slot.va.load(Ordering::Relaxed),
+                slot.cr3.load(Ordering::Relaxed),
+                recorded, displaced, install_stamp::SLOTS,
+            );
+            return;
+        }
+
+        let phys = slot.phys.load(Ordering::Relaxed);
+        let tick = slot.tick.load(Ordering::Relaxed);
+        let packed = slot.packed.load(Ordering::Relaxed);
+        let (file, line) = loc(slot.site.load(Ordering::Relaxed));
+        let prev_phys = slot.prev_phys.load(Ordering::Relaxed);
+        let prev_tick = slot.prev_tick.load(Ordering::Relaxed);
+        let prev_packed = slot.prev_packed.load(Ordering::Relaxed);
+        let (prev_file, prev_line) = loc(slot.prev_site.load(Ordering::Relaxed));
+        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+
+        crate::serial_println!(
+            "[INSTALL/STAMP] tag={} va={:#x} cr3={:#x} hit=1 site={}:{} kind={} \
+             phys={:#x} tick={} age_ticks={} tid={} cpu={} \
+             prev_site={}:{} prev_kind={} prev_phys={:#x} prev_tick={} \
+             totals=(recorded={},displaced={})",
+            tag, va_page, cr3, file, line, pte_kind_str((packed & 0xFF) as u8),
+            phys, tick, now.saturating_sub(tick),
+            packed >> 32, (packed >> 8) & 0xFF,
+            prev_file, prev_line, pte_kind_str((prev_packed & 0xFF) as u8),
+            prev_phys, prev_tick,
+            recorded, displaced,
+        );
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    let _ = (tag, va, cr3);
+}
+
+/// Read INSTALL_STAMP counters for kdb introspection.
+pub fn install_stamp_recorded_count() -> u64 {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        install_stamp::RECORDED.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        0
+    }
+}
+
+/// Displaced-install count — the ring's saturation, reportable alongside any
+/// conclusion drawn from a miss.
+pub fn install_stamp_displaced_count() -> u64 {
+    #[cfg(feature = "firefox-test-core")]
+    {
+        install_stamp::DISPLACED.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "firefox-test-core"))]
+    {
+        0
+    }
 }
 
 // ── In-flight bulk-unmap registry ──────────────────────────────────────────
