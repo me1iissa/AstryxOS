@@ -4358,24 +4358,53 @@ pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
 fn teardown_range_in_parent(parent_pid: Pid, base: u64, length: u64) -> Option<(u64, usize)> {
     // ── Phase 1 (lock) — drop the records, then reserve the range they
     // described, before the lock is released.
-    let (parent_cr3, teardown_slot) = {
+    let (parent_cr3, teardown_slot, had_records) = {
         let mut procs = PROCESS_TABLE.lock();
         let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
         let cr3 = p.cr3;
         if cr3 == 0 {
             return None;
         }
-        let space = p.vm_space.as_mut()?;
-        let _ = space.remove_range(base, length);
-        let slot = crate::mm::vma::teardown_publish(
-            space.cr3, base, base.saturating_add(length),
-        );
-        (cr3, slot)
+        match p.vm_space.as_mut() {
+            Some(space) => {
+                // The cr3 used to publish is the cr3 used to sweep, carried out
+                // together, so the range reserved is provably the range cleared.
+                let sweep_cr3 = space.cr3;
+                let _ = space.remove_range(base, length);
+                let slot = crate::mm::vma::teardown_publish(
+                    sweep_cr3, base, base.saturating_add(length),
+                );
+                (sweep_cr3, slot, true)
+            }
+            // A process with a cr3 but no `VmSpace`.  Returning here would skip
+            // the sweep entirely, leaving the entries present and their frames
+            // never decremented — a leaked writable user mapping plus leaked
+            // frames — where the code this helper replaced swept on `cr3` alone.
+            // So sweep anyway, unreserved: with no records there is nothing to
+            // remove, nothing to go stale, and hence no ordering to preserve and
+            // nothing for a reservation to protect; the entries still have to go.
+            //
+            // Not reachable today — `alloc_vfork_child_stack` needs a `VmSpace`
+            // to create the range at all, and `vm_space.take()` is paired with
+            // `proc.cr3 = 0` under one lock acquisition, so exit cannot produce
+            // `(cr3 != 0, vm_space == None)`.  Handled regardless: the state is
+            // contemplated elsewhere in the tree (`sys_mmap` lazily initialises
+            // exactly it), and the failure mode of guessing wrong is a silent
+            // leak rather than a loud error.
+            None => (cr3, crate::mm::vma::TEARDOWN_NO_SLOT, false),
+        }
     }; // PROCESS_TABLE released here
 
     // ── Phase 2 (lock-free) — clear the entries and release the frames.
+    // The invariant sampled below is about records versus reservation, so it
+    // only means anything when there were records; the no-`VmSpace` sweep above
+    // is unreserved by design and must not be counted as a defect.
     #[cfg(feature = "test-mode")]
-    teardown_gap_observe(parent_pid, parent_cr3, base, length);
+    if had_records {
+        teardown_gap_observe(parent_pid, parent_cr3, base, length);
+    }
+    #[cfg(not(feature = "test-mode"))]
+    let _ = had_records; // only the sampled build reads it
     let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
     crate::mm::vma::teardown_retire(teardown_slot);
 

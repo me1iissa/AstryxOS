@@ -461,6 +461,11 @@ static TEARDOWN_UNRESERVED: AtomicU64 = AtomicU64::new(0);
 /// mmap path — skip the scan entirely in the overwhelmingly common case where
 /// no teardown is in flight, so consulting the table costs one relaxed load.
 static TEARDOWN_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Reservations published since boot.  Monotonic, unlike `TEARDOWN_LIVE`, so a
+/// caller can assert that a teardown path took a reservation at all — which a
+/// live-count check cannot, since a correctly balanced publish/retire pair
+/// leaves the live count exactly as it found it.
+static TEARDOWN_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
 /// Token returned when no reservation slot could be claimed.
 pub const TEARDOWN_NO_SLOT: usize = usize::MAX;
@@ -488,6 +493,7 @@ pub fn teardown_publish(cr3: u64, lo: u64, hi: u64) -> usize {
             // Publish last: a reader that sees the cr3 also sees the bounds.
             TEARDOWN_CR3[i].store(cr3, Ordering::Release);
             TEARDOWN_LIVE.fetch_add(1, Ordering::Release);
+            TEARDOWN_PUBLISHED.fetch_add(1, Ordering::Relaxed);
             return i;
         }
     }
@@ -550,12 +556,50 @@ pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
     lowest
 }
 
+/// Widest extent among in-flight teardowns in `cr3` overlapping `[lo, hi)`.
+///
+/// `teardown_conflict` answers "is this range clear?"; this answers "how much
+/// work is the teardown holding it up?".  A caller that must WAIT for a teardown
+/// needs the second question answered: a page-table sweep costs O(pages), so a
+/// wait budget that does not scale with the range will always expire on a large
+/// enough one, whatever constant it is given.
+pub fn teardown_conflict_extent(cr3: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    if cr3 == 0 || cr3 == u64::MAX || TEARDOWN_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut widest: Option<(u64, u64)> = None;
+    for i in 0..TEARDOWN_SLOTS {
+        if TEARDOWN_CR3[i].load(Ordering::Acquire) != cr3 {
+            continue;
+        }
+        let t_lo = TEARDOWN_LO[i].load(Ordering::Relaxed);
+        let t_hi = TEARDOWN_HI[i].load(Ordering::Relaxed);
+        if lo < t_hi && hi > t_lo {
+            let span = t_hi.saturating_sub(t_lo);
+            widest = match widest {
+                Some((w_lo, w_hi)) if w_hi.saturating_sub(w_lo) >= span => Some((w_lo, w_hi)),
+                _ => Some((t_lo, t_hi)),
+            };
+        }
+    }
+    widest
+}
+
 /// Number of teardowns that ran without a reservation (slot table full).
 ///
 /// Non-zero means the placement window described in `teardown_publish` was
 /// open for that many teardowns.  Surfaced by the `mm-teardown` kdb op.
 pub fn teardown_unreserved_count() -> u64 {
     TEARDOWN_UNRESERVED.load(Ordering::Relaxed)
+}
+
+/// Reservations published since boot (monotonic).
+///
+/// A balanced publish/retire pair leaves `teardown_in_flight_count` unchanged,
+/// so this is the only way to observe that a teardown path reserved its range
+/// rather than running unreserved.
+pub fn teardown_published_count() -> u64 {
+    TEARDOWN_PUBLISHED.load(Ordering::Relaxed)
 }
 
 /// Reservations currently published (claimed slots, including mid-publish).

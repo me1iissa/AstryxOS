@@ -2494,6 +2494,13 @@ pub fn run() -> ! {
     total += 1;
     if test_744_teardown_reservation_blocks_placement() { passed += 1; }
 
+    // ── Test 746: MAP_FIXED does not commit over an in-flight teardown ──
+    // A MAP_FIXED replacement has the same removal→clear gap munmap has, and its
+    // caller names the address, so it can neither be re-picked nor covered by
+    // the placement search.  Drives the real mmap(2) dispatch.
+    total += 1;
+    if test_746_mapfixed_commit_respects_teardown() { passed += 1; }
+
     // ── Test 747: vfork range teardown removes records before clearing PTEs ──
     // The two vfork cleanups ran the phases in the inverse order, leaving a
     // stale record over a range whose entries were being cleared.  Sampled at
@@ -62167,6 +62174,301 @@ fn test_744_teardown_reservation_blocks_placement() -> bool {
             test_fail!(NAME, "placement not restored after retire");
             return false;
         }
+    }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 746: MAP_FIXED must not commit a VMA over an in-flight teardown ─────
+//
+// `mmap(MAP_FIXED)` replaces whatever it overlaps: it removes the overlapping
+// VMA records under the process lock, releases the lock, and only then clears
+// the range's page-table entries.  That is the same two-phase shape `sys_munmap`
+// has, and it admits the same silent loss — a concurrent mapping placed inside
+// the range has its entries wiped by the still-running clear, and the next
+// access is served a fresh zero-filled anonymous frame per mmap(2), so
+// userspace reads back zeroes where it wrote data.
+//
+// The reservation covers the removal→clear gap for that replacement.  The other
+// half is the COMMIT: a `MAP_FIXED` caller names its own address, so unlike a
+// kernel-chosen placement it cannot re-pick when the range it named turns out to
+// be under teardown — and it also bypasses the placement search entirely, so
+// nothing else checks on its behalf.  Its only correct resolutions are to wait
+// for the teardown or to fail.
+//
+// This drives the REAL `mmap(2)` dispatch (syscall 9) rather than the
+// reservation registry alone, and pins four things:
+//
+//   1. a `MAP_FIXED` naming a range under teardown does NOT succeed;
+//   2. once the teardown retires, the same call succeeds at the named base —
+//      so the check withholds the address only while it is genuinely unsafe;
+//   3. a teardown that merely ABUTS the named range does not block it;
+//  3b. `MAP_FIXED_NOREPLACE` fails FAST rather than waiting, and is never
+//      relocated — `is_fixed` is true for it, so it needs its own arm;
+//  3c. a teardown retiring DURING the wait lets the placement through — the
+//      transition the wait loop exists for, which neither (1) (never retires)
+//      nor (2) (retired before the call) can reach;
+//   4. the replacement itself reserves the range it is clearing, and retires it.
+//
+// (1) and (4) fail without the fix: unfixed, the commit path exempts MAP_FIXED
+// from the check, so (1) returns the base instead of ENOMEM, and Phase 2a
+// publishes no reservation at all, so (4) sees no change in the publish count.
+// (3b) fails against a fix that guards on `is_fixed` alone.
+fn test_746_mapfixed_commit_respects_teardown() -> bool {
+    use crate::mm::vma::{
+        teardown_publish, teardown_retire, teardown_conflict, teardown_published_count,
+        teardown_in_flight_count, TEARDOWN_NO_SLOT,
+    };
+    const NAME: &str =
+        "[MM/VMA] MAP_FIXED does not commit over an in-flight teardown (Test 746)";
+    test_header!(NAME);
+
+    // Linux mmap(2) flag bits, as the dispatch below receives them.
+    const MAP_PRIVATE_ANON_FIXED: u64 = 0x02 | 0x20 | 0x10;
+    const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
+    const MAP_FIXED_NOREPLACE: u64 = 0x0010_0000;
+    const PROT_RW: u64 = 0x3;
+    const ENOMEM: i64 = -12;
+    const LEN: u64 = 0x2000; // two pages
+    // Well clear of the mmap downward walk and the stack-ASLR window, so no
+    // incidental runner allocation can land here and turn a real failure into
+    // an accidental pass.
+    const FIXED_VA: u64 = 0x0000_6A00_0000_0000;
+
+    // Force a VmSpace into existence, so this test does not depend on which
+    // earlier test happened to create one (same throwaway-mmap technique as
+    // `test_kernel_static_frame_survives_munmap`).
+    let probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0);
+    if probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+    let pid = crate::proc::current_pid_lockless();
+    let cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|v| v.cr3)
+            .unwrap_or(0)
+    };
+    if cr3 == 0 {
+        test_fail!(NAME, "runner has no VmSpace even after the mmap probe");
+        return false;
+    }
+    // A zero cr3 is the free-slot marker and is exempt from the check by
+    // construction, so a runner carrying one could not exercise this at all.
+    if teardown_conflict(cr3, FIXED_VA, FIXED_VA + LEN).is_some() {
+        test_fail!(NAME, "test range already under teardown before the test starts");
+        return false;
+    }
+
+    // ── 1. A live teardown over the named range must block the commit ────────
+    //
+    // Stands in for a sibling thread whose munmap has removed the records and
+    // is clearing entries.  The placement waits for it and, because nothing
+    // retires the reservation, gives up at its deadline and reports ENOMEM —
+    // the fail-closed outcome.  A wrong SUCCESS here is the silent data loss.
+    // This case deliberately costs the wait budget (~2 s) in wall clock.
+    let slot = teardown_publish(cr3, FIXED_VA, FIXED_VA + LEN);
+    if slot == TEARDOWN_NO_SLOT {
+        test_fail!(NAME, "no reservation slot available");
+        return false;
+    }
+    let blocked = crate::syscall::dispatch_linux_kernel(
+        9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
+    teardown_retire(slot);
+    if blocked != ENOMEM {
+        // Clean up an address the call should not have handed out.
+        if blocked > 0 {
+            let _ = crate::syscall::dispatch_linux_kernel(11, blocked as u64, LEN, 0, 0, 0, 0);
+        }
+        test_fail!(NAME,
+            "MAP_FIXED over an in-flight teardown returned {:#x} (expected ENOMEM {}) — \
+             a VMA was committed inside a range whose entries were still being cleared",
+            blocked, ENOMEM);
+        return false;
+    }
+
+    // ── 2. Retiring the teardown restores the address ───────────────────────
+    //
+    // The check must withhold the range only while it is unsafe; a MAP_FIXED
+    // permanently refused at its own address would be worse than the race.
+    let placed = crate::syscall::dispatch_linux_kernel(
+        9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
+    if placed != FIXED_VA as i64 {
+        test_fail!(NAME,
+            "MAP_FIXED after the teardown retired returned {:#x}, expected the named base {:#x}",
+            placed, FIXED_VA);
+        return false;
+    }
+
+    // ── 3. A merely abutting teardown must not block ─────────────────────────
+    //
+    // The interval is half-open, so a teardown starting exactly where this
+    // mapping ends touches none of its entries.
+    let abut = teardown_publish(cr3, FIXED_VA + LEN, FIXED_VA + 2 * LEN);
+    if abut == TEARDOWN_NO_SLOT {
+        test_fail!(NAME, "no reservation slot for the abutting case");
+        return false;
+    }
+    let placed_abut = crate::syscall::dispatch_linux_kernel(
+        9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
+    teardown_retire(abut);
+    if placed_abut != FIXED_VA as i64 {
+        test_fail!(NAME,
+            "MAP_FIXED blocked by a merely abutting teardown: returned {:#x}, expected {:#x}",
+            placed_abut, FIXED_VA);
+        return false;
+    }
+
+    // ── 3b. MAP_FIXED_NOREPLACE must fail FAST, never wait ──────────────────
+    //
+    // `is_fixed` is true for NOREPLACE, so without its own arm it is swept into
+    // the wait.  Its whole contract per mmap(2) is to report a collision
+    // immediately without destroying anything, and callers probe with it in
+    // retry loops — a multi-second stall would be a liveness regression on the
+    // one flag that exists to avoid waiting.  It must also NOT be relocated,
+    // which is what falling through to the re-pick arm would do.
+    let nr_slot = teardown_publish(cr3, FIXED_VA, FIXED_VA + LEN);
+    if nr_slot == TEARDOWN_NO_SLOT {
+        test_fail!(NAME, "no reservation slot for the NOREPLACE case");
+        return false;
+    }
+    let t0 = crate::sched::total_ticks();
+    let noreplace = crate::syscall::dispatch_linux_kernel(
+        9, FIXED_VA, LEN, PROT_RW,
+        MAP_PRIVATE_ANON | MAP_FIXED_NOREPLACE, u64::MAX, 0);
+    let nr_elapsed = crate::sched::total_ticks().saturating_sub(t0);
+    teardown_retire(nr_slot);
+    if noreplace == FIXED_VA as i64 {
+        test_fail!(NAME,
+            "MAP_FIXED_NOREPLACE placed at {:#x} over an in-flight teardown", FIXED_VA);
+        return false;
+    }
+    if noreplace > 0 {
+        // Relocation is the other way to violate the flag.
+        let _ = crate::syscall::dispatch_linux_kernel(11, noreplace as u64, LEN, 0, 0, 0, 0);
+        test_fail!(NAME,
+            "MAP_FIXED_NOREPLACE was RELOCATED to {:#x} — the flag forbids re-picking",
+            noreplace);
+        return false;
+    }
+    // Fast means fast: a tick or two of scheduling noise is fine, anything near
+    // the wait budget means it took the wait path.
+    if nr_elapsed >= 10 {
+        test_fail!(NAME,
+            "MAP_FIXED_NOREPLACE waited {} ticks for a teardown — it must fail immediately",
+            nr_elapsed);
+        return false;
+    }
+
+    // ── 3c. A teardown retiring DURING the wait lets the placement through ──
+    //
+    // This is the transition the wait loop exists for, and no case above can
+    // reach it: in case 1 the reservation never retires, so the placement always
+    // leaves through the deny path, and in case 2 it had already retired before
+    // the call.  Here a sibling thread retires it part-way into the wait, and
+    // the placement must then succeed at the named base.
+    {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static RETIRE_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static RETIRE_RAN: AtomicBool = AtomicBool::new(false);
+        const RETIRE_AFTER_TICKS: u64 = 20; // well inside the budget floor (200)
+
+        fn retirer_entry() {
+            crate::hal::enable_interrupts();
+            crate::proc::sleep_ticks(RETIRE_AFTER_TICKS);
+            let slot = RETIRE_SLOT.swap(usize::MAX, Ordering::SeqCst);
+            if slot != usize::MAX {
+                crate::mm::vma::teardown_retire(slot);
+            }
+            RETIRE_RAN.store(true, Ordering::SeqCst);
+            crate::proc::exit_thread(0);
+        }
+
+        RETIRE_RAN.store(false, Ordering::SeqCst);
+        let mid = teardown_publish(cr3, FIXED_VA, FIXED_VA + LEN);
+        if mid == TEARDOWN_NO_SLOT {
+            test_fail!(NAME, "no reservation slot for the mid-wait retire case");
+            return false;
+        }
+        RETIRE_SLOT.store(mid, Ordering::SeqCst);
+
+        let was_active = crate::sched::is_active();
+        if !was_active { crate::sched::enable(); }
+        let _ = crate::proc::create_kernel_process(
+            "teardown_retirer", retirer_entry as *const () as u64);
+
+        let waited = crate::syscall::dispatch_linux_kernel(
+            9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
+
+        // Restore the scheduler to the state this case found it in, BEFORE any
+        // early return below.  Leaving it enabled would leak global state into
+        // every subsequent test — the cross-test contamination that makes a
+        // suite non-reproducible — so it must be restored on the failure paths
+        // too, not only the success one.
+        if !was_active { crate::sched::disable(); }
+
+        // Retire defensively in case the worker never ran, so a failure here
+        // cannot strand a reservation for the rest of the boot.
+        let leftover = RETIRE_SLOT.swap(usize::MAX, Ordering::SeqCst);
+        if leftover != usize::MAX {
+            teardown_retire(leftover);
+        }
+
+        if !RETIRE_RAN.load(Ordering::SeqCst) {
+            test_fail!(NAME,
+                "the sibling retirer never ran, so the mid-wait transition was not exercised \
+                 (mmap returned {:#x})", waited);
+            return false;
+        }
+        if waited != FIXED_VA as i64 {
+            test_fail!(NAME,
+                "MAP_FIXED returned {:#x} after its conflicting teardown retired mid-wait, \
+                 expected the named base {:#x} — the wait gave up instead of proceeding",
+                waited, FIXED_VA);
+            return false;
+        }
+    }
+
+    // ── 4. The replacement reserves the range it is clearing ────────────────
+    //
+    // A balanced publish/retire pair leaves the live count exactly as it found
+    // it, so the live count alone cannot tell "reserved and retired" from
+    // "never reserved".  The monotonic publish count can.  The replacement below
+    // also overlaps the mapping case 3c left behind, so it is a teardown that
+    // genuinely tears something down — though the publish is unconditional, so
+    // this case would hold either way.
+    let published_before = teardown_published_count();
+    let in_flight_before = teardown_in_flight_count();
+    let replaced = crate::syscall::dispatch_linux_kernel(
+        9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
+    let published_after = teardown_published_count();
+    let in_flight_after = teardown_in_flight_count();
+
+    // Clean up before reporting, so a failure does not leave the mapping behind.
+    let _ = crate::syscall::dispatch_linux_kernel(11, FIXED_VA, LEN, 0, 0, 0, 0);
+
+    if replaced != FIXED_VA as i64 {
+        test_fail!(NAME, "MAP_FIXED replacement returned {:#x}, expected {:#x}",
+                   replaced, FIXED_VA);
+        return false;
+    }
+    // `>=` rather than `==`: on an SMP leg an unrelated thread may publish in
+    // the same window.  It cannot publish FEWER than the replacement's own.
+    if published_after < published_before + 1 {
+        test_fail!(NAME,
+            "MAP_FIXED replacement published no teardown reservation ({} → {}) — the \
+             removal→clear gap is unreserved and a concurrent mmap can be placed inside it",
+            published_before, published_after);
+        return false;
+    }
+    if in_flight_after != in_flight_before {
+        test_fail!(NAME,
+            "reservation leaked across a MAP_FIXED replacement: in-flight {} → {}",
+            in_flight_before, in_flight_after);
+        return false;
     }
 
     test_pass!(NAME);

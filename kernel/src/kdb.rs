@@ -570,10 +570,13 @@ fn op_mm_teardown(out: &mut String) {
     use core::fmt::Write;
     let _ = write!(
         out,
-        r#"{{"ok":true,"in_flight":{},"slots":{},"unreserved":{}}}"#,
+        r#"{{"ok":true,"in_flight":{},"slots":{},"unreserved":{},"published":{},"fixed_waits":{},"fixed_denied":{}}}"#,
         crate::mm::vma::teardown_in_flight_count(),
         crate::mm::vma::teardown_slot_count(),
         crate::mm::vma::teardown_unreserved_count(),
+        crate::mm::vma::teardown_published_count(),
+        crate::syscall::mmap_fixed_teardown_wait_count(),
+        crate::syscall::mmap_fixed_teardown_denied_count(),
     );
 }
 
