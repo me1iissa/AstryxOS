@@ -55,8 +55,31 @@ jobs:
           -Zbuild-std-features=compiler-builtins-mem
           -Zjson-target-spec
 
-      - name: rustfmt (advisory only — won't fail the build)
-        run: cargo +nightly fmt --all -- --check || true
+      # Advisory only: this step reports formatting drift, but it must never
+      # be able to fail the job.  It needs two independent guards because
+      # they contain different failure modes:
+      #
+      #   * `ulimit -v` bounds the address space rustfmt may claim.  This is
+      #     the load-bearing guard.  A pathological input makes rustfmt ask
+      #     for more memory than the runner has (see rustfmt.toml), and the
+      #     kernel OOM-killer then takes down the step — or the runner agent
+      #     itself, which surfaces as a `cancelled` step that no workflow
+      #     policy can contain, because there is no step left to apply the
+      #     policy to.  That also skipped the fault-immunity gate below,
+      #     since a failed step stops the rest of the job.  Under the limit
+      #     rustfmt fails its own allocation and exits normally instead of
+      #     taking the runner with it.  8 GB leaves 4x headroom — the whole
+      #     workspace formats fine under a 2 GB cap today.
+      #   * `continue-on-error` contains every ordinary non-zero exit: the
+      #     formatting diff itself, and a rustfmt that aborted under the
+      #     limit.  It replaces the previous `|| true` because it still
+      #     surfaces drift as a step annotation instead of silently
+      #     reporting success.
+      - name: rustfmt (advisory only — never fails the build)
+        continue-on-error: true
+        run: |
+          ulimit -v 8000000
+          cargo +nightly fmt --all -- --check
 
       # PR #127 caveat: enforce the fault-immunity contract for
       # `ke::bugcheck` and `util::no_alloc_fmt` — these two files must

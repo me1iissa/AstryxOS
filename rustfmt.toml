@@ -1,0 +1,28 @@
+# rustfmt configuration for AstryxOS.
+#
+# `ignore` is a nightly-only rustfmt option.  CI runs `cargo +nightly fmt`
+# and `rust-toolchain.toml` pins the nightly channel, so it takes effect for
+# every supported invocation.  Under a *stable* toolchain rustfmt warns that
+# it is ignoring the nightly-only option and formats the file anyway — which
+# reproduces exactly the blow-up described below.  Always format with
+# nightly.
+
+ignore = [
+    # kernel/src/test_runner.rs is a single ~62k-line file, and rustfmt's
+    # peak memory is quadratic in per-file size.  Measured on this tree with
+    # rustfmt 1.9.0-nightly (doubling the line count quadruples the peak):
+    #
+    #     14,031 lines ->  0.97 GB      41,084 lines ->  8.09 GB
+    #     29,152 lines ->  4.11 GB      58,818 lines -> 16.51 GB
+    #                                   62,321 lines -> 18.60 GB
+    #
+    # A GitHub-hosted `ubuntu-latest` runner has 16 GB of RAM, so formatting
+    # this file asks the allocator for ~18.9 GB in one request and the
+    # process is OOM-killed.  Skipping this one file takes the peak of a
+    # whole-workspace `cargo fmt --all -- --check` from 18.69 GB to 0.86 GB
+    # while still checking the other 200+ files in the workspace.
+    #
+    # Drop this entry if the file is ever split into per-area modules — the
+    # blow-up is a property of per-file size, not of the code itself.
+    "kernel/src/test_runner.rs",
+]
