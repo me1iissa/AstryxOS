@@ -3809,17 +3809,29 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // The reservation keeps the range continuously accounted for: first by
         // its records, then by its reservation.  See `vma::teardown_publish`.
         //
-        // Reserve only when a record actually overlapped.  The reservation table
-        // is fixed-size (64) and its exhaustion is deliberately FAIL-OPEN — a
-        // teardown that cannot claim a slot runs unreserved, reopening the very
-        // window the table exists to close.  MAP_FIXED is high-frequency and its
-        // commonest use, a loader laying PT_LOAD segments into a fresh region,
-        // overlaps nothing at all; reserving for those would spend slots on
-        // teardowns that tear nothing down and raise the rate at which
-        // `sys_munmap` loses its reservation.  When nothing overlapped this call
-        // removes no record, so any entry its sweep still finds belongs to some
-        // other agent — and if that agent is a teardown, it holds its own
-        // reservation for the range.
+        // The publish is UNCONDITIONAL, and that is deliberate — do not "save" a
+        // slot by gating it on whether a record actually overlapped.  It looks
+        // free, because the commonest MAP_FIXED (a loader laying a PT_LOAD
+        // segment into a fresh region) overlaps nothing, and it is wrong.
+        //
+        // The hazard is not the entries already present when the sweep starts;
+        // it is the entries created DURING it.  Phase 2b walks every page of the
+        // range whether or not anything was mapped — `unmap_and_free_range_in`
+        // has no empty-range short circuit — so with nothing published a
+        // concurrent KERNEL-CHOSEN mmap reads the range as free, is placed
+        // inside it, inserts its VMA and demand-faults a page to refcount 1, and
+        // the sweep still in flight then reaches that page, decrements it to 0
+        // and returns the frame to the allocator underneath a live mapping.
+        // That this MAP_FIXED would evict the intruder in Phase 3 does not
+        // rescue it: a kernel-chosen placement must never be HANDED a range an
+        // in-flight teardown is claiming.
+        //
+        // Slot pressure is not a reason to gate it either.  A slot is held only
+        // across a sweep and never across a block or a yield, so live
+        // reservations are bounded by the number of threads simultaneously
+        // INSIDE a sweep — concurrency, not call frequency.  If occupancy is
+        // ever in question, read `teardown_in_flight_count` through the
+        // `mm-teardown` kdb op rather than trading the window away for it.
         //
         // Publish and sweep are bound to ONE cr3, carried out of the lock
         // together, so the range reserved is provably the range cleared even if
@@ -3831,14 +3843,10 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
                 if let Some(space) = proc.vm_space.as_mut() {
                     sweep_cr3 = space.cr3;
-                    let end = base.saturating_add(length);
-                    let overlapped = space.areas.iter().any(|v| {
-                        v.base < end && v.base.saturating_add(v.length) > base
-                    });
                     let _ = space.remove_range(base, length);
-                    if overlapped {
-                        slot = crate::mm::vma::teardown_publish(sweep_cr3, base, end);
-                    }
+                    slot = crate::mm::vma::teardown_publish(
+                        sweep_cr3, base, base.saturating_add(length),
+                    );
                 }
             }
             (slot, sweep_cr3)

@@ -62403,6 +62403,13 @@ fn test_746_mapfixed_commit_respects_teardown() -> bool {
         let waited = crate::syscall::dispatch_linux_kernel(
             9, FIXED_VA, LEN, PROT_RW, MAP_PRIVATE_ANON_FIXED, u64::MAX, 0);
 
+        // Restore the scheduler to the state this case found it in, BEFORE any
+        // early return below.  Leaving it enabled would leak global state into
+        // every subsequent test — the cross-test contamination that makes a
+        // suite non-reproducible — so it must be restored on the failure paths
+        // too, not only the success one.
+        if !was_active { crate::sched::disable(); }
+
         // Retire defensively in case the worker never ran, so a failure here
         // cannot strand a reservation for the rest of the boot.
         let leftover = RETIRE_SLOT.swap(usize::MAX, Ordering::SeqCst);
@@ -62430,8 +62437,9 @@ fn test_746_mapfixed_commit_respects_teardown() -> bool {
     // A balanced publish/retire pair leaves the live count exactly as it found
     // it, so the live count alone cannot tell "reserved and retired" from
     // "never reserved".  The monotonic publish count can.  The replacement below
-    // overlaps the mapping case 3c left behind, so it genuinely tears something
-    // down — the publish is gated on an overlap having occurred.
+    // also overlaps the mapping case 3c left behind, so it is a teardown that
+    // genuinely tears something down — though the publish is unconditional, so
+    // this case would hold either way.
     let published_before = teardown_published_count();
     let in_flight_before = teardown_in_flight_count();
     let replaced = crate::syscall::dispatch_linux_kernel(
