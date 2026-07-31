@@ -67,6 +67,40 @@ pub fn sys_mmap_shared_write_filebacked_count() -> u64 {
     SYS_MMAP_SHARED_WRITE_FILEBACKED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// How long a `MAP_FIXED` placement may wait for a teardown covering the
+/// address the caller named, before it gives up and returns ENOMEM.
+///
+/// A tick budget rather than a spin count: what is being waited for is a
+/// page-table sweep, whose duration is set by the size of the range being
+/// cleared, not by how often this thread manages to get scheduled.  Sweeps of
+/// the largest ranges this tree produces run a few hundred milliseconds, so two
+/// seconds is generous by an order of magnitude — deliberately, because failing
+/// a `MAP_FIXED` is disruptive to a caller with no alternative address (a
+/// dynamic loader placing a `PT_LOAD` segment, say), and a teardown still in
+/// flight after two seconds is not one this wait is going to outlast.
+///
+/// `TICK_HZ` is 100, so this is 2 s.
+const MMAP_FIXED_TEARDOWN_WAIT_TICKS: u64 = 200;
+
+/// `MAP_FIXED` placements that waited at least one round for a teardown.
+static MMAP_FIXED_TEARDOWN_WAITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// `MAP_FIXED` placements refused with ENOMEM because the wait budget was spent.
+/// Non-zero means a teardown outlived `MMAP_FIXED_TEARDOWN_WAIT_TICKS`, which
+/// should not happen and is worth seeing.
+static MMAP_FIXED_TEARDOWN_DENIED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Rounds spent waiting for a teardown across all `MAP_FIXED` placements.
+pub fn mmap_fixed_teardown_wait_count() -> u64 {
+    MMAP_FIXED_TEARDOWN_WAITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `MAP_FIXED` placements refused because a teardown outlived the wait bound.
+pub fn mmap_fixed_teardown_denied_count() -> u64 {
+    MMAP_FIXED_TEARDOWN_DENIED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // User pointer validation
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3744,14 +3778,33 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // Non-MAP_FIXED skips Phases 2a/2b entirely — there is nothing to
     // clear.
     if is_fixed && !is_noreplace {
-        // Phase 2a — remove the overlapping VMA records under PROCESS_TABLE.
-        let mut procs = crate::proc::PROCESS_TABLE.lock();
-        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
-            if let Some(space) = proc.vm_space.as_mut() {
-                let _ = space.remove_range(base, length);
+        // Phase 2a — remove the overlapping VMA records under PROCESS_TABLE,
+        // and reserve the range before the lock is released.
+        //
+        // Between the record removal and the entry clear below, nothing
+        // describes these addresses.  That is the same gap `sys_munmap` has,
+        // and it admits the same loss: address placement consults the VMA list
+        // alone, so a concurrent mmap in this address space is handed a base
+        // inside the range, faults pages in, and the clear below wipes them.
+        // Nothing reports an error — a later access to an anonymous page is
+        // served with a fresh zero-filled frame, as mmap(2) specifies for
+        // MAP_ANONYMOUS — so userspace reads back zeroes where it wrote data.
+        //
+        // The reservation keeps the range continuously accounted for: first by
+        // its records, then by its reservation.  See `vma::teardown_publish`.
+        let teardown_slot = {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            let mut slot = crate::mm::vma::TEARDOWN_NO_SLOT;
+            if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                if let Some(space) = proc.vm_space.as_mut() {
+                    let _ = space.remove_range(base, length);
+                    slot = crate::mm::vma::teardown_publish(
+                        space.cr3, base, base.saturating_add(length),
+                    );
+                }
             }
-        }
-        drop(procs);
+            slot
+        }; // PROCESS_TABLE released here
 
         // Phase 2b — clear the PTEs and release the backing frames without
         // holding PROCESS_TABLE.  unmap_and_free_range_in serialises on
@@ -3759,6 +3812,10 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // proc <pid> queries can still progress (they use try_lock_brief
         // — see kdb.rs).
         crate::mm::vmm::unmap_and_free_range_in(cr3, base, length);
+        // The entries are clear: the range is genuinely free and may be placed.
+        // This retires before Phase 3 runs, so this call's own reservation can
+        // never be the conflict Phase 3 observes.
+        crate::mm::vma::teardown_retire(teardown_slot);
     }
 
     // The VMA record is constructed inside Phase 3 (below) rather than here:
@@ -3817,10 +3874,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     //     deadlock class closed on the #PF path.  MAP_FIXED_NOREPLACE is
     //     excluded: its overlap is a genuine caller error, not a race to evict.
     let result = 'phase3: {
-        enum Step { Done(Option<u64>), Evict }
+        enum Step { Done(Option<u64>), Evict(usize), AwaitTeardown }
 
         let mut cur_base = base;
         let mut fixed_evict_attempts = 0u32;
+        // Set on the first wait, so the budget covers the whole placement rather
+        // than restarting on every round.
+        let mut fixed_teardown_deadline: Option<u64> = None;
 
         let installed: Option<u64> = 'evict: loop {
             // Re-acquire PROCESS_TABLE each `'evict` iteration so a MAP_FIXED
@@ -3851,9 +3911,24 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                     // because a reservation is published under the same lock
                     // this phase holds.
                     //
-                    // MAP_FIXED is excluded deliberately: the caller named the
-                    // address, so there is nowhere else to put it.  Re-picking
-                    // is only meaningful for a kernel-chosen placement.
+                    // MAP_FIXED cannot re-pick — the caller named the address,
+                    // so there is nowhere else to put it — but it must not be
+                    // exempt from the check either: committing a VMA over a
+                    // range whose entries are still being cleared produces
+                    // exactly the silent loss this reservation exists to
+                    // prevent, and MAP_FIXED reaches that outcome by a shorter
+                    // route than a kernel-chosen base, since it also bypasses
+                    // the Phase-1 placement search entirely.  Its two available
+                    // resolutions are to WAIT for the teardown or to FAIL; it
+                    // waits, off the lock, and fails closed if the wait is
+                    // spent.  See the `AwaitTeardown` arm below.
+                    if is_fixed
+                        && crate::mm::vma::teardown_conflict(
+                            space.cr3, cur_base, cur_base.saturating_add(length),
+                        ).is_some()
+                    {
+                        break Step::AwaitTeardown;
+                    }
                     if !is_fixed
                         && crate::mm::vma::teardown_conflict(
                             space.cr3, cur_base, cur_base.saturating_add(length),
@@ -3927,8 +4002,14 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                             // MAP_FIXED must evict the raced overlap.  Remove the
                             // VMA record now (under the lock); the PTE clear +
                             // cross-CPU shootdown runs lock-free after we drop it.
+                            // Reserve the range across that gap for the same
+                            // reason Phase 2a does — this eviction has the same
+                            // shape and admits the same loss without it.
                             let _ = space.remove_range(cur_base, length);
-                            break Step::Evict;
+                            let slot = crate::mm::vma::teardown_publish(
+                                space.cr3, cur_base, cur_base.saturating_add(length),
+                            );
+                            break Step::Evict(slot);
                         }
                         Err(_) => break Step::Done(None),
                     }
@@ -3937,11 +4018,51 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
 
             match step {
                 Step::Done(r) => break 'evict r,
-                Step::Evict => {
+                Step::AwaitTeardown => {
+                    // A sibling teardown covers the address this MAP_FIXED
+                    // named.  Wait for it: once the reservation retires its
+                    // entry clear is complete, so a VMA committed afterwards
+                    // cannot have its entries swept by it.  The wait happens
+                    // HERE, with PROCESS_TABLE released — waiting under the
+                    // lock would block the shootdown the teardown is running,
+                    // which is the lock-across-shootdown deadlock this two-phase
+                    // structure exists to avoid.
+                    //
+                    // Bounded, and fails CLOSED when the bound is spent: an
+                    // mmap that reports success at an address being cleared is
+                    // silent data loss, while ENOMEM is a documented mmap(2)
+                    // failure the caller can see and act on.  Exhaustion needs a
+                    // teardown to outlive the whole wait, so it is reported.
+                    MMAP_FIXED_TEARDOWN_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let now = crate::sched::total_ticks();
+                    let deadline = *fixed_teardown_deadline
+                        .get_or_insert(now.saturating_add(MMAP_FIXED_TEARDOWN_WAIT_TICKS));
+                    if now >= deadline {
+                        MMAP_FIXED_TEARDOWN_DENIED
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::serial_println!(
+                            "[MMAP] pid={} MAP_FIXED at base={:#x} len={:#x} denied: a teardown of \
+                             this range was still in flight after {} ticks — returning ENOMEM \
+                             rather than placing inside it",
+                            pid, cur_base, length, MMAP_FIXED_TEARDOWN_WAIT_TICKS,
+                        );
+                        break 'evict None;
+                    }
+                    // Yield first so a teardown on this CPU can make progress;
+                    // `spin_loop` rather than `hlt` because this wait is
+                    // deadline-bounded and must keep re-checking (a bare `hlt`
+                    // here would park the thread on a wake that never comes —
+                    // the reservation retires without signalling anyone).
+                    crate::sched::yield_cpu();
+                    core::hint::spin_loop();
+                    continue 'evict; // re-acquire the lock, re-check at the same base
+                }
+                Step::Evict(teardown_slot) => {
                     // Lock-free, mirroring Phase 2b: `unmap_and_free_range_in`
                     // performs its own cross-CPU shootdown + mm_sem — no lock is
                     // held across it.
                     crate::mm::vmm::unmap_and_free_range_in(cr3, cur_base, length);
+                    crate::mm::vma::teardown_retire(teardown_slot);
                     fixed_evict_attempts += 1;
                     // Rare event (a MAP_FIXED that lost the Phase-2a→Phase-3 race
                     // to a sibling and had to re-evict): log unconditionally, same
