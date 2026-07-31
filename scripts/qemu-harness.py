@@ -4872,6 +4872,10 @@ def cmd_list(args):
                 # flag for boots heading toward a reap.
                 "terminal_cause":     stored_terminal,
                 "livelock_suspected": bool(sess.get("livelock_suspected", False)),
+                # Non-null when the guest has halted (bugcheck/panic) even
+                # though QEMU is still alive — lets a boot-series driver spot a
+                # dead VM holding a slot without a per-session `status` call.
+                "guest_halted_cause": _guest_halted_cause(sess.get("serial_log", "")),
             })
         except (json.JSONDecodeError, KeyError):
             pass
@@ -5086,6 +5090,49 @@ def cmd_tail(args):
         "total_lines": total_lines,
         "returned":    len(result),
     })
+
+
+def _guest_halted_cause(serial_log: str):
+    """
+    Classify whether the GUEST has stopped for good, independently of whether
+    the QEMU process is still alive.
+
+    A kernel bugcheck prints its banner and halts the machine; QEMU keeps
+    running, so `_pid_alive` stays true and `_classify_exit_cause` short-
+    circuits to "running" without ever reading the log.  A session in that
+    state looks healthy indefinitely while making no progress, and holds a
+    QEMU slot until something outside the harness notices.  Measured on the
+    GUI SMP=2 Firefox axis, roughly a third of boots end this way, so an
+    un-reaped bugcheck is the dominant throughput loss on a boot series.
+
+    Returns a short cause string, or None when the guest shows no terminal
+    marker.  Purely observational: nothing here stops or reaps a session, and
+    `running` keeps meaning exactly "the QEMU process is alive", so no existing
+    caller changes behaviour.
+    """
+    try:
+        with Path(serial_log).open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 256 * 1024), 0)
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    m = re.search(r"BUGCHECK\s+0x([0-9a-fA-F]+)", tail)
+    if m:
+        return f"bugcheck:0x{m.group(1).lower()}"
+    # The banner prints its code on a separate line ("Code: 0xdead0004
+    # (SCHEDULER_DEADLOCK)"), so match the banner too — that form carries no
+    # "BUGCHECK 0x…" for the pattern above to find.
+    if re.search(r"\*\*\*\s*AETHER KERNEL BUGCHECK\s*\*\*\*", tail):
+        m2 = re.search(r"Code:\s+0x([0-9a-fA-F]+)", tail)
+        return f"bugcheck:0x{m2.group(1).lower()}" if m2 else "bugcheck"
+    if re.search(r"SCHEDULER_DEADLOCK", tail):
+        return "scheduler_deadlock"
+    if re.search(r"PANIC:|panicked at", tail):
+        return "panic"
+    return None
 
 
 def _classify_exit_cause(serial_log: str, running: bool) -> str:
@@ -5909,10 +5956,23 @@ def cmd_status(args):
 
     exit_cause = _classify_exit_cause(sess["serial_log"], alive)
 
+    # A bugcheck halts the guest but leaves QEMU running, so `alive` stays true
+    # and `exit_cause` short-circuits to "running".  Classify the guest
+    # separately: `guest_halted_cause` is non-null exactly when the guest has
+    # stopped for good, whether or not the process outlives it.  Additive —
+    # `running` and `exit_cause` keep their existing meanings, so a caller that
+    # ignores this field behaves as before, while a boot-series driver can use
+    # it to reap a dead VM that would otherwise hold a slot indefinitely.
+    guest_halted_cause = _guest_halted_cause(sess["serial_log"])
+
     # Livelock auto-reap: a stored `terminal_cause` (set by the watcher when it
     # reaped this session) is authoritative over the live-classified exit_cause.
     stored_terminal = sess.get("terminal_cause")
-    terminal_cause = stored_terminal or (None if alive else exit_cause)
+    terminal_cause = (
+        stored_terminal
+        or (None if alive else exit_cause)
+        or guest_halted_cause
+    )
 
     # Host-side capture.  Report path + whether QEMU has started writing frames
     # (file present + byte size), plus the decision metadata.  pcap_path is ""
@@ -5942,6 +6002,11 @@ def cmd_status(args):
         # reaped a spinning boot, else the classified exit cause once dead,
         # else None while still running.  Additive — never renames exit_cause.
         "terminal_cause":  terminal_cause,
+        # Non-null exactly when the GUEST has stopped for good — a bugcheck
+        # halts the machine but leaves QEMU alive, so `running` alone cannot
+        # distinguish a wedged-but-dead VM from a healthy one.  Check this
+        # before concluding a silent serial means "paused" or "still working".
+        "guest_halted_cause": guest_halted_cause,
         # Live early-warning flag: True when the boot is churning pid=1
         # syscalls past the reap threshold with the deepest gate frozen, but
         # the wall-clock window has not yet elapsed (a reap is "coming").
