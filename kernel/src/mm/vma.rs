@@ -556,6 +556,35 @@ pub fn teardown_conflict(cr3: u64, lo: u64, hi: u64) -> Option<u64> {
     lowest
 }
 
+/// Widest extent among in-flight teardowns in `cr3` overlapping `[lo, hi)`.
+///
+/// `teardown_conflict` answers "is this range clear?"; this answers "how much
+/// work is the teardown holding it up?".  A caller that must WAIT for a teardown
+/// needs the second question answered: a page-table sweep costs O(pages), so a
+/// wait budget that does not scale with the range will always expire on a large
+/// enough one, whatever constant it is given.
+pub fn teardown_conflict_extent(cr3: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    if cr3 == 0 || cr3 == u64::MAX || TEARDOWN_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut widest: Option<(u64, u64)> = None;
+    for i in 0..TEARDOWN_SLOTS {
+        if TEARDOWN_CR3[i].load(Ordering::Acquire) != cr3 {
+            continue;
+        }
+        let t_lo = TEARDOWN_LO[i].load(Ordering::Relaxed);
+        let t_hi = TEARDOWN_HI[i].load(Ordering::Relaxed);
+        if lo < t_hi && hi > t_lo {
+            let span = t_hi.saturating_sub(t_lo);
+            widest = match widest {
+                Some((w_lo, w_hi)) if w_hi.saturating_sub(w_lo) >= span => Some((w_lo, w_hi)),
+                _ => Some((t_lo, t_hi)),
+            };
+        }
+    }
+    widest
+}
+
 /// Number of teardowns that ran without a reservation (slot table full).
 ///
 /// Non-zero means the placement window described in `teardown_publish` was
