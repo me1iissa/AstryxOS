@@ -2494,6 +2494,13 @@ pub fn run() -> ! {
     total += 1;
     if test_744_teardown_reservation_blocks_placement() { passed += 1; }
 
+    // ── Test 747: vfork range teardown removes records before clearing PTEs ──
+    // The two vfork cleanups ran the phases in the inverse order, leaving a
+    // stale record over a range whose entries were being cleared.  Sampled at
+    // the clear point, which is the only moment the two orders differ.
+    total += 1;
+    if test_747_vfork_cleanup_removes_records_before_clearing() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -62160,6 +62167,153 @@ fn test_744_teardown_reservation_blocks_placement() -> bool {
             test_fail!(NAME, "placement not restored after retire");
             return false;
         }
+    }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 747: the vfork range teardown removes records BEFORE clearing PTEs ──
+//
+// `vfork_isolated_stack_cleanup` and `vfork_isolated_tls_cleanup` tear down a
+// range from the PARENT's live address space.  They used to run the two phases
+// in the inverse order — clear the page-table entries first, remove the VMA
+// record second — which leaves a window where a stale record describes a range
+// whose entries are being cleared.  A concurrent demand fault on another CPU
+// finds that record, allocates a frame and installs an entry, and the in-flight
+// clear wipes it; because a later access to an anonymous page is served with a
+// fresh zero-filled frame (mmap(2), MAP_ANONYMOUS) the loss is silent.
+//
+// Both now route through the shared `remove_range` → reserve → clear → retire
+// sequence, matching `sys_munmap`.
+//
+// Asserting only on the END state would not pin the order: both orders finish
+// with no record and no entry.  What distinguishes them is the state at the
+// moment the entries are cleared, so the teardown samples exactly that under
+// `test-mode` and counts violations; this test asserts the count does not move.
+// Under the inverse order it moves by one per cleanup, so this case is red on
+// the unfixed ordering rather than merely on an end state both orders reach.
+fn test_747_vfork_cleanup_removes_records_before_clearing() -> bool {
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+    use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_NO_EXECUTE};
+    const NAME: &str =
+        "[PROC/VFORK] range teardown drops records before clearing entries (Test 747)";
+    test_header!(NAME);
+
+    const PROT_RW: u64 = 0x3;
+    const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
+    const LEN: u64 = 0x1000;
+    // Clear of the mmap downward walk and the stack-ASLR window.
+    const TEST_VA: u64 = 0x0000_6B00_0000_0000;
+
+    // Force a VmSpace into existence so this does not depend on test ordering.
+    let probe = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x1000, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0);
+    if probe > 0 {
+        let _ = crate::syscall::dispatch_linux_kernel(11, probe as u64, 0x1000, 0, 0, 0, 0);
+    }
+    let pid = crate::proc::current_pid_lockless();
+    let cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|v| v.cr3)
+            .unwrap_or(0)
+    };
+    if cr3 == 0 {
+        test_fail!(NAME, "runner has no VmSpace even after the mmap probe");
+        return false;
+    }
+
+    // Build the same shape the vfork helpers leave behind: an anonymous VMA
+    // with a backed, refcounted page inside it.
+    let frame = match crate::mm::pmm::alloc_page() {
+        Some(f) => f,
+        None => { test_fail!(NAME, "no free frame for the test mapping"); return false; }
+    };
+    if !crate::mm::vmm::map_page_in(
+        cr3, TEST_VA, frame,
+        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE)
+    {
+        crate::mm::pmm::free_page(frame);
+        test_fail!(NAME, "map_page_in failed for the test mapping");
+        return false;
+    }
+    crate::mm::refcount::page_ref_inc(frame);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(vs) = p.vm_space.as_mut() {
+                let _ = vs.insert_vma(VmArea {
+                    base: TEST_VA, length: LEN,
+                    prot: PROT_READ | PROT_WRITE,
+                    flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                    backing: VmBacking::Anonymous,
+                    name: "[vfork-stack]",
+                });
+            }
+        }
+    }
+
+    let stale_before = crate::proc::teardown_stale_record_count();
+    let unaccounted_before = crate::proc::teardown_unaccounted_count();
+    let unreserved_before = crate::mm::vma::teardown_unreserved_count();
+    let in_flight_before = crate::mm::vma::teardown_in_flight_count();
+
+    // The real cleanup entry point, on a real address space.
+    crate::proc::vfork_isolated_stack_cleanup(pid, TEST_VA, LEN);
+
+    let stale_after = crate::proc::teardown_stale_record_count();
+    let unaccounted_after = crate::proc::teardown_unaccounted_count();
+    let unreserved_after = crate::mm::vma::teardown_unreserved_count();
+    let in_flight_after = crate::mm::vma::teardown_in_flight_count();
+    let record_after = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|v| v.find_vma(TEST_VA).is_some())
+            .unwrap_or(false)
+    };
+    let pte_after = crate::mm::vmm::read_pte(cr3, TEST_VA);
+
+    // ── The ordering invariant ───────────────────────────────────────────────
+    if stale_after != stale_before {
+        test_fail!(NAME,
+            "a record still described {:#x} when its entries were about to be cleared \
+             (stale-record {} → {}) — the phases ran in the inverse order, so a concurrent \
+             fault could install an entry the clear then wipes",
+            TEST_VA, stale_before, stale_after);
+        return false;
+    }
+
+    // ── The gap between the phases is reserved ───────────────────────────────
+    //
+    // Only meaningful if a slot was actually available; slot exhaustion is a
+    // legitimate (and separately counted) reason for the range to be
+    // unaccounted for, and must not be reported as an ordering defect.
+    if unaccounted_after != unaccounted_before && unreserved_after == unreserved_before {
+        test_fail!(NAME,
+            "the range described {:#x} was accounted for by neither a record nor a \
+             reservation when its entries were cleared (unaccounted {} → {}) — placement \
+             can hand it to a concurrent mmap mid-clear",
+            TEST_VA, unaccounted_before, unaccounted_after);
+        return false;
+    }
+    if in_flight_after != in_flight_before {
+        test_fail!(NAME, "reservation leaked across the teardown: in-flight {} → {}",
+                   in_flight_before, in_flight_after);
+        return false;
+    }
+
+    // ── And the teardown still does its job ──────────────────────────────────
+    if record_after {
+        test_fail!(NAME, "VMA record for {:#x} survived the cleanup", TEST_VA);
+        return false;
+    }
+    if pte_after & PAGE_PRESENT != 0 {
+        test_fail!(NAME, "page-table entry for {:#x} still present after cleanup ({:#x})",
+                   TEST_VA, pte_after);
+        return false;
     }
 
     test_pass!(NAME);
