@@ -3922,18 +3922,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                     // resolutions are to WAIT for the teardown or to FAIL; it
                     // waits, off the lock, and fails closed if the wait is
                     // spent.  See the `AwaitTeardown` arm below.
-                    if is_fixed
-                        && crate::mm::vma::teardown_conflict(
-                            space.cr3, cur_base, cur_base.saturating_add(length),
-                        ).is_some()
-                    {
+                    let under_teardown = crate::mm::vma::teardown_conflict(
+                        space.cr3, cur_base, cur_base.saturating_add(length),
+                    ).is_some();
+                    if under_teardown && is_fixed {
                         break Step::AwaitTeardown;
                     }
-                    if !is_fixed
-                        && crate::mm::vma::teardown_conflict(
-                            space.cr3, cur_base, cur_base.saturating_add(length),
-                        ).is_some()
-                    {
+                    if under_teardown {
                         // Out of re-picks with a conflict still standing: fail
                         // here, do NOT fall through to the insert.  The bound
                         // must be tested inside the branch rather than as part
