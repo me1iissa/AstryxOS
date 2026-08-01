@@ -238,6 +238,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_blocking_write_semantics() { passed += 1; }
 
+    // ── Test 0a2b: suspended spawn stays unscheduled until unblock_process ─
+    total += 1;
+    if test_suspended_process_not_runnable_until_unblocked() { passed += 1; }
+
     // ── Test 0a3: inline console-drain-on-park (FF first-paint wedge) ────
     #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     {
@@ -41895,9 +41899,20 @@ fn test_pipe_blocking_write_semantics() -> bool {
 
     W5_A_DONE.store(0, Ordering::SeqCst);
     W5_B_DONE.store(0, Ordering::SeqCst);
-    let wa_pid = crate::proc::create_kernel_process(
+    // Reserve each writer's process and install + publish its write-end fd
+    // BEFORE the thread that reads it exists.  `create_kernel_process` makes
+    // the new thread immediately runnable, so spawning first and publishing
+    // afterwards lets a writer that wins the race observe the statics' initial
+    // 0 — which is not "no fd" but the pre-populated console stdin (fd 0/1/2
+    // are stdin/stdout/stderr on every kernel process).  A `write(2)` there is
+    // an fd not open for writing, so POSIX returns EBADF and the writer exits
+    // silently without ever depositing its record; the drain loop below then
+    // has nothing to read and no writer left to produce.  Creating the process
+    // suspended, installing the fd, publishing it, and only then releasing the
+    // thread removes the window entirely.
+    let wa_pid = crate::proc::create_kernel_process_suspended(
         "pipe_writer_a", writer_a_entry as *const () as u64);
-    let wb_pid = crate::proc::create_kernel_process(
+    let wb_pid = crate::proc::create_kernel_process_suspended(
         "pipe_writer_b", writer_b_entry as *const () as u64);
     let wa_fd = install_pipe_write_fd(wa_pid, pipe_id5);
     let wb_fd = install_pipe_write_fd(wb_pid, pipe_id5);
@@ -41909,6 +41924,8 @@ fn test_pipe_blocking_write_semantics() -> bool {
     }
     W5_A_WFD.store(wa_fd as u64, Ordering::SeqCst);
     W5_B_WFD.store(wb_fd as u64, Ordering::SeqCst);
+    crate::proc::unblock_process(wa_pid);
+    crate::proc::unblock_process(wb_pid);
 
     // Let both writers attempt their writes before the reader drains, to
     // maximise the interleave window the old separate-lock code would lose on.
@@ -41923,9 +41940,23 @@ fn test_pipe_blocking_write_semantics() -> bool {
     let mut stream: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 * REC);
     let mut chunk5 = [0u8; 256];
     let mut spins = 0u32;
+    // `rfd5` is a BLOCKING read end and this thread holds `wfd5` open itself,
+    // so a `read(2)` issued on an empty pipe parks indefinitely and never
+    // returns — per pipe(7) the write end is still open, so there is no EOF to
+    // observe.  The bounded give-up below (and its `spins` budget) lives on the
+    // no-data path, so it is only reachable if we decline to issue that
+    // blocking read in the first place.  Probe for buffered bytes first: any
+    // future defect that leaves a writer unable to produce then fails this
+    // sub-test with a diagnosis instead of wedging the whole suite.  Reads
+    // still go through the real `read(2)` whenever data is present, preserving
+    // the drain -> `wake_writers_all` edge this sub-test exercises.
     while stream.len() < 2 * REC && spins < 4096 {
-        let rn = crate::syscall::dispatch_linux_kernel(
-            0 /*read*/, rfd5, chunk5.as_mut_ptr() as u64, chunk5.len() as u64, 0, 0, 0);
+        let rn = if crate::ipc::pipe::pipe_has_data(pipe_id5) {
+            crate::syscall::dispatch_linux_kernel(
+                0 /*read*/, rfd5, chunk5.as_mut_ptr() as u64, chunk5.len() as u64, 0, 0, 0)
+        } else {
+            0
+        };
         if rn > 0 {
             stream.extend_from_slice(&chunk5[..rn as usize]);
         } else {
@@ -41984,6 +42015,76 @@ fn test_pipe_blocking_write_semantics() -> bool {
     test_println!("  concurrent two-writer atomicity: 2 contiguous {}B records, no interleave ✓", REC);
 
     test_pass!("pipe blocking write — capacity / atomic-park / concurrent-atomicity / EAGAIN / EPIPE / reader-wakes-writer");
+    true
+}
+
+// ── Test: a suspended kernel process stays unscheduled until unblock_process ─
+//
+// Regression gate for the `pipe_atomic_park_drain` suite wedge.  That wedge was
+// a use-before-publish race: a worker thread was spawned Ready and then handed
+// its pipe fd, so a worker that won the race read the fd static's initial 0.
+// fd 0 is the pre-populated console stdin on every kernel process, and a
+// `write(2)` to an fd not open for writing is EBADF (POSIX.1-2017 write(2)) —
+// so the worker exited silently without producing, and the reader parked
+// forever on a pipe whose write end it held open itself (pipe(7): no EOF while
+// a write end is open).
+//
+// The fix creates such workers with `create_kernel_process_suspended` and
+// releases them with `unblock_process` only after their fds are installed and
+// published.  That is load-bearing: if a suspended spawn ever became
+// immediately runnable the race would silently return, and its symptom is a
+// whole-suite hang rather than a failing case — invisible to CI.  This test
+// pins the invariant directly, and fails (rather than hangs) if it breaks.
+fn test_suspended_process_not_runnable_until_unblocked() -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    fn probe_entry() {
+        RAN.store(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    RAN.store(0, Ordering::SeqCst);
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    let pid = crate::proc::create_kernel_process_suspended(
+        "suspended_probe", probe_entry as *const () as u64);
+
+    // Give the scheduler ample opportunity to run the probe.  A correctly
+    // suspended thread is Blocked, so no amount of yielding may run it.
+    for _ in 0..256u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    let ran_while_suspended = RAN.load(Ordering::SeqCst);
+
+    crate::proc::unblock_process(pid);
+    let mut ran_after_unblock = 0u32;
+    for _ in 0..4096u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        ran_after_unblock = RAN.load(Ordering::SeqCst);
+        if ran_after_unblock == 1 { break; }
+    }
+    if !was_active { crate::sched::disable(); }
+
+    if ran_while_suspended != 0 {
+        test_fail!("suspended_process_gate",
+            "create_kernel_process_suspended thread RAN before unblock_process — \
+             a spawn-then-publish setup race is reachable again (this is the \
+             pipe_atomic_park_drain suite-wedge class)");
+        return false;
+    }
+    if ran_after_unblock != 1 {
+        test_fail!("suspended_process_gate",
+            "suspended thread never ran after unblock_process (thread stuck Blocked)");
+        return false;
+    }
+    test_println!("  suspended spawn stayed unscheduled, then ran after unblock_process ✓");
+
+    test_pass!("suspended kernel process is not runnable until unblock_process");
     true
 }
 
