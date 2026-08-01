@@ -1436,6 +1436,7 @@ fn revalidate_file_vma_generation(
     vma_base: u64,
     vma_end: u64,
 ) -> Option<u64> {
+    let _pt_mark = crate::proc::mark_process_table_held();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let vs = procs.iter()
         .find(|p| p.pid == target_pid)
@@ -1527,6 +1528,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
         // IF=0 fault-entry acquire: drain incoming shootdowns while spinning so
         // a peer `clone_for_fork` holding PROCESS_TABLE across its CoW shootdown
         // cannot deadlock against us (see `proc::lock_process_table_draining`).
+        let _pt_mark = crate::proc::mark_process_table_held();
         let procs = crate::proc::lock_process_table_draining();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -1541,6 +1543,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
     let target_pid = {
         // IF=0 fault-entry acquire — drain incoming shootdowns while spinning
         // (see the acquire above and `proc::lock_process_table_draining`).
+        let _pt_mark = crate::proc::mark_process_table_held();
         let procs = crate::proc::lock_process_table_draining();
         let has_vma = procs.iter().find(|p| p.pid == pid)
             .and_then(|p| p.vm_space.as_ref())
@@ -1564,6 +1567,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
 
     // IF=0 fault-entry acquire — drain incoming shootdowns while spinning
     // (see the two acquires above and `proc::lock_process_table_draining`).
+    let _pt_mark = crate::proc::mark_process_table_held();
     let mut procs = crate::proc::lock_process_table_draining();
     let proc = match procs.iter_mut().find(|p| p.pid == target_pid) {
         Some(p) => p,
@@ -1979,6 +1983,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                     Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>> = None;
                 let mut ch_gen_at_revalidate: u64 = 0;
                 let still_valid = {
+                    let _pt_mark = crate::proc::mark_process_table_held();
                     let procs = crate::proc::PROCESS_TABLE.lock();
                     let vs_opt = procs.iter()
                         .find(|p| p.pid == target_pid)
@@ -2633,6 +2638,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
             let mut gen_at_revalidate: u64 = 0;
             if n_pages > 0 {
                 let still_valid = {
+                    let _pt_mark = crate::proc::mark_process_table_held();
                     let procs = crate::proc::PROCESS_TABLE.lock();
                     let vs_opt = procs.iter()
                         .find(|p| p.pid == target_pid)
@@ -3181,6 +3187,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 let mut sp_gen_at_revalidate: u64 = 0;
                 {
                     let still_valid = {
+                        let _pt_mark = crate::proc::mark_process_table_held();
                         let procs = crate::proc::PROCESS_TABLE.lock();
                         let vs_opt = procs.iter()
                             .find(|p| p.pid == target_pid)

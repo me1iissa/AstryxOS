@@ -103,6 +103,16 @@ static BOOTSTRAP_STACK_PHYS_LAST: core::sync::atomic::AtomicU64 =
 /// Lock for bitmap operations.
 static PMM_LOCK: Mutex<()> = Mutex::new(());
 
+/// Number of times [`alloc_page`] found the bitmap full and fell through to
+/// the OOM killer.  Drives the rate-limited `[PMM/EXHAUSTED]` line and is read
+/// by Test 750; monotone since boot.
+static PMM_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`PMM_EXHAUSTED_TOTAL`].
+pub fn exhausted_count() -> u64 {
+    PMM_EXHAUSTED_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Total available pages.
 static TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 /// Used pages.
@@ -693,8 +703,26 @@ pub fn alloc_page() -> Option<u64> {
         }
     } // release lock before calling OOM killer
 
-    // Slow path: bitmap is full.  Invoke the OOM killer, yield briefly so the
-    // scheduler can run SIGKILL handling, then retry once.
+    // Slow path: bitmap is full.  Announce it BEFORE calling the OOM killer:
+    // every diagnostic downstream of this point (the `[OOM]` lines) is emitted
+    // by code that has to acquire a lock first, so a kernel that exhausts
+    // memory while that lock is contended produces no evidence at all that it
+    // ran out.  This line is the one signal that cannot be swallowed.
+    // Rate-limited (first 8, then every 1024th) so a sustained-pressure
+    // workload does not turn COM1 into the bottleneck.
+    {
+        let total = PMM_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if total <= 8 || total % 1024 == 0 {
+            crate::serial_println!(
+                "[PMM/EXHAUSTED] alloc_page found no free frame — invoking OOM killer; \
+                 count_total={}",
+                total,
+            );
+        }
+    }
+
+    // Invoke the OOM killer, yield briefly so the scheduler can run SIGKILL
+    // handling, then retry once.
     if crate::mm::oom::invoke_oom_killer(1).is_some() {
         // Spin a moment to let the killed process's exit path run.  We cannot
         // call schedule() here because alloc_page() may be called from paths
