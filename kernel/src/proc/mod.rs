@@ -565,6 +565,57 @@ pub static PROCESS_TABLE: Mutex<Vec<Process>> = Mutex::new(Vec::new());
 /// Thread table.
 pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 
+/// Per-CPU nesting depth of "this CPU is inside a region that owns
+/// `PROCESS_TABLE`" on the page-fault path.  See [`mark_process_table_held`].
+static PROCESS_TABLE_HELD_DEPTH: [core::sync::atomic::AtomicU32;
+    crate::arch::x86_64::apic::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
+
+/// RAII marker recording that this CPU owns (or is acquiring) `PROCESS_TABLE`.
+/// Created by [`mark_process_table_held`]; clears the mark on drop.
+pub struct ProcessTableHeldMark {
+    cpu: usize,
+}
+
+impl Drop for ProcessTableHeldMark {
+    fn drop(&mut self) {
+        if self.cpu < crate::arch::x86_64::apic::MAX_CPUS {
+            PROCESS_TABLE_HELD_DEPTH[self.cpu]
+                .fetch_sub(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Record that this CPU is entering a region that owns `PROCESS_TABLE`.
+///
+/// Bind this immediately BEFORE the acquisition, not after: the mark then
+/// outlives the guard by the width of the acquire, which biases every race in
+/// the fail-safe direction — a spurious "held" only costs one skipped OOM
+/// attempt, whereas a spurious "not held" costs the deadlock this whole change
+/// exists to prevent.
+///
+/// Read back by [`process_table_held_here`], whose only consumer is
+/// `mm::oom::invoke_oom_killer` — it cannot read the process table through a
+/// lock this CPU already owns, and must not spin waiting for one it will never
+/// release.
+#[must_use]
+pub fn mark_process_table_held() -> ProcessTableHeldMark {
+    let cpu = crate::arch::x86_64::apic::cpu_index() as usize;
+    if cpu < crate::arch::x86_64::apic::MAX_CPUS {
+        PROCESS_TABLE_HELD_DEPTH[cpu].fetch_add(1, core::sync::atomic::Ordering::Acquire);
+    }
+    ProcessTableHeldMark { cpu }
+}
+
+/// True if this CPU is inside a [`mark_process_table_held`] region, i.e. it
+/// owns `PROCESS_TABLE` (or is in the act of acquiring it) and therefore must
+/// not block on it again.
+pub fn process_table_held_here() -> bool {
+    let cpu = crate::arch::x86_64::apic::cpu_index() as usize;
+    cpu < crate::arch::x86_64::apic::MAX_CPUS
+        && PROCESS_TABLE_HELD_DEPTH[cpu].load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 /// Acquire `PROCESS_TABLE` from a `#PF` handler running with interrupts
 /// disabled, servicing this CPU's own incoming TLB-shootdown slot on every
 /// contended spin iteration instead of blocking outright.

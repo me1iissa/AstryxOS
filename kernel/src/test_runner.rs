@@ -2512,6 +2512,13 @@ pub fn run() -> ! {
     total += 1;
     if test_747_vfork_cleanup_removes_records_before_clearing() { passed += 1; }
 
+    // ── Test 750: the OOM killer must not block on PROCESS_TABLE ──
+    // alloc_page's exhaustion path is reachable while PROCESS_TABLE is already
+    // held, so a blocking acquire there wedges the machine rather than
+    // reclaiming.  Driven with the lock held — the self-deadlock shape.
+    total += 1;
+    if test_750_oom_killer_does_not_block_on_process_table() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -62717,6 +62724,106 @@ fn test_747_vfork_cleanup_removes_records_before_clearing() -> bool {
         test_fail!(NAME, "page-table entry for {:#x} still present after cleanup ({:#x})",
                    TEST_VA, pte_after);
         return false;
+    }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 750: the OOM killer never blocks on a PROCESS_TABLE it may hold ────
+//
+// `pmm::alloc_page`'s exhaustion slow path calls `mm::oom::invoke_oom_killer`,
+// whose first act is to read `PROCESS_TABLE`.  `alloc_page` is reachable from
+// contexts that ALREADY hold `PROCESS_TABLE`, and from the `#PF` handler, which
+// runs on an interrupt gate with IF=0 (Intel SDM Vol. 3A §6.8.1/§6.12.1).
+// Because `PROCESS_TABLE` is a plain non-reentrant spinlock, a blocking
+// `lock()` there could never complete: the holder is either this very thread,
+// or a peer whose TLB shootdown can never be acknowledged by an IF-masked CPU.
+// The observable outcome was that the OOM killer never ran even once — it hung
+// on its first statement, so it emitted neither its "killed pid=" line nor its
+// "no eligible targets" line — no memory was ever reclaimed, and the machine
+// wedged in Ring 0 until the scheduler watchdog declared SCHEDULER_DEADLOCK.
+//
+// The acquisition is now a bounded `try_lock` retry that fails closed.  This
+// case pins exactly that: with `PROCESS_TABLE` held by the caller — the
+// self-deadlock shape — `invoke_oom_killer` must RETURN (reporting `None`)
+// rather than spin forever, and must record the give-up.  On the unfixed code
+// this test does not fail, it hangs, which is itself the regression signal.
+fn test_750_oom_killer_does_not_block_on_process_table() -> bool {
+    const NAME: &str =
+        "[MM/OOM] invoke_oom_killer fails closed instead of blocking on PROCESS_TABLE (Test 750)";
+    test_header!(NAME);
+
+    let giveups_before = crate::mm::oom::lock_giveup_count();
+
+    // ── Case A: the marked self-deadlock shape (what the fault path does) ──
+    // `mark_process_table_held` is what `handle_page_fault` binds before each
+    // of its PROCESS_TABLE acquisitions.  With the mark set, the OOM path must
+    // reject IMMEDIATELY — not spin out its retry bound.  This is the case that
+    // matters for machine behaviour: because the anonymous demand-fault arm
+    // holds the lock across the fault, EVERY IF=0 allocation failure lands
+    // here, so a bound spun out in full would be ~1.4 s of interrupts-disabled
+    // stall paid every single time.  Asserting the elapsed tick cost is the
+    // point of this case — a correct-but-slow implementation passes the
+    // return-value assertions and still wedges the machine's latency.
+    let t0 = crate::arch::x86_64::irq::get_ticks();
+    let marked_result = {
+        let _held = crate::proc::PROCESS_TABLE.lock();
+        let _mark = crate::proc::mark_process_table_held();
+        crate::mm::oom::invoke_oom_killer(1)
+    };
+    let marked_ticks = crate::arch::x86_64::irq::get_ticks().saturating_sub(t0);
+
+    if marked_result.is_some() {
+        test_fail!(NAME,
+            "invoke_oom_killer reported a kill ({:?}) while PROCESS_TABLE was held — it \
+             cannot have read the table",
+            marked_result);
+        return false;
+    }
+    // The bounded path costs ~90-150 ticks; the fast reject should cost 0-1.
+    // Anything above a couple of ticks means the mark was not consulted.
+    if marked_ticks > 5 {
+        test_fail!(NAME,
+            "marked self-deadlock shape took {} ticks — expected an immediate reject, so the \
+             PROCESS_TABLE-held mark is not being consulted and the retry bound is being spun \
+             out with interrupts disabled",
+            marked_ticks);
+        return false;
+    }
+
+    // ── Case B: unmarked contention still terminates (the backstop) ────────
+    // Holding the lock WITHOUT the mark is the shape the fast reject cannot
+    // see — a peer that never releases.  That must still fail closed via the
+    // bounded retry rather than spinning forever.
+    let result = {
+        let _held = crate::proc::PROCESS_TABLE.lock();
+        crate::mm::oom::invoke_oom_killer(1)
+    };
+
+    if result.is_some() {
+        test_fail!(NAME,
+            "invoke_oom_killer reported a kill ({:?}) on the unmarked contended path",
+            result);
+        return false;
+    }
+
+    let giveups_after = crate::mm::oom::lock_giveup_count();
+    if giveups_after != giveups_before + 2 {
+        test_fail!(NAME,
+            "expected exactly two give-ups to be recorded (marked + unmarked), saw {} -> {}",
+            giveups_before, giveups_after);
+        return false;
+    }
+
+    // The lock must be usable again afterwards: the bounded path must not have
+    // left it poisoned or taken.
+    match crate::proc::PROCESS_TABLE.try_lock() {
+        Some(_) => {}
+        None => {
+            test_fail!(NAME, "PROCESS_TABLE still held after invoke_oom_killer returned");
+            return false;
+        }
     }
 
     test_pass!(NAME);
