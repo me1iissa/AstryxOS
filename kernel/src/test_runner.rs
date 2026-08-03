@@ -2519,6 +2519,13 @@ pub fn run() -> ! {
     total += 1;
     if test_750_oom_killer_does_not_block_on_process_table() { passed += 1; }
 
+    // ── Test 752: PMM counters must agree with the frame bitmap ──
+    // `reserve_range` set bitmap bits without counting them, and `init` zeroed
+    // USED_PAGES after the boot reservations had already run, so every
+    // free-memory readout overstated by the static kernel heap's whole span.
+    total += 1;
+    if test_752_pmm_counters_match_bitmap() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -62825,6 +62832,130 @@ fn test_750_oom_killer_does_not_block_on_process_table() -> bool {
             return false;
         }
     }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 752: PMM counters must agree with the frame bitmap ─────────────────
+//
+// `alloc_page` searches the bitmap; it succeeds or fails on that alone.  The
+// `TOTAL_PAGES`/`USED_PAGES` counters are maintained separately, and every
+// free-memory readout on the machine — `/proc/meminfo`, sysinfo(2), the
+// page-cache low-memory guard in `mm::cache`, `kdb heap-stats` — is derived
+// from the counters, not from the bitmap.  So a counter that runs ahead of the
+// bitmap is not a cosmetic defect: it is the whole system being told there is
+// free memory that the allocator will refuse to produce.
+//
+// Two paths used to break the agreement, and both are pinned here:
+//
+//   * `reserve_range` set bitmap bits without adding to `USED_PAGES`.  Its
+//     dominant caller reserves the static kernel heap — `mm::heap::HEAP_SIZE`,
+//     hundreds of MiB — so the counters reported that entire span as free.
+//   * `init` stored `USED_PAGES = 0` *after* the kernel image, BootInfo, low
+//     1 MiB and bootstrap-stack reservations had already set their bits.
+//
+// The check is not a tautology: `accounting_snapshot` reads the counters and
+// re-derives the free count from the bitmap under one `PMM_LOCK` hold, so the
+// two sides come from independent state and cannot drift because of sampling.
+fn test_752_pmm_counters_match_bitmap() -> bool {
+    const NAME: &str = "[MM/PMM] free-frame counters agree with the bitmap (Test 752)";
+    test_header!(NAME);
+
+    // ── At rest ────────────────────────────────────────────────────────────
+    let base = crate::mm::pmm::accounting_snapshot();
+    test_println!(
+        "  total={} reserved={} used={} counter_free={} bitmap_free={} drift={}",
+        base.total, base.reserved, base.used,
+        base.counter_free, base.bitmap_free, base.drift(),
+    );
+    if base.drift() != 0 {
+        test_fail!(NAME,
+            "counter_free={} but bitmap_free={} (drift {} pages / {} MiB) — free-memory \
+             readouts are overstated by that much",
+            base.counter_free, base.bitmap_free, base.drift(),
+            base.drift() * 4 / 1024);
+        return false;
+    }
+
+    // ── The reservation must be visible, not merely balanced ───────────────
+    // A snapshot could agree by both sides being wrong in the same direction
+    // (e.g. if the heap were never reserved at all).  The static kernel heap
+    // is reserved before any other frame is handed out, so `reserved` must
+    // account for at least that span.
+    let heap_pages = (crate::mm::heap::HEAP_SIZE / crate::mm::pmm::PAGE_SIZE) as u64;
+    if base.reserved < heap_pages {
+        test_fail!(NAME,
+            "reserved={} pages but the static kernel heap alone is {} pages — the heap \
+             reservation is not being counted",
+            base.reserved, heap_pages);
+        return false;
+    }
+    if base.used < base.reserved {
+        test_fail!(NAME,
+            "used={} is below reserved={} — reserved frames must be a subset of used",
+            base.used, base.reserved);
+        return false;
+    }
+    test_println!("  reserved {} pages >= kernel heap {} pages ok",
+        base.reserved, heap_pages);
+
+    // ── Under allocation ───────────────────────────────────────────────────
+    // Both sides must move together.  Exact equality is asserted only on the
+    // drift, because a sibling CPU may allocate concurrently and shift the
+    // absolute figures between snapshots.
+    const N: usize = 64;
+    let mut frames = [0u64; N];
+    let mut got = 0usize;
+    while got < N {
+        match crate::mm::pmm::alloc_page() {
+            Some(p) => { frames[got] = p; got += 1; }
+            None => break,
+        }
+    }
+    if got == 0 {
+        test_fail!(NAME, "could not allocate a single frame to exercise the counters");
+        return false;
+    }
+
+    let loaded = crate::mm::pmm::accounting_snapshot();
+    if loaded.drift() != 0 {
+        test_fail!(NAME,
+            "after {} allocations: counter_free={} bitmap_free={} (drift {})",
+            got, loaded.counter_free, loaded.bitmap_free, loaded.drift());
+        for i in 0..got { crate::mm::pmm::free_page(frames[i]); }
+        return false;
+    }
+    if loaded.total != base.total {
+        test_fail!(NAME,
+            "TOTAL_PAGES moved under allocation ({} -> {}) — it describes the machine, \
+             not occupancy",
+            base.total, loaded.total);
+        for i in 0..got { crate::mm::pmm::free_page(frames[i]); }
+        return false;
+    }
+    if loaded.reserved != base.reserved {
+        test_fail!(NAME,
+            "RESERVED_PAGES moved under allocation ({} -> {}) — ordinary allocations \
+             are not reservations",
+            base.reserved, loaded.reserved);
+        for i in 0..got { crate::mm::pmm::free_page(frames[i]); }
+        return false;
+    }
+    test_println!("  {} frames allocated, drift still 0", got);
+
+    // ── And back ───────────────────────────────────────────────────────────
+    for i in 0..got {
+        crate::mm::pmm::free_page(frames[i]);
+    }
+    let after = crate::mm::pmm::accounting_snapshot();
+    if after.drift() != 0 {
+        test_fail!(NAME,
+            "after freeing {} frames: counter_free={} bitmap_free={} (drift {})",
+            got, after.counter_free, after.bitmap_free, after.drift());
+        return false;
+    }
+    test_println!("  {} frames freed, drift still 0", got);
 
     test_pass!(NAME);
     true

@@ -977,8 +977,10 @@ fn execute_command(cmd: &str) {
         }
         "mem" => {
             let (total, used) = crate::mm::pmm::stats();
+            let reserved = crate::mm::pmm::reserved_page_count();
             kprintln!("Physical Memory:");
             kprintln!("  Total: {} pages ({} MiB)", total, total * 4 / 1024);
+            kprintln!("  Rsvd:  {} pages ({} MiB)", reserved, reserved * 4 / 1024);
             kprintln!("  Used:  {} pages ({} MiB)", used, used * 4 / 1024);
             kprintln!("  Free:  {} pages ({} MiB)", total - used, (total - used) * 4 / 1024);
         }

@@ -2197,8 +2197,17 @@ fn op_tlb_stats(out: &mut String) {
 //       "tlb_quarantine":   N,
 //       "tcp_connections":  N | -1
 //     },
+//     "pmm": { "total_pages":N|-1, "reserved_pages":N|-1, "used_pages":N|-1,
+//              "free_pages":N|-1, "bitmap_free_pages":N|-1,
+//              "drift_pages":N|-1, "free_mib":N|-1, "exhausted_total":N },
 //     "uptime_ticks": N
 //   }
+//
+// The `pmm` block answers a question the heap block cannot: the kernel heap
+// is carved out of a statically reserved physical span, so heap occupancy
+// says nothing about how close the machine is to running out of *frames*.
+// `bitmap_free_pages` is what `alloc_page` will actually find; `drift_pages`
+// cross-checks the counters against it and must be 0.
 //
 // Collection probes that cannot acquire their lock within the brief
 // try-lock window emit `-1` so the caller distinguishes "no data this
@@ -2253,6 +2262,36 @@ fn op_heap_stats(out: &mut String) {
     };
     let _ = write!(out, r#""tcp_connections":{}"#, tcp_n);
 
+    out.push('}');
+
+    // ── Frame allocator ────────────────────────────────────────────────────
+    // The kernel heap is carved out of a *statically reserved* physical span,
+    // so heap occupancy alone cannot say whether the machine is close to
+    // running out of frames.  `bitmap_free` is the decisive figure — it is
+    // what `alloc_page` will actually find — and `drift` cross-checks the
+    // counters against it (must be 0).
+    out.push_str(r#","pmm":{"#);
+    match crate::mm::pmm::accounting_snapshot_nonblocking() {
+        Some(acct) => {
+            let _ = write!(out, r#""total_pages":{},"#, acct.total);
+            let _ = write!(out, r#""reserved_pages":{},"#, acct.reserved);
+            let _ = write!(out, r#""used_pages":{},"#, acct.used);
+            let _ = write!(out, r#""free_pages":{},"#, acct.counter_free);
+            let _ = write!(out, r#""bitmap_free_pages":{},"#, acct.bitmap_free);
+            let _ = write!(out, r#""drift_pages":{},"#, acct.drift());
+            let _ = write!(out, r#""free_mib":{},"#, acct.counter_free * 4 / 1024);
+        }
+        // Same convention as the collection probes above: -1 means "no data
+        // this sample", never a genuine zero.
+        None => {
+            let _ = write!(out, r#""total_pages":-1,"reserved_pages":-1,"#);
+            let _ = write!(out, r#""used_pages":-1,"free_pages":-1,"#);
+            let _ = write!(out, r#""bitmap_free_pages":-1,"drift_pages":-1,"#);
+            let _ = write!(out, r#""free_mib":-1,"#);
+        }
+    }
+    let _ = write!(out, r#""exhausted_total":{}"#,
+        crate::mm::pmm::exhausted_count());
     out.push('}');
 
     // Uptime for caller-side rate computation.
