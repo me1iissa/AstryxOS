@@ -905,6 +905,192 @@ pub fn map_page_in_cow_if_unchanged(
     true
 }
 
+/// Leaf-PTE value observed at the instant [`cow_break_if_unchanged`] issued its
+/// TLB shootdown, recorded so a test can assert the break-before-make ordering
+/// directly rather than inferring it from the end state.
+///
+/// The whole point of the sequence is that the old translation is invalidated
+/// while the leaf is **not present** — so this must read back as `0` after a
+/// successful break.  An install-then-flush ordering would leave the freshly
+/// published entry here instead, which is what
+/// `test_cow_break_flushes_before_install` checks for.  Diagnostic only
+/// (`firefox-test-core`); never consulted by the running kernel.
+#[cfg(feature = "firefox-test-core")]
+pub static COW_BREAK_PTE_AT_FLUSH: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Outcome of [`cow_break_if_unchanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CowBreak {
+    /// The private copy was published at `virt_addr`.  The payload is the
+    /// `shootdown_range` return value for the break flush: `true` when every
+    /// target CPU acknowledged, `false` when one or more timed out (in which
+    /// case a deferred force-flush was posted to them — see
+    /// `mm::tlb::shootdown_range`).
+    Installed { flush_acked: bool },
+    /// The leaf no longer mapped `expected_phys` (a sibling CPU CoW-broke the
+    /// same page first, or the mapping was torn down).  Nothing was written and
+    /// no flush was issued; the caller must drop its copy.
+    Lost,
+}
+
+/// Break-before-make CoW install: replace the leaf PTE at `virt_addr` with
+/// `new_phys`, **invalidating the old translation on every CPU before the new
+/// one is observable**, and only if the leaf still maps `expected_phys`.
+///
+/// Sequence, entirely under this address space's `mm_sem` in **write** mode:
+///
+/// 1. **Re-validate + break** — under `VMM_LOCK`, confirm the leaf is present
+///    and still maps `expected_phys`, then clear it to zero.  A mismatch
+///    returns [`CowBreak::Lost`] having written nothing.
+/// 2. **Flush** — release `VMM_LOCK`, then `tlb::shootdown_page`.  After this
+///    returns, no CPU holds a cached translation from `virt_addr` to
+///    `expected_phys`.
+/// 3. **Make** — retake `VMM_LOCK` and publish `new_phys | flags | PRESENT`.
+///
+/// # Why not install-then-flush
+///
+/// Writing the new PTE first and flushing afterwards leaves a window in which
+/// one CPU has already re-walked and cached the *new* frame while another still
+/// holds the *old* one — two CPUs in a single address space disagreeing about
+/// the contents of one virtual address.  Clearing and flushing first collapses
+/// that window: a not-present entry is never cached (Intel SDM Vol. 3A
+/// §4.10.2.3 — the processor does not create a TLB entry for a linear address
+/// whose translation would fault), so between steps 1 and 3 no CPU can hold
+/// *any* translation for `virt_addr`, and the step-3 store therefore needs no
+/// second shootdown (§4.10.4.3: a not-present → present transition requires no
+/// invalidation).  The IPI cost is identical to the install-then-flush
+/// ordering — one shootdown per CoW break — it is simply issued earlier.
+///
+/// # Why `mm_sem` in write mode
+///
+/// Between steps 1 and 3 the leaf is not present while a live VMA still covers
+/// `virt_addr`.  A concurrent faulter on a sibling CPU that observed that hole
+/// would take the demand-paging path and install a *zero* (or freshly
+/// file-read) frame over the copy this call is about to publish — the copied
+/// contents would be silently lost.  Holding `mm_sem` in write mode across all
+/// three steps excludes every other PTE mutator for this address space (the
+/// acquisition rules on [`crate::mm::vma::VmSpace`] require read mode for
+/// single-page edits including every page-fault install arm), so the hole is
+/// never observable to another installer.  A faulter that sampled the PTE
+/// *before* step 1 and blocks in its own install primitive resolves correctly
+/// on release: its `map_page_in_if_absent` / `map_page_in_cow_if_unchanged`
+/// re-validation sees the published `new_phys`, refuses, and the faulting
+/// access simply re-executes against the new mapping.
+///
+/// # Lock-vs-IPI
+///
+/// Step 2 sends an IPI while `mm_sem` is held in write mode.  That combination
+/// is already load-bearing in this kernel (`clone_for_fork`,
+/// `free_process_memory` and `free_vm_space` all shoot down under
+/// `mm_sem.write()`), and it is deadlock-free because every acquirer that can
+/// be an IPI target services its own incoming shootdown slot while it spins:
+/// readers via `vma::mm_sem_read_draining`, and this call's own writer
+/// acquisition via `vma::mm_sem_write_draining`.  `VMM_LOCK` is explicitly
+/// **not** held across step 2 — it is a global leaf lock taken by every address
+/// space, so holding it across an IPI would stall a target CPU that cannot then
+/// acknowledge.  `PROCESS_TABLE` must likewise already be released by the
+/// caller (the write-fault arm in `arch/x86_64/idt.rs` drops it first).
+///
+/// # Frame lifetime
+///
+/// The caller must release its reference on `expected_phys` **after** this
+/// returns `Installed`, never before: until the step-2 flush completes this
+/// address space can still reach the frame through a cached entry, and dropping
+/// the reference earlier would let a concurrent holder's decrement reach zero
+/// and return the frame to the PMM while those entries are live.
+pub fn cow_break_if_unchanged(
+    pml4_phys: u64,
+    virt_addr: u64,
+    new_phys: u64,
+    flags: u64,
+    expected_phys: u64,
+) -> CowBreak {
+    // Draining write acquire: this runs inside the `#PF` handler with IF=0, so
+    // a plain blocking `write()` would make this CPU unserviceable to a peer's
+    // shootdown for the whole wait.  See `vma::mm_sem_write_draining`.
+    //
+    // An unregistered CR3 yields no lock and therefore no exclusion, exactly as
+    // in the sibling primitives above.  Every address space that can take a
+    // user CoW write-fault registers its `mm_sem` at construction
+    // (`VmSpace::new_user`; `from_existing_cr3` shares the parent's), so this
+    // only degrades for CR3s that never reach this arm.
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_write = _mm_guard
+        .as_ref()
+        .map(|s| crate::mm::vma::mm_sem_write_draining(s));
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    // --- Step 1: re-validate and break, under VMM_LOCK. ---
+    //
+    // The leaf pointer resolved here stays valid across step 2 without a
+    // re-walk: `mm_sem` is held in write mode, which excludes `clone_for_fork`,
+    // `free_process_memory`, `free_vm_space` and every read-mode PTE mutator,
+    // so no page-table page in this walk can be freed or replaced meanwhile.
+    let pt_ptr = unsafe {
+        let _lock = VMM_LOCK.lock();
+
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
+            Some(addr) => addr,
+            None => return CowBreak::Lost,
+        };
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, flags) {
+            Some(addr) => addr,
+            None => return CowBreak::Lost,
+        };
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, flags) {
+            Some(addr) => addr,
+            None => return CowBreak::Lost,
+        };
+
+        let pt_ptr = p2v(pt_phys);
+        let existing = *pt_ptr.add(pt_idx);
+        if existing & PAGE_PRESENT == 0 || (existing & ADDR_MASK) != (expected_phys & ADDR_MASK) {
+            // A sibling CPU already replaced this mapping, or it was torn
+            // down.  Nothing broken, nothing to flush.
+            return CowBreak::Lost;
+        }
+        // Break: the old translation is now unreachable by a page walk.  Any
+        // CPU that already cached it is retired by the flush below.
+        *pt_ptr.add(pt_idx) = 0;
+        pt_ptr
+    };
+
+    // --- Step 2: flush, with VMM_LOCK released. ---
+    #[cfg(feature = "firefox-test-core")]
+    COW_BREAK_PTE_AT_FLUSH.store(
+        unsafe { *pt_ptr.add(pt_idx) },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    let flush_acked = crate::mm::tlb::shootdown_page(pml4_phys, virt_addr);
+
+    // --- Step 3: make. ---
+    unsafe {
+        let _lock = VMM_LOCK.lock();
+        *pt_ptr.add(pt_idx) = (new_phys & ADDR_MASK) | flags | PAGE_PRESENT;
+    }
+
+    #[cfg(feature = "firefox-test-core")]
+    {
+        crate::mm::w215_diag::pte_change_record(
+            virt_addr,
+            new_phys & ADDR_MASK,
+            expected_phys & ADDR_MASK,
+            crate::mm::w215_diag::PTE_KIND_MAP,
+            ring_caller_rip(),
+            pml4_phys,
+        );
+        crate::mm::w215_diag::alias_install_check(
+            virt_addr, new_phys & ADDR_MASK, pml4_phys, ring_caller_rip());
+    }
+
+    CowBreak::Installed { flush_acked }
+}
+
 /// Sole-owner CoW-break: flip the leaf PTE at `virt_addr` writable
 /// (`expected_phys | flags | PAGE_PRESENT`) **only if**, atomically under
 /// `VMM_LOCK`, it is still present, still maps `expected_phys`, AND

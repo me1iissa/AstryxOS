@@ -1359,6 +1359,15 @@ pub fn run() -> ! {
     total += 1;
     if test_map_page_in_cow_if_unchanged_anti_alias() { passed += 1; }
 
+    // Test 98g2b: CoW break-before-make ordering (the old translation is
+    // invalidated before the private copy becomes observable).  The ordering
+    // witness it asserts on is only compiled in under `firefox-test-core`.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        total += 1;
+        if test_cow_break_flushes_before_install() { passed += 1; }
+    }
+
     // Test 98g3: demand-paging gen-revalidate file-VMA identity predicate
     // (SMP gen-abort false-abort fix).
     total += 1;
@@ -35695,6 +35704,168 @@ fn test_map_page_in_cow_if_unchanged_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_cow_if_unchanged anti-aliasing");
+    true
+}
+
+/// `cow_break_if_unchanged` must invalidate the OLD translation before the NEW
+/// one is observable, and must leave the caller's reference on the old frame
+/// alone.
+///
+/// Breaking a CoW page by publishing the private copy first and shooting the
+/// old translation down afterwards leaves a window in which one CPU has already
+/// cached the new frame while another still holds the old one — a single
+/// address space observing two different contents for one virtual address
+/// (Intel SDM Vol. 3A §4.10.4.3).  The primitive therefore clears the leaf,
+/// flushes, and only then publishes.
+///
+/// The ordering is asserted directly, not inferred from the end state: the
+/// primitive records the leaf value it saw at the instant it issued the
+/// shootdown in `COW_BREAK_PTE_AT_FLUSH`, and a correct break flushes a
+/// not-present leaf, so that witness must read back `0`.  Reintroducing the
+/// install-then-flush ordering leaves the freshly published entry there instead
+/// and fails check (2) — this test gates the ordering itself, not merely the
+/// re-validation.
+#[cfg(feature = "firefox-test-core")]
+fn test_cow_break_flushes_before_install() -> bool {
+    test_header!("cow_break_if_unchanged: break-before-make ordering");
+
+    use crate::mm::vmm::{read_pte, map_page_in, cow_break_if_unchanged, CowBreak,
+                         COW_BREAK_PTE_AT_FLUSH, PAGE_PRESENT, PAGE_WRITABLE,
+                         PAGE_USER, ADDR_MASK};
+    use core::sync::atomic::Ordering;
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cow_break_bbm", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    let va: u64 = 0x7fff_fffd_b000;
+    let page = crate::mm::vma::page_align_down(va);
+
+    let frame_shared = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("cow_break_bbm", "OOM shared"); return false; }
+    };
+    let frame_priv = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_break_bbm", "OOM private"); return false;
+        }
+    };
+    let frame_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::mm::pmm::free_page(frame_priv);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_break_bbm", "OOM loser"); return false;
+        }
+    };
+    if frame_shared == frame_priv || frame_shared == frame_loser || frame_priv == frame_loser {
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_priv);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm", "allocator returned overlapping frames");
+        return false;
+    }
+
+    let ro_flags = PAGE_PRESENT | PAGE_USER;
+    let rw_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // Fork-shared state: the leaf maps frame_shared read-only, and this address
+    // space holds one of its two references.
+    map_page_in(cr3, page, frame_shared, ro_flags);
+    crate::mm::refcount::page_ref_set(frame_shared, 2);
+
+    COW_BREAK_PTE_AT_FLUSH.store(u64::MAX, Ordering::Relaxed);
+
+    // (1) The break wins: the leaf still maps frame_shared, so the private copy
+    //     is published writable.
+    let outcome = cow_break_if_unchanged(cr3, page, frame_priv, rw_flags, frame_shared);
+    let pte1 = read_pte(cr3, va);
+    if !matches!(outcome, CowBreak::Installed { .. })
+        || (pte1 & ADDR_MASK) != (frame_priv & ADDR_MASK)
+        || pte1 & PAGE_WRITABLE == 0
+    {
+        crate::mm::refcount::page_ref_set(frame_shared, 0);
+        crate::mm::pmm::free_page(frame_priv);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm", "break failed: outcome={:?} pte={:#x} expect={:#x}",
+            outcome, pte1, frame_priv);
+        return false;
+    }
+    test_println!("  (1) private frame {:#x} published writable ok", frame_priv);
+
+    // (2) THE ORDERING.  The shootdown must have been issued while the leaf was
+    //     not present.  Anything else means the new entry was already reachable
+    //     by a page walk on a sibling CPU when the old one was retired.
+    let at_flush = COW_BREAK_PTE_AT_FLUSH.load(Ordering::Relaxed);
+    if at_flush != 0 {
+        crate::mm::refcount::page_ref_set(frame_shared, 0);
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm",
+            "shootdown issued with leaf = {:#x}, expected 0 (not-present): the new \
+             PTE was observable before the old translation was invalidated",
+            at_flush);
+        return false;
+    }
+    test_println!("  (2) shootdown issued on a not-present leaf -- break precedes make ok");
+
+    // (3) The primitive must NOT release the old frame's reference.  That is the
+    //     caller's job, strictly after the flush; a dec inside here (or before
+    //     the flush) would let a concurrent holder's dec reach zero and recycle
+    //     the frame while sibling CPUs still hold cached translations to it.
+    let rc = crate::mm::refcount::page_ref_count(frame_shared);
+    if rc != 2 {
+        crate::mm::refcount::page_ref_set(frame_shared, 0);
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm",
+            "old frame refcount is {} after the break, expected 2 (untouched)", rc);
+        return false;
+    }
+    test_println!("  (3) old frame reference left to the caller ok");
+
+    // (4) A racing sibling that still expects frame_shared must lose, write
+    //     nothing, and leave the winner's mapping intact.  It must not flush
+    //     either: it never broke a mapping, so the witness stays at the sentinel.
+    COW_BREAK_PTE_AT_FLUSH.store(u64::MAX, Ordering::Relaxed);
+    let lost = cow_break_if_unchanged(cr3, page, frame_loser, rw_flags, frame_shared);
+    let pte2 = read_pte(cr3, va);
+    if !matches!(lost, CowBreak::Lost) || (pte2 & ADDR_MASK) != (frame_priv & ADDR_MASK) {
+        crate::mm::refcount::page_ref_set(frame_shared, 0);
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm",
+            "loser did not back out: outcome={:?} pte={:#x} winner={:#x}",
+            lost, pte2, frame_priv);
+        return false;
+    }
+    if COW_BREAK_PTE_AT_FLUSH.load(Ordering::Relaxed) != u64::MAX {
+        crate::mm::refcount::page_ref_set(frame_shared, 0);
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_break_bbm", "losing break issued a shootdown it did not need");
+        return false;
+    }
+    test_println!("  (4) racing break backed out; winner mapping intact ok");
+
+    crate::mm::refcount::page_ref_set(frame_shared, 0);
+    crate::mm::pmm::free_page(frame_shared);
+    crate::mm::pmm::free_page(frame_loser);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("cow_break_if_unchanged break-before-make");
     true
 }
 
