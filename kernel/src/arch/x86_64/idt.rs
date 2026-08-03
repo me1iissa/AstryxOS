@@ -1777,6 +1777,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                         // reach old_phys through a cached entry, so they would
                         // read — and, with any stale writable entry, write — a
                         // frame the PMM had already handed to someone else.
+                        //
+                        // `flush_acked` is deliberately not consulted.  This arm
+                        // frees nothing, so it has no frame to route through
+                        // `quarantine_free`; on an ACK timeout `shootdown_range`
+                        // posts a deferred force-flush to each unacknowledged
+                        // CPU, which is the same guarantee every other
+                        // non-freeing PTE mutator here relies on.
                         let _ = crate::mm::refcount::page_ref_dec(old_phys);
                     }
                     crate::mm::vmm::CowBreak::Lost => {
