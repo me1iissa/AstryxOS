@@ -62,5 +62,36 @@ pub fn init(boot_info: &BootInfo) {
     // in-flight transfer references them (VIRTIO 1.2 §2.7.13.3).  Must follow
     // heap+refcount init: it heap-allocates its per-PFN table.
     dma_pin::init();
+
+    // Every boot-time frame reservation has now run (kernel image and low
+    // 1 MiB in `pmm::init`; the static kernel heap and its guard frames in
+    // `vmm::init` / `heap::init_guard_pages`).  Report the accounting the rest
+    // of the system reads, and cross-check the counters against the bitmap
+    // they describe: `alloc_page` succeeds or fails on the bitmap alone, so a
+    // non-zero drift means every free-memory readout on the machine
+    // (`/proc/meminfo`, sysinfo(2), the page-cache low-memory guard) is
+    // quoting memory the allocator cannot produce.
+    let acct = pmm::accounting_snapshot();
+    crate::serial_println!(
+        "[PMM] Accounting: total={} pages ({} MiB) reserved={} ({} MiB) used={} \
+         free={} ({} MiB) bitmap_free={} drift={}",
+        acct.total,
+        acct.total * 4 / 1024,
+        acct.reserved,
+        acct.reserved * 4 / 1024,
+        acct.used,
+        acct.counter_free,
+        acct.counter_free * 4 / 1024,
+        acct.bitmap_free,
+        acct.drift(),
+    );
+    if acct.drift() != 0 {
+        crate::serial_println!(
+            "[PMM] WARN: free-frame counter disagrees with the bitmap by {} pages \
+             — free-memory readouts are wrong by that much",
+            acct.drift(),
+        );
+    }
+
     crate::serial_println!("[MM] Memory management subsystem initialized");
 }

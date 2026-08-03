@@ -5113,8 +5113,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let uptime = (ticks / 100) as i64; // 100 Hz → seconds
             // PMM stats (pages, each 4 KiB).  Express in bytes for
             // consistency with mem_unit=1.
+            // `totalram` is "total usable main memory size" per sysinfo(2),
+            // which excludes the frames the kernel permanently reserves for
+            // itself — the same convention `MemTotal` follows in proc(5).
+            // `freeram` is what the frame allocator can still hand out.
             let (total_pages, used_pages) = crate::mm::pmm::stats();
-            let total_bytes = total_pages.saturating_mul(4096);
+            let reserved_pages = crate::mm::pmm::reserved_page_count();
+            let total_bytes = total_pages
+                .saturating_sub(reserved_pages)
+                .saturating_mul(4096);
             let free_bytes  = total_pages.saturating_sub(used_pages).saturating_mul(4096);
             let procs       = crate::proc::process_count().min(u16::MAX as usize) as u16;
 

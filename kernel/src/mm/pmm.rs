@@ -113,10 +113,54 @@ pub fn exhausted_count() -> u64 {
     PMM_EXHAUSTED_TOTAL.load(Ordering::Relaxed)
 }
 
-/// Total available pages.
+/// Total pages the allocator manages: every frame the firmware memory map
+/// reported as `Available`, counted once at [`init`] and constant thereafter.
+///
+/// This is a property of the machine, not of occupancy — boot-time
+/// reservations (kernel image, BootInfo, low 1 MiB, bootstrap stack, the
+/// static kernel heap) do **not** subtract from it.  They are counted in
+/// [`USED_PAGES`] and [`RESERVED_PAGES`] instead; see the accounting
+/// invariant on [`USED_PAGES`].
 static TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
-/// Used pages.
+
+/// Frames inside the [`TOTAL_PAGES`] domain whose bitmap bit is currently
+/// set — allocated **and** reserved alike.
+///
+/// # Accounting invariant
+///
+/// ```text
+/// free_page_count() == #{ p < MAX_PAGES : BITMAP bit p is clear }
+/// ```
+///
+/// i.e. `TOTAL_PAGES - USED_PAGES` equals the number of frames `alloc_page`
+/// can actually hand out.  `alloc_page` succeeds or fails on the bitmap
+/// alone, so a counter that does not track the bitmap exactly is a counter
+/// that reports free memory the allocator cannot produce.  Every path that
+/// sets a bit must add here, and every path that clears one must subtract:
+///
+/// * [`alloc_page_locked`] / [`alloc_pages`] — `+1` / `+count`
+/// * [`free_page`] — `-1`, and deliberately *not* on the refusal arms
+///   (kernel-static, residual PTE refs, DMA-pinned), which leave the bit set
+/// * the boot reservations in [`init`] and [`reserve_range`] — `+n` for the
+///   `n` frames whose bit each one newly set
+///
+/// The bitmap starts entirely set (`0xFF`), so frames outside the firmware's
+/// `Available` regions are never clear and never enter this count in either
+/// direction.
 static USED_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// The subset of [`USED_PAGES`] that is permanently reserved rather than
+/// dynamically allocated: the kernel image, the BootInfo handoff pages, the
+/// low 1 MiB, the UEFI bootstrap stack, and every [`reserve_range`] caller
+/// (the static kernel heap and its guard frames).
+///
+/// These frames are real RAM the allocator can never hand out, so
+/// `/proc/meminfo` subtracts them from `MemTotal` — proc(5) defines
+/// `MemTotal` as "total usable RAM (i.e., physical RAM minus a few reserved
+/// bits and the kernel binary code)".  They stay inside [`TOTAL_PAGES`] and
+/// [`USED_PAGES`] because the allocator's own invariant is about bitmap bits,
+/// not about who owns them.
+static RESERVED_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Next-fit cursor: byte index into BITMAP to start the next search.
 /// Avoids O(N) scans from 0 when low physical frames are all in use.
@@ -312,6 +356,10 @@ pub fn is_page_used_for_test(page: usize) -> bool {
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
     let mut total_available = 0u64;
+    // Frames this function reserves out of the `Available` domain.  Counted
+    // here and published to RESERVED_PAGES/USED_PAGES at the end, rather than
+    // subtracted from `total_available`: see the invariant on `USED_PAGES`.
+    let mut boot_reserved = 0u64;
 
     for i in 0..boot_info.memory_map.entry_count as usize {
         let entry = &boot_info.memory_map.entries[i];
@@ -322,7 +370,14 @@ pub fn init(boot_info: &BootInfo) {
 
             for page in start_page..start_page + page_count {
                 if page < MAX_PAGES {
+                    // Count each frame once even if two map entries overlap:
+                    // the bitmap starts all-set, so a frame already flipped
+                    // free by an earlier entry is already in the tally.
+                    // SAFETY: lock held, page index bounds-checked above.
                     unsafe {
+                        if !is_page_used_locked(page) {
+                            continue;
+                        }
                         mark_page_free(page);
                     }
                     total_available += 1;
@@ -370,11 +425,16 @@ pub fn init(boot_info: &BootInfo) {
     for page in kernel_start..kernel_start + kernel_pages + 256 {
         if page < MAX_PAGES {
             // SAFETY: We hold the PMM lock and page is in bounds.
+            //
+            // Only frames that were free (i.e. inside the `Available` domain
+            // and not already reserved) count towards `boot_reserved` — a
+            // frame the firmware never offered was never in `total_available`
+            // and must not be counted as used against it.
             unsafe {
-                mark_page_used(page);
-            }
-            if total_available > 0 {
-                total_available -= 1;
+                if !is_page_used_locked(page) {
+                    mark_page_used(page);
+                    boot_reserved += 1;
+                }
             }
         }
     }
@@ -436,7 +496,7 @@ pub fn init(boot_info: &BootInfo) {
             // `mark_page_used` is idempotent against an already-used bit
             // (it ORs the bit in), so any page already covered by the
             // kernel-image reservation above is harmless to re-mark.  We
-            // still decrement `total_available` only for pages that were
+            // still count towards `boot_reserved` only pages that were
             // previously free.
             //
             // The `is_page_used_locked == true` branch is silently no-op
@@ -446,9 +506,7 @@ pub fn init(boot_info: &BootInfo) {
             unsafe {
                 if !is_page_used_locked(page) {
                     mark_page_used(page);
-                    if total_available > 0 {
-                        total_available -= 1;
-                    }
+                    boot_reserved += 1;
                     boot_info_reserved_pages += 1;
                 }
             }
@@ -466,10 +524,19 @@ pub fn init(boot_info: &BootInfo) {
     );
 
     // Mark first 1 MiB as reserved (BIOS, VGA, etc.)
+    //
+    // Parts of this span are typically reported `Available` by the firmware
+    // map, so it can take real frames out of `total_available`; the rest was
+    // never offered and is already set.  Counting only the newly-set bits
+    // keeps `boot_reserved` equal to the number of `Available` frames this
+    // function withdrew.
     for page in 0..256 {
         // SAFETY: We hold the PMM lock and page is in bounds.
         unsafe {
-            mark_page_used(page);
+            if !is_page_used_locked(page) {
+                mark_page_used(page);
+                boot_reserved += 1;
+            }
         }
     }
 
@@ -536,9 +603,7 @@ pub fn init(boot_info: &BootInfo) {
                     if !is_page_used_locked(p) {
                         mark_page_used(p);
                         reserved += 1;
-                        if total_available > 0 {
-                            total_available -= 1;
-                        }
+                        boot_reserved += 1;
                     }
                 }
             }
@@ -554,13 +619,23 @@ pub fn init(boot_info: &BootInfo) {
         }
     }
 
+    // Publish the counters together, and only now — every reservation above
+    // has already run, so `USED_PAGES` starts life agreeing with the bitmap
+    // instead of being zeroed on top of frames that are already withdrawn.
+    // (Zeroing it here is what previously made the counters report the
+    // boot reservations — most of it the static kernel heap — as free.)
     TOTAL_PAGES.store(total_available, Ordering::Relaxed);
-    USED_PAGES.store(0, Ordering::Relaxed);
+    USED_PAGES.store(boot_reserved, Ordering::Relaxed);
+    RESERVED_PAGES.store(boot_reserved, Ordering::Relaxed);
 
     crate::serial_println!(
-        "[PMM] Initialized: {} MiB available ({} pages)",
+        "[PMM] Initialized: {} MiB usable RAM ({} pages), {} MiB reserved at boot \
+         ({} pages), {} MiB allocatable",
         total_available * 4 / 1024,
-        total_available
+        total_available,
+        boot_reserved * 4 / 1024,
+        boot_reserved,
+        total_available.saturating_sub(boot_reserved) * 4 / 1024,
     );
 }
 
@@ -989,24 +1064,139 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
 ///
 /// Used to protect memory that is implicitly mapped by the bootloader's
 /// 2 MiB huge pages (e.g., the kernel heap's backing physical range).
+///
+/// End-exclusive, idempotent, and **accounted**: every frame whose bit this
+/// call newly sets is added to both `USED_PAGES` and `RESERVED_PAGES`, so the
+/// counters keep agreeing with the bitmap (see the invariant on
+/// [`USED_PAGES`]).  Re-reserving an already-reserved frame counts nothing.
+///
+/// The dominant caller is `mm::vmm::init`, which reserves the static kernel
+/// heap — hundreds of MiB on a heavy-render build.  Before this was counted,
+/// `stats()` and everything derived from it (`/proc/meminfo`, `kdb
+/// heap-stats`) reported that entire span as free memory the allocator could
+/// hand out, which it never could.
 pub fn reserve_range(start: u64, end: u64) {
     let _lock = PMM_LOCK.lock();
     let start_page = (start / PAGE_SIZE as u64) as usize;
     let end_page = ((end + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
+    let mut newly_reserved = 0u64;
     for page in start_page..end_page {
         if page < MAX_PAGES {
             // SAFETY: We hold the PMM lock and page is in bounds.
-            unsafe { mark_page_used(page); }
+            unsafe {
+                if !is_page_used_locked(page) {
+                    mark_page_used(page);
+                    newly_reserved += 1;
+                }
+            }
         }
+    }
+    if newly_reserved > 0 {
+        USED_PAGES.fetch_add(newly_reserved, Ordering::Relaxed);
+        RESERVED_PAGES.fetch_add(newly_reserved, Ordering::Relaxed);
     }
 }
 
-/// Get memory statistics.
+/// Get memory statistics: `(total_pages, used_pages)`.
+///
+/// `total_pages` is all firmware-usable RAM; `used_pages` counts allocated
+/// **and** boot-reserved frames.  `total - used` is therefore exactly what
+/// `alloc_page` can still hand out — see the invariant on [`USED_PAGES`].
+/// Callers that want proc(5) `MemTotal` semantics (usable RAM minus the
+/// kernel's own permanent reservations) subtract [`reserved_page_count`].
 pub fn stats() -> (u64, u64) {
     (
         TOTAL_PAGES.load(Ordering::Relaxed),
         USED_PAGES.load(Ordering::Relaxed),
     )
+}
+
+/// Frames permanently reserved at boot — the kernel image, BootInfo, the low
+/// 1 MiB, the bootstrap stack, and every [`reserve_range`] span (chiefly the
+/// static kernel heap).  A subset of the `used` figure from [`stats`].
+pub fn reserved_page_count() -> u64 {
+    RESERVED_PAGES.load(Ordering::Relaxed)
+}
+
+/// A consistent snapshot of the frame allocator's counters *and* of the
+/// bitmap they are supposed to describe.
+#[derive(Clone, Copy, Debug)]
+pub struct Accounting {
+    /// All firmware-usable RAM, in frames ([`TOTAL_PAGES`]).
+    pub total: u64,
+    /// Frames whose bitmap bit is set — allocated + reserved ([`USED_PAGES`]).
+    pub used: u64,
+    /// The permanently-reserved subset of `used` ([`RESERVED_PAGES`]).
+    pub reserved: u64,
+    /// `total - used` — what the counters claim is allocatable.
+    pub counter_free: u64,
+    /// Clear bits in the bitmap — what `alloc_page` can actually hand out.
+    pub bitmap_free: u64,
+}
+
+impl Accounting {
+    /// `counter_free - bitmap_free`.  Must be zero; a positive value is the
+    /// allocator promising memory it cannot produce.
+    pub fn drift(&self) -> i64 {
+        self.counter_free as i64 - self.bitmap_free as i64
+    }
+}
+
+/// Read the counters and scan the bitmap under a single `PMM_LOCK`
+/// acquisition, so the two cannot drift apart *because of the sampling*.
+///
+/// Every mutator (`alloc_page_locked`, `alloc_pages`, `free_page`,
+/// `reserve_range`, `init`) updates the bitmap and its counter inside the same
+/// lock hold, so a snapshot taken here observes both or neither.  That makes
+/// `drift() != 0` a real defect rather than a sampling artefact.
+///
+/// The scan reads the 128 KiB bitmap eight bytes at a time, so the lock hold
+/// is tens of microseconds rather than hundreds — but it is still far too long
+/// for an allocation path.  This is for tests and boot-time verification;
+/// sampling callers that must not stall the allocator use
+/// [`accounting_snapshot_nonblocking`].
+pub fn accounting_snapshot() -> Accounting {
+    let _lock = PMM_LOCK.lock();
+    // SAFETY: PMM_LOCK held for the whole read.
+    unsafe { accounting_snapshot_locked() }
+}
+
+/// [`accounting_snapshot`] that gives up rather than waiting for `PMM_LOCK`.
+///
+/// Returns `None` on contention so a sampling caller (`kdb`) can report "no
+/// data this sample" instead of blocking every allocation on the machine for
+/// the duration of a bitmap scan.
+pub fn accounting_snapshot_nonblocking() -> Option<Accounting> {
+    // SAFETY: the snapshot runs only on the `Some` arm, i.e. with the lock
+    // held for its whole duration.
+    PMM_LOCK.try_lock().map(|_g| unsafe { accounting_snapshot_locked() })
+}
+
+/// Body of [`accounting_snapshot`].
+///
+/// # Safety
+/// Caller must hold `PMM_LOCK` for the whole call.
+unsafe fn accounting_snapshot_locked() -> Accounting {
+    let total = TOTAL_PAGES.load(Ordering::Relaxed);
+    let used = USED_PAGES.load(Ordering::Relaxed);
+    let reserved = RESERVED_PAGES.load(Ordering::Relaxed);
+    let mut bitmap_free = 0u64;
+    // `BITMAP_SIZE` is a power of two ≥ 8, so `chunks_exact(8)` covers it
+    // exactly and leaves no remainder to handle.
+    for chunk in BITMAP.chunks_exact(8) {
+        let word = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+            chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        bitmap_free += word.count_zeros() as u64;
+    }
+    Accounting {
+        total,
+        used,
+        reserved,
+        counter_free: total.saturating_sub(used),
+        bitmap_free,
+    }
 }
 
 /// H2 diagnostic: return the cumulative count of physical frames that were

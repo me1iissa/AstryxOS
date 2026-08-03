@@ -965,8 +965,10 @@ fn cmd_uptime() {
 
 fn cmd_mem() {
     let (total, used) = crate::mm::pmm::stats();
+    let reserved = crate::mm::pmm::reserved_page_count();
     orbit_println!("Physical Memory:");
     orbit_println!("  Total: {:>6} pages ({:>4} MiB)", total, total * 4 / 1024);
+    orbit_println!("  Rsvd:  {:>6} pages ({:>4} MiB)", reserved, reserved * 4 / 1024);
     orbit_println!("  Used:  {:>6} pages ({:>4} MiB)", used, used * 4 / 1024);
     orbit_println!("  Free:  {:>6} pages ({:>4} MiB)", total - used, (total - used) * 4 / 1024);
     let pct = if total > 0 { (used * 100) / total } else { 0 };

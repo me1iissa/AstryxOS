@@ -817,12 +817,23 @@ fn get_cpu_brand_string() -> String {
 }
 
 /// Generate `/proc/meminfo` content from live PMM stats.
+///
+/// `MemTotal` follows proc(5): "total usable RAM (i.e., physical RAM minus a
+/// few reserved bits and the kernel binary code)" — so the frames the kernel
+/// permanently withholds (its own image, the BootInfo handoff, the low 1 MiB,
+/// the bootstrap stack and the statically reserved kernel heap) are subtracted
+/// from the machine's usable RAM rather than reported as memory a process
+/// could ever obtain.
+///
+/// `MemFree` is what the frame allocator can actually hand out right now.
+/// `MemTotal - MemFree` is therefore the dynamically allocated footprint.
 pub fn generate_meminfo() -> Vec<u8> {
     let (total, used) = crate::mm::pmm::stats();
+    let reserved = crate::mm::pmm::reserved_page_count();
     let free = total.saturating_sub(used);
     let available = free;
     // Each PMM page = 4 KiB.
-    let total_kb  = total    * 4;
+    let total_kb  = total.saturating_sub(reserved) * 4;
     let free_kb   = free     * 4;
     let avail_kb  = available * 4;
     let content = alloc::format!(
