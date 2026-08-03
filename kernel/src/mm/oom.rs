@@ -24,10 +24,21 @@
 //! meaning of resident set size — the score estimates the pressure relieved by
 //! killing this process, not exclusive ownership.
 //!
-//! A process whose address space is not tracked (the resident-set table was
-//! saturated when it started) scores 0 and so is never selected.  The failure
-//! direction is deliberate: an untracked process is passed over, never killed
-//! on the strength of a number nobody measured.
+//! Two kinds of candidate are refused rather than ranked, and the refusal is
+//! implemented in [`select_victim`] — not left to a `max_by` that would in fact
+//! return the highest PID once every score reached zero:
+//!
+//! * a process whose address space is **not tracked** (the resident-set table
+//!   was saturated when it started) — never killed on the strength of a number
+//!   nobody measured;
+//! * a process measured at **zero resident pages** — killing it reclaims
+//!   nothing, so the allocation fails either way and the process is spent for
+//!   free.
+//!
+//! When that leaves no candidate the killer reclaims nothing and says so.  The
+//! caller then fails an allocation, which is recoverable; there is no
+//! "kill someone anyway" fallback, because every candidate such a fallback
+//! could reach is one of the two cases above.
 //!
 //! Tie-breaking: among equal scores, the process with the highest PID is
 //! targeted first (higher PID ≈ created more recently ≈ youngest, matching the
@@ -146,9 +157,8 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         return None;
     }
 
-    // (pid, resident_pages, mapped_pages).  Only the resident figure is
-    // scored; the mapped figure rides along so the log line can show both.
-    let candidates: alloc::vec::Vec<(Pid, u64, u64)> = {
+    // Score every eligible process while the table is held; rank afterwards.
+    let candidates: alloc::vec::Vec<Candidate> = {
         let procs = {
             let mut guard = None;
             let mut iters: u32 = 0;
@@ -195,7 +205,11 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
                 }
                 true
             })
-            .map(|p| (p.pid, rss_pages(p), mapped_pages(p)))
+            .map(|p| Candidate {
+                pid: p.pid,
+                score: oom_score(p.vm_space.as_ref()),
+                mapped: mapped_pages(p.vm_space.as_ref()),
+            })
             .collect()
     }; // PROCESS_TABLE lock released here
 
@@ -207,33 +221,53 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         return None;
     }
 
-    // Pick the candidate with the largest resident set.  On ties, prefer the
-    // highest PID (youngest process by creation order).
-    let (target_pid, target_rss, target_mapped) = candidates
+    // `untracked` and `zero_resident` are counted separately: the first means
+    // the resident-set table had no slot (a measurement gap), the second means
+    // it measured the process and found no frames (a real answer).  Both are
+    // refused by `select_victim`, but only the first says the decision was
+    // made with incomplete information.
+    let untracked = candidates.iter().filter(|c| c.score.is_none()).count();
+    let zero_resident = candidates
         .iter()
-        .copied()
-        .max_by(|(pid_a, rss_a, _), (pid_b, rss_b, _)| {
-            rss_a.cmp(rss_b).then(pid_a.cmp(pid_b))
-        })
-        .expect("non-empty candidates must yield a maximum");
+        .filter(|c| c.score == Some(0))
+        .count();
 
-    // Both figures are logged because their ratio is the whole point: a
-    // victim with a large `mapped` and a small `rss` is one that reserved
-    // address space it never touched, and killing it frees `rss`, not
-    // `mapped`.  `untracked` counts candidates with no resident-set slot —
-    // they scored 0 and could not be selected, so a non-zero value means the
-    // choice was made with incomplete information.
-    let untracked = candidates.iter().filter(|(_, rss, _)| *rss == 0).count();
+    let target_pid = match select_victim(&candidates) {
+        Some(pid) => pid,
+        None => {
+            crate::serial_println!(
+                "[OOM] no candidate holds reclaimable memory (needed={} frames) — \
+                 failing the allocation; candidates={} untracked={} zero_resident={} \
+                 rss_slots_full={}",
+                needed_frames,
+                candidates.len(),
+                untracked,
+                zero_resident,
+                crate::mm::rss::attach_failures(),
+            );
+            return None;
+        }
+    };
+
+    // Both figures are logged because their ratio is the whole point: a victim
+    // with a large `mapped` and a small `rss` is one that reserved address
+    // space it never touched, and killing it frees `rss`, not `mapped`.
+    let victim = candidates
+        .iter()
+        .find(|c| c.pid == target_pid)
+        .copied()
+        .expect("select_victim returns a pid from the list it was given");
     crate::serial_println!(
         "[OOM] killed pid={} rss={} pages ({} KiB) mapped={} pages need={} pages \
-         candidates={} zero_rss={} rss_slots_full={}",
+         candidates={} untracked={} zero_resident={} rss_slots_full={}",
         target_pid,
-        target_rss,
-        target_rss * 4,
-        target_mapped,
+        victim.score.unwrap_or(0),
+        victim.score.unwrap_or(0) * 4,
+        victim.mapped,
         needed_frames,
         candidates.len(),
         untracked,
+        zero_resident,
         crate::mm::rss::attach_failures(),
     );
 
@@ -249,31 +283,35 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
     Some(target_pid)
 }
 
-/// Resident set size of a process, in 4 KiB pages.
+/// **The** OOM victim score: resident pages, in 4 KiB units.
 ///
-/// A lock-free read of the per-address-space counter maintained by
-/// `mm::rss` at every leaf-PTE install and clear.  Deliberately *not* a
-/// page-table walk: this runs when the machine is already out of frames, and
-/// the whole point of the `PROCESS_TABLE` handling above is to keep this path
-/// short and non-blocking.
+/// A lock-free read of the per-address-space counter maintained by `mm::rss`
+/// at every leaf-PTE install and clear.  Deliberately *not* a page-table walk:
+/// this runs when the machine is already out of frames, and the whole point of
+/// the `PROCESS_TABLE` handling above is to keep this path short and
+/// non-blocking.
 ///
-/// Returns 0 for kernel threads (no address space) and for an address space
-/// the resident-set table could not track — see the module-level note on why
-/// that failure direction is the safe one.
-fn rss_pages(proc: &crate::proc::Process) -> u64 {
-    match proc.vm_space.as_ref() {
-        None => 0,
-        Some(vm) => crate::mm::rss::resident_pages(vm.cr3).unwrap_or(0),
-    }
+/// `None` means "not measured" and is distinct from `Some(0)`:
+///
+/// * `None` — no address space (a kernel thread), or the resident-set table
+///   had no slot for this one.  [`select_victim`] refuses to rank it.
+/// * `Some(0)` — measured, and it holds no frames.
+///
+/// Taking this from `vm.areas` lengths instead is the defect this module was
+/// changed to fix; see the module-level note.  Test 753 drives this exact
+/// function against an address space whose virtual size and resident set
+/// differ by four orders of magnitude, so that substitution fails the suite.
+pub fn oom_score(vm_space: Option<&crate::mm::vma::VmSpace>) -> Option<u64> {
+    crate::mm::rss::resident_pages(vm_space?.cr3)
 }
 
 /// Sum of the process's VMA lengths in pages — its *virtual* size.
 ///
-/// Not used for scoring (see the module-level note); logged next to the
-/// resident figure so the gap between what a process reserved and what it
-/// actually touched is legible in the one line the killer emits.
-fn mapped_pages(proc: &crate::proc::Process) -> u64 {
-    match proc.vm_space.as_ref() {
+/// Explicitly **not** the score (see [`oom_score`]); carried alongside it so
+/// the gap between what a process reserved and what it actually touched is
+/// legible in the one line the killer emits.
+pub fn mapped_pages(vm_space: Option<&crate::mm::vma::VmSpace>) -> u64 {
+    match vm_space {
         None => 0,
         Some(vm) => vm
             .areas
@@ -283,20 +321,51 @@ fn mapped_pages(proc: &crate::proc::Process) -> u64 {
     }
 }
 
-// ── Unit-testable scoring helpers ───────────────────────────────────────────
-//
-// The test runner exercises these through direct calls rather than through the
-// full OOM path (which requires a running PMM and is hard to exhaust safely).
+/// One scored OOM candidate.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub pid: Pid,
+    /// [`oom_score`] for this process.
+    pub score: Option<u64>,
+    /// [`mapped_pages`], carried for the log line only — never ranked on.
+    pub mapped: u64,
+}
 
-/// Score a slice of (pid, rss) pairs and return the winning PID.
+/// Select the OOM victim from a scored candidate list.
 ///
-/// Exported for testing.  Production callers should use `invoke_oom_killer`.
-pub fn score_pick(candidates: &[(Pid, u64)]) -> Option<Pid> {
+/// **This is the production selector**: [`invoke_oom_killer`] calls exactly
+/// this function, so a test that drives it is testing the decision the machine
+/// actually makes.  It previously existed twice — an inline `max_by` in the
+/// killer and a `score_pick` helper that only tests called — which let the
+/// tested copy stay correct while the live one regressed.  There is now one.
+///
+/// Two kinds of candidate are refused outright rather than ranked, which is
+/// where the module's "never killed on the strength of a number nobody
+/// measured" guarantee is actually implemented:
+///
+/// * **untracked** (`score == None`) — nothing measured this address space, so
+///   choosing it would be a guess.
+/// * **zero-resident** (`score == Some(0)`) — it holds no frames, so killing
+///   it reclaims nothing and the allocation that triggered the OOM fails
+///   anyway.  Spending a process for no memory is strictly worse than failing
+///   the allocation.
+///
+/// If that leaves nothing the answer is `None` and the caller fails the
+/// allocation, which is recoverable.  There is deliberately **no** "kill
+/// someone anyway" fallback, because every candidate it could fall back to is
+/// one of the two cases above.  A plain `max_by` over the whole list has the
+/// opposite behaviour: with every score zero it silently returns the highest
+/// PID.
+///
+/// Among the rest the largest resident set wins; ties go to the highest PID
+/// (youngest by creation order).
+pub fn select_victim(candidates: &[Candidate]) -> Option<Pid> {
     candidates
         .iter()
-        .copied()
-        .max_by(|(pid_a, rss_a), (pid_b, rss_b)| {
-            rss_a.cmp(rss_b).then(pid_a.cmp(pid_b))
+        .filter_map(|c| match c.score {
+            Some(pages) if pages > 0 => Some((c.pid, pages)),
+            _ => None,
         })
-        .map(|(pid, _rss)| pid)
+        .max_by(|(pid_a, rss_a), (pid_b, rss_b)| rss_a.cmp(rss_b).then(pid_a.cmp(pid_b)))
+        .map(|(pid, _)| pid)
 }

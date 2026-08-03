@@ -59,6 +59,16 @@ const KEY_EMPTY: u64 = 0;
 /// zeroing a live process's resident count.  A real CR3 is a page-aligned
 /// physical address and can never collide with this value.
 const KEY_TOMBSTONE: u64 = u64::MAX;
+/// Slot key meaning "claimed by an [`attach`] that has not published its CR3
+/// yet" — a lookup must probe *past* it, exactly like a tombstone.
+///
+/// This is what makes the claim safe against a concurrent `attach`: the count
+/// is reset only after the slot has been won and while it is still unreachable
+/// by `find`, so no losing racer can zero a slot another address space has
+/// already begun counting into, and no `account` can slip in between the reset
+/// and the publish.  A real CR3 is a page-aligned physical address and can
+/// never collide with this value.
+const KEY_CLAIMING: u64 = u64::MAX - 1;
 
 /// CR3 of the address space occupying each slot.
 static RSS_KEYS: [AtomicU64; RSS_SLOTS] = [const { AtomicU64::new(KEY_EMPTY) }; RSS_SLOTS];
@@ -85,9 +95,10 @@ fn slot_for(cr3: u64) -> usize {
 
 /// Find the slot holding `cr3`, or `None`.
 ///
-/// Probes past tombstones and stops at the first never-used slot: an entry
-/// that exists is always reachable from its hash position through a chain of
-/// occupied-or-tombstoned slots.
+/// Probes past every non-matching key — another CR3, a tombstone, or a slot
+/// mid-claim — and stops only at the first never-used slot: an entry that
+/// exists is always reachable from its hash position through an unbroken chain
+/// of non-empty slots.
 #[inline]
 fn find(cr3: u64) -> Option<usize> {
     let start = slot_for(cr3);
@@ -96,6 +107,7 @@ fn find(cr3: u64) -> Option<usize> {
         match RSS_KEYS[idx].load(Ordering::Acquire) {
             KEY_EMPTY => return None,
             k if k == cr3 => return Some(idx),
+            // KEY_TOMBSTONE, KEY_CLAIMING, or a different CR3 — keep probing.
             _ => continue,
         }
     }
@@ -121,24 +133,31 @@ pub fn attach(cr3: u64) -> bool {
     if find(cr3).is_some() {
         return true;
     }
-    // Pass 2: claim the first empty-or-tombstoned slot.
+    // Pass 2: claim the first empty-or-tombstoned slot, in two steps.
+    //
+    // Win the slot FIRST (CAS to `KEY_CLAIMING`), then reset the count, then
+    // publish the CR3.  Resetting before the CAS would be a live-data bug: on
+    // a lost race the slot already belongs to another address space, and this
+    // call would have wiped a count that space had begun accumulating.  While
+    // the key reads `KEY_CLAIMING` the slot is invisible to `find`, so the
+    // reset also cannot race an `account` for the CR3 about to be published.
     for i in 0..RSS_SLOTS {
         let idx = (start + i) % RSS_SLOTS;
         let cur = RSS_KEYS[idx].load(Ordering::Relaxed);
         if cur != KEY_EMPTY && cur != KEY_TOMBSTONE {
             continue;
         }
-        // Zero the count *before* publishing the key, so no concurrent
-        // `account` for this CR3 can observe a slot carrying a stale count
-        // from the previous occupant.
-        RSS_PAGES[idx].store(0, Ordering::Relaxed);
         if RSS_KEYS[idx]
-            .compare_exchange(cur, cr3, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(cur, KEY_CLAIMING, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
+            RSS_PAGES[idx].store(0, Ordering::Relaxed);
+            // Release: the zeroed count happens-before any `find` that
+            // acquires this key and starts accounting into the slot.
+            RSS_KEYS[idx].store(cr3, Ordering::Release);
             return true;
         }
-        // Lost the race for this slot; keep probing.
+        // Lost the race for this slot; keep probing.  Nothing was written.
     }
     RSS_ATTACH_FAILURES.fetch_add(1, Ordering::Relaxed);
     false
@@ -207,7 +226,7 @@ pub fn tracked_count() -> usize {
     let mut n = 0;
     for slot in RSS_KEYS.iter() {
         let k = slot.load(Ordering::Relaxed);
-        if k != KEY_EMPTY && k != KEY_TOMBSTONE {
+        if k != KEY_EMPTY && k != KEY_TOMBSTONE && k != KEY_CLAIMING {
             n += 1;
         }
     }
@@ -224,6 +243,13 @@ pub fn tracked_count() -> usize {
 ///
 /// A huge leaf counts as the number of 4 KiB frames it covers, matching how
 /// the maintenance sites account for one.
+///
+/// Kernel identity-map leaves (`phys == va` inside the identity window) are
+/// **excluded**, matching the exclusion in `VmSpace::clone_for_fork`.  They
+/// appear in PML4[0] only on the kernel's own CR3 — which the in-kernel test
+/// runner can fork — and are aliases of kernel memory that no process teardown
+/// frees.  Counting them would put up to 2^20 phantom pages into a score whose
+/// entire purpose is to predict how much memory killing the process returns.
 pub fn walk_resident_pages(cr3: u64) -> u64 {
     /// Higher-half physical map base — matches `mm::vmm::PHYS_OFF`.
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
@@ -252,8 +278,12 @@ pub fn walk_resident_pages(cr3: u64) -> u64 {
                 if pdpte & PAGE_PRESENT == 0 {
                     continue;
                 }
+                let va_1g = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30);
                 if pdpte & PAGE_HUGE != 0 {
-                    resident += 512 * 512; // one 1 GiB leaf
+                    let phys_1g = pdpte & !0x3FFF_FFFFu64;
+                    if !crate::mm::vmm::is_identity_map_phys(va_1g, phys_1g) {
+                        resident += 512 * 512; // one 1 GiB leaf
+                    }
                     continue;
                 }
                 let pd = (PHYS_OFF + (pdpte & ADDR_MASK)) as *const u64;
@@ -262,13 +292,22 @@ pub fn walk_resident_pages(cr3: u64) -> u64 {
                     if pde & PAGE_PRESENT == 0 {
                         continue;
                     }
+                    let va_2m = va_1g | ((pd_idx as u64) << 21);
                     if pde & PAGE_HUGE != 0 {
-                        resident += 512; // one 2 MiB leaf
+                        let phys_2m = pde & 0x000F_FFFF_FFE0_0000u64;
+                        if !crate::mm::vmm::is_identity_map_phys(va_2m, phys_2m) {
+                            resident += 512; // one 2 MiB leaf
+                        }
                         continue;
                     }
                     let pt = (PHYS_OFF + (pde & ADDR_MASK)) as *const u64;
                     for pt_idx in 0..512usize {
-                        if *pt.add(pt_idx) & PAGE_PRESENT != 0 {
+                        let pte = *pt.add(pt_idx);
+                        if pte & PAGE_PRESENT == 0 {
+                            continue;
+                        }
+                        let va = va_2m | ((pt_idx as u64) << 12);
+                        if !crate::mm::vmm::is_identity_map_phys(va, pte & ADDR_MASK) {
                             resident += 1;
                         }
                     }

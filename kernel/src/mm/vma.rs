@@ -955,7 +955,16 @@ impl VmSpace {
         // Begin resident-set accounting for this address space (mm::rss).
         // PML4[0] is empty at this point, so it correctly starts at zero and
         // every later leaf install/clear in `mm::vmm` moves it from there.
-        // Paired with the `rss::detach` in `Drop` below.
+        //
+        // Released in TWO places, and it needs both.  `free_user_page_tables`
+        // is the normal path and the load-bearing one — it runs before the
+        // PML4 frame is recycled, which is the ordering that stops a late
+        // adjustment landing on the next address space to occupy that frame.
+        // The last-owner arm of `Drop` below is the backstop for a `VmSpace`
+        // that is dropped *without* that teardown ever running, e.g. an
+        // `execve` whose ELF load fails after the new address space was built.
+        // Without it, that slot would be leaked for the rest of the boot.
+        // `detach` is idempotent, so the ordinary path running both is fine.
         crate::mm::rss::attach(new_pml4);
         // Record that a user address space (and thus a user CR3) now exists.
         // The BSP stack-pivot in `main.rs` asserts this is zero before it runs,
@@ -1164,7 +1173,12 @@ impl VmSpace {
                             // both parent and child (copy the PDPTE verbatim).
                             *parent_pdpt.add(pdpt_idx) = pdpte;
                             *child_pdpt .add(pdpt_idx) = pdpte;
-                            child_resident += 512 * 512; // 1 GiB leaf
+                            // NOT counted into `child_resident`: this is the
+                            // kernel's own 1:1 map, aliased into the child,
+                            // and teardown frees none of it.  Counting it
+                            // would add 262144 phantom pages per 1 GiB leaf
+                            // to an OOM score that killing the process cannot
+                            // redeem.
                             continue;
                         }
                         let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
@@ -1216,8 +1230,13 @@ impl VmSpace {
                             };
                             *parent_pd.add(pd_idx) = parent_pde;
                             *child_pd .add(pd_idx) = child_pde;
-                            child_resident += 512; // 2 MiB leaf
                             if !identity {
+                                // Same exclusion as the refcount below, for
+                                // the same reason: a kernel identity leaf is
+                                // aliased into the child but owned by nobody
+                                // there, so teardown frees none of it and it
+                                // must not inflate the child's OOM score.
+                                child_resident += 512; // 2 MiB leaf
                                 for sub in 0..512u64 {
                                     page_ref_inc(phys_2m + sub * 0x1000);
                                 }
@@ -1282,7 +1301,16 @@ impl VmSpace {
                                 page_ref_inc(phys);
                             }
                             total_pages_cow += 1;
-                            child_resident += 1;
+                            // Exclude the kernel identity leaf from the OOM
+                            // score for the same reason its refcount is
+                            // skipped: it is aliased into the child, owned by
+                            // nobody there, and freed by no teardown.  An SHM
+                            // `Device` leaf IS counted — it is genuinely
+                            // resident in this address space, and RSS counts a
+                            // shared frame once per space that maps it.
+                            if !identity {
+                                child_resident += 1;
+                            }
                         }
                     }
                 }
@@ -1835,6 +1863,17 @@ impl Drop for VmSpace {
                 // safe to call while `reg` (MM_REGISTRY) is still held.
                 #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::live_cr3_forget(self.cr3);
+                // Resident-set slot (`mm::rss`) follows the same last-owner
+                // lifecycle, and for the same reason as `live_cr3_forget`: a
+                // vfork sibling still holding this cr3 must keep its count.
+                // The normal teardown path already detached in
+                // `free_user_page_tables`, and `detach` is idempotent — this
+                // arm exists for the `VmSpace` that is dropped WITHOUT that
+                // teardown (an `execve` whose ELF load fails after building
+                // the new address space), which would otherwise leak the slot
+                // for the rest of the boot.  Lock-free, so safe to call while
+                // `reg` is still held.
+                crate::mm::rss::detach(self.cr3);
                 // Generation registry tracks the same lifecycle (per-cr3,
                 // shared with from_existing_cr3 vfork siblings).  Remove the
                 // entry only when the sem entry was also removed so the two

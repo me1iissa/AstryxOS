@@ -630,6 +630,16 @@ fn is_user_va(virt_addr: u64) -> bool {
 /// bootstrap address spaces), and for writes that leave the present bit
 /// unchanged — flag-only rewrites (CoW write-protect, `mprotect`) and
 /// same-address CoW installs move no page in or out of the resident set.
+///
+/// Also a no-op for a kernel identity leaf (`phys == va` inside the identity
+/// window).  Those are aliases of kernel memory that no process teardown
+/// frees, so they must not enter a score whose purpose is to predict how much
+/// memory killing the process returns.  The same exclusion is applied by
+/// `VmSpace::clone_for_fork` and by `mm::rss::walk_resident_pages`; keeping the
+/// rule identical in all three is what lets the counter be checked against the
+/// walk.  The transition is judged against whichever side of the write is
+/// present, so an identity leaf that is skipped on install is also skipped on
+/// clear and the counter stays balanced.
 #[inline]
 fn account_leaf_pte(pml4_phys: u64, virt_addr: u64, old_pte: u64, new_pte: u64) {
     if !is_user_va(virt_addr) {
@@ -638,6 +648,10 @@ fn account_leaf_pte(pml4_phys: u64, virt_addr: u64, old_pte: u64, new_pte: u64) 
     let was_present = old_pte & PAGE_PRESENT != 0;
     let now_present = new_pte & PAGE_PRESENT != 0;
     if was_present == now_present {
+        return;
+    }
+    let live_pte = if now_present { new_pte } else { old_pte };
+    if is_identity_map_phys(virt_addr, live_pte & ADDR_MASK) {
         return;
     }
     crate::mm::rss::account(pml4_phys, if now_present { 1 } else { -1 });
