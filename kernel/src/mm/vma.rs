@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, RwLock, RwLockReadGuard};
+use spin::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// VMA protection flags (mmap-compatible).
 pub type VmProt = u32;
@@ -726,6 +726,47 @@ pub(crate) fn mm_sem_read_draining(sem: &RwLock<()>) -> RwLockReadGuard<'_, ()> 
     loop {
         crate::mm::tlb::drain_incoming_shootdown_if_smp();
         if let Some(guard) = sem.try_read() {
+            return guard;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Acquire `sem.write()` from an IF=0 caller, servicing this CPU's own incoming
+/// TLB-shootdown slot on every contended spin iteration.
+///
+/// The write-mode counterpart of [`mm_sem_read_draining`], and it exists for
+/// the same reason, one step further along: the existing `mm_sem.write()`
+/// holders (`clone_for_fork`, `free_process_memory`, `free_vm_space`) all
+/// acquire from a syscall context with interrupts enabled, so a plain blocking
+/// `RwLock::write()` there can never present as unserviceable dead weight to a
+/// peer's shootdown — the ordinary ISR still runs while they spin.  The
+/// break-before-make CoW arm (`vmm::cow_break_if_unchanged`) is the first
+/// writer that acquires from inside the `#PF` handler, i.e. with IF=0 for the
+/// whole acquisition (Intel SDM Vol. 3A §6.8.1/§6.12.1: an interrupt gate
+/// clears IF on entry).
+///
+/// That changes the hazard.  While this CPU spins IF=0 on a plain `write()`, a
+/// peer CPU's `shootdown_range` targeting us cannot make progress: IF=0 leaves
+/// the shootdown vector pending in our LAPIC IRR (Intel SDM Vol. 3A §10.6.1),
+/// so the peer spins its full ACK bound waiting for an ACK we cannot send until
+/// we return from the fault — which we cannot do until we acquire, which we
+/// cannot do until the peer (a reader or writer of this same `mm_sem`)
+/// releases.  Draining our own slot on each iteration removes that cycle
+/// without weakening the exclusion: we still do not proceed until every reader
+/// and writer has released.
+///
+/// `drain_incoming_shootdown_if_smp` is lock-free and EOI-free, so it is safe
+/// under IF=0 provided this CPU holds neither `mm_sem` nor `VMM_LOCK` — it
+/// holds neither here (it is still spinning for the former, and the latter is
+/// only ever taken after it, per the lock-ordering invariant on [`VmSpace`]).
+pub(crate) fn mm_sem_write_draining(sem: &RwLock<()>) -> RwLockWriteGuard<'_, ()> {
+    if let Some(guard) = sem.try_write() {
+        return guard;
+    }
+    loop {
+        crate::mm::tlb::drain_incoming_shootdown_if_smp();
+        if let Some(guard) = sem.try_write() {
             return guard;
         }
         core::hint::spin_loop();
