@@ -8259,7 +8259,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
               "bell-stats", "compose-stats", "mouse-state", "x11-windows", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
-              "tlb-stats", "heap-stats", "w215-diag",
+              "tlb-stats", "heap-stats", "oom-candidates", "w215-diag",
               # cpu-state: per-CPU scheduler/timer survey + TID-0 reactor
               # placement.  Diagnoses SMP "de-facto single core" imbalance.
               "cpu-state",
@@ -14666,7 +14666,7 @@ def main():
         "bell-stats", "compose-stats", "mouse-state", "x11-windows", "cache-audit", "cache-aliasing",
         "cache-lookup",
         "fault-cache-keys",
-        "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
+        "w215-cache-residency", "tlb-stats", "heap-stats", "oom-candidates", "w215-diag",
         "arm-phys",
         # cpu-state: per-CPU scheduler/timer survey (timer_isr, current_tid,
         # watchdog, nr_running) + the TID-0 poll-reactor placement (last_cpu,

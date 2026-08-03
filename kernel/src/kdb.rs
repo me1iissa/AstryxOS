@@ -415,6 +415,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "tlb-stats"        => op_tlb_stats(out),
         "cpu-state"        => op_cpu_state(out),
         "heap-stats"       => op_heap_stats(out),
+        "oom-candidates"   => op_oom_candidates(out),
         "w215-diag"        => op_w215_diag(out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
@@ -2297,6 +2298,106 @@ fn op_heap_stats(out: &mut String) {
     // Uptime for caller-side rate computation.
     let _ = write!(out, r#","uptime_ticks":{}}}"#,
         crate::arch::x86_64::irq::get_ticks());
+}
+
+// ── oom-candidates ───────────────────────────────────────────────────────────
+//
+// Show the decision `mm::oom::invoke_oom_killer` WOULD make right now, without
+// making it.  Every number and the verdict come from the production functions
+// (`oom_score`, `mapped_pages`, `select_victim`), so this is the killer's own
+// arithmetic on the live process table rather than a reimplementation of it.
+//
+// Why it exists: the killer only emits its `[OOM] killed` line when it
+// actually fires, and the dominant production arrival — `alloc_page`
+// exhaustion inside the `#PF` demand-fault handler — returns at
+// `invoke_oom_killer`'s fast reject because that path already holds
+// PROCESS_TABLE (see PR #751).  Selection is therefore not observable from a
+// live pressure run through that path, and it needs to be: the whole point of
+// scoring by resident pages is that `resident` and `mapped` differ, often by
+// orders of magnitude, and only a loaded machine shows by how much.
+//
+// Output shape (JSON):
+//   { "candidates": [ {"pid":N, "resident_pages":N|null, "resident_kib":N|null,
+//                      "mapped_pages":N, "name":"..."} ],
+//     "would_kill": N | null,
+//     "untracked": N, "zero_resident": N,
+//     "rss_slots_full": N, "rss_tracked": N, "rss_underflows": N,
+//     "process_table": "read" | "contended" }
+//
+// `resident_pages` is null for an address space the resident-set table never
+// tracked — reported as null rather than 0 because "not measured" and
+// "measured empty" are different answers, and `select_victim` refuses both for
+// different reasons.  Read-only: no process is signalled.
+fn op_oom_candidates(out: &mut String) {
+    use core::fmt::Write;
+
+    let mut cands: alloc::vec::Vec<(crate::proc::Pid, crate::mm::oom::Candidate,
+                                    alloc::string::String)> = alloc::vec::Vec::new();
+    let table_state = match try_lock_brief(&PROCESS_TABLE) {
+        Some(procs) => {
+            for p in procs.iter() {
+                // Same eligibility filter as `invoke_oom_killer`.
+                if p.pid == 0 || p.pid == 1 || p.vm_space.is_none() {
+                    continue;
+                }
+                if p.state == crate::proc::ProcessState::Zombie {
+                    continue;
+                }
+                let name_end = p.name.iter().position(|&b| b == 0).unwrap_or(p.name.len());
+                let name = alloc::string::String::from_utf8_lossy(&p.name[..name_end])
+                    .into_owned();
+                cands.push((
+                    p.pid,
+                    crate::mm::oom::Candidate {
+                        pid: p.pid,
+                        score: crate::mm::oom::oom_score(p.vm_space.as_ref()),
+                        mapped: crate::mm::oom::mapped_pages(p.vm_space.as_ref()),
+                    },
+                    name,
+                ));
+            }
+            "read"
+        }
+        None => "contended",
+    };
+
+    let only: alloc::vec::Vec<crate::mm::oom::Candidate> =
+        cands.iter().map(|(_, c, _)| *c).collect();
+    let would_kill = crate::mm::oom::select_victim(&only);
+    let untracked = only.iter().filter(|c| c.score.is_none()).count();
+    let zero_resident = only.iter().filter(|c| c.score == Some(0)).count();
+
+    out.push_str(r#"{"candidates":["#);
+    for (i, (_pid, c, name)) in cands.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        let _ = write!(out, r#""pid":{},"#, c.pid);
+        match c.score {
+            Some(r) => {
+                let _ = write!(out, r#""resident_pages":{},"resident_kib":{},"#, r, r * 4);
+            }
+            None => {
+                let _ = write!(out, r#""resident_pages":null,"resident_kib":null,"#);
+            }
+        }
+        let _ = write!(out, r#""mapped_pages":{},"mapped_kib":{},"#, c.mapped, c.mapped * 4);
+        let _ = write!(out, r#""name":"{}""#, name);
+        out.push('}');
+    }
+    out.push(']');
+    match would_kill {
+        Some(pid) => { let _ = write!(out, r#","would_kill":{}"#, pid); }
+        None => out.push_str(r#","would_kill":null"#),
+    }
+    let _ = write!(out, r#","untracked":{},"zero_resident":{},"#, untracked, zero_resident);
+    let _ = write!(out, r#""rss_slots_full":{},"#, crate::mm::rss::attach_failures());
+    let _ = write!(out, r#""rss_tracked":{},"#, crate::mm::rss::tracked_count());
+    let _ = write!(out, r#""rss_underflows":{},"#, crate::mm::rss::underflow_count());
+    let _ = write!(out, r#""oom_exhausted_total":{},"#, crate::mm::pmm::exhausted_count());
+    let _ = write!(out, r#""oom_lock_giveups":{},"#, crate::mm::oom::lock_giveup_count());
+    let _ = write!(out, r#""process_table":"{}"}}"#, table_state);
 }
 
 // ── proc-tree ────────────────────────────────────────────────────────────────
