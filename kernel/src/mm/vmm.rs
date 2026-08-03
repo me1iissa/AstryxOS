@@ -914,8 +914,13 @@ pub fn map_page_in_cow_if_unchanged(
 /// successful break.  An install-then-flush ordering would leave the freshly
 /// published entry here instead, which is what
 /// `test_cow_break_flushes_before_install` checks for.  Diagnostic only
-/// (`firefox-test-core`); never consulted by the running kernel.
-#[cfg(feature = "firefox-test-core")]
+/// (test builds only); never consulted by the running kernel.
+///
+/// Gated on `test-mode` OR `firefox-test-core`: CI's suite job builds the kernel
+/// with `--features test-mode` alone, so a `firefox-test-core`-only gate would
+/// compile both this witness and Test 98g2b out of the very build that is meant
+/// to enforce them.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub static COW_BREAK_PTE_AT_FLUSH: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -1061,7 +1066,7 @@ pub fn cow_break_if_unchanged(
     };
 
     // --- Step 2: flush, with VMM_LOCK released. ---
-    #[cfg(feature = "firefox-test-core")]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     COW_BREAK_PTE_AT_FLUSH.store(
         unsafe { *pt_ptr.add(pt_idx) },
         core::sync::atomic::Ordering::Relaxed,

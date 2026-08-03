@@ -1361,8 +1361,9 @@ pub fn run() -> ! {
 
     // Test 98g2b: CoW break-before-make ordering (the old translation is
     // invalidated before the private copy becomes observable).  The ordering
-    // witness it asserts on is only compiled in under `firefox-test-core`.
-    #[cfg(feature = "firefox-test-core")]
+    // witness it asserts on compiles under `test-mode` (which is what CI's
+    // suite job builds) as well as `firefox-test-core`.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     {
         total += 1;
         if test_cow_break_flushes_before_install() { passed += 1; }
@@ -35725,7 +35726,7 @@ fn test_map_page_in_cow_if_unchanged_anti_alias() -> bool {
 /// install-then-flush ordering leaves the freshly published entry there instead
 /// and fails check (2) — this test gates the ordering itself, not merely the
 /// re-validation.
-#[cfg(feature = "firefox-test-core")]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 fn test_cow_break_flushes_before_install() -> bool {
     test_header!("cow_break_if_unchanged: break-before-make ordering");
 
