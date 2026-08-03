@@ -6899,6 +6899,213 @@ def cmd_mem(args):
     })
 
 
+def _resolve_symbol_suffix(elf_path: Path, needle: str) -> Optional[dict]:
+    """
+    Resolve a Rust static whose mangled name CONTAINS `needle`.
+
+    Rust statics carry a crate-hash prefix and (with LTO) an `.llvm.<hash>`
+    or `.0` suffix, so exact-name lookup cannot find them.  Returns the same
+    shape as `_resolve_symbol`, plus the full mangled name; None if the
+    needle matches zero or more than one symbol (ambiguity is an error, not
+    a coin flip).
+    """
+    if not elf_path.exists():
+        return None
+
+    hits = []
+    try:
+        from elftools.elf.elffile import ELFFile
+        from elftools.elf.sections import SymbolTableSection
+        with elf_path.open("rb") as f:
+            elf = ELFFile(f)
+            for sec in elf.iter_sections():
+                if not isinstance(sec, SymbolTableSection):
+                    continue
+                for sym in sec.iter_symbols():
+                    if needle in sym.name and sym["st_value"]:
+                        hits.append((sym.name, sym["st_value"], sym["st_size"]))
+    except ImportError:
+        # pyelftools is NOT installed on every host that runs this harness.
+        # Fall back to binutils `nm`, which is always present alongside the
+        # cross-toolchain.  Size is unavailable from plain `nm` output; the
+        # callers below read a fixed 8 bytes (AtomicU64), so 0 is harmless.
+        try:
+            raw = subprocess.run(["nm", str(elf_path)], capture_output=True,
+                                 text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if raw.returncode != 0:
+            return None
+        for line in raw.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            addr_s, _kind, name = parts
+            if needle not in name:
+                continue
+            try:
+                addr = int(addr_s, 16)
+            except ValueError:
+                continue
+            if addr:
+                hits.append((name, addr, 0))
+    # De-duplicate identical (name, addr) pairs across .symtab/.dynsym.
+    hits = sorted(set(hits))
+    if len(hits) != 1:
+        return None
+    name, addr, size = hits[0]
+    return {"addr": hex(addr), "size": size, "type": "obj", "mangled": name}
+
+
+# Rust statics sampled by `pmm-stats`.  Keyed by output field; the value is
+# the mangled-name substring that uniquely identifies the static.  All are
+# AtomicU64 (8 bytes, little-endian).
+_PMM_STAT_SYMS = {
+    "total_pages":            "2mm3pmm11TOTAL_PAGES",
+    "used_pages":             "2mm3pmm10USED_PAGES",
+    "exhausted_total":        "2mm3pmm19PMM_EXHAUSTED_TOTAL",
+    "free_residual_refs":     "2mm3pmm22PMM_FREE_RESIDUAL_REFS",
+    "free_kstatic_refused":   "2mm3pmm30PMM_FREE_KERNEL_STATIC_REFUSED",
+}
+
+# The allocator's frame bitmap (0 = free, 1 = used/reserved).
+_PMM_BITMAP_SYM = "2mm3pmm6BITMAP"
+
+
+def cmd_pmm_stats(args):
+    """
+    [Tier2] Sample the physical-frame allocator's live counters via the GDB
+    stub — free/used/total frames plus the exhaustion and refused-free
+    counters.  Read-only: resolves the `mm::pmm` Rust statics from the
+    kernel ELF and reads 8 bytes at each address.  No kernel change, no new
+    serial output.
+
+    Purpose: turn "memory was exhausted" into a TRAJECTORY.  A single
+    `[PMM/EXHAUSTED]` line dates the first failure but says nothing about
+    whether free frames declined over the whole boot (workload pressure) or
+    collapsed in a short window (leak/burst).  Sample this at intervals to
+    tell those apart.
+
+    Observer effect: each sample briefly halts the guest for the GDB reads
+    (~5 x 8 bytes).  Keep samples sparse (>= 10 s apart) on any boot whose
+    wall-clock timing is itself being measured.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    elf  = _get_kernel_elf()
+
+    addrs, unresolved = {}, []
+    for field, needle in _PMM_STAT_SYMS.items():
+        r = _resolve_symbol_suffix(elf, needle)
+        if r is None:
+            unresolved.append(field)
+        else:
+            addrs[field] = int(r["addr"], 16)
+
+    if "total_pages" not in addrs or "used_pages" not in addrs:
+        _err(f"pmm-stats: could not resolve TOTAL_PAGES/USED_PAGES in {elf} "
+             f"(unresolved={unresolved})")
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    vals = {}
+    try:
+        for field, addr in addrs.items():
+            raw = gdb.read_mem(addr, 8)
+            vals[field] = int.from_bytes(raw[:8], "little") if len(raw) >= 8 else None
+    except Exception as e:
+        _err(f"GDB mem error: {e}")
+    finally:
+        gdb.close()
+
+    total = vals.get("total_pages") or 0
+    used  = vals.get("used_pages") or 0
+    free  = total - used if total >= used else None
+
+    # ── Optional: count free bits straight out of the frame bitmap ─────────
+    # The USED_PAGES counter and the bitmap are maintained separately, so a
+    # disagreement between them is itself the finding: `alloc_page` fails iff
+    # EVERY bitmap byte is 0xFF, regardless of what the counter says.  Only
+    # the bytes covering TOTAL_PAGES are scanned — the tail of the bitmap is
+    # permanently 0xFF (frames beyond installed RAM) and would swamp the
+    # count.
+    bitmap = None
+    if getattr(args, "bitmap", False):
+        r = _resolve_symbol_suffix(elf, _PMM_BITMAP_SYM)
+        if r is None:
+            bitmap = {"error": "BITMAP symbol not resolved"}
+        else:
+            base = int(r["addr"], 16)
+            nbytes = (total + 7) // 8 if total else 0
+            gdb = GdbClient("127.0.0.1", port)
+            if not gdb.connect():
+                _err(f"Cannot connect to GDB stub on port {port}")
+            raw = bytearray()
+            try:
+                off = 0
+                while off < nbytes:
+                    chunk = min(4096, nbytes - off)
+                    part = gdb.read_mem(base + off, chunk)
+                    if not part:
+                        break
+                    raw += part
+                    off += len(part)
+            except Exception as e:
+                _err(f"GDB bitmap read error: {e}")
+            finally:
+                gdb.close()
+            scanned_pages = min(total, len(raw) * 8)
+            free_bits = 0
+            nonfull_bytes = 0
+            first_free_byte = None
+            for i in range(len(raw)):
+                b = raw[i]
+                if b != 0xFF:
+                    nonfull_bytes += 1
+                    if first_free_byte is None:
+                        first_free_byte = i
+                    for bit in range(8):
+                        if not (b >> bit) & 1 and i * 8 + bit < total:
+                            free_bits += 1
+            bitmap = {
+                "base": hex(base),
+                "bytes_read": len(raw),
+                "bytes_expected": nbytes,
+                "scanned_pages": scanned_pages,
+                "free_pages_bitmap": free_bits,
+                "free_mib_bitmap": round(free_bits * 4096 / (1024 * 1024), 1),
+                "nonfull_bytes": nonfull_bytes,
+                "first_free_byte": first_free_byte,
+                # The decisive field: alloc_page's two-pass scan returns None
+                # iff no byte anywhere in the bitmap is < 0xFF.
+                "alloc_would_fail": nonfull_bytes == 0,
+                "counter_vs_bitmap_delta": (free - free_bits)
+                                           if free is not None else None,
+            }
+
+    out = {
+        "ok": True,
+        "sid": args.sid,
+        "host_ts": time.time(),
+        "total_pages": total,
+        "used_pages": used,
+        "free_pages": free,
+        "total_mib": round(total * 4096 / (1024 * 1024), 1) if total else 0,
+        "used_mib":  round(used * 4096 / (1024 * 1024), 1) if used else 0,
+        "free_mib":  round(free * 4096 / (1024 * 1024), 1) if free is not None else None,
+        "used_pct":  round(100.0 * used / total, 2) if total else None,
+        "exhausted_total":      vals.get("exhausted_total"),
+        "free_residual_refs":   vals.get("free_residual_refs"),
+        "free_kstatic_refused": vals.get("free_kstatic_refused"),
+        "unresolved": unresolved,
+        "addrs": {k: hex(v) for k, v in addrs.items()},
+    }
+    if bitmap is not None:
+        out["bitmap"] = bitmap
+    _out(out)
+
+
 def cmd_sym(args):
     """Resolve a kernel symbol name from the ELF; no GDB needed."""
     elf = _get_kernel_elf()
@@ -14278,6 +14485,19 @@ def main():
     p_mem.add_argument("addr", help="Guest virtual address (hex or decimal)")
     p_mem.add_argument("length", type=int, help="Byte count (capped at 4096)")
 
+    # pmm-stats
+    p_pmm = sub.add_parser(
+        "pmm-stats",
+        help="[Tier2] Sample live physical-frame allocator counters (free/used/"
+             "total frames + exhaustion count) via the GDB stub. Read-only; "
+             "turns a single [PMM/EXHAUSTED] line into a trajectory.")
+    p_pmm.add_argument("sid")
+    p_pmm.add_argument("--bitmap", action="store_true",
+                       help="Also scan the frame bitmap itself and report the "
+                            "free-bit count. Distinguishes 'the allocator is "
+                            "genuinely full' from 'the USED_PAGES counter has "
+                            "drifted'. Costs ~8 extra GDB reads.")
+
     # sym
     p_sym = sub.add_parser("sym", help="[Tier2] Resolve kernel symbol to address (ELF parse, no GDB)")
     p_sym.add_argument("sid")
@@ -15322,6 +15542,7 @@ def main():
         "cr3-drain-catch": cmd_cr3_drain_catch,
         "mem":    cmd_mem,
         "sym":    cmd_sym,
+        "pmm-stats": cmd_pmm_stats,
         "bp":     cmd_bp,
         "step":   cmd_step,
         "cont":   cmd_cont,
