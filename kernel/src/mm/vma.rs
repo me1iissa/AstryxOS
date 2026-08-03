@@ -952,6 +952,11 @@ impl VmSpace {
         // dereferencing a freed/recycled PML4 frame.
         #[cfg(feature = "firefox-test-core")]
         crate::mm::w215_diag::live_cr3_mark(new_pml4);
+        // Begin resident-set accounting for this address space (mm::rss).
+        // PML4[0] is empty at this point, so it correctly starts at zero and
+        // every later leaf install/clear in `mm::vmm` moves it from there.
+        // Paired with the `rss::detach` in `Drop` below.
+        crate::mm::rss::attach(new_pml4);
         // Record that a user address space (and thus a user CR3) now exists.
         // The BSP stack-pivot in `main.rs` asserts this is zero before it runs,
         // so a boot-phase reorder that spawns a user process before the pivot
@@ -1118,6 +1123,14 @@ impl VmSpace {
         // At each level allocate a fresh table for the child so the child's
         // PD/PT pages are never shared with the parent's.
         let mut total_pages_cow: u64 = 0;
+        // Present user leaves the child inherits, in 4 KiB units — the child's
+        // starting resident set (`mm::rss`).  Counted here rather than by
+        // re-walking the child afterwards because this loop already visits
+        // every entry, and separately from `total_pages_cow` because that
+        // tally is specifically the 4 KiB CoW population reported by the
+        // fork trace.  A huge leaf contributes the frames it covers, matching
+        // `rss::walk_resident_pages`.
+        let mut child_resident: u64 = 0;
         unsafe {
             let parent_pml4 = (PHYS_OFF + actual_cr3) as *mut u64;
             let child_pml4  = (PHYS_OFF + child_pml4_phys) as *mut u64;
@@ -1151,11 +1164,13 @@ impl VmSpace {
                             // both parent and child (copy the PDPTE verbatim).
                             *parent_pdpt.add(pdpt_idx) = pdpte;
                             *child_pdpt .add(pdpt_idx) = pdpte;
+                            child_resident += 512 * 512; // 1 GiB leaf
                             continue;
                         }
                         let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
                         *parent_pdpt.add(pdpt_idx) = phys_1g | flags_ro;
                         *child_pdpt .add(pdpt_idx) = phys_1g | flags_ro;
+                        child_resident += 512 * 512; // 1 GiB leaf
                         continue;
                     }
 
@@ -1201,6 +1216,7 @@ impl VmSpace {
                             };
                             *parent_pd.add(pd_idx) = parent_pde;
                             *child_pd .add(pd_idx) = child_pde;
+                            child_resident += 512; // 2 MiB leaf
                             if !identity {
                                 for sub in 0..512u64 {
                                     page_ref_inc(phys_2m + sub * 0x1000);
@@ -1266,6 +1282,7 @@ impl VmSpace {
                                 page_ref_inc(phys);
                             }
                             total_pages_cow += 1;
+                            child_resident += 1;
                         }
                     }
                 }
@@ -1312,6 +1329,16 @@ impl VmSpace {
         register_mm_sem(child_pml4_phys, child_mm_sem.clone());
         let child_generation = Arc::new(AtomicU64::new(0));
         register_mm_generation(child_pml4_phys, child_generation.clone());
+
+        // Publish the child's resident set.  The walk above wrote the child's
+        // leaves directly rather than through `mm::vmm`, so nothing has
+        // accounted for them; seed the counter with the population the walk
+        // counted.  `attach` starts the slot at zero, so this is the child's
+        // whole resident set and not an increment on stale state.  The parent
+        // is untouched: write-protecting a present leaf moves nothing in or
+        // out of its resident set.
+        crate::mm::rss::attach(child_pml4_phys);
+        crate::mm::rss::account(child_pml4_phys, child_resident as i64);
 
         // Bump the parent's generation: the CoW write-protect pass above
         // mutated parent PTEs (clear PAGE_WRITABLE), which the PFH treats

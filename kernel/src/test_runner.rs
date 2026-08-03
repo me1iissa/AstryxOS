@@ -2526,6 +2526,13 @@ pub fn run() -> ! {
     total += 1;
     if test_752_pmm_counters_match_bitmap() { passed += 1; }
 
+    // ── Test 753: OOM scoring counts resident pages, not reserved VA ──
+    // Scoring by VMA length ranked by who reserved the most address space, so
+    // an 8.5 GiB untouched anonymous reservation scored 10.5 GiB "RSS" on a
+    // 1 GiB machine.  Drives the production victim-selection path.
+    total += 1;
+    if test_753_oom_scores_resident_not_reserved() { passed += 1; }
+
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
     // uniprocessor must SPIN (not `hlt`) so it self-clocks off the TSC; SMP and
@@ -62837,6 +62844,7 @@ fn test_750_oom_killer_does_not_block_on_process_table() -> bool {
     true
 }
 
+<<<<<<< HEAD
 // ── Test 752: PMM counters must agree with the frame bitmap ─────────────────
 //
 // `alloc_page` searches the bitmap; it succeeds or fails on that alone.  The
@@ -62956,6 +62964,197 @@ fn test_752_pmm_counters_match_bitmap() -> bool {
         return false;
     }
     test_println!("  {} frames freed, drift still 0", got);
+=======
+// ── Test 753: OOM scoring uses resident pages, not reserved address space ───
+//
+// `mm::oom` ranked candidates by the sum of their VMA *lengths* — the process's
+// virtual size.  A reservation costs no physical memory until it is touched, so
+// that ranks by "who asked for the most address space", not "who is using the
+// most memory".  Measured on a 1 GiB machine, it scored a browser content
+// process holding an 8.5 GiB anonymous reservation at 10.5 GiB of "RSS" and
+// selected it near-deterministically, whatever its real footprint was.
+//
+// The fix is a per-address-space resident counter (`mm::rss`) maintained at
+// every leaf-PTE install and clear.  This case pins three things:
+//
+//   A. the counter tracks the page tables — checked against an independent
+//      walk of those very tables, so agreement is evidence and not a
+//      restatement of the counter's own arithmetic;
+//   B. it counts user leaves only, so the shared kernel half never inflates a
+//      process's score;
+//   C. scoring by it actually changes the victim.  A decision table run
+//      through the same `score_pick` production uses shows the two inputs
+//      selecting different processes — a test that only checked the counter
+//      would pass even if the killer still read the old number.
+fn test_753_oom_scores_resident_not_reserved() -> bool {
+    const NAME: &str =
+        "[MM/OOM] victim scoring counts resident pages, not reserved address space (Test 753)";
+    test_header!(NAME);
+
+    // ── A. The counter tracks the page tables ──────────────────────────────
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!(NAME, "VmSpace::new_user() failed — cannot exercise accounting");
+            return false;
+        }
+    };
+    let cr3 = vm.cr3;
+
+    match crate::mm::rss::resident_pages(cr3) {
+        Some(0) => test_println!("  fresh address space cr3={:#x} starts at 0 resident", cr3),
+        Some(n) => {
+            test_fail!(NAME, "fresh address space reports {} resident pages, expected 0", n);
+            return false;
+        }
+        None => {
+            test_fail!(NAME,
+                "fresh address space is untracked — the resident-set table is full \
+                 (attach_failures={})",
+                crate::mm::rss::attach_failures());
+            return false;
+        }
+    }
+
+    const BASE: u64 = 0x4000_0000; // 1 GiB — a user VA in an otherwise empty PML4[0]
+    const N: usize = 64;
+    const UNMAP: usize = 16;
+    const PTE_FLAGS: u64 = 0b111; // present | writable | user
+
+    let mut frames = [0u64; N];
+    let mut installed = 0usize;
+    while installed < N {
+        match crate::mm::pmm::alloc_page() {
+            Some(p) => {
+                let va = BASE + (installed as u64) * 0x1000;
+                if !crate::mm::vmm::map_page_in(cr3, va, p, PTE_FLAGS) {
+                    crate::mm::pmm::free_page(p);
+                    break;
+                }
+                frames[installed] = p;
+                installed += 1;
+            }
+            None => break,
+        }
+    }
+    if installed < N {
+        test_fail!(NAME, "only mapped {}/{} pages — cannot exercise accounting", installed, N);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    let counted = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
+    let walked = crate::mm::rss::walk_resident_pages(cr3);
+    test_println!("  after {} installs: counter={} page-table walk={}", N, counted, walked);
+    if counted != N as u64 || walked != N as u64 {
+        test_fail!(NAME,
+            "after {} installs the counter says {} and the page tables hold {}",
+            N, counted, walked);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── B. The shared kernel half must not be counted ──────────────────────
+    // Every address space maps the kernel; counting it would add the same
+    // constant to every candidate and, worse, let kernel mappings dominate a
+    // process's score.  A kernel VA is above the non-canonical hole.
+    let kernel_probe_va: u64 = 0xFFFF_8000_0000_0000 + 0x20_0000;
+    let kernel_frame = crate::mm::pmm::alloc_page();
+    if let Some(kf) = kernel_frame {
+        crate::mm::vmm::map_page_in(cr3, kernel_probe_va, kf, 0b11);
+        let after_kernel = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
+        if after_kernel != N as u64 {
+            test_fail!(NAME,
+                "a kernel-half mapping moved the resident count {} -> {}",
+                N, after_kernel);
+            crate::mm::vmm::unmap_page_in(cr3, kernel_probe_va);
+            crate::mm::pmm::free_page(kf);
+            for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+            crate::proc::free_vm_space(vm);
+            return false;
+        }
+        test_println!("  kernel-half mapping ignored, still {} resident", after_kernel);
+        crate::mm::vmm::unmap_page_in(cr3, kernel_probe_va);
+        crate::mm::pmm::free_page(kf);
+    }
+
+    // ── A (cont). Clears must decrement, and still match the tables ────────
+    for i in 0..UNMAP {
+        crate::mm::vmm::unmap_page_in(cr3, BASE + (i as u64) * 0x1000);
+    }
+    let counted = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
+    let walked = crate::mm::rss::walk_resident_pages(cr3);
+    let expect = (N - UNMAP) as u64;
+    test_println!("  after {} clears: counter={} page-table walk={}", UNMAP, counted, walked);
+    if counted != expect || walked != expect {
+        test_fail!(NAME,
+            "after {} clears expected {} resident; counter says {}, page tables hold {}",
+            UNMAP, expect, counted, walked);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── C. Scoring by resident pages picks a different victim ──────────────
+    // The measured shape: pid 5 reserved 8.5 GiB and touched a fraction of it;
+    // pid 7 reserved little and touched most of it.  Run both inputs through
+    // the same `score_pick` the killer uses.  If these agreed, the test could
+    // not tell a fixed killer from an unfixed one.
+    const GIB: u64 = 1024 * 1024 * 1024 / 4096; // pages per GiB
+    let by_mapped   = [(5 as crate::proc::Pid, 10 * GIB), (7, 64 * 1024)];
+    let by_resident = [(5 as crate::proc::Pid, 2 * 1024),  (7, 60 * 1024)];
+    let picked_mapped = crate::mm::oom::score_pick(&by_mapped);
+    let picked_resident = crate::mm::oom::score_pick(&by_resident);
+    test_println!(
+        "  score_pick(virtual sizes)={:?}  score_pick(resident sets)={:?}",
+        picked_mapped, picked_resident);
+    if picked_mapped != Some(5) {
+        test_fail!(NAME,
+            "control failed: scoring by virtual size should pick pid 5, got {:?}",
+            picked_mapped);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    if picked_resident != Some(7) {
+        test_fail!(NAME,
+            "scoring by resident set should pick pid 7 (the process actually holding \
+             memory), got {:?}",
+            picked_resident);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── D. Teardown releases the slot, and nothing underflowed ─────────────
+    let underflows_before = crate::mm::rss::underflow_count();
+    for i in UNMAP..installed {
+        crate::mm::vmm::unmap_page_in(cr3, BASE + (i as u64) * 0x1000);
+    }
+    for i in 0..installed {
+        crate::mm::pmm::free_page(frames[i]);
+    }
+    vm.areas.clear(); // frames already returned above; keep teardown from double-freeing
+    crate::proc::free_vm_space(vm);
+
+    if crate::mm::rss::resident_pages(cr3).is_some() {
+        test_fail!(NAME,
+            "cr3={:#x} still tracked after teardown — its slot was not released, so a \
+             recycled PML4 frame would inherit a stale count",
+            cr3);
+        return false;
+    }
+    let underflows_after = crate::mm::rss::underflow_count();
+    if underflows_after != underflows_before {
+        test_fail!(NAME,
+            "resident counter underflowed during teardown ({} -> {}) — some path clears a \
+             leaf PTE more often than it installs one",
+            underflows_before, underflows_after);
+        return false;
+    }
+    test_println!("  slot released on teardown, no underflow");
+>>>>>>> 7464fb5c (mm/oom: score victims by resident pages, not by reserved address space)
 
     test_pass!(NAME);
     true

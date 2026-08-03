@@ -2724,6 +2724,15 @@ fn free_user_page_tables(cr3: u64) {
     // the lifetime of the kernel.
     crate::mm::tlb::forget_cr3(cr3);
 
+    // End resident-set accounting for this address space and release its
+    // tracking slot (`mm::rss`).  Done here, alongside `forget_cr3`, because
+    // this function is the single point both teardown paths
+    // (`free_process_memory` and the execve `free_vm_space`) funnel through,
+    // and it runs before the PML4 frame is recycled — a late accounting call
+    // from this dying space must never land on the next occupant of the same
+    // physical frame.
+    crate::mm::rss::detach(cr3);
+
     /// Convert physical address to a kernel-accessible virtual pointer
     /// using the higher-half direct map (not identity map).
     #[inline(always)]

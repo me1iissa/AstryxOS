@@ -5,17 +5,33 @@
 //! largest resident set.
 //!
 //! # Scoring policy
-//! RSS is computed as the sum of all VMA lengths divided by PAGE_SIZE.  VMAs
-//! are walked from the process's `VmSpace::areas` list; every mapped region
-//! counts equally regardless of backing type, because we don't have per-page
-//! resident/swapped tracking yet.  This over-counts a little (includes VMAs
-//! that haven't been faulted in yet) but is conservative in the right
-//! direction: we'd rather kill a process that *has* a large address space than
-//! one that doesn't.
 //!
-//! Tie-breaking: among equal RSS scores, the process with the highest PID is
-//! targeted first (higher PID ≈ created more recently ≈ youngest, matching
-//! the "most recent wins the kill" policy from Linux).
+//! Candidates are ranked by **resident** pages — the frames a process has
+//! actually faulted in, read from the per-address-space counter in
+//! [`crate::mm::rss`].  That is the quantity killing the process returns to
+//! the allocator, and therefore the only one that answers the question the
+//! killer is asking.
+//!
+//! This was previously the sum of all VMA *lengths*, i.e. the process's
+//! virtual size.  A reservation costs no physical memory until it is touched,
+//! so scoring by it selects whoever asked for the most address space rather
+//! than whoever is using the most memory: a browser content process holding an
+//! 8.5 GiB anonymous reservation scored "10.5 GiB RSS" on a 1 GiB machine and
+//! was picked near-deterministically, whatever its real footprint.
+//!
+//! A frame mapped by several address spaces (fork-CoW, `MAP_SHARED`, SysV SHM)
+//! counts once in each of them.  That is deliberate and is the standard
+//! meaning of resident set size — the score estimates the pressure relieved by
+//! killing this process, not exclusive ownership.
+//!
+//! A process whose address space is not tracked (the resident-set table was
+//! saturated when it started) scores 0 and so is never selected.  The failure
+//! direction is deliberate: an untracked process is passed over, never killed
+//! on the strength of a number nobody measured.
+//!
+//! Tie-breaking: among equal scores, the process with the highest PID is
+//! targeted first (higher PID ≈ created more recently ≈ youngest, matching the
+//! "most recent wins the kill" policy).
 //!
 //! # Protected PIDs
 //! - PID 0  — idle / kernel process.
@@ -130,7 +146,9 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         return None;
     }
 
-    let candidates: alloc::vec::Vec<(Pid, u64)> = {
+    // (pid, resident_pages, mapped_pages).  Only the resident figure is
+    // scored; the mapped figure rides along so the log line can show both.
+    let candidates: alloc::vec::Vec<(Pid, u64, u64)> = {
         let procs = {
             let mut guard = None;
             let mut iters: u32 = 0;
@@ -177,10 +195,7 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
                 }
                 true
             })
-            .map(|p| {
-                let rss = rss_pages(p);
-                (p.pid, rss)
-            })
+            .map(|p| (p.pid, rss_pages(p), mapped_pages(p)))
             .collect()
     }; // PROCESS_TABLE lock released here
 
@@ -192,19 +207,34 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         return None;
     }
 
-    // Pick the candidate with the maximum RSS.  On ties, prefer the highest
-    // PID (youngest process by creation order).
-    let (target_pid, target_rss) = candidates
+    // Pick the candidate with the largest resident set.  On ties, prefer the
+    // highest PID (youngest process by creation order).
+    let (target_pid, target_rss, target_mapped) = candidates
         .iter()
         .copied()
-        .max_by(|(pid_a, rss_a), (pid_b, rss_b)| {
+        .max_by(|(pid_a, rss_a, _), (pid_b, rss_b, _)| {
             rss_a.cmp(rss_b).then(pid_a.cmp(pid_b))
         })
         .expect("non-empty candidates must yield a maximum");
 
+    // Both figures are logged because their ratio is the whole point: a
+    // victim with a large `mapped` and a small `rss` is one that reserved
+    // address space it never touched, and killing it frees `rss`, not
+    // `mapped`.  `untracked` counts candidates with no resident-set slot —
+    // they scored 0 and could not be selected, so a non-zero value means the
+    // choice was made with incomplete information.
+    let untracked = candidates.iter().filter(|(_, rss, _)| *rss == 0).count();
     crate::serial_println!(
-        "[OOM] killed pid={} rss={} pages, need={} pages",
-        target_pid, target_rss, needed_frames
+        "[OOM] killed pid={} rss={} pages ({} KiB) mapped={} pages need={} pages \
+         candidates={} zero_rss={} rss_slots_full={}",
+        target_pid,
+        target_rss,
+        target_rss * 4,
+        target_mapped,
+        needed_frames,
+        candidates.len(),
+        untracked,
+        crate::mm::rss::attach_failures(),
     );
 
     // Deliver SIGKILL.  signal::kill() acquires PROCESS_TABLE internally.
@@ -219,23 +249,37 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
     Some(target_pid)
 }
 
-/// Compute the RSS (resident set size) of a process in pages.
+/// Resident set size of a process, in 4 KiB pages.
 ///
-/// Sums the lengths of all VMAs in the process's virtual address space and
-/// converts to pages.  This is an approximation: it counts all *mapped*
-/// regions, not only physically-present pages, because AstryxOS does not
-/// yet maintain a per-page present/absent bitmap.  The approximation is
-/// acceptable for OOM scoring — a process with a large mapped footprint is
-/// a good kill candidate whether or not every page has been faulted in.
+/// A lock-free read of the per-address-space counter maintained by
+/// `mm::rss` at every leaf-PTE install and clear.  Deliberately *not* a
+/// page-table walk: this runs when the machine is already out of frames, and
+/// the whole point of the `PROCESS_TABLE` handling above is to keep this path
+/// short and non-blocking.
+///
+/// Returns 0 for kernel threads (no address space) and for an address space
+/// the resident-set table could not track — see the module-level note on why
+/// that failure direction is the safe one.
 fn rss_pages(proc: &crate::proc::Process) -> u64 {
     match proc.vm_space.as_ref() {
         None => 0,
-        Some(vm) => {
-            vm.areas
-                .iter()
-                .map(|vma| vma.length / crate::mm::pmm::PAGE_SIZE as u64)
-                .sum()
-        }
+        Some(vm) => crate::mm::rss::resident_pages(vm.cr3).unwrap_or(0),
+    }
+}
+
+/// Sum of the process's VMA lengths in pages — its *virtual* size.
+///
+/// Not used for scoring (see the module-level note); logged next to the
+/// resident figure so the gap between what a process reserved and what it
+/// actually touched is legible in the one line the killer emits.
+fn mapped_pages(proc: &crate::proc::Process) -> u64 {
+    match proc.vm_space.as_ref() {
+        None => 0,
+        Some(vm) => vm
+            .areas
+            .iter()
+            .map(|vma| vma.length / crate::mm::pmm::PAGE_SIZE as u64)
+            .sum(),
     }
 }
 
