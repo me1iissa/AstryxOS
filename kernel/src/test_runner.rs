@@ -63056,28 +63056,46 @@ fn test_753_oom_scores_resident_not_reserved() -> bool {
     }
 
     // ── B. The shared kernel half must not be counted ──────────────────────
-    // Every address space maps the kernel; counting it would add the same
-    // constant to every candidate and, worse, let kernel mappings dominate a
-    // process's score.  A kernel VA is above the non-canonical hole.
+    // Every address space maps the whole kernel — `new_user` copies
+    // PML4[256..512] from the running CR3.  If those mappings counted, every
+    // process would start with a large constant resident set and the kernel
+    // half would dominate every score.
+    //
+    // The check is read-only, and deliberately so.  Installing a probe mapping
+    // at a kernel VA would not test this, it would BREAK THE MACHINE: the
+    // kernel-half PML4 entries are shallow copies of the kernel's own PDPT/PD
+    // pages, so `map_page_in` walking one splits a shared 2 MiB kernel .text
+    // huge page in place, and clearing the resulting leaf makes kernel code
+    // not-present in every address space at once.  (Observed: a kernel
+    // instruction-fetch fault at a live `.text` address, `0xdead0006`.)
+    //
+    // Confirming the kernel half really is mapped is what makes the zero above
+    // evidence: without it, "0 resident on a fresh space" could equally mean
+    // the kernel half was never mapped in the first place.
     let kernel_probe_va: u64 = 0xFFFF_8000_0000_0000 + 0x20_0000;
-    let kernel_frame = crate::mm::pmm::alloc_page();
-    if let Some(kf) = kernel_frame {
-        crate::mm::vmm::map_page_in(cr3, kernel_probe_va, kf, 0b11);
-        let after_kernel = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
-        if after_kernel != N as u64 {
-            test_fail!(NAME,
-                "a kernel-half mapping moved the resident count {} -> {}",
-                N, after_kernel);
-            crate::mm::vmm::unmap_page_in(cr3, kernel_probe_va);
-            crate::mm::pmm::free_page(kf);
-            for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
-            crate::proc::free_vm_space(vm);
-            return false;
-        }
-        test_println!("  kernel-half mapping ignored, still {} resident", after_kernel);
-        crate::mm::vmm::unmap_page_in(cr3, kernel_probe_va);
-        crate::mm::pmm::free_page(kf);
+    let kernel_pte = crate::mm::vmm::read_pte(cr3, kernel_probe_va);
+    if kernel_pte & 1 == 0 {
+        test_fail!(NAME,
+            "kernel VA {:#x} is not mapped in this address space (pte={:#x}) — the \
+             kernel-half exclusion cannot be demonstrated against it",
+            kernel_probe_va, kernel_pte);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
     }
+    let walked_user_only = crate::mm::rss::walk_resident_pages(cr3);
+    if walked_user_only != N as u64 {
+        test_fail!(NAME,
+            "the kernel half is mapped (pte={:#x}) yet the user-half walk reports {} \
+             instead of {} — kernel mappings are leaking into the resident set",
+            kernel_pte, walked_user_only, N);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!(
+        "  kernel half mapped (pte={:#x}) yet resident stays {} — kernel VAs excluded",
+        kernel_pte, walked_user_only);
 
     // ── A (cont). Clears must decrement, and still match the tables ────────
     for i in 0..UNMAP {
