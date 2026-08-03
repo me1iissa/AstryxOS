@@ -395,7 +395,13 @@ pub fn map_page(virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
         // Set the final page table entry
         let pt_ptr = p2v(pt_phys);
         let entry_ptr = pt_ptr.add(pt_idx);
-        *entry_ptr = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        let old_pte = *entry_ptr;
+        let new_pte = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        *entry_ptr = new_pte;
+        // This variant writes the *active* page table; callers are kernel
+        // mappings (MMIO, guard pages) so it is normally a double no-op, but
+        // accounting it keeps every leaf-write path uniform.
+        account_leaf_pte(pml4_phys, virt_addr, old_pte, new_pte);
     }
 
     true
@@ -475,7 +481,10 @@ pub fn unmap_page(virt_addr: u64) {
         let pd_entry = *p2v(pdpt_entry & ADDR_MASK).add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 { return; }
 
-        *p2v(pd_entry & ADDR_MASK).add(pt_idx) = 0;
+        let leaf = p2v(pd_entry & ADDR_MASK).add(pt_idx);
+        let old_pte = *leaf;
+        *leaf = 0;
+        account_leaf_pte(pml4_phys, virt_addr, old_pte, 0);
 
         // Flush TLB for this address
         invlpg(virt_addr);
@@ -601,6 +610,53 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
 // Per-Process Page Table Operations
 // ============================================================================
 
+/// True if `virt_addr` lies in the user half of the address space
+/// (PML4[0..256], i.e. below the non-canonical hole).  The kernel half is
+/// shared by every address space and belongs to no process's resident set.
+#[inline]
+fn is_user_va(virt_addr: u64) -> bool {
+    virt_addr < 0x0000_8000_0000_0000
+}
+
+/// Record a leaf-PTE present-bit transition against the owning address
+/// space's resident-set counter (`mm::rss`).
+///
+/// Called from directly beside each leaf write, while `VMM_LOCK` is still
+/// held, because that is the only point at which the old and new entries are
+/// known to describe the same PTE — a re-read after the lock is dropped can
+/// observe a sibling CPU's subsequent change and account for it twice.
+///
+/// No-op for kernel VAs, for CR3s that `mm::rss` does not track (kernel and
+/// bootstrap address spaces), and for writes that leave the present bit
+/// unchanged — flag-only rewrites (CoW write-protect, `mprotect`) and
+/// same-address CoW installs move no page in or out of the resident set.
+///
+/// Also a no-op for a kernel identity leaf (`phys == va` inside the identity
+/// window).  Those are aliases of kernel memory that no process teardown
+/// frees, so they must not enter a score whose purpose is to predict how much
+/// memory killing the process returns.  The same exclusion is applied by
+/// `VmSpace::clone_for_fork` and by `mm::rss::walk_resident_pages`; keeping the
+/// rule identical in all three is what lets the counter be checked against the
+/// walk.  The transition is judged against whichever side of the write is
+/// present, so an identity leaf that is skipped on install is also skipped on
+/// clear and the counter stays balanced.
+#[inline]
+fn account_leaf_pte(pml4_phys: u64, virt_addr: u64, old_pte: u64, new_pte: u64) {
+    if !is_user_va(virt_addr) {
+        return;
+    }
+    let was_present = old_pte & PAGE_PRESENT != 0;
+    let now_present = new_pte & PAGE_PRESENT != 0;
+    if was_present == now_present {
+        return;
+    }
+    let live_pte = if now_present { new_pte } else { old_pte };
+    if is_identity_map_phys(virt_addr, live_pte & ADDR_MASK) {
+        return;
+    }
+    crate::mm::rss::account(pml4_phys, if now_present { 1 } else { -1 });
+}
+
 /// Map a virtual page in an arbitrary page table (identified by `pml4_phys`).
 ///
 /// This does NOT modify the current CR3 — it writes to the specified page table.
@@ -683,7 +739,12 @@ fn map_page_in_impl(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) 
         };
 
         let pt_ptr = p2v(pt_phys);
-        *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        // Unconditional write, so the entry may or may not have been present;
+        // sample it under the lock to tell a fresh install from an overwrite.
+        let old_pte = *pt_ptr.add(pt_idx);
+        let new_pte = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        *pt_ptr.add(pt_idx) = new_pte;
+        account_leaf_pte(pml4_phys, virt_addr, old_pte, new_pte);
     }
 
     // Track K (2026-05-20): record PTE-change events for user-stack VAs
@@ -785,7 +846,11 @@ pub fn map_page_in_if_absent(
         if existing & PAGE_PRESENT != 0 {
             return false;
         }
-        *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        let new_pte = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+        *pt_ptr.add(pt_idx) = new_pte;
+        // Reached only on the not-present → present transition (the check
+        // above returns otherwise), so this is always a resident-set gain.
+        account_leaf_pte(pml4_phys, virt_addr, existing, new_pte);
     }
 
     #[cfg(feature = "firefox-test-core")]
@@ -885,6 +950,9 @@ pub fn map_page_in_cow_if_unchanged(
         if existing & PAGE_PRESENT == 0 || (existing & ADDR_MASK) != (expected_phys & ADDR_MASK) {
             return false;
         }
+        // No `account_leaf_pte`: the guard above proves the entry was already
+        // present and the write leaves it present.  A CoW break swaps which
+        // frame backs the page, not how many pages are resident.
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
@@ -979,6 +1047,8 @@ pub fn flip_writable_if_sole_owner(
         if crate::mm::refcount::pte_share_count(expected_phys) > 1 {
             return false;
         }
+        // No `account_leaf_pte`: present → present, same frame, writable bit
+        // only.  Nothing enters or leaves the resident set.
         *pt_ptr.add(pt_idx) = (expected_phys & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
@@ -1074,7 +1144,10 @@ fn unmap_page_in_at(
         let pd_entry = *p2v(pdpt_entry & ADDR_MASK).add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 { return; }
 
-        *p2v(pd_entry & ADDR_MASK).add(pt_idx) = 0;
+        let leaf = p2v(pd_entry & ADDR_MASK).add(pt_idx);
+        let old_pte = *leaf;
+        *leaf = 0;
+        account_leaf_pte(pml4_phys, virt_addr, old_pte, 0);
     }
 
     #[cfg(feature = "firefox-test-core")]
@@ -1347,7 +1420,13 @@ fn write_pte_impl(
         let pd_entry = *p2v(pdpt_entry & ADDR_MASK).add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 { return; }
 
-        *p2v(pd_entry & ADDR_MASK).add(pt_idx) = pte;
+        let leaf = p2v(pd_entry & ADDR_MASK).add(pt_idx);
+        let old_pte = *leaf;
+        *leaf = pte;
+        // Most callers here rewrite flags on a present entry (CoW
+        // write-protect, `mprotect`) and account for nothing; the ones that
+        // write a not-present value destroy the mapping and must decrement.
+        account_leaf_pte(pml4_phys, virt_addr, old_pte, pte);
     }
 
     #[cfg(feature = "firefox-test-core")]

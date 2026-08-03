@@ -1384,7 +1384,7 @@ pub fn run() -> ! {
     // total += 1;
     // if test_vfork_exit() { passed += 1; }
 
-    // ── Test 101: OOM killer — score_pick selects largest RSS ───────────
+    // ── Test 101: OOM killer — select_victim picks the largest resident set ─
 
     total += 1;
     if test_oom_picks_largest_rss() { passed += 1; }
@@ -2525,6 +2525,13 @@ pub fn run() -> ! {
     // free-memory readout overstated by the static kernel heap's whole span.
     total += 1;
     if test_752_pmm_counters_match_bitmap() { passed += 1; }
+
+    // ── Test 753: OOM scoring counts resident pages, not reserved VA ──
+    // Scoring by VMA length ranked by who reserved the most address space, so
+    // an 8.5 GiB untouched anonymous reservation scored 10.5 GiB "RSS" on a
+    // 1 GiB machine.  Drives the production victim-selection path.
+    total += 1;
+    if test_753_oom_scores_resident_not_reserved() { passed += 1; }
 
     // ── Test 63b-1: idle-halt predicate truth table (spin-mitigation) ──
     // Pure decision table for the 63b idle-halt liveness fix: a hypervisor/test
@@ -29160,37 +29167,40 @@ fn test_procfs_self_maps() -> bool {
 
 // ── OOM killer tests ─────────────────────────────────────────────────────────
 
-/// Test that `score_pick` selects the candidate with the largest RSS.
+/// Test that `select_victim` selects the candidate with the largest resident set.
 ///
 /// Uses the pure-scoring helper directly — no PMM exhaustion required.
 fn test_oom_picks_largest_rss() -> bool {
-    test_header!("OOM killer — score_pick selects largest RSS");
+    test_header!("OOM killer — select_victim picks the largest resident set");
 
-    // Three mock (pid, rss_pages) candidates.
-    let candidates: &[(crate::proc::Pid, u64)] = &[
-        (10, 128),   // 128 pages
-        (11, 512),   // 512 pages — largest; should be selected
-        (12, 256),   // 256 pages
+    // Three mock candidates, scored as the killer scores them.
+    let mk = |pid, resident: u64| crate::mm::oom::Candidate {
+        pid, score: Some(resident), mapped: resident,
+    };
+    let candidates = [
+        mk(10, 128),   // 128 pages
+        mk(11, 512),   // 512 pages — largest; should be selected
+        mk(12, 256),   // 256 pages
     ];
 
-    let winner = crate::mm::oom::score_pick(candidates);
-    test_println!("  score_pick({:?}) = {:?}", candidates, winner);
+    let winner = crate::mm::oom::select_victim(&candidates);
+    test_println!("  select_victim(128/512/256 resident) = {:?}", winner);
 
     match winner {
         Some(pid) if pid == 11 => {
-            test_pass!("OOM killer score_pick selects pid=11 (rss=512)");
+            test_pass!("OOM killer select_victim selects pid=11 (resident=512)");
             true
         }
         other => {
-            test_fail!("OOM killer score_pick", "expected pid=11, got {:?}", other);
+            test_fail!("OOM killer select_victim", "expected pid=11, got {:?}", other);
             false
         }
     }
 }
 
-/// Test that `score_pick` never returns PID 1 (init protection).
+/// Test that `select_victim` never returns PID 1 (init protection).
 ///
-/// The OOM implementation filters PID 1 out before calling `score_pick`,
+/// The OOM implementation filters PID 1 out before calling `select_victim`,
 /// so we verify both layers: the filter (by including PID 1 with a huge RSS
 /// and checking it is excluded by `invoke_oom_killer`'s eligibility logic)
 /// and the raw scorer (which would pick it if fed the entry — we test the
@@ -29198,7 +29208,7 @@ fn test_oom_picks_largest_rss() -> bool {
 ///
 /// Specifically: we simulate the filtered candidate list that
 /// `invoke_oom_killer` would produce when PID 1 is the only process with a
-/// large RSS but is excluded.  The list passed to `score_pick` must not
+/// large RSS but is excluded.  The list passed to `select_victim` must not
 /// contain PID 1, so the function should either pick a non-init candidate or
 /// return None.
 fn test_oom_skips_init() -> bool {
@@ -29208,14 +29218,17 @@ fn test_oom_skips_init() -> bool {
     // PID 1 is filtered out before score_pick is called; only non-init
     // candidates reach the scorer.  With PID 1 absent, the next-largest RSS
     // wins.
-    let filtered_candidates: &[(crate::proc::Pid, u64)] = &[
+    let mk = |pid, resident: u64| crate::mm::oom::Candidate {
+        pid, score: Some(resident), mapped: resident,
+    };
+    let filtered_candidates = [
         // PID 1 is intentionally absent (filtered by invoke_oom_killer).
-        (20, 64),
-        (21, 32),
+        mk(20, 64),
+        mk(21, 32),
     ];
 
-    let winner = crate::mm::oom::score_pick(filtered_candidates);
-    test_println!("  score_pick (init filtered out) = {:?}", winner);
+    let winner = crate::mm::oom::select_victim(&filtered_candidates);
+    test_println!("  select_victim (init filtered out) = {:?}", winner);
 
     match winner {
         Some(1) => {
@@ -29237,7 +29250,7 @@ fn test_oom_skips_init() -> bool {
         None => {
             // No candidates at all — also acceptable if the list were empty,
             // but here it has entries, so something is wrong.
-            test_fail!("OOM killer skips init", "score_pick returned None on non-empty list");
+            test_fail!("OOM killer skips init", "select_victim returned None on non-empty list");
             false
         }
     }
@@ -62956,6 +62969,354 @@ fn test_752_pmm_counters_match_bitmap() -> bool {
         return false;
     }
     test_println!("  {} frames freed, drift still 0", got);
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 753: OOM scoring uses resident pages, not reserved address space ───
+//
+// `mm::oom` ranked candidates by the sum of their VMA *lengths* — the process's
+// virtual size.  A reservation costs no physical memory until it is touched, so
+// that ranks by "who asked for the most address space", not "who is using the
+// most memory".  Measured on a 1 GiB machine, it scored a browser content
+// process holding an 8.5 GiB anonymous reservation at 10.5 GiB of "RSS" and
+// selected it near-deterministically, whatever its real footprint was.
+//
+// The fix is a per-address-space resident counter (`mm::rss`) maintained at
+// every leaf-PTE install and clear.  This case pins five things:
+//
+//   A. the counter tracks the page tables — checked against an independent
+//      walk of those very tables, so agreement is evidence and not a
+//      restatement of the counter's own arithmetic;
+//   B. it counts user leaves only, so the shared kernel half never inflates a
+//      process's score;
+//   C. `oom_score` — the function `invoke_oom_killer` itself calls, not a
+//      helper sitting beside it — answers with the resident set.  It is driven
+//      against an address space whose virtual size and resident set differ by
+//      four orders of magnitude, so restoring the VMA-length sum inside
+//      `oom_score` makes it answer 2176000 where it must answer 48, and this
+//      case reports that by name.  This is the assertion that gates the fix:
+//      an earlier revision drove a `score_pick` helper that no production code
+//      called, so exactly that substitution left the test green while the
+//      machine went on choosing its victim the old way;
+//   D. `select_victim` — again the production selector, not a copy of it —
+//      ranks on that score, so the two scoring inputs choose different
+//      processes;
+//   E. the refusals `select_victim` documents are implemented: untracked and
+//      zero-resident candidates are never returned, which a plain `max_by`
+//      over the same list violates by handing back the highest PID.
+fn test_753_oom_scores_resident_not_reserved() -> bool {
+    const NAME: &str =
+        "[MM/OOM] victim scoring counts resident pages, not reserved address space (Test 753)";
+    test_header!(NAME);
+
+    // ── A. The counter tracks the page tables ──────────────────────────────
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!(NAME, "VmSpace::new_user() failed — cannot exercise accounting");
+            return false;
+        }
+    };
+    let cr3 = vm.cr3;
+
+    match crate::mm::rss::resident_pages(cr3) {
+        Some(0) => test_println!("  fresh address space cr3={:#x} starts at 0 resident", cr3),
+        Some(n) => {
+            test_fail!(NAME, "fresh address space reports {} resident pages, expected 0", n);
+            return false;
+        }
+        None => {
+            test_fail!(NAME,
+                "fresh address space is untracked — the resident-set table is full \
+                 (attach_failures={})",
+                crate::mm::rss::attach_failures());
+            return false;
+        }
+    }
+
+    const BASE: u64 = 0x4000_0000; // 1 GiB — a user VA in an otherwise empty PML4[0]
+    const N: usize = 64;
+    const UNMAP: usize = 16;
+    const PTE_FLAGS: u64 = 0b111; // present | writable | user
+
+    let mut frames = [0u64; N];
+    let mut installed = 0usize;
+    while installed < N {
+        match crate::mm::pmm::alloc_page() {
+            Some(p) => {
+                let va = BASE + (installed as u64) * 0x1000;
+                if !crate::mm::vmm::map_page_in(cr3, va, p, PTE_FLAGS) {
+                    crate::mm::pmm::free_page(p);
+                    break;
+                }
+                frames[installed] = p;
+                installed += 1;
+            }
+            None => break,
+        }
+    }
+    if installed < N {
+        test_fail!(NAME, "only mapped {}/{} pages — cannot exercise accounting", installed, N);
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    let counted = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
+    let walked = crate::mm::rss::walk_resident_pages(cr3);
+    test_println!("  after {} installs: counter={} page-table walk={}", N, counted, walked);
+    if counted != N as u64 || walked != N as u64 {
+        test_fail!(NAME,
+            "after {} installs the counter says {} and the page tables hold {}",
+            N, counted, walked);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── B. The shared kernel half must not be counted ──────────────────────
+    // Every address space maps the whole kernel — `new_user` copies
+    // PML4[256..512] from the running CR3.  If those mappings counted, every
+    // process would start with a large constant resident set and the kernel
+    // half would dominate every score.
+    //
+    // The check is read-only, and deliberately so.  Installing a probe mapping
+    // at a kernel VA would not test this, it would BREAK THE MACHINE: the
+    // kernel-half PML4 entries are shallow copies of the kernel's own PDPT/PD
+    // pages, so `map_page_in` walking one splits a shared 2 MiB kernel .text
+    // huge page in place, and clearing the resulting leaf makes kernel code
+    // not-present in every address space at once.  (Observed: a kernel
+    // instruction-fetch fault at a live `.text` address, `0xdead0006`.)
+    //
+    // Confirming the kernel half really is mapped is what makes the zero above
+    // evidence: without it, "0 resident on a fresh space" could equally mean
+    // the kernel half was never mapped in the first place.
+    let kernel_probe_va: u64 = 0xFFFF_8000_0000_0000 + 0x20_0000;
+    let kernel_pte = crate::mm::vmm::read_pte(cr3, kernel_probe_va);
+    if kernel_pte & 1 == 0 {
+        test_fail!(NAME,
+            "kernel VA {:#x} is not mapped in this address space (pte={:#x}) — the \
+             kernel-half exclusion cannot be demonstrated against it",
+            kernel_probe_va, kernel_pte);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    let walked_user_only = crate::mm::rss::walk_resident_pages(cr3);
+    if walked_user_only != N as u64 {
+        test_fail!(NAME,
+            "the kernel half is mapped (pte={:#x}) yet the user-half walk reports {} \
+             instead of {} — kernel mappings are leaking into the resident set",
+            kernel_pte, walked_user_only, N);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!(
+        "  kernel half mapped (pte={:#x}) yet resident stays {} — kernel VAs excluded",
+        kernel_pte, walked_user_only);
+
+    // ── A (cont). Clears must decrement, and still match the tables ────────
+    for i in 0..UNMAP {
+        crate::mm::vmm::unmap_page_in(cr3, BASE + (i as u64) * 0x1000);
+    }
+    let counted = crate::mm::rss::resident_pages(cr3).unwrap_or(u64::MAX);
+    let walked = crate::mm::rss::walk_resident_pages(cr3);
+    let expect = (N - UNMAP) as u64;
+    test_println!("  after {} clears: counter={} page-table walk={}", UNMAP, counted, walked);
+    if counted != expect || walked != expect {
+        test_fail!(NAME,
+            "after {} clears expected {} resident; counter says {}, page tables hold {}",
+            UNMAP, expect, counted, walked);
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── C. The PRODUCTION scorer, driven against the real defect shape ─────
+    // This is the part that gates the fix.  `oom_score` is the function
+    // `invoke_oom_killer` calls, and it is fed the same `VmSpace` the machine
+    // would feed it.  Give that space the measured shape: an 8.5 GiB
+    // reservation on top of a resident set of `expect` pages.  Substituting a
+    // VMA-length sum back into `oom_score` — the exact bug this change
+    // removes — makes it answer 2228224 instead of 48, and this fails.
+    const RESERVATION_BYTES: u64 = 8_500 * 1024 * 1024; // 8.5 GiB, as measured
+    let reservation_pages = RESERVATION_BYTES / 4096;
+    vm.areas.push(crate::mm::vma::VmArea {
+        base: 0x1_0000_0000,
+        length: RESERVATION_BYTES,
+        prot: crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
+        flags: crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+        backing: crate::mm::vma::VmBacking::Anonymous,
+        name: "[oom-score-probe]",
+    });
+
+    let scored = crate::mm::oom::oom_score(Some(&vm));
+    let mapped = crate::mm::oom::mapped_pages(Some(&vm));
+    test_println!(
+        "  oom_score={:?} pages  mapped={} pages ({} MiB reserved, {} pages resident)",
+        scored, mapped, RESERVATION_BYTES / (1024 * 1024), expect);
+    if scored != Some(expect) {
+        test_fail!(NAME,
+            "oom_score returned {:?} for an address space with {} resident pages and a \
+             {}-page reservation — the killer is not scoring the resident set",
+            scored, expect, reservation_pages);
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    if mapped != reservation_pages {
+        test_fail!(NAME,
+            "control failed: mapped_pages returned {} for a {}-page reservation, so the \
+             two quantities are not actually distinguishable here",
+            mapped, reservation_pages);
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── C2. And it changes the victim, through the production selector ─────
+    // `select_victim` is what `invoke_oom_killer` calls.  Same two processes,
+    // scored the two ways: pid 5 reserved 10 GiB and touched 8 MiB; pid 7
+    // reserved 256 MiB and touched almost all of it.
+    const GIB: u64 = 1024 * 1024 * 1024 / 4096; // pages per GiB
+    let cand = |pid, score: Option<u64>, mapped| crate::mm::oom::Candidate {
+        pid, score, mapped,
+    };
+    let by_mapped = [
+        cand(5, Some(10 * GIB), 10 * GIB),
+        cand(7, Some(64 * 1024), 64 * 1024),
+    ];
+    let by_resident = [
+        cand(5, Some(2 * 1024), 10 * GIB),
+        cand(7, Some(60 * 1024), 64 * 1024),
+    ];
+    let picked_mapped = crate::mm::oom::select_victim(&by_mapped);
+    let picked_resident = crate::mm::oom::select_victim(&by_resident);
+    test_println!(
+        "  select_victim(virtual sizes)={:?}  select_victim(resident sets)={:?}",
+        picked_mapped, picked_resident);
+    if picked_mapped != Some(5) || picked_resident != Some(7) {
+        test_fail!(NAME,
+            "the two scoring inputs must select different victims for this test to \
+             distinguish them: by-virtual={:?} (want pid 5), by-resident={:?} (want pid 7)",
+            picked_mapped, picked_resident);
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+
+    // ── C3. Untracked and zero-resident candidates are refused ─────────────
+    // The module documents that neither is ever selected.  A plain `max_by`
+    // satisfies every assertion above and still fails this one: it returns the
+    // highest PID once every score is zero or absent.
+    let unmeasured = [cand(31, None, 10 * GIB), cand(32, None, 4 * GIB)];
+    if let Some(pid) = crate::mm::oom::select_victim(&unmeasured) {
+        test_fail!(NAME,
+            "select_victim chose pid {} from candidates whose resident set was never \
+             measured — the untracked guarantee is not implemented",
+            pid);
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    let all_empty = [cand(41, Some(0), 8 * GIB), cand(42, Some(0), 2 * GIB)];
+    if let Some(pid) = crate::mm::oom::select_victim(&all_empty) {
+        test_fail!(NAME,
+            "select_victim chose pid {} from candidates holding zero resident pages — \
+             killing it reclaims nothing",
+            pid);
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    // …but a single tracked, non-empty candidate among them still wins.
+    let mixed = [
+        cand(51, None, 10 * GIB),
+        cand(52, Some(0), 9 * GIB),
+        cand(53, Some(7), 1),
+    ];
+    if crate::mm::oom::select_victim(&mixed) != Some(53) {
+        test_fail!(NAME,
+            "select_victim must still pick the one measured, non-empty candidate, got {:?}",
+            crate::mm::oom::select_victim(&mixed));
+        vm.areas.clear();
+        for i in 0..installed { crate::mm::pmm::free_page(frames[i]); }
+        crate::proc::free_vm_space(vm);
+        return false;
+    }
+    test_println!("  untracked and zero-resident candidates refused; measured one still wins");
+
+    vm.areas.clear(); // the probe VMA backs nothing; keep teardown off it
+
+    // ── D. Teardown releases the slot, and nothing underflowed ─────────────
+    let underflows_before = crate::mm::rss::underflow_count();
+    for i in UNMAP..installed {
+        crate::mm::vmm::unmap_page_in(cr3, BASE + (i as u64) * 0x1000);
+    }
+    for i in 0..installed {
+        crate::mm::pmm::free_page(frames[i]);
+    }
+    vm.areas.clear(); // frames already returned above; keep teardown from double-freeing
+    crate::proc::free_vm_space(vm);
+
+    if crate::mm::rss::resident_pages(cr3).is_some() {
+        test_fail!(NAME,
+            "cr3={:#x} still tracked after teardown — its slot was not released, so a \
+             recycled PML4 frame would inherit a stale count",
+            cr3);
+        return false;
+    }
+    let underflows_after = crate::mm::rss::underflow_count();
+    if underflows_after != underflows_before {
+        test_fail!(NAME,
+            "resident counter underflowed during teardown ({} -> {}) — some path clears a \
+             leaf PTE more often than it installs one",
+            underflows_before, underflows_after);
+        return false;
+    }
+    test_println!("  slot released on teardown, no underflow");
+
+    // ── E. A VmSpace dropped WITHOUT teardown must not leak its slot ───────
+    // `free_user_page_tables` is the normal release point, but an `execve`
+    // whose ELF load fails drops the freshly-built `VmSpace` without ever
+    // reaching it.  Before the last-owner arm in `Drop`, that slot stayed
+    // claimed for the rest of the boot; enough of them would saturate the
+    // table and start scoring live processes as untracked.
+    let leaked_cr3 = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => {
+            let c = v.cr3;
+            if crate::mm::rss::resident_pages(c).is_none() {
+                test_fail!(NAME, "new_user() did not begin tracking cr3={:#x}", c);
+                return false;
+            }
+            drop(v); // the failed-execve shape: no free_vm_space, no teardown
+            c
+        }
+        None => {
+            test_fail!(NAME, "VmSpace::new_user() failed on the drop-path case");
+            return false;
+        }
+    };
+    if crate::mm::rss::resident_pages(leaked_cr3).is_some() {
+        test_fail!(NAME,
+            "cr3={:#x} is still tracked after its VmSpace was dropped without teardown — \
+             the slot is leaked",
+            leaked_cr3);
+        crate::mm::pmm::free_page(leaked_cr3);
+        return false;
+    }
+    // The drop path frees no frames; return the PML4 by hand so the test stays
+    // allocation-neutral.  It has no user mappings, so no page-table pages
+    // were ever allocated beneath it.
+    crate::mm::pmm::free_page(leaked_cr3);
+    test_println!("  drop without teardown also releases the slot");
 
     test_pass!(NAME);
     true
