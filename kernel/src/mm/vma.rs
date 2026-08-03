@@ -964,7 +964,20 @@ impl VmSpace {
         // that is dropped *without* that teardown ever running, e.g. an
         // `execve` whose ELF load fails after the new address space was built.
         // Without it, that slot would be leaked for the rest of the boot.
-        // `detach` is idempotent, so the ordinary path running both is fine.
+        //
+        // What makes the ordinary path running BOTH safe is not that `detach`
+        // is idempotent — idempotence alone would still let a second detach
+        // release a slot that a *re-attached* address space had meanwhile
+        // claimed on a recycled PML4 frame.  It is that the `Drop` detach sits
+        // inside the `MM_REGISTRY`-guarded last-owner arm, which runs only
+        // while the registry still names THIS `VmSpace`'s own `mm_sem` Arc.
+        // A recycled cr3 is re-registered by the `register_mm_sem` call above
+        // *before* its `rss::attach`, so by the time any stale `Drop` reaches
+        // the guard the registry already names the new owner's Arc, the
+        // `Arc::ptr_eq` fails, and the detach is skipped.  That is the same
+        // guard already protecting `live_cr3_forget` and the generation
+        // registry, and the same one that leaves a vfork sibling's count alone
+        // while it still holds the cr3.
         crate::mm::rss::attach(new_pml4);
         // Record that a user address space (and thus a user CR3) now exists.
         // The BSP stack-pivot in `main.rs` asserts this is zero before it runs,

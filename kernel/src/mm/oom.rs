@@ -134,9 +134,11 @@ pub fn lock_giveup_count() -> u64 {
 /// What changes is that it dies promptly and legibly instead of taking the
 /// machine down with it.
 pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
-    // Collect (pid, rss_pages) for all eligible processes.  We take the lock,
-    // do a read-only walk, collect into a small local vec, and release before
-    // calling kill() (which re-acquires PROCESS_TABLE).
+    // Shape of what follows: take PROCESS_TABLE, walk it read-only scoring
+    // every eligible process into a small local vec of `Candidate`, release
+    // the lock, and only then rank and kill.  Ranking has to happen outside
+    // the lock because `signal::kill` re-acquires it.
+    //
     // Fast reject: this CPU already owns PROCESS_TABLE.  There is nothing to
     // wait for — the byte can only be released by code this call sits
     // underneath — so spinning out the full retry bound would burn ~1.4 s with
@@ -190,26 +192,8 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
 
         procs
             .iter()
-            .filter(|p| {
-                // Skip PID 0 (idle/kernel) and PID 1 (init).
-                if p.pid == 0 || p.pid == 1 {
-                    return false;
-                }
-                // Skip kernel threads — they have no user address space.
-                if p.vm_space.is_none() {
-                    return false;
-                }
-                // Skip zombies — already dying; killing them again is pointless.
-                if p.state == crate::proc::ProcessState::Zombie {
-                    return false;
-                }
-                true
-            })
-            .map(|p| Candidate {
-                pid: p.pid,
-                score: oom_score(p.vm_space.as_ref()),
-                mapped: mapped_pages(p.vm_space.as_ref()),
-            })
+            .filter(|p| is_eligible(p))
+            .map(score_process)
             .collect()
     }; // PROCESS_TABLE lock released here
 
@@ -238,12 +222,13 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
             crate::serial_println!(
                 "[OOM] no candidate holds reclaimable memory (needed={} frames) — \
                  failing the allocation; candidates={} untracked={} zero_resident={} \
-                 rss_slots_full={}",
+                 rss_slots_full={} rss_underflows={}",
                 needed_frames,
                 candidates.len(),
                 untracked,
                 zero_resident,
                 crate::mm::rss::attach_failures(),
+                crate::mm::rss::underflow_count(),
             );
             return None;
         }
@@ -252,6 +237,13 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
     // Both figures are logged because their ratio is the whole point: a victim
     // with a large `mapped` and a small `rss` is one that reserved address
     // space it never touched, and killing it frees `rss`, not `mapped`.
+    //
+    // `rss_slots_full` and `rss_underflows` qualify the score itself.  A
+    // non-zero underflow count means some path has reported a leaf PTE cleared
+    // more often than installed, so every resident figure on this line is an
+    // undercount of unknown size — and the kill that follows was decided on
+    // it.  Reading that after the fact requires it to be on the line, because
+    // the counter is not sampled anywhere else at the moment of the decision.
     let victim = candidates
         .iter()
         .find(|c| c.pid == target_pid)
@@ -259,7 +251,7 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         .expect("select_victim returns a pid from the list it was given");
     crate::serial_println!(
         "[OOM] killed pid={} rss={} pages ({} KiB) mapped={} pages need={} pages \
-         candidates={} untracked={} zero_resident={} rss_slots_full={}",
+         candidates={} untracked={} zero_resident={} rss_slots_full={} rss_underflows={}",
         target_pid,
         victim.score.unwrap_or(0),
         victim.score.unwrap_or(0) * 4,
@@ -269,6 +261,7 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         untracked,
         zero_resident,
         crate::mm::rss::attach_failures(),
+        crate::mm::rss::underflow_count(),
     );
 
     // Deliver SIGKILL.  signal::kill() acquires PROCESS_TABLE internally.
@@ -318,6 +311,36 @@ pub fn mapped_pages(vm_space: Option<&crate::mm::vma::VmSpace>) -> u64 {
             .iter()
             .map(|vma| vma.length / crate::mm::pmm::PAGE_SIZE as u64)
             .sum(),
+    }
+}
+
+/// True if `proc` may be considered as an OOM victim at all.
+///
+/// Exported so an observer (`kdb oom-candidates`) shows the same population
+/// the killer would consider rather than its own approximation of it — a
+/// second copy of this predicate is free to drift from the real one, and a
+/// diagnostic that quietly disagrees with the code it reports on is worse than
+/// no diagnostic.
+///
+/// * PID 0 (idle/kernel) and PID 1 (init) are protected.
+/// * A process with no `vm_space` is a kernel thread — nothing to reclaim.
+/// * A zombie is already dying; killing it again frees nothing.
+pub fn is_eligible(proc: &crate::proc::Process) -> bool {
+    proc.pid != 0
+        && proc.pid != 1
+        && proc.vm_space.is_some()
+        && proc.state != crate::proc::ProcessState::Zombie
+}
+
+/// Build the [`Candidate`] for an eligible process.
+///
+/// Paired with [`is_eligible`] for the same reason: the observer must score
+/// candidates exactly as the killer does, not merely filter them the same way.
+pub fn score_process(proc: &crate::proc::Process) -> Candidate {
+    Candidate {
+        pid: proc.pid,
+        score: oom_score(proc.vm_space.as_ref()),
+        mapped: mapped_pages(proc.vm_space.as_ref()),
     }
 }
 

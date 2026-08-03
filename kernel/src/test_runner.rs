@@ -62984,17 +62984,28 @@ fn test_752_pmm_counters_match_bitmap() -> bool {
 // selected it near-deterministically, whatever its real footprint was.
 //
 // The fix is a per-address-space resident counter (`mm::rss`) maintained at
-// every leaf-PTE install and clear.  This case pins three things:
+// every leaf-PTE install and clear.  This case pins five things:
 //
 //   A. the counter tracks the page tables — checked against an independent
 //      walk of those very tables, so agreement is evidence and not a
 //      restatement of the counter's own arithmetic;
 //   B. it counts user leaves only, so the shared kernel half never inflates a
 //      process's score;
-//   C. scoring by it actually changes the victim.  A decision table run
-//      through the same `score_pick` production uses shows the two inputs
-//      selecting different processes — a test that only checked the counter
-//      would pass even if the killer still read the old number.
+//   C. `oom_score` — the function `invoke_oom_killer` itself calls, not a
+//      helper sitting beside it — answers with the resident set.  It is driven
+//      against an address space whose virtual size and resident set differ by
+//      four orders of magnitude, so restoring the VMA-length sum inside
+//      `oom_score` makes it answer 2176000 where it must answer 48, and this
+//      case reports that by name.  This is the assertion that gates the fix:
+//      an earlier revision drove a `score_pick` helper that no production code
+//      called, so exactly that substitution left the test green while the
+//      machine went on choosing its victim the old way;
+//   D. `select_victim` — again the production selector, not a copy of it —
+//      ranks on that score, so the two scoring inputs choose different
+//      processes;
+//   E. the refusals `select_victim` documents are implemented: untracked and
+//      zero-resident candidates are never returned, which a plain `max_by`
+//      over the same list violates by handing back the highest PID.
 fn test_753_oom_scores_resident_not_reserved() -> bool {
     const NAME: &str =
         "[MM/OOM] victim scoring counts resident pages, not reserved address space (Test 753)";

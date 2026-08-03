@@ -2336,25 +2336,19 @@ fn op_oom_candidates(out: &mut String) {
     let table_state = match try_lock_brief(&PROCESS_TABLE) {
         Some(procs) => {
             for p in procs.iter() {
-                // Same eligibility filter as `invoke_oom_killer`.
-                if p.pid == 0 || p.pid == 1 || p.vm_space.is_none() {
-                    continue;
-                }
-                if p.state == crate::proc::ProcessState::Zombie {
+                // `is_eligible` and `score_process` are the killer's own
+                // predicate and scorer, called rather than re-expressed: a
+                // second copy here would be free to drift from the code this
+                // op exists to report on, which is the failure mode that
+                // motivated collapsing the killer's two scoring paths into
+                // one in the first place.
+                if !crate::mm::oom::is_eligible(p) {
                     continue;
                 }
                 let name_end = p.name.iter().position(|&b| b == 0).unwrap_or(p.name.len());
                 let name = alloc::string::String::from_utf8_lossy(&p.name[..name_end])
                     .into_owned();
-                cands.push((
-                    p.pid,
-                    crate::mm::oom::Candidate {
-                        pid: p.pid,
-                        score: crate::mm::oom::oom_score(p.vm_space.as_ref()),
-                        mapped: crate::mm::oom::mapped_pages(p.vm_space.as_ref()),
-                    },
-                    name,
-                ));
+                cands.push((p.pid, crate::mm::oom::score_process(p), name));
             }
             "read"
         }
