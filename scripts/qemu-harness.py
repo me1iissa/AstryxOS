@@ -6971,6 +6971,18 @@ _PMM_STAT_SYMS = {
 # The allocator's frame bitmap (0 = free, 1 = used/reserved).
 _PMM_BITMAP_SYM = "2mm3pmm6BITMAP"
 
+# Full size of that bitmap in bytes: `MAX_PAGES / 8`, MAX_PAGES = 1 << 20.
+#
+# Used only when the ELF symbol carries no size (the `nm` fallback path in
+# `_resolve_symbol_suffix` cannot report one).  The bitmap must be scanned in
+# FULL: `TOTAL_PAGES` counts the frames the firmware reported usable, which is
+# not the same as the highest usable frame INDEX, because the Available set is
+# not a contiguous prefix of the address space.  Scanning only the first
+# `(TOTAL_PAGES + 7) // 8` bytes therefore misses legitimately-free frames that
+# sit at or above `TOTAL_PAGES`, and reports them as counter-vs-bitmap drift
+# that does not exist.
+_PMM_BITMAP_BYTES = (1 << 20) // 8
+
 
 def cmd_pmm_stats(args):
     """
@@ -6988,7 +7000,15 @@ def cmd_pmm_stats(args):
 
     Observer effect: each sample briefly halts the guest for the GDB reads
     (~5 x 8 bytes).  Keep samples sparse (>= 10 s apart) on any boot whose
-    wall-clock timing is itself being measured.
+    wall-clock timing is itself being measured.  `--bitmap` adds a full
+    128 KiB read (~32 x 4 KiB), so it halts the guest appreciably longer —
+    use it to answer a counter-vs-bitmap question, not on every sample of a
+    trajectory.
+
+    With `--bitmap`, the field to read is `bitmap.free_pages_bitmap_full` and
+    its `counter_vs_bitmap_delta_full`.  `free_pages_bitmap` /
+    `counter_vs_bitmap_delta` are the pre-fix truncated figures, retained for
+    one release and biased — see the comment on the scan below.
     """
     sess = _load_session(args.sid)
     port = _get_gdb_port(sess)
@@ -7026,10 +7046,24 @@ def cmd_pmm_stats(args):
     # ── Optional: count free bits straight out of the frame bitmap ─────────
     # The USED_PAGES counter and the bitmap are maintained separately, so a
     # disagreement between them is itself the finding: `alloc_page` fails iff
-    # EVERY bitmap byte is 0xFF, regardless of what the counter says.  Only
-    # the bytes covering TOTAL_PAGES are scanned — the tail of the bitmap is
-    # permanently 0xFF (frames beyond installed RAM) and would swamp the
-    # count.
+    # EVERY bitmap byte is 0xFF, regardless of what the counter says.
+    #
+    # The WHOLE bitmap is scanned.  An earlier version read only the first
+    # `(total + 7) // 8` bytes on the assumption that the tail is permanently
+    # 0xFF (frames beyond installed RAM); that assumption is false.  The
+    # firmware Available set is not a contiguous prefix, so `TOTAL_PAGES` — a
+    # count of usable frames — is not the highest usable frame index, and free
+    # frames legitimately exist at indices at or above it.  Truncating the scan
+    # under-counts them and reports the shortfall as counter-vs-bitmap drift
+    # that is not there.  Measured: 1471 such frames (indices 259478..261867)
+    # on a kernel whose true drift was 0, and 3140 on one whose true drift was
+    # 98219 — a bias that varies with guest RAM layout, so it can neither
+    # accept a correct kernel nor size an incorrect one.
+    #
+    # Scanning in full also fixes `alloc_would_fail`, which is derived from
+    # `nonfull_bytes`: the allocator's own two-pass search covers the entire
+    # bitmap, so a truncated scan could report exhaustion while frames above
+    # `TOTAL_PAGES` were still allocatable.
     bitmap = None
     if getattr(args, "bitmap", False):
         r = _resolve_symbol_suffix(elf, _PMM_BITMAP_SYM)
@@ -7037,7 +7071,12 @@ def cmd_pmm_stats(args):
             bitmap = {"error": "BITMAP symbol not resolved"}
         else:
             base = int(r["addr"], 16)
-            nbytes = (total + 7) // 8 if total else 0
+            # Prefer the size the ELF reports, so this tracks MAX_PAGES if the
+            # kernel's bitmap is ever resized; `nm` cannot report one, hence
+            # the constant fallback.
+            sym_size = r.get("size") or 0
+            nbytes = sym_size if sym_size > 0 else _PMM_BITMAP_BYTES
+            size_source = "elf-symbol" if sym_size > 0 else "constant"
             gdb = GdbClient("127.0.0.1", port)
             if not gdb.connect():
                 _err(f"Cannot connect to GDB stub on port {port}")
@@ -7055,10 +7094,11 @@ def cmd_pmm_stats(args):
                 _err(f"GDB bitmap read error: {e}")
             finally:
                 gdb.close()
-            scanned_pages = min(total, len(raw) * 8)
-            free_bits = 0
+            free_full = 0        # every clear bit in the bitmap
+            free_below = 0       # clear bits at index < total_pages
             nonfull_bytes = 0
             first_free_byte = None
+            highest_free_page = None
             for i in range(len(raw)):
                 b = raw[i]
                 if b != 0xFF:
@@ -7066,22 +7106,44 @@ def cmd_pmm_stats(args):
                     if first_free_byte is None:
                         first_free_byte = i
                     for bit in range(8):
-                        if not (b >> bit) & 1 and i * 8 + bit < total:
-                            free_bits += 1
+                        if not (b >> bit) & 1:
+                            idx = i * 8 + bit
+                            free_full += 1
+                            highest_free_page = idx
+                            if idx < total:
+                                free_below += 1
             bitmap = {
                 "base": hex(base),
                 "bytes_read": len(raw),
                 "bytes_expected": nbytes,
-                "scanned_pages": scanned_pages,
-                "free_pages_bitmap": free_bits,
-                "free_mib_bitmap": round(free_bits * 4096 / (1024 * 1024), 1),
+                "bitmap_size_source": size_source,
+                "scanned_pages": len(raw) * 8,
+                # ── Authoritative: the whole bitmap ────────────────────────
+                # Counts exactly what the kernel's own `accounting_snapshot`
+                # counts, so the two are directly comparable.
+                "free_pages_bitmap_full": free_full,
+                "free_mib_bitmap_full": round(free_full * 4096 / (1024 * 1024), 1),
+                "counter_vs_bitmap_delta_full": (free - free_full)
+                                                if free is not None else None,
+                # Explains the difference between the two deltas below: free
+                # frames the firmware placed at or above `total_pages`.
+                "free_pages_at_or_above_total": free_full - free_below,
+                "highest_free_page_index": highest_free_page,
+                # ── Retained for one release; BIASED, do not gate on it ────
+                # The pre-fix truncated scan.  Kept so a dispatch comparing
+                # against an older sample can see both figures at once; it
+                # under-reports free frames by `free_pages_at_or_above_total`
+                # and its delta overstates drift by the same amount.
+                "free_pages_bitmap": free_below,
+                "free_mib_bitmap": round(free_below * 4096 / (1024 * 1024), 1),
+                "counter_vs_bitmap_delta": (free - free_below)
+                                           if free is not None else None,
+                "truncated_scan_deprecated": True,
                 "nonfull_bytes": nonfull_bytes,
                 "first_free_byte": first_free_byte,
                 # The decisive field: alloc_page's two-pass scan returns None
                 # iff no byte anywhere in the bitmap is < 0xFF.
                 "alloc_would_fail": nonfull_bytes == 0,
-                "counter_vs_bitmap_delta": (free - free_bits)
-                                           if free is not None else None,
             }
 
     out = {
@@ -14496,7 +14558,10 @@ def main():
                        help="Also scan the frame bitmap itself and report the "
                             "free-bit count. Distinguishes 'the allocator is "
                             "genuinely full' from 'the USED_PAGES counter has "
-                            "drifted'. Costs ~8 extra GDB reads.")
+                            "drifted'. Scans all 128 KiB of the bitmap (~32 "
+                            "extra GDB reads); read free_pages_bitmap_full and "
+                            "counter_vs_bitmap_delta_full, not the retained "
+                            "truncated fields.")
 
     # sym
     p_sym = sub.add_parser("sym", help="[Tier2] Resolve kernel symbol to address (ELF parse, no GDB)")
