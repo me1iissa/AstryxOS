@@ -1101,7 +1101,7 @@ pub fn init_ap() {
 
         // IA32_FMASK — RFLAGS bits to clear on SYSCALL entry.
         //
-        // Per Intel SDM Vol. 3A §6.8.8 (SYSCALL flag-masking) every bit set in
+        // Per Intel SDM Vol. 3A §5.8.8 (SYSCALL flag-masking) every bit set in
         // FMASK is cleared in RFLAGS by the CPU as part of the SYSCALL
         // transition into ring 0.  We mask:
         //   - bit  8 (TF) — kernel must not run with single-step on a user-
@@ -2790,17 +2790,31 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 //
                 // The lock context here differs from the `#PF` caller and is
                 // worth stating.  This runs on the CLONE_CHILD_CLEARTID
-                // thread-exit path with **interrupts enabled**, not inside an
-                // interrupt gate, so this CPU can always service an incoming
-                // shootdown IPI through the ordinary ISR while it waits; the
-                // draining acquire inside `cow_break_if_unchanged` is therefore
-                // superset-safe here rather than load-bearing, exactly as the
-                // read-side draining acquire already is for this caller.  No
-                // lock is held across the call: the `PROCESS_TABLE` borrow taken
-                // for the VMA check above is scoped and already released, and
-                // `mm_sem` is not held on this path — `free_process_memory`, the
-                // one `mm_sem.write()` holder on thread exit, has returned well
-                // before the CLEARTID store is attempted.
+                // thread-exit path, and whether interrupts are enabled for it
+                // depends on how the exiting thread entered the kernel:
+                //
+                //   * SYSCALL — `IA32_FMASK` clears IF at the transition (Intel
+                //     SDM Vol. 3A §5.8.8), but the entry stub re-enables it with
+                //     `sti` once it is on the kernel stack, so IF=1 here.
+                //   * INT 0x80 / INT 0x2E — both vectors are installed as 64-bit
+                //     **interrupt** gates (type 0xE), and an interrupt gate
+                //     clears IF on entry where a trap gate does not (Intel SDM
+                //     Vol. 3A §6.12.1.2).  Neither stub issues `sti`, so the
+                //     whole kernel-side call runs with IF=0.
+                //
+                // On those two gates the draining acquire inside
+                // `cow_break_if_unchanged` is therefore **load-bearing**, not
+                // merely superset-safe: with IF=0 a plain spin for `mm_sem`
+                // could never acknowledge a peer's shootdown IPI, so a peer
+                // waiting on our acknowledgement while holding the lock we spin
+                // for would wedge both CPUs.  Draining while spinning is what
+                // breaks that cycle — the same reason the `#PF` caller needs it.
+                //
+                // No lock is held across the call: the `PROCESS_TABLE` borrow
+                // taken for the VMA check above is scoped and already released,
+                // and `mm_sem` is not held on this path — `free_process_memory`,
+                // the one `mm_sem.write()` holder on thread exit, has returned
+                // well before the CLEARTID store is attempted.
                 match crate::mm::vmm::cow_break_if_unchanged(
                     cr3, page_addr, new_phys, flags, old_phys,
                 ) {

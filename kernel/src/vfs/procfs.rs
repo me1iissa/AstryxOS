@@ -834,8 +834,12 @@ pub fn generate_meminfo() -> Vec<u8> {
     let available = free;
     // Each PMM page = 4 KiB.
     let total_kb  = total.saturating_sub(reserved) * 4;
-    let free_kb   = free     * 4;
-    let avail_kb  = available * 4;
+    // Fail closed: `MemFree` is derived from `used` and `MemTotal` from
+    // `reserved`, two counters nothing in the running kernel keeps ordered, so
+    // clamp rather than emit `MemFree > MemTotal` — a state proc(5) does not
+    // describe and parsers do not expect.
+    let free_kb   = (free * 4).min(total_kb);
+    let avail_kb  = (available * 4).min(total_kb);
     let content = alloc::format!(
         "MemTotal:       {total_kb:>8} kB\n\
          MemFree:        {free_kb:>8} kB\n\

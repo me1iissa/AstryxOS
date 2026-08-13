@@ -5122,7 +5122,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let total_bytes = total_pages
                 .saturating_sub(reserved_pages)
                 .saturating_mul(4096);
-            let free_bytes  = total_pages.saturating_sub(used_pages).saturating_mul(4096);
+            // Fail closed, as in /proc/meminfo: `freeram` comes from
+            // `used_pages` and `totalram` from `reserved_pages`, two counters
+            // nothing keeps ordered in the running kernel, so clamp rather
+            // than report more free RAM than usable RAM.
+            let free_bytes  = total_pages.saturating_sub(used_pages)
+                .saturating_mul(4096)
+                .min(total_bytes);
             let procs       = crate::proc::process_count().min(u16::MAX as usize) as u16;
 
             unsafe {
