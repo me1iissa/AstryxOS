@@ -10,17 +10,26 @@
 #
 #     channel = "nightly-2026-04-30"
 #
-#   Local devs should `rustup toolchain install nightly` periodically and
-#   CI uses `dtolnay/rust-toolchain@nightly` (always pulls the latest
-#   nightly) — so a date pin here is the chokepoint when CI starts failing
-#   for toolchain reasons rather than code reasons.  After landing a date
-#   pin, mirror it into `.github/workflows/build.yml` (`toolchain:` field
-#   on each `dtolnay/rust-toolchain` step) to keep CI and local in sync.
+#   A date pin here is the chokepoint when CI starts failing for toolchain
+#   reasons rather than code reasons.  After landing a date pin, mirror it
+#   into `.github/workflows/build.yml` (`toolchain:` field on each
+#   `dtolnay/rust-toolchain` step) to keep CI and local in sync.
+#
+#   For that chokepoint to actually hold, build paths must invoke plain
+#   `cargo` / `rustc` and let rustup resolve the toolchain from this file.
+#   Do NOT reintroduce `cargo +nightly` in `build.sh` or the workflow: a
+#   `+toolchain` argument outranks this file in rustup's override
+#   precedence, so it silently pins past the pin.
+#
+# Current pin: nightly-2026-05-01 = rustc 1.97.0-nightly (f53b654a8
+# 2026-04-30).  Pinned 2026-08-13 because the then-current nightly
+# (1.99.0-nightly, c98d0cb27 2026-08-12) fails to link `astryx-boot` for
+# `x86_64-unknown-uefi` with `rust-lld: error: undefined symbol: wcslen`.
 #
 # Required components / targets are listed below; do NOT remove them
 # without first confirming each consumer (kernel ELF target spec,
 # UEFI bootloader, `objcopy` in `build.sh`) is happy.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-05-01"
 components = ["rust-src", "llvm-tools-preview"]
 targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]

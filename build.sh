@@ -18,14 +18,14 @@ echo "======================================"
 
 # Step 1: Build the bootloader (UEFI application)
 echo "[BUILD] Building AstryxBoot (UEFI bootloader)..."
-cargo +nightly build \
+cargo build \
     --package astryx-boot \
     --target "${BOOT_TARGET}" \
     --profile "${PROFILE}"
 
 # Step 2: Build the kernel
 echo "[BUILD] Building Aether Kernel..."
-cargo +nightly build \
+cargo build \
     --package astryx-kernel \
     --target "${KERNEL_TARGET_JSON}" \
     --profile "${PROFILE}" \
@@ -51,7 +51,7 @@ cp "${BOOT_BIN}" "${BUILD_DIR}/esp/EFI/BOOT/BOOTX64.EFI"
 
 # Copy kernel as flat binary
 # Use objcopy to convert ELF to flat binary
-OBJCOPY=$(find "$(rustc +nightly --print sysroot)" -name "llvm-objcopy" | head -1)
+OBJCOPY=$(find "$(rustc --print sysroot)" -name "llvm-objcopy" | head -1)
 if [ -z "${OBJCOPY}" ]; then
     OBJCOPY="llvm-objcopy"
 fi
