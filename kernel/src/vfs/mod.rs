@@ -47,6 +47,13 @@ pub enum VfsError {
     TooManyOpenFiles = 24, // EMFILE
     NoSpace = 28,       // ENOSPC
     BadFd = 9,          // EBADF
+    /// Destination buffer is not accessible — the caller's memory could not be
+    /// resolved for writing.  Per the `read(2)` man page EFAULT is returned
+    /// when "buf is outside your accessible address space"; note that the base
+    /// POSIX `read()` ERRORS list does not itself enumerate EFAULT, so this is
+    /// the conventional (and universally implemented) mapping rather than a
+    /// standard-mandated one.
+    Fault = 14,         // EFAULT
     NotEmpty = 39,      // ENOTEMPTY
     Unsupported = 95,   // EOPNOTSUPP
     Io = 5,             // EIO
@@ -81,6 +88,9 @@ impl From<VfsError> for astryx_shared::NtStatus {
             VfsError::Io => STATUS_IO_DEVICE_ERROR,
             VfsError::WouldBlock => STATUS_NO_MORE_FILES,
             VfsError::TimedOut => STATUS_TIMEOUT,
+            // EFAULT — the caller's buffer could not be accessed.  NT reports
+            // an inaccessible caller buffer as an access violation.
+            VfsError::Fault => STATUS_ACCESS_VIOLATION,
         }
     }
 }
@@ -2973,6 +2983,26 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             // unaffected by either path.  All read variants
             // (read/pread/readv/preadv) funnel through fd_read, so this covers
             // every backing-store read.
+            // ── Destination pre-flight class (see
+            // `syscall::preflight_user_write_range` for the full rationale)
+            //
+            // Only a *user* destination needs pre-faulting.  Internal kernel
+            // callers hand `fd_read` a direct-mapped kernel buffer that is
+            // present by construction, and the resolver would correctly refuse
+            // to find a VMA for it — so pre-flighting those would turn every
+            // in-kernel read into EFAULT.
+            const USER_ADDR_END: u64 = 0x0000_8000_0000_0000;
+            let preflight_dest = (buf as u64) < USER_ADDR_END
+                && !crate::syscall::preflight_would_deadlock();
+            // Intel SDM Vol. 3A §4.5: CR3 holds the physical base of the active
+            // PML4 — the address space `buf` belongs to, since this runs on the
+            // calling thread.
+            let dest_cr3 = if preflight_dest {
+                crate::mm::vmm::get_cr3()
+            } else {
+                0
+            };
+
             let n = {
                 let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
                 // Bounce in bounded chunks so a single read(2) with a huge
@@ -2985,6 +3015,7 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let chunk_cap = count.min(BOUNCE_CHUNK);
                 let mut bounce = alloc::vec![0u8; chunk_cap];
                 let mut done = 0usize;
+                let mut dest_faulted = false;
                 loop {
                     if done >= count {
                         break;
@@ -2998,14 +3029,46 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                     if got == 0 {
                         break; // EOF / short read — stop.
                     }
+                    // Resolve this chunk of the destination before copying into
+                    // it, so an unbacked or unresolvable user page becomes a
+                    // return value instead of a ring-0 fault.
+                    let safe = if preflight_dest {
+                        crate::syscall::preflight_user_write_range(
+                            dest_cr3, buf as u64 + done as u64, got)
+                    } else {
+                        got
+                    };
                     // SAFETY: `buffer` is the caller's destination of length
-                    // `count`; `done + got <= count` because `want <= count -
-                    // done` and `got <= want`.
-                    buffer[done..done + got].copy_from_slice(&bounce[..got]);
-                    done += got;
+                    // `count`; `done + safe <= count` because `safe <= got`,
+                    // `want <= count - done` and `got <= want`.
+                    if safe > 0 {
+                        buffer[done..done + safe].copy_from_slice(&bounce[..safe]);
+                        done += safe;
+                    }
+                    if safe < got {
+                        // Destination went bad partway.  Bytes beyond `safe`
+                        // were pulled from the backing store but never
+                        // delivered; that loses nothing, because `fs.read` is
+                        // addressed by absolute offset and is idempotent — the
+                        // fd offset advances only by what the caller actually
+                        // received (POSIX read(2): "the file offset shall be
+                        // incremented by the number of bytes actually read"),
+                        // so a subsequent read re-delivers them.
+                        dest_faulted = true;
+                        break;
+                    }
                     if got < want {
                         break; // short read — backing store has no more here.
                     }
+                }
+                // Report progress if there was any, and EFAULT only when
+                // nothing at all could be delivered.  POSIX read(2) permits a
+                // short return ("the value returned may be less than nbyte")
+                // and treats it as success rather than an error; returning the
+                // bytes that genuinely landed is the conventional rendering of
+                // a destination that failed partway.
+                if dest_faulted && done == 0 {
+                    return Err(VfsError::Fault);
                 }
                 done
             };

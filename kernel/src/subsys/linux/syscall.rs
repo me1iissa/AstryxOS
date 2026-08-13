@@ -6480,6 +6480,18 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
         if flags & MREMAP_MAYMOVE != 0 {
             let dest = crate::syscall::sys_mmap(0, new_size, 0x3, MAP_ANONYMOUS, u64::MAX, 0);
             if dest < 0 { return -12; } // ENOMEM
+            // The destination is a freshly-created anonymous mapping, so EVERY
+            // page of it is not-present by construction and the relocation copy
+            // below faults each one in from ring 0.  Resolve them first, so an
+            // exhausted allocator surfaces as ENOMEM instead of an
+            // unrecoverable kernel fault (see
+            // `syscall::preflight_user_write_range`).  mremap(2) specifies
+            // ENOMEM when "there is not enough (virtual) memory available",
+            // which is exactly the condition being reported.
+            if !preflight_mremap_dest(dest as u64, old_size as usize) {
+                let _ = crate::syscall::sys_munmap(dest as u64, new_size);
+                return -12; // ENOMEM
+            }
             unsafe {
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(
@@ -6494,6 +6506,13 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
         let dest = crate::syscall::sys_mmap(new_addr, new_size, 0x3,
             MAP_ANONYMOUS | MAP_FIXED, u64::MAX, 0);
         if dest < 0 { return dest; }
+        // Same pre-flight as the MAYMOVE arm above: a fresh anonymous
+        // destination is entirely not-present, so resolve it before copying
+        // into it from ring 0.
+        if !preflight_mremap_dest(dest as u64, old_size.min(new_size) as usize) {
+            let _ = crate::syscall::sys_munmap(dest as u64, new_size);
+            return -12; // ENOMEM
+        }
         unsafe {
             let _g = crate::arch::x86_64::smap::UserGuard::new();
             core::ptr::copy_nonoverlapping(
@@ -6502,6 +6521,26 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
         let _ = crate::syscall::sys_munmap(old_addr, old_size);
         dest
     }
+}
+
+/// Resolve every page of an `mremap` relocation destination before the copy.
+///
+/// Returns `true` when the whole range is backed and the copy may proceed.  A
+/// `false` return means the allocator could not back some page, and the caller
+/// must undo the destination mapping and report ENOMEM rather than letting the
+/// copy fault in ring 0.  See `syscall::preflight_user_write_range` for why the
+/// pre-flight exists and what it does not guarantee.
+fn preflight_mremap_dest(dest: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if crate::syscall::preflight_would_deadlock() {
+        // Fail open — this is exactly the behaviour that predates the
+        // pre-flight, so skipping it can only forgo the hardening.
+        return true;
+    }
+    crate::syscall::preflight_user_write_range(
+        crate::mm::vmm::get_cr3(), dest, len) == len
 }
 
 /// Linux read(fd, buf, count) — same semantics as AstryxOS read.

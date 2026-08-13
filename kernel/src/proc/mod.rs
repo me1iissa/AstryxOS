@@ -3478,9 +3478,20 @@ pub(crate) fn fire_cleartid_for_group(pid: Pid) {
         procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
     };
     // (3) For each writer: zero the user-VA and FUTEX_WAKE one waiter.
-    //     `write_u32_to_user` is fault-immune (it returns early if the
-    //     PTE is not Present), matching the "best effort" semantics
-    //     `exit_thread` already provides for a torn-down VmSpace.
+    //     `write_u32_to_user` is fault-immune, but NOT (as this comment
+    //     previously claimed) by returning early whenever the PTE is not
+    //     Present — that was the historical no-op bug, and it silently dropped
+    //     the clear+wake for every merely lazily-paged target, stranding
+    //     `pthread_join` waiters.  It now *resolves* a not-present or
+    //     read-only PTE through the owning VmSpace and gives up only when the
+    //     target is genuinely unresolvable (no VMA, non-writable VMA, or the
+    //     frame allocation fails).  Fault-immunity comes from the store itself:
+    //     it goes through the higher-half direct map at the resolved physical
+    //     address, never through the user VA, so it cannot take a user-VA fault
+    //     regardless of what a sibling CPU does to the mapping.  Giving up on
+    //     an unresolvable target still matches the "best effort" semantics
+    //     `exit_thread` provides for a torn-down VmSpace (clone(2)
+    //     CLONE_CHILD_CLEARTID / set_tid_address(2)).
     //     `futex_wake_for_exit` is a no-op if no waiter is parked on the
     //     uaddr.
     for (tid, uaddr) in &writers {
