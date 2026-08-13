@@ -1515,6 +1515,79 @@ pub(crate) fn anon_vma_identity_matches(
 /// (Intel SDM Vol. 3A §6.8.1/§6.12.1; see `proc::lock_process_table_draining`).
 /// Intel SDM Vol. 3A §8.2.3: the Acquire load pairs with the Release
 /// generation bump performed by the VMA mutators.
+/// Zero a freshly-allocated frame and publish it as the anonymous mapping for
+/// `page_addr`, backing out cleanly if a sibling CPU won the same fault.
+///
+/// Shared by both allocation paths of the anonymous demand-fault arm (the fast
+/// path that keeps `PROCESS_TABLE` held, and the exhaustion path that releases
+/// it), which differ only in how they obtain the frame and re-validate the VMA.
+/// Takes only `Copy` scalars, so it is callable with or without the process
+/// table held.  Returns `true` in both the won and lost cases: the fault is
+/// resolved either way, since a lost race means the winner's mapping is
+/// already live at this VA.
+///
+/// # The aliasing hazard this closes
+///
+/// Anti-aliasing re-check (POSIX mmap(2) demand paging; Intel SDM Vol. 3A
+/// §4.10.4.3 "Optional Invalidation").  On a shared address space (CLONE_VM /
+/// vfork — multiple threads on one CR3, one per logical processor), two CPUs
+/// can take a not-present `#PF` on the SAME anonymous VA at the same time.  The
+/// hardware page-fault error code the arm branched on was latched at fault
+/// time; by the time this install runs the *other* CPU may already have
+/// allocated a frame and written the PTE.  Installing our own freshly-zeroed
+/// frame now would overwrite the winner's PTE with a DIFFERENT physical frame,
+/// leaving the winning CPU's TLB caching the first frame while the page table
+/// points at the second — a single VA backed by two frames.  A subsequent store
+/// by the loser's thread (e.g. a release-store to a shared control word) lands
+/// on the second frame, but the winner keeps reading the first through its
+/// stale TLB entry, so the store is never observed: a silent cross-CPU
+/// store-visibility failure on the shared stack page.
+///
+/// `map_page_in_if_absent` performs the install atomically-with-present-check
+/// under `VMM_LOCK`, writing nothing if a sibling already published a PTE for
+/// this VA.  This is the standard demand-paging re-validation: re-check the PTE
+/// under the page-table lock immediately before writing it, and discard the
+/// loser's frame rather than aliasing the mapping.  The file-backed readahead
+/// arm carries the same back-out.
+fn install_anon_frame(cr3: u64, page_addr: u64, page_flags: u64, phys: u64) -> bool {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    // Zero before publishing: the frame may carry another process's data, and
+    // POSIX mmap(2) requires MAP_ANONYMOUS pages to read as zero.
+    unsafe {
+        core::ptr::write_bytes(
+            (PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    }
+    if crate::mm::vmm::map_page_in_if_absent(cr3, page_addr, phys, page_flags) {
+        // We won the race and published the PTE — record the single PTE
+        // reference and refresh our local TLB.  The refcount is set AFTER a
+        // successful install so a lost race leaves the frame at refcount 0 and
+        // frees cleanly (`pmm::free_page` refuses to free a frame whose
+        // pte_share_count is non-zero).
+        crate::mm::refcount::page_ref_set(phys, 1);
+        crate::mm::vmm::invlpg(page_addr);
+        return true;
+    }
+    // Lost the race: a sibling CPU already mapped this VA.  Our frame was never
+    // installed (refcount still 0), so it frees cleanly.  Refresh THIS CPU's
+    // TLB so the faulting instruction re-walks to the winner's authoritative
+    // PTE.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        static RACE: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 10 || n % 500 == 0 {
+            crate::serial_println!(
+                "[PF/anon-race] #{} addr={:#x} sibling already mapped — \
+                 dropping our frame {:#x}",
+                n, page_addr, phys);
+        }
+    }
+    crate::mm::pmm::free_page(phys);
+    crate::mm::vmm::invlpg(page_addr);
+    true
+}
+
 fn revalidate_anon_vma_generation(
     target_pid: u64,
     faulting_addr: u64,
@@ -3608,25 +3681,94 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                         );
                     }
                 }
-                // ── Release PROCESS_TABLE for the duration of the allocation ──
+                // W216 H_5j-B (unified concurrency): sample the VmSpace
+                // generation before the allocation+zero+install sequence.
+                // Anonymous faults have a narrower race window than file-backed
+                // (no I/O drop of PROCESS_TABLE) but a sibling-CPU
+                // sys_munmap / MAP_FIXED Phase 2b can still mutate the VMA list
+                // between the find_vma above and the install below; the check
+                // keeps the abort-and-retry invariant uniform across all PFH
+                // install arms.  See `VmSpace::generation`.
+                let gen_at_start =
+                    vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
+
+                // ── Fast path: allocate WITHOUT releasing PROCESS_TABLE ───────
                 //
-                // Why this is required, not merely tidy.  When `alloc_page`
-                // finds no free frame it invokes the OOM killer, and the killer
-                // cannot read the process table through a lock this CPU already
-                // owns: it declines immediately (`mm::oom`, "caller already owns
-                // PROCESS_TABLE") and the allocation fails.  A failed allocation
-                // here makes `handle_page_fault` return `false`.  For a ring-3
-                // fault that costs one process — recoverable.  For a *ring-0*
-                // fault it is machine-fatal: this handler does not consult CPL,
-                // and a kernel-mediated bulk copy writing into a not-yet-faulted
-                // user page has no fault-fixup path to return to, so the fault
-                // escalates to a bugcheck.  Holding the table across
-                // `alloc_page` therefore converts survivable memory pressure
-                // into a dead machine, and it does so while suppressing the one
-                // mechanism (reclaim) that could have satisfied the request.
-                // The copy-on-write arm and the file-backed arm both already
-                // release before their fault-time work; this brings the
-                // anonymous arm to the same discipline.
+                // `try_alloc_page` is the plain bitmap allocation with no
+                // OOM-killer escalation, so it never reaches the code that
+                // needs this lock released.  Keeping the common case on this
+                // path matters: the anonymous demand fault is one of the
+                // hottest paths in the kernel, and a lock release plus
+                // re-acquisition plus re-validation on every fault would be a
+                // permanent cost paid to handle a condition that only arises
+                // under exhaustion.  So the hot path keeps exactly the cost and
+                // exactly the generation check it always had.
+                if let Some(phys) = crate::mm::pmm::try_alloc_page() {
+                    // Re-check generation immediately before install.
+                    let gen_now =
+                        vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
+                    if gen_now != gen_at_start {
+                        // The whole-address-space generation moved.  This is
+                        // USUALLY an unrelated concurrent mapping (a sibling
+                        // thread's mmap, or a `clone` mmapping a worker stack),
+                        // NOT a change to the faulting VMA.  A bare "generation
+                        // moved → return false" delivers a fatal SIGSEGV (no
+                        // re-fault path), killing the process on every unrelated
+                        // race — observed when a llvmpipe thread pool spawns
+                        // concurrently with a loader heap/.bss demand-fault.
+                        // Re-confirm the specific VMA is still an anonymous
+                        // mapping covering this VA before aborting.  PROCESS_TABLE
+                        // is HELD on this path, so re-validate via the
+                        // already-borrowed `vm_space` directly — re-locking
+                        // PROCESS_TABLE would self-deadlock.  Only a genuine
+                        // teardown/replace (VMA gone, or no longer Anonymous at
+                        // the same base/end) must abort.
+                        let still_anon = vm_space.find_vma(page_addr)
+                            .map(|v| anon_vma_identity_matches(
+                                v, anon_vma_base, anon_vma_end))
+                            .unwrap_or(false);
+                        if !still_anon {
+                            #[cfg(feature = "firefox-test-core")]
+                            {
+                                static CNT: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n < 5 || n % 500 == 0 {
+                                    crate::serial_println!(
+                                        "[PF/gen-abort] ANON #{} addr={:#x} \
+                                         gen_at_start={} gen_now={} — VMA replaced, \
+                                         releasing frame",
+                                        n, page_addr, gen_at_start, gen_now);
+                                }
+                            }
+                            crate::mm::pmm::free_page(phys);
+                            return false;
+                        }
+                        // else: unrelated bump — fall through and install.
+                    }
+                    return install_anon_frame(cr3, page_addr, page_flags, phys);
+                }
+
+                // ── Slow path: the frame bitmap is full ───────────────────────
+                //
+                // Release PROCESS_TABLE before retrying through `alloc_page`,
+                // which escalates to the OOM killer.  The killer cannot read
+                // the process table through a lock this CPU already owns: it
+                // declines immediately (`mm::oom`, "caller already owns
+                // PROCESS_TABLE") and the allocation fails without any reclaim
+                // ever being attempted.  A failed allocation here makes
+                // `handle_page_fault` return `false`.  For a ring-3 fault that
+                // costs one process — recoverable.  For a *ring-0* fault it is
+                // machine-fatal: this handler does not consult CPL, and a
+                // kernel-mediated bulk copy writing into a not-yet-faulted user
+                // page has no fault-fixup path to return to, so the fault
+                // escalates to a bugcheck.  Holding the table across the
+                // escalation therefore converts survivable memory pressure into
+                // a dead machine, while suppressing the one mechanism that
+                // could have satisfied the request.  The copy-on-write arm and
+                // the file-backed arm both already release before their
+                // fault-time work; this brings the anonymous arm to the same
+                // discipline, and pays for it only when memory is actually out.
                 //
                 // Why releasing here is SAFE.  What the lock protects on this
                 // path is the `Process` entry and the `VmSpace`/VMA list read
@@ -3638,11 +3780,11 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 // teardown cannot complete while it is executing.  What a
                 // sibling CPU *can* do is mutate the VMA list (`sys_munmap`,
                 // `MAP_FIXED` Phase 2b, `MADV_DONTNEED`) — which is precisely
-                // what the post-allocation re-validation below detects, and the
-                // install itself is separately CAS-guarded by
-                // `map_page_in_if_absent`.  Lock ordering is unchanged:
-                // PROCESS_TABLE is the top of the order and is re-acquired
-                // alone, never while holding anything else (#703 / #708).
+                // what the re-validation below detects, and the install itself
+                // is separately CAS-guarded by `map_page_in_if_absent`.  Lock
+                // ordering is unchanged: PROCESS_TABLE is the top of the order
+                // and is re-acquired alone, never while holding anything else
+                // (#703 / #708).
                 drop(procs);
                 // The held-*mark*, not the guard, is what the allocator's OOM
                 // path reads (`proc::process_table_held_here`).  It is bound at
@@ -3650,108 +3792,35 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 // guard, which means dropping the guard alone would leave the
                 // OOM killer still declining and change nothing.  Release both.
                 drop(_pt_mark);
-                // Allocate a zeroed page
-                if let Some(phys) = crate::mm::pmm::alloc_page() {
-                    unsafe {
-                        core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
-                    }
-                    // Re-validate under a fresh acquisition before installing.
-                    //
-                    // This replaces the previous "sample the VmSpace generation
-                    // before, compare after, and check VMA identity only when it
-                    // moved" sequence, which is no longer expressible: the
-                    // generation lives in the `VmSpace` we just released.  The
-                    // decision taken is identical in all three cases — nothing
-                    // changed, an unrelated sibling mmap bumped the generation
-                    // (proceed either way, since a bare "generation moved →
-                    // return false" delivers a fatal SIGSEGV on every unrelated
-                    // race, observed when a thread pool spawns concurrently with
-                    // a loader heap/.bss demand-fault), or this VMA was itself
-                    // removed/replaced (abort).  Testing identity directly is
-                    // simply the more precise form of the same test.
-                    if revalidate_anon_vma_generation(
-                        target_pid, page_addr, anon_vma_base, anon_vma_end).is_none()
-                    {
-                        #[cfg(feature = "firefox-test-core")]
-                        {
-                            static CNT: core::sync::atomic::AtomicU64 =
-                                core::sync::atomic::AtomicU64::new(0);
-                            let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            if n < 5 || n % 500 == 0 {
-                                crate::serial_println!(
-                                    "[PF/gen-abort] ANON #{} addr={:#x} \
-                                     vma=[{:#x}..{:#x}] — VMA replaced, \
-                                     releasing frame",
-                                    n, page_addr, anon_vma_base, anon_vma_end);
-                            }
-                        }
-                        crate::mm::pmm::free_page(phys);
-                        return false;
-                    }
-                    // Anti-aliasing re-check (POSIX mmap(2) demand paging;
-                    // Intel SDM Vol. 3A §4.10.4.3 "Optional Invalidation").
-                    //
-                    // On a shared address space (CLONE_VM / vfork — multiple
-                    // threads on one CR3, one per logical processor), two
-                    // CPUs can take a not-present #PF on the SAME anonymous VA
-                    // at the same time.  The hardware page-fault error code we
-                    // branched on (`!is_present`) was latched at fault time;
-                    // by the time we reach this install the *other* CPU may
-                    // already have allocated a frame and written the PTE.
-                    // Installing our own freshly-zeroed frame now would
-                    // overwrite the winner's PTE with a DIFFERENT physical
-                    // frame, leaving the winning CPU's TLB caching the first
-                    // frame while the page table points at the second — a
-                    // single VA backed by two frames.  A subsequent store by
-                    // the loser's thread (e.g. a release-store to a shared
-                    // control word) lands on the second frame, but the winner
-                    // keeps reading the first through its stale TLB entry, so
-                    // the store is never observed: a silent cross-CPU
-                    // store-visibility failure on the shared stack page.
-                    //
-                    // Install atomically-with-present-check under VMM_LOCK.
-                    // `map_page_in_if_absent` returns false (writing nothing) if
-                    // a sibling won the race and already published a PTE for
-                    // this VA, so we never overwrite the winner's mapping with a
-                    // second frame.  This is the standard demand-paging
-                    // re-validation: re-check the PTE under the page-table lock
-                    // immediately before writing it, and discard the loser's
-                    // frame rather than aliasing the mapping.  The file-backed
-                    // readahead arm above carries the same back-out
-                    // (`existing_pte & PAGE_PRESENT`); the anonymous arm needs
-                    // the identical guarantee for shared-CR3 stack pages.
-                    if crate::mm::vmm::map_page_in_if_absent(cr3, page_addr, phys, page_flags) {
-                        // We won the race and published the PTE — record the
-                        // single PTE reference and refresh our local TLB.  The
-                        // refcount is set AFTER a successful install so a lost
-                        // race leaves the frame at refcount 0 and frees cleanly
-                        // (pmm::free_page refuses to free a frame whose
-                        // pte_share_count is non-zero).
-                        crate::mm::refcount::page_ref_set(phys, 1);
-                        crate::mm::vmm::invlpg(page_addr);
-                        return true;
-                    }
-                    // Lost the race: a sibling CPU already mapped this VA.  Our
-                    // frame was never installed (refcount still 0), so it frees
-                    // cleanly.  Refresh THIS CPU's TLB so the faulting
-                    // instruction re-walks to the winner's authoritative PTE.
+                let phys = match crate::mm::pmm::alloc_page() {
+                    Some(p) => p,
+                    None => return false, // genuinely out of memory after reclaim
+                };
+                // Re-validate under a fresh acquisition before installing: the
+                // generation lives in the `VmSpace` we just released, so the
+                // identity test replaces the generation compare here.  The
+                // decision is the same in all three cases — nothing changed, an
+                // unrelated sibling mmap bumped the generation (proceed either
+                // way), or this VMA was itself removed/replaced (abort).
+                if revalidate_anon_vma_generation(
+                    target_pid, page_addr, anon_vma_base, anon_vma_end).is_none()
+                {
                     #[cfg(feature = "firefox-test-core")]
                     {
-                        static RACE: core::sync::atomic::AtomicU64 =
+                        static CNT: core::sync::atomic::AtomicU64 =
                             core::sync::atomic::AtomicU64::new(0);
-                        let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if n < 10 || n % 500 == 0 {
+                        let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 5 || n % 500 == 0 {
                             crate::serial_println!(
-                                "[PF/anon-race] #{} addr={:#x} sibling already mapped — \
-                                 dropping our frame {:#x}",
-                                n, page_addr, phys);
+                                "[PF/gen-abort] ANON-slow #{} addr={:#x} \
+                                 vma=[{:#x}..{:#x}] — VMA replaced, releasing frame",
+                                n, page_addr, anon_vma_base, anon_vma_end);
                         }
                     }
                     crate::mm::pmm::free_page(phys);
-                    crate::mm::vmm::invlpg(page_addr);
-                    return true;
+                    return false;
                 }
-                return false; // OOM
+                return install_anon_frame(cr3, page_addr, page_flags, phys);
             }
             crate::mm::vma::VmBacking::Device { phys_base } => {
                 // Identity-map device memory (no allocation needed)

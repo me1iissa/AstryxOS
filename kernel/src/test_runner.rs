@@ -63312,12 +63312,31 @@ fn test_750_oom_killer_does_not_block_on_process_table() -> bool {
 
     // The lock must be usable again afterwards: the bounded path must not have
     // left it poisoned or taken.
-    match crate::proc::PROCESS_TABLE.try_lock() {
-        Some(_) => {}
-        None => {
-            test_fail!(NAME, "PROCESS_TABLE still held after invoke_oom_killer returned");
-            return false;
+    //
+    // This is deliberately a BOUNDED RETRY, not a single `try_lock`.  What the
+    // assertion is about is `invoke_oom_killer` leaking the lock — a permanent
+    // condition.  A single-shot check cannot distinguish that from a legitimate
+    // concurrent holder: the suite has live user processes on other CPUs, and
+    // any of them entering process teardown (`exit_group`) takes PROCESS_TABLE
+    // for the duration.  Observed doing exactly that between this test's two
+    // OOM calls, which made the single-shot form fail on a machine whose lock
+    // was perfectly healthy a moment later.  Retrying keeps the real property
+    // (the lock becomes acquirable again) and drops the unprovable one (it is
+    // acquirable at one specific instant, which no caller can guarantee on an
+    // SMP machine with other runnable threads).
+    let mut reacquired = false;
+    for _ in 0..1000 {
+        if crate::proc::PROCESS_TABLE.try_lock().is_some() {
+            reacquired = true;
+            break;
         }
+        crate::sched::yield_cpu();
+    }
+    if !reacquired {
+        test_fail!(NAME,
+            "PROCESS_TABLE never became acquirable after invoke_oom_killer returned \
+             (1000 yields) — the bounded path leaked or poisoned it");
+        return false;
     }
 
     test_pass!(NAME);

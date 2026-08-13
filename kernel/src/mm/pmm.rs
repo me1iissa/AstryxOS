@@ -779,7 +779,17 @@ unsafe fn alloc_page_locked() -> Option<u64> {
 /// allocation itself — see that function's doc for why it lives here — and
 /// is cheap (a single relaxed load-and-compare) on every call where the
 /// interval isn't due.
-pub fn alloc_page() -> Option<u64> {
+/// Allocate a single physical page frame **without** escalating to the OOM
+/// killer — the plain bitmap allocation and nothing more.
+///
+/// This is [`alloc_page`]'s fast path, exposed separately for callers that
+/// must know whether an allocation can be satisfied *right now* without
+/// entering reclaim.  The distinction matters to callers holding a lock the
+/// OOM killer itself needs: they can take this path while holding it, and
+/// release only on the rare failure before retrying through [`alloc_page`].
+/// Returns `None` when the bitmap has no free frame, having done no reclaim
+/// and emitted no diagnostics.
+pub fn try_alloc_page() -> Option<u64> {
     // Opportunistic, tick-throttled sweep of the DMA-pin deferred-free ring
     // (~once/second) — closes the "device went idle right after an
     // ISR-context reclaim" gap without a block-layer-specific idle hook. See
@@ -787,14 +797,17 @@ pub fn alloc_page() -> Option<u64> {
     // hot path: it is cheap when not due, and fires independent of disk I/O.
     crate::mm::dma_pin::drain_deferred_if_due();
 
-    // Fast path: try the normal allocation first.
-    {
-        let _lock = PMM_LOCK.lock();
-        // SAFETY: We hold the PMM lock.
-        if let Some(addr) = unsafe { alloc_page_locked() } {
-            return Some(addr);
-        }
-    } // release lock before calling OOM killer
+    let _lock = PMM_LOCK.lock();
+    // SAFETY: We hold the PMM lock.
+    unsafe { alloc_page_locked() }
+}
+
+pub fn alloc_page() -> Option<u64> {
+    // Fast path: try the normal allocation first.  Releases PMM_LOCK before
+    // returning, so the OOM killer below is never called with it held.
+    if let Some(addr) = try_alloc_page() {
+        return Some(addr);
+    }
 
     // Slow path: bitmap is full.  Announce it BEFORE calling the OOM killer:
     // every diagnostic downstream of this point (the `[OOM]` lines) is emitted
