@@ -1315,6 +1315,11 @@ impl Ext2Fs {
         }
         bitmap[byte_idx] &= !(1 << bit_off);
         if self.write_block(bitmap_block, &bitmap).is_err() { return; }
+        // The block is free as of here, so any cached copy of it as an indirect
+        // block is now a liability: a later allocation can hand this same block
+        // to another file's indirect tree, and a stale slot would answer reads
+        // of it with the previous owner's pointers.
+        self.invalidate_indirect_cache(block_num);
         let mut state = self.state.lock();
         state.bgdt[group as usize].free_blocks_count += 1;
         state.superblock.free_blocks_count += 1;
@@ -1450,6 +1455,29 @@ impl Ext2Fs {
     /// Also invalidates the single-entry indirect-block cache (PR-E) so a
     /// subsequent `read_indirect` on the same block sees the updated value
     /// rather than a stale cache entry.
+    /// Drop any cached copy of `block_num` from the indirect-block cache.
+    ///
+    /// Must be called whenever a block's role or contents change underneath the
+    /// cache: when its bytes are rewritten outside [`Self::write_indirect_slot`],
+    /// and when it is freed (a freed block can be reallocated as a *different*
+    /// file's indirect block, and a stale slot would then hand out pointers
+    /// decoded from the previous owner's contents).
+    ///
+    /// Sweeps every level rather than guessing one: the caller does not know
+    /// the depth at which the block was cached, and a block number can legally
+    /// be cached at one depth and reallocated to another.
+    ///
+    /// Takes the state lock briefly and must not be called while it is held.
+    fn invalidate_indirect_cache(&self, block_num: u32) {
+        if block_num == 0 { return; }
+        let mut state = self.state.lock();
+        for slot in state.indirect_cache.iter_mut() {
+            if matches!(slot, Some((cached, _)) if *cached == block_num) {
+                *slot = None;
+            }
+        }
+    }
+
     fn write_indirect_slot(&self, block_num: u32, index: usize, value: u32)
         -> Result<(), &'static str>
     {
@@ -1461,18 +1489,7 @@ impl Ext2Fs {
         }
         buf[byte_off..byte_off + 4].copy_from_slice(&value.to_le_bytes());
         self.write_block(block_num, &buf)?;
-        // Invalidate every slot holding this block.  The written block's depth
-        // is not known here, and nothing stops the same block number being
-        // cached at more than one level across a remount or a reallocation, so
-        // sweep all slots rather than guessing one.
-        {
-            let mut state = self.state.lock();
-            for slot in state.indirect_cache.iter_mut() {
-                if matches!(slot, Some((cached_block, _)) if *cached_block == block_num) {
-                    *slot = None;
-                }
-            }
-        }
+        self.invalidate_indirect_cache(block_num);
         Ok(())
     }
 
@@ -1753,6 +1770,7 @@ impl Ext2Fs {
                 }
                 if top_changed {
                     let _ = self.write_block(inode.block[13], &buf);
+                    self.invalidate_indirect_cache(inode.block[13]);
                 }
             }
             if local_first == 0 {
@@ -1790,6 +1808,7 @@ impl Ext2Fs {
                 }
                 if top_changed {
                     let _ = self.write_block(inode.block[14], &buf);
+                    self.invalidate_indirect_cache(inode.block[14]);
                 }
             }
             if local_first == 0 {
@@ -1824,6 +1843,7 @@ impl Ext2Fs {
         }
         if changed {
             let _ = self.write_block(ind_block, &buf);
+            self.invalidate_indirect_cache(ind_block);
         }
     }
 
@@ -1853,6 +1873,7 @@ impl Ext2Fs {
         }
         if changed {
             let _ = self.write_block(dind_block, &buf);
+            self.invalidate_indirect_cache(dind_block);
         }
     }
 
