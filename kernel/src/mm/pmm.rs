@@ -139,8 +139,9 @@ static TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 /// sets a bit must add here, and every path that clears one must subtract:
 ///
 /// * [`alloc_page_locked`] / [`alloc_pages`] — `+1` / `+count`
-/// * [`free_page`] — `-1`, and deliberately *not* on the refusal arms
-///   (kernel-static, residual PTE refs, DMA-pinned), which leave the bit set
+/// * [`free_page`] — `-1`, and deliberately *not* on the refusal arms:
+///   kernel-static, residual PTE refs and DMA-pinned leave the bit set, and
+///   the double-free arm finds it already clear (see [`PMM_FREE_ALREADY_FREE`])
 /// * the boot reservations in [`init`] and [`reserve_range`] — `+n` for the
 ///   `n` frames whose bit each one newly set
 ///
@@ -203,6 +204,23 @@ static PMM_FREE_RESIDUAL_REFS: AtomicU64 = AtomicU64::new(0);
 /// tightened (this counter catches it without the frame ever actually
 /// leaving the reserved pool).
 static PMM_FREE_KERNEL_STATIC_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of [`free_page`] calls refused because the frame's
+/// bitmap bit was already clear — i.e. a double free, or a free of a frame
+/// inside the firmware `Available` domain that was never allocated.
+///
+/// Clearing an already-clear bit is idempotent, but the matching
+/// `USED_PAGES` decrement is not: without this guard each such call
+/// permanently raises the reported free-frame count by one while the bitmap
+/// stands still, which is exactly the counter-vs-bitmap drift the accounting
+/// invariant on [`USED_PAGES`] exists to exclude — reintroduced one page at a
+/// time and invisibly, because the boot-time drift check has long since run.
+///
+/// Refusing the free instead makes a double free a detectable no-op: the
+/// counter stays exact, the frame is not handed out twice, and every
+/// increment here names a caller that freed a frame it did not own.  Always 0
+/// in a correctly-behaving build.
+static PMM_FREE_ALREADY_FREE: AtomicU64 = AtomicU64::new(0);
 
 // ── Kernel image linker symbols ────────────────────────────────────────────
 //
@@ -1003,12 +1021,47 @@ pub fn free_page(phys_addr: u64) {
         crate::mm::w215_diag::free_shadow_record(phys_addr, rip);
     }
 
+    // Double-free refusal.  `mark_page_free` is an AND-NOT and is therefore
+    // idempotent; the `USED_PAGES` decrement below is not.  Freeing a frame
+    // whose bit is already clear would leave the bitmap unchanged while
+    // raising the counter-derived free count by one — the counter-vs-bitmap
+    // drift the accounting invariant on `USED_PAGES` forbids, reintroduced a
+    // page at a time and undetectably (the boot-time check ran long ago).
+    // None of the refusals above can stand in for this one: they test frame
+    // *identity* (`page >= MAX_PAGES`, kernel-static, residual PTE refs,
+    // DMA-pinned), never the frame's current bitmap state.
+    //
+    // The test-and-clear and the counter update happen inside the one
+    // `PMM_LOCK` hold, so `accounting_snapshot_locked` — which reads counters
+    // and bitmap under that same lock — can never observe a half-applied free.
     let _lock = PMM_LOCK.lock();
-    // SAFETY: We hold the PMM lock and page is in bounds.
-    unsafe {
-        mark_page_free(page);
+    // SAFETY: PMM_LOCK is held and `page < MAX_PAGES` was checked on entry.
+    let already_free = unsafe {
+        if is_page_used_locked(page) {
+            mark_page_free(page);
+            USED_PAGES.fetch_sub(1, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    };
+    if already_free {
+        // Release before reporting: the serial path takes its own lock, and
+        // nothing below this point applies to a refused free anyway.  The
+        // success path keeps the hold to the end of the function exactly as
+        // before, so the recent-free ring is still published before a
+        // concurrent `alloc_page` can acquire the lock and hand the frame out.
+        drop(_lock);
+        let total = PMM_FREE_ALREADY_FREE.fetch_add(1, Ordering::Relaxed) + 1;
+        if total <= 16 || total % 1000 == 0 {
+            crate::serial_println!(
+                "[PMM/DOUBLE-FREE] refusing free of phys={:#x} — bitmap bit already \
+                 clear; caller_rip={:#x} refused_total={}",
+                phys_addr, caller_rip(), total,
+            );
+        }
+        return;
     }
-    USED_PAGES.fetch_sub(1, Ordering::Relaxed);
 
     // H2 diagnostic: record this free in the recent-free ring so that
     // a rapid re-allocation of the same frame triggers PMM_ALLOC_RECENT_FREE.
@@ -1114,8 +1167,17 @@ pub fn stats() -> (u64, u64) {
 /// Frames permanently reserved at boot — the kernel image, BootInfo, the low
 /// 1 MiB, the bootstrap stack, and every [`reserve_range`] span (chiefly the
 /// static kernel heap).  A subset of the `used` figure from [`stats`].
+///
+/// The subset relation is what makes `total - reserved >= total - used`, i.e.
+/// what keeps every consumer's `MemTotal >= MemFree`.  Nothing in the running
+/// kernel maintains it: `RESERVED_PAGES` is monotone (only ever stored once
+/// and `fetch_add`ed) while `USED_PAGES` falls on every `free_page`, so a
+/// stray free of a reserved frame would invert it.  Reporting it back is
+/// clamped here so a readout can never claim more free RAM than usable RAM —
+/// the raw counters stay unclamped in [`Accounting`], where Test 752 asserts
+/// the relation directly and would still catch the inversion.
 pub fn reserved_page_count() -> u64 {
-    RESERVED_PAGES.load(Ordering::Relaxed)
+    RESERVED_PAGES.load(Ordering::Relaxed).min(USED_PAGES.load(Ordering::Relaxed))
 }
 
 /// A consistent snapshot of the frame allocator's counters *and* of the
@@ -1183,7 +1245,15 @@ unsafe fn accounting_snapshot_locked() -> Accounting {
     let mut bitmap_free = 0u64;
     // `BITMAP_SIZE` is a power of two ≥ 8, so `chunks_exact(8)` covers it
     // exactly and leaves no remainder to handle.
-    for chunk in BITMAP.chunks_exact(8) {
+    //
+    // `chunks_exact` is a slice method, so naming `BITMAP` directly would
+    // create a shared reference to a mutable static — `static_mut_refs`, a
+    // warning under edition 2021 and a hard error after the edition 2024
+    // migration.  SAFETY: the caller holds `PMM_LOCK` for the whole call (see
+    // the fn contract), so no concurrent mutation of `BITMAP` is possible and
+    // the borrow this raw pointer is promoted to is uniquely ours.
+    let bitmap = unsafe { &*core::ptr::addr_of!(BITMAP) };
+    for chunk in bitmap.chunks_exact(8) {
         let word = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
             chunk[4], chunk[5], chunk[6], chunk[7],
@@ -1250,6 +1320,16 @@ pub fn pmm_free_residual_refs_count() -> u64 {
 /// freed, so a nonzero count is a diagnostic signal, not damage.
 pub fn pmm_free_kernel_static_refused_count() -> u64 {
     PMM_FREE_KERNEL_STATIC_REFUSED.load(Ordering::Relaxed)
+}
+
+/// Read the cumulative `PMM_FREE_ALREADY_FREE` counter.
+///
+/// Returns the number of times [`free_page`] was refused because the frame's
+/// bitmap bit was already clear. Each increment is one double free (or one
+/// free of a never-allocated frame) that would otherwise have overstated the
+/// machine's free memory by a page for the rest of the boot.
+pub fn pmm_free_already_free_count() -> u64 {
+    PMM_FREE_ALREADY_FREE.load(Ordering::Relaxed)
 }
 
 /// Mark a page as used in the bitmap.

@@ -2200,7 +2200,8 @@ fn op_tlb_stats(out: &mut String) {
 //     },
 //     "pmm": { "total_pages":N|-1, "reserved_pages":N|-1, "used_pages":N|-1,
 //              "free_pages":N|-1, "bitmap_free_pages":N|-1,
-//              "drift_pages":N|-1, "free_mib":N|-1, "exhausted_total":N },
+//              "drift_pages":N|null, "free_mib":N|-1, "exhausted_total":N,
+//              "double_free_refused":N },
 //     "uptime_ticks": N
 //   }
 //
@@ -2214,6 +2215,13 @@ fn op_tlb_stats(out: &mut String) {
 // try-lock window emit `-1` so the caller distinguishes "no data this
 // sample" from a genuine zero.  Every probe uses a budget of ~few
 // microseconds so this op never blocks the kdb pump thread.
+//
+// `drift_pages` is the one exception, and emits `null` instead: every other
+// field is a count and cannot be negative, but drift is a signed difference
+// (`counter_free - bitmap_free`) for which `-1` is a legal reading — the
+// counters sitting one page below the bitmap, i.e. exactly the small-magnitude
+// drift a slow leak produces first.  A `-1` sentinel there would be
+// indistinguishable from that measurement.
 //
 // Public spec citations:
 //   - POSIX 1003.1-2024 process model — process / thread table sizing.
@@ -2283,16 +2291,23 @@ fn op_heap_stats(out: &mut String) {
             let _ = write!(out, r#""free_mib":{},"#, acct.counter_free * 4 / 1024);
         }
         // Same convention as the collection probes above: -1 means "no data
-        // this sample", never a genuine zero.
+        // this sample", never a genuine zero — except for `drift_pages`, whose
+        // whole range is legal, which reports the same condition as `null`.
         None => {
             let _ = write!(out, r#""total_pages":-1,"reserved_pages":-1,"#);
             let _ = write!(out, r#""used_pages":-1,"free_pages":-1,"#);
-            let _ = write!(out, r#""bitmap_free_pages":-1,"drift_pages":-1,"#);
+            let _ = write!(out, r#""bitmap_free_pages":-1,"drift_pages":null,"#);
             let _ = write!(out, r#""free_mib":-1,"#);
         }
     }
-    let _ = write!(out, r#""exhausted_total":{}"#,
+    let _ = write!(out, r#""exhausted_total":{},"#,
         crate::mm::pmm::exhausted_count());
+    // Counter-only (no lock), so it is reported on every sample including the
+    // contended one.  Any non-zero value is a caller that freed a frame whose
+    // bitmap bit was already clear: the free was refused, so `drift_pages`
+    // stays 0 and this is the only field that records it happened.
+    let _ = write!(out, r#""double_free_refused":{}"#,
+        crate::mm::pmm::pmm_free_already_free_count());
     out.push('}');
 
     // Uptime for caller-side rate computation.
