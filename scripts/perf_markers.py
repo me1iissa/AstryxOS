@@ -89,6 +89,7 @@ _sw, _SW_PATH = _load_serial_web()
 
 if _sw is not None:
     MILESTONES = _sw.MILESTONES
+    OPTIONAL_MILESTONES = _sw.OPTIONAL_MILESTONES
     _match = _sw._match
     _TICK_KERNEL = _sw._TICK_KERNEL
     _SC_RE = _sw._SC_RE
@@ -109,7 +110,8 @@ else:
         ("VFS / mount",       ("mounted", "ext2", "fat32", "rootfs")),
         ("init / userspace",  ("init started", "PID 1", "spawn")),
         ("X11 ready",         ("X11 server ready", "Xastryx")),
-        ("firefox exec",      ("firefox-bin",)),
+        ("firefox exec",      ("[FFTEST] Launching", "[EXEC] pid=1",
+                               ("[EXEC]", "firefox-bin"))),
         ("TLS / network",     ("[TCP] Established", "] Established →")),
         # Mirror of serial-web.py — render gates accept the low-frequency
         # kernel `[GATE] <label>` markers (default-ON on firefox-test-core) so
@@ -121,10 +123,15 @@ else:
                                ("[FF/write]", "ScreenshotParent"),
                                ("[FF/write]", "sendQuery"))),
         ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
-        ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+        ("PNG write",         ("[GATE] png-write",
+                               ("[FF-OUT-PNG:", "sig_ok=true"),
                                "/tmp/out.png present", "89504e47", "out.png written")),
         ("exit_group",        ("exit_group(",)),
     ]
+    # Mirror of serial-web.py's OPTIONAL_MILESTONES: gates a successful run may
+    # legitimately never emit, and which must therefore never stall the ladder.
+    OPTIONAL_MILESTONES = {"TLS / network", "init / userspace",
+                           "drawSnapshot", "screenshot-actors"}
     _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
     # pid=1 syscall-count. The serial-web vendored copy is r"pid=1[^\n]*?sc=(\d+)"
     # which lacks a word boundary and will read pid=10/pid=11/pid=19 lines as if
