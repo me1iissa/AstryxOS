@@ -1073,6 +1073,15 @@ _IDLE_SECONDS = 30
 PANIC_SNAPSHOT_MIN_INTERVAL_SECS_DEFAULT = 30.0
 PANIC_SNAPSHOT_MAX_ATTEMPTS_DEFAULT = 3
 
+# Watcher serial-poll period. Every gate mark is stamped when the watcher READS
+# the line, so a stamp can be up to one period late — i.e. this is the timing
+# resolution of the whole marks sidecar, and `phases` reports it alongside the
+# numbers so a phase shorter than one period is flagged rather than believed.
+WATCHER_POLL_S = 1.0
+
+# Published kernel timer rate ("timer at ~100 Hz" in the boot log): 1 tick = 10 ms.
+MS_PER_TICK_MS = 10.0
+
 # Kernel-tick regex for stamping each gate mark with the latest tick (so a
 # historical re-derivation cross-checks against the exact host stamp). Same
 # kernel-only form serial-web/perf_markers use ([HB]/PROC-METRICS tick=).
@@ -1520,20 +1529,41 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                             # first see milestone N's marker (and only at/after
                             # N-1), record its host arrival time. One line can
                             # satisfy several milestones in sequence (while-advance).
-                            while (_gate_idx < len(_gm.MILESTONES)
-                                   and _gm.match(line, _gm.MILESTONES[_gate_idx][1])):
-                                _label = _gm.MILESTONES[_gate_idx][0]
-                                _gm.append_gate_mark(
-                                    sid, str(HARNESS_DIR), _label,
-                                    host_ts=time.time(), tick=_cur_tick,
-                                    line=_line_no)
-                                _emit_event(sid, {
-                                    "event": "gate",
-                                    "label": _label,
-                                    "tick": _cur_tick,
-                                    "line": _line_no,
-                                })
-                                _gate_idx += 1
+                            #
+                            # OPTIONAL gates must not stall the ladder. A gate a
+                            # given run legitimately never emits (no X server on a
+                            # headless boot, no TCP on a file:// render) would
+                            # otherwise park the cursor forever and leave every
+                            # DEEPER gate unstamped — so a run that wrote a PNG
+                            # would show no firefox-exec/render/PNG marks at all.
+                            # Same lookahead rule the dashboards use: skip past an
+                            # optional gate only when some deeper gate matches
+                            # this very line, so the ladder stays monotone and a
+                            # merely late gate is still stamped when it arrives.
+                            _mst = _gm.MILESTONES
+                            _opt = getattr(_gm, "OPTIONAL_MILESTONES", frozenset())
+                            while _gate_idx < len(_mst):
+                                if _gm.match(line, _mst[_gate_idx][1]):
+                                    _label = _mst[_gate_idx][0]
+                                    _gm.append_gate_mark(
+                                        sid, str(HARNESS_DIR), _label,
+                                        host_ts=time.time(), tick=_cur_tick,
+                                        line=_line_no)
+                                    _emit_event(sid, {
+                                        "event": "gate",
+                                        "label": _label,
+                                        "tick": _cur_tick,
+                                        "line": _line_no,
+                                    })
+                                    _gate_idx += 1
+                                    continue
+                                if _mst[_gate_idx][0] in _opt and any(
+                                    _gm.match(line, _mst[j][1])
+                                    for j in range(_gate_idx + 1, len(_mst))
+                                ):
+                                    _gate_idx += 1
+                                    continue
+                                break
                         except Exception:
                             # disable gate stamping for the rest of this run; keep
                             # the watcher alive for panics/idles.
@@ -1656,7 +1686,7 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                 })
                 idle_event_sent = True
 
-        time.sleep(1.0)
+        time.sleep(WATCHER_POLL_S)
 
 
 # ── Build helper (shared with watch-test.py) ──────────────────────────────────
@@ -13900,6 +13930,135 @@ def cmd_kdb_read_png(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# phases — host-wall-clock decomposition of a boot, gate by gate
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The watcher already stamps the host arrival time of every bring-up/render gate
+# into `<sid>.marks.jsonl` (see gate_marks.append_gate_mark).  What was missing
+# was a one-shot reader that turns those stamps into the thing a performance
+# question actually needs: "how many seconds did each phase take, and what share
+# of the run was that?".  This subcommand is that reader.  It is READ-ONLY — it
+# touches no QMP socket, sets no breakpoint, and perturbs a live guest in no way,
+# so it is safe to call during a timed run.
+#
+# Two additive extras beyond the raw gate deltas:
+#
+#   * `prepopulate` — the `[FFTEST] Cached <path> (<n> pages, <t> ticks …)` lines
+#     rolled up per file and in total.  This burst is AstryxOS-specific page-cache
+#     warming that happens BEFORE Firefox is executed, so it is invisible in any
+#     gate delta that starts at the exec; costing it separately keeps the INIT
+#     phase honest.  Tick→seconds uses the kernel's published 100 Hz timer.
+#
+#   * `resolution_s` — the watcher's serial-poll period.  Every gate stamp is
+#     quantised to at most this much LATE, so a phase shorter than the period is
+#     not measurable and is reported with `below_resolution: true` rather than
+#     being silently believed.
+def cmd_phases(args):
+    # `stop` prunes the session JSON, but the marks/events/serial sidecars
+    # survive — and a boot is most often decomposed AFTER it has been stopped.
+    # So fall back to the session's own event stream for the launch epoch rather
+    # than refusing to report on any finished run.
+    try:
+        sess = _load_session(args.sid)
+    except SystemExit:
+        sess = {"serial_log": str(HARNESS_DIR / f"{args.sid}.serial.log")}
+    started_at = sess.get("started_at")
+    launch_source = "session"
+    if started_at is None:
+        launch_source = None
+        try:
+            with _events_path(args.sid).open() as fh:
+                for raw in fh:
+                    ts = json.loads(raw).get("ts")
+                    if ts is not None:
+                        started_at, launch_source = ts, "events-first-ts"
+                        break
+        except (OSError, json.JSONDecodeError):
+            pass
+    gm = _load_gate_marks()
+    if gm is None:
+        _err("gate_marks helper not importable — cannot decompose phases")
+
+    marks = gm.read_gate_marks(args.sid, str(HARNESS_DIR))
+    gate_to_phase = getattr(gm, "GATE_TO_PHASE", {})
+    ladder = [lab for lab, _ in gm.MILESTONES]
+
+    resolution_s = float(getattr(args, "resolution_s", None) or WATCHER_POLL_S)
+
+    gates = []
+    prev_elapsed = None
+    for label in ladder:
+        mk = marks.get(label)
+        if mk is None or mk.get("host_ts") is None or not started_at:
+            gates.append({"label": label, "phase": gate_to_phase.get(label),
+                          "hit": False, "host_ts": None, "elapsed_s": None,
+                          "delta_s": None, "line": None, "tick": None})
+            continue
+        elapsed = max(0.0, mk["host_ts"] - started_at)
+        delta = None if prev_elapsed is None else max(0.0, elapsed - prev_elapsed)
+        gates.append({
+            "label": label,
+            "phase": gate_to_phase.get(label),
+            "hit": True,
+            "host_ts": mk["host_ts"],
+            "elapsed_s": round(elapsed, 3),
+            "delta_s": None if delta is None else round(delta, 3),
+            "below_resolution": (delta is not None and delta < resolution_s),
+            "line": mk.get("line"),
+            "tick": mk.get("tick"),
+        })
+        prev_elapsed = elapsed
+
+    hit = [g for g in gates if g["hit"]]
+    total_s = hit[-1]["elapsed_s"] if hit else None
+    # Percent-of-total per gate delta, so the ranked table needs no post-math.
+    for g in hit:
+        if g["delta_s"] is not None and total_s:
+            g["pct_of_total"] = round(100.0 * g["delta_s"] / total_s, 1)
+
+    # ── prepopulate roll-up (AstryxOS-only pre-exec page-cache warming) ───────
+    prepop = {"files": [], "total_ticks": 0, "total_pages": 0, "total_s": None}
+    cached_re = re.compile(
+        r"\[FFTEST\] Cached (\S+) \((\d+) pages, (\d+) ticks")
+    try:
+        with Path(sess["serial_log"]).open("rb") as fh:
+            for raw in fh:
+                line = raw.decode("utf-8", errors="replace")
+                m = cached_re.search(line)
+                if m:
+                    pages, ticks = int(m.group(2)), int(m.group(3))
+                    prepop["files"].append(
+                        {"path": m.group(1), "pages": pages, "ticks": ticks,
+                         "seconds": round(ticks * MS_PER_TICK_MS / 1000.0, 2)})
+                    prepop["total_ticks"] += ticks
+                    prepop["total_pages"] += pages
+    except OSError:
+        pass
+    prepop["total_s"] = round(prepop["total_ticks"] * MS_PER_TICK_MS / 1000.0, 2)
+    prepop["files"].sort(key=lambda f: -f["ticks"])
+
+    out = {
+        "sid":          args.sid,
+        "ff_url":       sess.get("ff_url") or None,
+        "ff_gui":       bool(sess.get("ff_gui")),
+        "features":     sess.get("features"),
+        "smp":          sess.get("smp"),
+        "kvm":          sess.get("kvm_effective"),
+        "started_at":   started_at,
+        "started_at_source": launch_source,
+        "resolution_s": resolution_s,
+        "total_s":      total_s,
+        "gates":        gates,
+        "gates_missing": [g["label"] for g in gates if not g["hit"]],
+        "prepopulate":  prepop,
+    }
+    if getattr(args, "output", None):
+        Path(args.output).write_text(json.dumps(out, indent=2))
+        out = dict(out, output=args.output)
+    _out(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # screendump — capture the QEMU framebuffer via QMP and write a PNG
 # ══════════════════════════════════════════════════════════════════════════════
 #
@@ -15385,6 +15544,27 @@ def main():
         "--timeout", type=float, default=10.0,
         help="kdb request timeout in seconds (default 10)")
 
+    # phases — host-wall-clock decomposition of a boot from the marks sidecar
+    p_phases = sub.add_parser(
+        "phases",
+        help="[Tier1] Decompose a boot into host-wall-clock phases from the "
+             "gate-marks sidecar. Read-only (no QMP, no GDB, no guest "
+             "perturbation), so it is safe to call during a timed run. "
+             "Reports each gate's elapsed, delta and share of total, the "
+             "AstryxOS-only "
+             "[FFTEST] page-cache prepopulate roll-up, and the watcher poll "
+             "period that bounds the timing resolution. "
+             "Example: phases <sid> --output /tmp/phases.json")
+    p_phases.add_argument("sid")
+    p_phases.add_argument("--resolution-s", dest="resolution_s", type=float,
+                          default=None,
+                          help="Override the assumed watcher poll period in "
+                               "seconds when judging which deltas fall below "
+                               "measurable resolution (default: the harness's "
+                               "own WATCHER_POLL_S).")
+    p_phases.add_argument("--output", default=None, metavar="PATH",
+                          help="Also write the JSON report to PATH.")
+
     # screendump — capture the framebuffer via QMP screendump + PPM->PNG
     p_screendump = sub.add_parser(
         "screendump",
@@ -15660,6 +15840,7 @@ def main():
         "read-ff-png": cmd_read_ff_png,
         "kdb-read-png": cmd_kdb_read_png,
         "screendump": cmd_screendump,
+        "phases":     cmd_phases,
         "input":      cmd_input,
         # Shared session context
         "context": cmd_context,

@@ -50,6 +50,12 @@ import perf_markers as pm
 # Re-export so callers can `from gate_marks import MILESTONES` without caring
 # whether it came from serial-web or the vendored fallback.
 MILESTONES = pm.MILESTONES
+# Gates a successful run may legitimately never emit (headless boots start no X
+# server; a file:// render opens no TCP connection). Re-exported so the harness
+# watcher applies the SAME non-stalling rule the dashboards do — without it the
+# marks sidecar dead-ends at the first absent gate and every deeper gate goes
+# unstamped, which silently truncates any timing built on the sidecar.
+OPTIONAL_MILESTONES = pm.OPTIONAL_MILESTONES
 MS_PER_TICK = pm.MS_PER_TICK
 # The AND-anchored marker-match rule (substring | tuple-of-substrings-all-on-line)
 # from serial-web/perf_markers — re-exported so the harness watcher uses the SAME

@@ -141,7 +141,15 @@ MILESTONES = [
     ("VFS / mount",       ("mounted", "ext2", "fat32", "rootfs")),
     ("init / userspace",  ("init started", "PID 1", "spawn")),
     ("X11 ready",         ("X11 server ready", "Xastryx")),
-    ("firefox exec",      ("firefox-bin",)),
+    # The bare "firefox-bin" token also appears in the page-cache prepopulate
+    # line ("[FFTEST] Cached /disk/opt/firefox/firefox-bin …") and in every
+    # [FFTEST/mmap-so] line, all of which PRECEDE the actual exec — so keying on
+    # it stamped this gate tens of lines and tens of seconds early, folding the
+    # prepopulate burst into the wrong side of the boundary. Key on the launch
+    # announcement instead, which is what perf_markers' `ff_launch` anchor
+    # already uses; the two taxonomies are meant to agree.
+    ("firefox exec",      ("[FFTEST] Launching", "[EXEC] pid=1",
+                           ("[EXEC]", "firefox-bin"))),
     ("TLS / network",     ("[TCP] Established", "] Established →")),
     # content-process spawn. `[GATE] content-procs` is the kernel-emitted
     # milestone marker (default-ON on firefox-test-core, fires once); the
@@ -165,7 +173,14 @@ MILESTONES = [
     # supervisor's functional `[FFTEST] /tmp/out.png present` /
     # `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core); the
     # `89504e47` magic / `out.png written` are kept for full-trace boots.
-    ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+    # `[GATE] png-write` is the kernel's own single-per-run marker, emitted by the
+    # VFS close-after-write hook for exactly the registered screenshot path — so
+    # it carries none of the favicon/theme-PNG false-positive risk the raw magic
+    # would, and it stamps the moment the file is CLOSED (the true end of the
+    # write) rather than when the supervisor's next poll notices the file. Listed
+    # first so it wins when both it and the supervisor lines are present.
+    ("PNG write",         ("[GATE] png-write",
+                           ("[FF-OUT-PNG:", "sig_ok=true"),
                            "/tmp/out.png present", "89504e47", "out.png written")),
     ("exit_group",        ("exit_group(",)),
 ]
@@ -186,7 +201,21 @@ MILESTONES = [
 #     ladder advance to the gates the boot actually reached. (Pre-existing
 #     ordering quirk, surfaced once the deep [GATE] markers made the deeper
 #     gates reachable on the fast profile.)
-OPTIONAL_MILESTONES = {"TLS / network", "init / userspace"}
+#   * "drawSnapshot" — the composite/draw stage is detected from a curated
+#     write-payload substring (drawSnapshot / CrossProcessPaint). A headless
+#     screenshot run can complete — writing a valid PNG — without either string
+#     ever appearing in a scanned write payload, so this gate is legitimately
+#     absent on a SUCCESSFUL run. Left mandatory it parks the cursor one step
+#     short of "PNG write", hiding the single most useful timing gate the ladder
+#     has on a run that demonstrably produced the PNG.
+#   * "screenshot-actors" — same detector, and measured to arrive AFTER the PNG
+#     is closed: on a headless Main_Page run `[GATE] png-write` landed at serial
+#     line 3982 and the first `[GATE] screenshot-actors` at 4001. The IPDL actor
+#     names are scanned out of write payloads whose ordering against the file
+#     close is not guaranteed, so this gate is an out-of-order arrival — the
+#     other case OPTIONAL_MILESTONES exists for — and must not block PNG write.
+OPTIONAL_MILESTONES = {"TLS / network", "init / userspace",
+                       "drawSnapshot", "screenshot-actors"}
 
 # Only the kernel's own tick lines, not arbitrary "tick=" in FF/JS output.
 _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
