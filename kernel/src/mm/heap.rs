@@ -63,7 +63,7 @@ use spin::Mutex;
 /// graceful degradation, it routes through [`kernel_alloc_error_handler`] to a
 /// `HEAP_EXHAUSTED` bugcheck that takes the machine down, and the free-list can
 /// need more than the live occupancy when it is fragmented.  The one-shot
-/// [`emit_pressure_warning`] line at [`pressure_threshold_bytes`] (75 % of
+/// [`emit_pressure_warning`] line at [`pressure_threshold_bytes`] (60 % of
 /// capacity) is the early signal that the margin is being consumed; treat it as
 /// a request to re-measure before the workload reaches the wall.
 ///
@@ -150,13 +150,20 @@ static HEAP_BAND_PENDING: AtomicUsize = AtomicUsize::new(0);
 static HEAP_PRESSURE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Numerator of the occupancy fraction at which the one-shot pressure
-/// warning fires (3/4 = 75 %).
+/// warning fires (3/5 = 60 %).
+///
+/// The fraction is chosen so the threshold sits BELOW the deepest kernel-heap
+/// occupancy yet observed (~167 MiB on the heaviest windowed-render boot):
+/// 60 % of a 256 MiB heap is ~153.6 MiB, so a boot as deep as the deepest on
+/// record trips the wire while typical boots (≤125 MiB) stay quiet.  A
+/// threshold above the whole observed distribution would be dead margin — a
+/// safeguard with no reachable positive case.
 const HEAP_PRESSURE_WARN_NUM: usize = 3;
 /// Denominator of the pressure-warning fraction.
-const HEAP_PRESSURE_WARN_DEN: usize = 4;
+const HEAP_PRESSURE_WARN_DEN: usize = 5;
 
 /// Occupancy at which the one-shot `[HEAP] WARN` pressure line fires —
-/// 75 % of [`HEAP_SIZE`].
+/// 60 % of [`HEAP_SIZE`].
 #[inline]
 pub const fn pressure_threshold_bytes() -> usize {
     HEAP_SIZE / HEAP_PRESSURE_WARN_DEN * HEAP_PRESSURE_WARN_NUM

@@ -29752,7 +29752,7 @@ fn test_heap_guard_pte() -> bool {
 ///    `heap::init` assertion bound — the heap stays inside the bootloader's
 ///    0..4 GiB higher-half huge-page map and never reaches MMIO territory).
 /// 3. The VA base equals `phys_start + PHYS_OFF` (higher-half identity offset).
-/// 4. The pressure threshold is 75 % of capacity and strictly inside it, and
+/// 4. The pressure threshold is 60 % of capacity and strictly inside it, and
 ///    the high-water mark is a live running maximum: bounded by capacity and
 ///    never below the occupancy a caller samples right now.
 /// 5. `BUGCHECK_HEAP_EXHAUSTED` resolves to the `"HEAP_EXHAUSTED"` name, so the
@@ -29817,10 +29817,10 @@ fn test_heap_region_and_oom_bugcheck() -> bool {
     // above `HEAP_SIZE` can only fire once the allocator has already failed,
     // which is precisely when the warning is useless.
     let threshold = pressure_threshold_bytes();
-    if threshold != HEAP_SIZE / 4 * 3 {
+    if threshold != HEAP_SIZE / 5 * 3 {
         test_fail!("heap_region",
-            "pressure_threshold_bytes()={} — expected 75% of HEAP_SIZE ({})",
-            threshold, HEAP_SIZE / 4 * 3);
+            "pressure_threshold_bytes()={} — expected 60% of HEAP_SIZE ({})",
+            threshold, HEAP_SIZE / 5 * 3);
         return false;
     }
     if threshold == 0 || threshold >= HEAP_SIZE {
@@ -29850,7 +29850,7 @@ fn test_heap_region_and_oom_bugcheck() -> bool {
             hw, live_used);
         return false;
     }
-    test_println!("  high_water={} KiB live_used={} KiB threshold={} MiB (75%) ✓",
+    test_println!("  high_water={} KiB live_used={} KiB threshold={} MiB (60%) ✓",
         hw / 1024, live_used / 1024, threshold / (1024 * 1024));
 
     // 4. The OOM bugcheck code is wired into the name table (not UNKNOWN).
