@@ -1733,7 +1733,7 @@ pub fn parse_dynamic_test(data: &[u8]) -> (usize, usize, bool) {
 /// VMAs for each loaded segment are pushed into `vmas` so the process's VmSpace
 /// covers interpreter pages and can free them via the VMA walk on exit.
 /// W215 dispatch-4 probe: bounded emission counter for `[W215/INTERP]` lines.
-#[cfg(all(feature = "firefox-test-core", not(feature = "lean-serial")))]
+#[cfg(feature = "w215-diag")]
 static W215_INTERP_LOG: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -1883,7 +1883,7 @@ fn load_elf_dyn(
                 if !vmm::map_page_in(cr3, page_vaddr, phys, flags) {
                     return Err(ElfError::OutOfMemory);
                 }
-                // W215 dispatch-4 probe (firefox-test-core gated, additive): log
+                // W215 dispatch-4 probe (w215-diag gated, additive): log
                 // each interpreter page's (pid, interp-VA, phys, rc_before) so a
                 // crash victim phys can be correlated back to the load that
                 // wrote it, and rc_before>0 directly names a PMM non-free reuse.
@@ -1891,7 +1891,12 @@ fn load_elf_dyn(
                 // in the loader path and must not take THREAD_TABLE per page --
                 // review F2, matching the alias detector's own choice in
                 // `mm::w215_diag::alias_install_check`.
-                #[cfg(all(feature = "firefox-test-core", not(feature = "lean-serial")))]
+                // Gated on `w215-diag`, not the fast profile: the W215 saga this
+                // probe was written for closed in #724 (primary face) and #738
+                // (residual), and on the fast profile it was measured at 815
+                // lines / 59 KB per Firefox boot — 17% of all serial bytes
+                // printed between the exec and the screenshot write.
+                #[cfg(feature = "w215-diag")]
                 {
                     let n = W215_INTERP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                     // review F3: `n <= 4096` alone would silently drop the

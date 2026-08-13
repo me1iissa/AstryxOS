@@ -67,6 +67,55 @@ pub fn sys_mmap_shared_write_filebacked_count() -> u64 {
     SYS_MMAP_SHARED_WRITE_FILEBACKED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Slot count for the `[FFTEST/mmap-so]` first-arrival filter.  A Firefox boot
+/// maps ~46 distinct DSOs across ~8 processes, so 1024 slots keeps the table
+/// under 40% occupancy — short probe chains, and 8 KiB of BSS.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
+const SO_TRACE_SEEN_SLOTS: usize = 1024;
+
+/// Open-addressed set of `(pid, path)` keys already printed to the load-base
+/// table.  Lockless and never cleared: a pid is only reused after the old
+/// process is gone, and a stale key costs one missing duplicate line, not a
+/// missing base — the entry for a reused pid's DSO is re-claimed on its own
+/// first arrival because the hash mixes the path in.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
+static SO_TRACE_SEEN: [core::sync::atomic::AtomicU64; SO_TRACE_SEEN_SLOTS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SO_TRACE_SEEN_SLOTS]
+};
+
+/// True the first time this `(pid, path)` pair is seen, so the load-base table
+/// carries one line per process per DSO instead of one per mapped segment.
+///
+/// Fails OPEN — a full table or a long probe chain returns `true` and prints.
+/// The asymmetry is deliberate: a duplicate line costs bytes, a dropped line
+/// costs the symboliser a load base it cannot recover.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
+fn so_trace_first_arrival(pid: u64, path: &str) -> bool {
+    use core::sync::atomic::Ordering;
+    // FNV-1a over the path, then mixed with the pid so the same DSO in two
+    // processes occupies two slots (each process has its own load base).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= pid.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    // 0 marks an empty slot, so it can never be a live key.
+    let key = if h == 0 { 1 } else { h };
+    let mut idx = (key as usize) & (SO_TRACE_SEEN_SLOTS - 1);
+    for _ in 0..16 {
+        match SO_TRACE_SEEN[idx].compare_exchange(
+            0, key, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return true,                        // claimed it: first arrival
+            Err(seen) if seen == key => return false,    // already in the table
+            Err(_) => idx = (idx + 1) & (SO_TRACE_SEEN_SLOTS - 1),
+        }
+    }
+    true
+}
+
 /// Floor of the budget a `MAP_FIXED` placement may spend waiting for a teardown
 /// covering the address the caller named, before it gives up and returns ENOMEM.
 ///
@@ -3768,23 +3817,27 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // Emit on any of:
     //   - `firefox-test-core` (the lean perf/render/CI profile): user-RIP
     //     symbolisation must work on lean boots too, so the load-base table is
-    //     part of the functional core, not the trace superset.  This is one log
-    //     line per DSO mmap (~80 lines total across a Firefox boot) — a cheap
-    //     boot-time table, NOT a hot per-syscall emitter, so it belongs on the
-    //     fast profile.  `firefox-test-trace` still emits it (it pulls the core).
+    //     part of the functional core, not the trace superset.
     //   - `test-mode` (headless dynamic-linker tests verify placement)
-    //   NOTE (measured 2026-08-13): the "~80 lines total" estimate above is
-    //   wrong by ~20x. Every content process re-maps the whole DSO closure, so
-    //   a Main_Page boot emits 1671 of these lines (186 KB) between the Firefox
-    //   exec and the screenshot write — 16 s of 115200-baud serial time on a
-    //   port the kernel busy-polls. `lean-serial` suppresses it for A/B runs.
-    #[cfg(all(any(feature = "firefox-test-core", feature = "test-mode-trace"),
-              not(feature = "lean-serial")))]
+    //
+    // The table the symboliser consumes is one entry per (process, DSO): the
+    // load base and total length, i.e. ld-linux's first mapping of that object
+    // at file offset 0.  Every later segment lands inside that same range and
+    // tells the symboliser nothing new — but it does cost serial bytes, and on
+    // this port those are paid in wall clock.  An earlier revision of this
+    // comment estimated "~80 lines total across a Firefox boot"; the measured
+    // count on a Wikipedia Main_Page boot is 1671 (186 KB), because every
+    // content process re-maps the whole DSO closure.  So the fast profile
+    // prints first-arrival only, and `firefox-trace-verbose` keeps the full
+    // per-segment stream for callers that want the complete mapping list.
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
     if let Some(path) = so_trace_path_out {
-        crate::serial_println!(
-            "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
-            pid, base, length, offset, prot, fd, path
-        );
+        if cfg!(feature = "firefox-trace-verbose") || so_trace_first_arrival(pid, &path) {
+            crate::serial_println!(
+                "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
+                pid, base, length, offset, prot, fd, path
+            );
+        }
     }
 
     // ── MAP_FIXED replacement: split into three phases ──────────────────────
