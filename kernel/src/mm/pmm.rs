@@ -1172,12 +1172,15 @@ pub fn stats() -> (u64, u64) {
 /// what keeps every consumer's `MemTotal >= MemFree`.  Nothing in the running
 /// kernel maintains it: `RESERVED_PAGES` is monotone (only ever stored once
 /// and `fetch_add`ed) while `USED_PAGES` falls on every `free_page`, so a
-/// stray free of a reserved frame would invert it.  Reporting it back is
-/// clamped here so a readout can never claim more free RAM than usable RAM —
-/// the raw counters stay unclamped in [`Accounting`], where Test 752 asserts
-/// the relation directly and would still catch the inversion.
+/// stray free of a reserved frame would invert it.  The consumers that
+/// *derive* from the relation (`/proc/meminfo`, `sysinfo(2)`) clamp at the
+/// point of computation; the figure returned here stays raw, so a standalone
+/// `Rsvd:` readout keeps reporting the reservation as recorded rather than
+/// silently mirroring `Used:` under exactly the fault an operator would be
+/// inspecting.  Test 752 asserts the subset relation directly against
+/// [`Accounting`] and catches the inversion at its source.
 pub fn reserved_page_count() -> u64 {
-    RESERVED_PAGES.load(Ordering::Relaxed).min(USED_PAGES.load(Ordering::Relaxed))
+    RESERVED_PAGES.load(Ordering::Relaxed)
 }
 
 /// A consistent snapshot of the frame allocator's counters *and* of the

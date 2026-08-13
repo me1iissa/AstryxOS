@@ -1101,7 +1101,7 @@ pub fn init_ap() {
 
         // IA32_FMASK — RFLAGS bits to clear on SYSCALL entry.
         //
-        // Per Intel SDM Vol. 3A §6.8.8 (SYSCALL flag-masking) every bit set in
+        // Per Intel SDM Vol. 3A §5.8.8 (SYSCALL flag-masking) every bit set in
         // FMASK is cleared in RFLAGS by the CPU as part of the SYSCALL
         // transition into ring 0.  We mask:
         //   - bit  8 (TF) — kernel must not run with single-step on a user-
@@ -2794,7 +2794,7 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 // depends on how the exiting thread entered the kernel:
                 //
                 //   * SYSCALL — `IA32_FMASK` clears IF at the transition (Intel
-                //     SDM Vol. 3A §6.8.8), but the entry stub re-enables it with
+                //     SDM Vol. 3A §5.8.8), but the entry stub re-enables it with
                 //     `sti` once it is on the kernel stack, so IF=1 here.
                 //   * INT 0x80 / INT 0x2E — both vectors are installed as 64-bit
                 //     **interrupt** gates (type 0xE), and an interrupt gate
