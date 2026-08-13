@@ -24,40 +24,218 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Kernel heap size: 384 MiB.
+/// Kernel heap size: 256 MiB.
 ///
-/// Sized for heavy *windowed* rendering, where the kernel heap carries the
-/// X11 per-window/pixmap backing stores, the compositor back-buffer, per-frame
-/// transient `Vec`/`String` churn, and the IPC transfer buffers all at once —
-/// a working set that comfortably exceeded the previous 128 MiB on a
-/// multi-window page render and risked exhaustion mid-frame.
+/// ## This constant is a memory *budget*, not a ceiling
 ///
-/// ## Why 384 MiB is safe for the physical layout
+/// The heap is RAM-backed and **statically reserved**: [`compute_heap_layout`]
+/// picks a contiguous physical range `[phys_start, phys_start + HEAP_SIZE)` and
+/// `vmm::init` calls `pmm::reserve_range` over it before any other frame is
+/// handed out.  Every byte is therefore withdrawn from the frame allocator for
+/// the whole boot whether the allocator ever touches it or not — unlike a
+/// grow-on-demand kernel pool, an over-sized value here is not spare headroom,
+/// it is memory permanently denied to user processes.  On the standard 1 GiB
+/// guest profile the reservation is the single largest claim on RAM after the
+/// page cache.
 ///
-/// The heap is RAM-backed: [`compute_heap_layout`] reserves a contiguous
-/// physical range `[phys_start, phys_start + HEAP_SIZE)` and `vmm::init` calls
-/// `pmm::reserve_range` over it before any other frame is handed out.  Default
-/// builds pin `phys_start = 0x80_0000` (8 MiB), so the heap occupies physical
-/// `0x80_0000 .. 0x1880_0000` (8 .. 392 MiB).  This is bounded on three sides:
+/// ## Why 256 MiB
+///
+/// Sized from measurement.  The defining workload is heavy *windowed*
+/// rendering, where the heap carries the X11 per-window/pixmap backing stores,
+/// the compositor back-buffer, per-frame transient `Vec`/`String` churn and the
+/// IPC transfer buffers at once.  Block-accurate occupancy is measured by
+/// [`high_water_bytes`] — the running maximum of what the allocator actually
+/// carved out, counting per-block headers, alignment padding and un-split
+/// remainders, none of which the requested-bytes peak in `crate::perf` sees.
+///
+/// Across windowed browser boots against a live HTTPS page the peak is **not a
+/// single number**: shallow boots plateau near 75 MiB, while a boot whose
+/// browser session survives to render deeply reaches ~167 MiB — a 2.2× spread
+/// on the same kernel and the same page.  The reservation has to cover the deep
+/// boot, which is the one that matters, so the size is set from the tail of the
+/// distribution and not from its mode.  Sampling only the shallow boots is how
+/// this constant would get set far too low.
+///
+/// The margin over the observed tail is deliberately kept: exhaustion is not
+/// graceful degradation, it routes through [`kernel_alloc_error_handler`] to a
+/// `HEAP_EXHAUSTED` bugcheck that takes the machine down, and the free-list can
+/// need more than the live occupancy when it is fragmented.  The one-shot
+/// [`emit_pressure_warning`] line at [`pressure_threshold_bytes`] (75 % of
+/// capacity) is the early signal that the margin is being consumed; treat it as
+/// a request to re-measure before the workload reaches the wall.
+///
+/// ## Why the physical layout is safe at this size
+///
+/// Default builds place `phys_start` just past `__kernel_end` rounded to the
+/// next 2 MiB boundary (12 MiB with the current image), so the heap occupies
+/// physical `0xC0_0000 .. 0x1_0C0_0000` (12 .. 268 MiB).  Shrinking moves only
+/// `phys_end`, never `phys_start`, so no address inside the retained span
+/// changes and the freed tail returns to the frame allocator.  The span stays
+/// bounded on three sides:
 ///
 /// * **Below the 1 GiB assertion** — [`init`] asserts `phys_end <= 0x4000_0000`
-///   (1 GiB); 392 MiB clears it with room to spare, and the assertion remains
-///   a loud build-misconfiguration tripwire for any future kernel grown so
-///   large that the heap would reach MMIO territory.
+///   (1 GiB); the assertion remains a loud build-misconfiguration tripwire for
+///   any future kernel grown so large that the heap would reach MMIO territory.
 /// * **Inside the mapped window** — the bootloader maps physical 0..4 GiB into
 ///   the higher-half (PML4[256]) with 2 MiB huge pages, so every heap VA is
 ///   backed by a present translation. See Intel SDM Vol. 3A §4.3.
 /// * **Within guest RAM** — the smallest boot profile provisions 1 GiB of
-///   guest RAM (heavier render profiles get 2 GiB), leaving the PMM well over
-///   half its frames after the heap reservation.
+///   guest RAM (heavier render profiles get 2 GiB).
 ///
-/// Raising this constant grows only the runtime physical *reservation*; it does
-/// not change the linker image or BSS size, so it cannot move the kernel image
-/// relative to the BootInfo handoff page (a distinct, image-size concern).
-pub const HEAP_SIZE: usize = 384 * 1024 * 1024;
+/// Changing this constant changes only the runtime physical *reservation*; it
+/// does not change the linker image or BSS size, so it cannot move the kernel
+/// image relative to the BootInfo handoff page (a distinct, image-size
+/// concern).  The heap-region test in `test_runner` pins the value so a change
+/// cannot land silently.
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Occupancy high-water mark + one-shot pressure warning
+//
+// `HEAP_SIZE` is a *static physical reservation*: every byte of it is
+// withdrawn from the frame allocator at boot whether the allocator ever
+// touches it or not, so an over-sized heap is not free headroom — it is
+// memory permanently denied to user processes.  Sizing it therefore needs a
+// measured occupancy figure, and keeping it sized needs a signal when the
+// real workload starts approaching the reservation.
+//
+// Two figures already existed and neither answers that question:
+//
+//   * `crate::perf::heap_alloc_stats().5` ("peak_bytes") is a true running
+//     peak, but of the sum of `Layout::size()` — it excludes the per-block
+//     `AllocHeader`, the alignment padding, the `BLOCK_ALIGN` round-up and
+//     the un-split remainders, so it *understates* what the allocator has
+//     actually carved out.
+//   * `stats().1` (`allocated_bytes`) is block-accurate but is a *sample*:
+//     whatever a caller happens to observe, never the maximum.
+//
+// `HEAP_HIGH_WATER` is the missing one: the running maximum of the
+// block-accurate `allocated_bytes`.  It is written only from inside the
+// allocator's own critical section (one writer at a time), so a plain
+// load/store pair is sufficient; readers may race and observe a slightly
+// stale value, which for a monotone maximum is always a lower bound.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Running maximum of `LinkedListAllocator::allocated_bytes` — the largest
+/// block-accurate occupancy the kernel heap has ever reached this boot.
+///
+/// Monotone non-decreasing.  Written only under the allocator lock; read
+/// lock-free by `high_water_bytes()`.
+static HEAP_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+/// Set once, when the high-water mark first crosses
+/// [`pressure_threshold_bytes`].  Latched so the warning is one-shot.
+static HEAP_PRESSURE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Granularity of the `[HEAP] high-water` serial trail: one line per band
+/// the high-water mark newly enters.  At the current [`HEAP_SIZE`] a boot can
+/// emit at most `HEAP_SIZE / HEAP_HIGH_WATER_BAND` such lines.
+const HEAP_HIGH_WATER_BAND: usize = 16 * 1024 * 1024;
+
+/// Highest band index already reported on the serial trail.  Advanced with
+/// `fetch_max` so concurrent cores cannot emit the same band twice.
+static HEAP_BAND_REPORTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Band index armed inside the allocator's critical section, drained by the
+/// `GlobalAlloc` wrapper once the heap lock is released.  `0` means nothing
+/// pending (band 0 is never reported — it is the empty heap).
+static HEAP_BAND_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Armed inside the allocator's critical section when the threshold is
+/// crossed; drained by the `GlobalAlloc` wrapper *after* the heap lock is
+/// released, which is what keeps the serial write out of the lock hold.
+static HEAP_PRESSURE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Numerator of the occupancy fraction at which the one-shot pressure
+/// warning fires (3/4 = 75 %).
+const HEAP_PRESSURE_WARN_NUM: usize = 3;
+/// Denominator of the pressure-warning fraction.
+const HEAP_PRESSURE_WARN_DEN: usize = 4;
+
+/// Occupancy at which the one-shot `[HEAP] WARN` pressure line fires —
+/// 75 % of [`HEAP_SIZE`].
+#[inline]
+pub const fn pressure_threshold_bytes() -> usize {
+    HEAP_SIZE / HEAP_PRESSURE_WARN_DEN * HEAP_PRESSURE_WARN_NUM
+}
+
+/// Largest block-accurate kernel-heap occupancy reached this boot, in bytes.
+///
+/// Includes per-allocation headers, alignment padding and un-split block
+/// remainders — i.e. what the allocator actually carved out of the heap,
+/// not the sum of requested sizes.  Monotone; never decreases.
+#[inline]
+pub fn high_water_bytes() -> usize {
+    HEAP_HIGH_WATER.load(Ordering::Relaxed)
+}
+
+/// Whether the one-shot pressure warning has already fired this boot.
+#[inline]
+pub fn pressure_warned() -> bool {
+    HEAP_PRESSURE_WARNED.load(Ordering::Relaxed)
+}
+
+/// Emit one `[HEAP] high-water` trail line for a newly entered band.
+///
+/// Bounded by construction: at most one line per [`HEAP_HIGH_WATER_BAND`] of
+/// capacity per boot, and `fetch_max` makes the band strictly increasing even
+/// if two cores drain the pending slot at once.  The trail exists so the
+/// occupancy peak of *any* boot can be read out of an archived serial log —
+/// including a boot that dies before anything can query `kdb heap-stats`,
+/// which is exactly the boot whose peak matters most.
+///
+/// Same locking discipline as [`emit_pressure_warning`]: called with the heap
+/// lock released.
+#[inline(never)]
+#[cold]
+fn emit_high_water_band(band: usize) {
+    if HEAP_BAND_REPORTED.fetch_max(band, Ordering::Relaxed) >= band {
+        return;
+    }
+    let hw = HEAP_HIGH_WATER.load(Ordering::Relaxed);
+    let pct = if HEAP_SIZE == 0 { 0 } else { hw * 100 / HEAP_SIZE };
+    crate::serial_println!(
+        "[HEAP] high-water {} MiB of {} MiB ({}%)",
+        hw / (1024 * 1024),
+        HEAP_SIZE / (1024 * 1024),
+        pct,
+    );
+}
+
+/// Emit the one-shot heap-pressure warning.
+///
+/// Called from the `GlobalAlloc` wrapper *after* the allocator lock has been
+/// released (interrupts are still masked by the caller's `HeapIrqGuard`), so
+/// the serial write cannot deadlock against a core that holds `SERIAL` and
+/// wants the heap.  Allocation-free: reads two atomics and formats through
+/// the serial sink.
+#[inline(never)]
+#[cold]
+fn emit_pressure_warning() {
+    // Exactly-once even if two cores drain the pending flag concurrently.
+    if HEAP_PRESSURE_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let hw = HEAP_HIGH_WATER.load(Ordering::Relaxed);
+    let pct = if HEAP_SIZE == 0 { 0 } else { hw * 100 / HEAP_SIZE };
+    crate::serial_println!(
+        "[HEAP] WARN: kernel heap high-water {} MiB of {} MiB ({}%) — crossed the {}% \
+         pressure threshold ({} MiB). Exhaustion aborts the machine via the \
+         HEAP_EXHAUSTED bugcheck; raise mm::heap::HEAP_SIZE (each MiB is taken \
+         from user memory) or find the growth.",
+        hw / (1024 * 1024),
+        HEAP_SIZE / (1024 * 1024),
+        pct,
+        HEAP_PRESSURE_WARN_NUM * 100 / HEAP_PRESSURE_WARN_DEN,
+        pressure_threshold_bytes() / (1024 * 1024),
+    );
+}
 
 /// Minimum heap base virtual address — phys 8 MiB in the higher-half map.
 ///
@@ -548,6 +726,7 @@ impl LinkedListAllocator {
 
                     header_block_size = total_needed;
                     self.allocated_bytes += total_needed;
+                    self.note_occupancy();
                 } else {
                     // Use the entire block (don't split tiny remainders).
                     if prev.is_null() {
@@ -558,6 +737,7 @@ impl LinkedListAllocator {
 
                     header_block_size = block_size;
                     self.allocated_bytes += block_size;
+                    self.note_occupancy();
                 }
 
                 // Write the allocation header just before user data, then fence
@@ -582,6 +762,32 @@ impl LinkedListAllocator {
 
         // Out of memory.
         ptr::null_mut()
+    }
+
+    /// Update the block-accurate occupancy high-water mark, and arm the
+    /// one-shot pressure warning the first time it crosses
+    /// [`pressure_threshold_bytes`].
+    ///
+    /// Runs with the allocator lock held, so it is the single writer of
+    /// [`HEAP_HIGH_WATER`] and a plain load/store pair is race-free.  It does
+    /// **not** print: printing here would hold the heap lock across a
+    /// `SERIAL` acquisition, so it only arms [`HEAP_PRESSURE_PENDING`] and
+    /// the `GlobalAlloc` wrapper emits once the lock is gone.
+    #[inline(always)]
+    fn note_occupancy(&self) {
+        let used = self.allocated_bytes;
+        if used > HEAP_HIGH_WATER.load(Ordering::Relaxed) {
+            HEAP_HIGH_WATER.store(used, Ordering::Relaxed);
+            let band = used / HEAP_HIGH_WATER_BAND;
+            if band > HEAP_BAND_REPORTED.load(Ordering::Relaxed) {
+                HEAP_BAND_PENDING.store(band, Ordering::Relaxed);
+            }
+            if used >= pressure_threshold_bytes()
+                && !HEAP_PRESSURE_WARNED.load(Ordering::Relaxed)
+            {
+                HEAP_PRESSURE_PENDING.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Deallocate memory and coalesce adjacent free blocks.
@@ -833,6 +1039,17 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
         let ptr = self.0.lock().alloc(layout);
         if !ptr.is_null() {
             crate::perf::record_heap_alloc(layout.size());
+        }
+        // The allocator arms this inside its critical section; emit here,
+        // with the heap lock released, so the `SERIAL` acquisition can never
+        // be taken while holding the heap lock.  Interrupts stay masked
+        // (`_irq` is still live), so no ISR can re-enter mid-line.
+        let band = HEAP_BAND_PENDING.swap(0, Ordering::Relaxed);
+        if band != 0 {
+            emit_high_water_band(band);
+        }
+        if HEAP_PRESSURE_PENDING.swap(false, Ordering::Relaxed) {
+            emit_pressure_warning();
         }
         ptr
     }

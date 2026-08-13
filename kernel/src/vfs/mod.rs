@@ -2977,7 +2977,8 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
                 // Bounce in bounded chunks so a single read(2) with a huge
                 // `count` never allocates a `count`-sized kernel buffer (which
-                // could exhaust the 384 MiB kernel heap).  256 KiB comfortably
+                // could exhaust the kernel heap — `mm::heap::HEAP_SIZE` is a
+                // fixed reservation, not a growable pool).  256 KiB comfortably
                 // exceeds the block device's per-request span, so a chunk is
                 // still serviced by at most one coalesced device read.
                 const BOUNCE_CHUNK: usize = 256 * 1024;
