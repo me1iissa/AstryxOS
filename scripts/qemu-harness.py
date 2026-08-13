@@ -51,6 +51,16 @@ Firefox serial profiles (perf vs trace):
           firefox-trace-verbose to a perf boot — both add large PT-walk + serial
           cost and stay explicit opt-ins outside both profiles.
 
+    Benchmark page for perf comparisons:
+        https://en.wikipedia.org/wiki/Main_Page  (--ff-url, the goal page)
+        Use it — not a long article — whenever a number is meant to be compared
+        run-to-run or against a host baseline.  Full-page screenshots of very
+        tall articles exhaust memory even on a stock Linux host at the same
+        1 GiB budget, so a tall-article run measures the OOM path rather than
+        render throughput and is not a like-for-like comparison.  Golden-path
+        run artefacts (serial logs, per-boot status JSON, screenshots) collect
+        under ffrender-artifacts/<series>/ in this checkout.
+
 Tier 1 — session management:
     python3 scripts/qemu-harness.py start [--features FLAGS] [--trace] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
@@ -223,6 +233,7 @@ ABI-conformance reference (delegates to scripts/strace-ref.py):
 
 import argparse
 import datetime
+import errno
 import json
 import os
 import re
@@ -1677,8 +1688,12 @@ def _build(features: str) -> bool:
     KERNEL_ELF   = wt.KERNEL_ELF
     KERNEL_BIN   = wt.KERNEL_BIN
 
+    # Plain `cargo` / `rustc` — NEVER `cargo +nightly`.  A `+toolchain`
+    # argument outranks rust-toolchain.toml in rustup's override precedence,
+    # so it silently boots past the date pin the TOML exists to enforce
+    # (the pin that keeps a broken nightly out of the build).
     r1 = subprocess.run(
-        ["cargo", "+nightly", "build",
+        ["cargo", "build",
          "--package", "astryx-boot",
          "--target", "x86_64-unknown-uefi",
          "--profile", "release"],
@@ -1687,7 +1702,7 @@ def _build(features: str) -> bool:
     if r1.returncode != 0:
         return False
 
-    kernel_cmd = ["cargo", "+nightly", "build",
+    kernel_cmd = ["cargo", "build",
                   "--package", "astryx-kernel",
                   f"--target={KERNEL_TARGET}",
                   "--profile", "release"]
@@ -1796,8 +1811,10 @@ def _build(features: str) -> bool:
     KERNEL_BIN.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(BOOT_EFI_SRC, BOOT_EFI_DST)
 
+    # Plain `rustc` so the sysroot we take llvm-objcopy from is the SAME
+    # toolchain rust-toolchain.toml just compiled the kernel with.
     sysroot = subprocess.check_output(
-        ["rustc", "+nightly", "--print", "sysroot"],
+        ["rustc", "--print", "sysroot"],
         text=True, cwd=ROOT
     ).strip()
     objcopy = next(Path(sysroot).rglob("llvm-objcopy"), None) or shutil.which("llvm-objcopy")
@@ -1810,7 +1827,7 @@ def _build(features: str) -> bool:
 
 def _check(features: str, root: str = "") -> tuple[int, str]:
     """
-    Run `cargo +nightly check` against the kernel package for `features`.
+    Run `cargo check` against the kernel package for `features`.
 
     Returns (rc, stderr_tail) — rc==0 on success.  Stderr is forwarded
     truncated to the last 4 KB so callers can surface the failing diagnostic
@@ -1833,7 +1850,8 @@ def _check(features: str, root: str = "") -> tuple[int, str]:
         ROOT = wt.ROOT
         KERNEL_TARGET = wt.KERNEL_TARGET
 
-    cmd = ["cargo", "+nightly", "check",
+    # Plain `cargo` — see _build(): `+toolchain` outranks rust-toolchain.toml.
+    cmd = ["cargo", "check",
            "--package", "astryx-kernel",
            f"--target={KERNEL_TARGET}",
            "--profile", "release"]
@@ -2600,6 +2618,150 @@ def _data_img_symlink_info(data_img: Path, wt_root: Path) -> dict:
         lex = os.path.abspath(str(data_img))
         out["write_through_outside_wt"] = (
             _inside(lex) and not _inside(out["resolved"]))
+    return out
+
+
+def _validate_explicit_data_img(path_str: str) -> dict:
+    """
+    Validate an explicit ``--data-img PATH`` before booting it.
+
+    An explicit image is booted AS GIVEN: `start` must never unlink, rename,
+    or re-symlink anything to "make room" for it.  This function only decides
+    whether the named path is bootable, and says why not in a structured way
+    when it is not.
+
+    Returns a dict that always carries an ``ok`` key:
+
+      ok=True   {"ok": True, "path": <abs>, "is_symlink": bool,
+                 "resolved": <realpath|None>, "size": <bytes|None>}
+      ok=False  {"ok": False, "path": <abs>, "reason": <code>, "error": <str>}
+
+    Stable ``reason`` codes (additive — new codes may be appended):
+
+      "missing"           path does not exist (and is not a symlink)
+      "symlink-cycle"     resolution fails with ELOOP: self-referential/cyclic
+      "dangling-symlink"  symlink whose target does not exist
+      "not-a-file"        exists but is not a regular file (dir, socket, ...)
+      "unreadable"        stat() failed for any other reason
+
+    Why the cycle case gets its own code: per symlink(7) a link naming itself
+    fails resolution with ELOOP, and ``os.path.exists`` reports False for it —
+    indistinguishable from "missing" without an islink() probe.  A harness that
+    conflated the two reported a misleading "--data-img not found" for a link
+    it had just created itself (2026-08-13 incident).
+    """
+    p = os.path.abspath(os.path.expanduser(str(path_str)))
+    out = {"ok": False, "path": p, "reason": None, "error": ""}
+    try:
+        is_link = os.path.islink(p)
+    except OSError:
+        is_link = False
+    try:
+        st = os.stat(p)                      # follows symlinks
+    except OSError as e:
+        tgt = None
+        if is_link:
+            try:
+                tgt = os.readlink(p)
+            except OSError:
+                tgt = None
+        arrow = f" -> {tgt}" if tgt else ""
+        if e.errno == errno.ELOOP:
+            out["reason"] = "symlink-cycle"
+            out["error"] = (f"--data-img is a symlink cycle (ELOOP): {p}{arrow}"
+                            " — remove or repoint the link; the harness will "
+                            "not rewrite a path you named explicitly")
+        elif is_link:
+            out["reason"] = "dangling-symlink"
+            out["error"] = (f"--data-img is a broken symlink: {p}{arrow} "
+                            "(target does not exist)")
+        elif e.errno == errno.ENOENT:
+            out["reason"] = "missing"
+            out["error"] = f"--data-img not found: {p}"
+        else:
+            out["reason"] = "unreadable"
+            out["error"] = f"--data-img not readable: {p} ({e.strerror})"
+        return out
+    if not os.path.isfile(p):
+        out["reason"] = "not-a-file"
+        out["error"] = (f"--data-img is not a regular file: {p} "
+                        f"(mode {oct(st.st_mode)})")
+        return out
+    resolved = None
+    try:
+        resolved = os.path.realpath(p)
+    except OSError:
+        pass
+    return {"ok": True, "path": p, "is_symlink": is_link,
+            "resolved": resolved, "size": st.st_size}
+
+
+def _link_canonical_data_img(data_img: Path, canonical: Path) -> dict:
+    """
+    Materialise ``<worktree>/build/data.img`` as a symlink to the canonical
+    image — without ever creating a self-referential link, and without ever
+    removing anything that holds data.
+
+    Only called on the IMPLICIT path (no ``--data-img`` given) when the
+    worktree has no usable data.img of its own.
+
+    Returns {"ok": bool, "action": <str>, "reason": <str|None>,
+             "target": <str>, "error": <str>}
+
+    ``action`` (stable, additive):
+      "linked"           created data_img -> canonical
+      "relinked-broken"  replaced a dangling/self-referential link (no data)
+      "noop"             something usable is already there; nothing done
+      "refused"          would have been unsafe or impossible; nothing done
+
+    The "refused" cases are the guard: linking a path to itself (the worktree
+    path IS the canonical path), a missing canonical image, or any OS error.
+    A self-referential link is unbootable AND makes every later `start` report
+    the image as missing, so it must never be created.
+    """
+    src = os.path.abspath(str(data_img))
+    dst = os.path.abspath(str(canonical))
+    out = {"ok": False, "action": "refused", "reason": None,
+           "target": dst, "error": ""}
+    is_link = os.path.islink(src)
+    # Where the new link would LIVE: ancestors resolved, leaf NOT followed
+    # (a symlink's own path is exactly that).  Comparing that slot against the
+    # fully-resolved canonical path catches "this checkout IS the canonical
+    # checkout" and "build/ is a symlink into the canonical build/" alike,
+    # while a healthy worktree link (src -> dst) compares unequal and is left
+    # alone below.
+    try:
+        _src_slot = os.path.join(os.path.realpath(os.path.dirname(src)),
+                                 os.path.basename(src))
+        _same_slot = (_src_slot == os.path.realpath(dst))
+    except OSError:
+        _same_slot = (src == dst)
+    if _same_slot:
+        out["reason"] = "self-referential"
+        out["error"] = (f"refusing to symlink {src} to itself — that path IS "
+                        f"the canonical image {dst}")
+        return out
+    if os.path.exists(src):
+        # Resolves fine — a real file or a working link.  Never touch it.
+        out.update(ok=True, action="noop", reason="already-present")
+        return out
+    if not os.path.exists(dst):
+        out["reason"] = "canonical-missing"
+        out["error"] = f"canonical image not found: {dst}"
+        return out
+    try:
+        if is_link:
+            # Broken or self-referential link: carries no data, safe to drop.
+            os.unlink(src)
+            os.symlink(dst, src)
+            out.update(ok=True, action="relinked-broken", reason="broken-link")
+        else:
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            os.symlink(dst, src)
+            out.update(ok=True, action="linked", reason=None)
+    except OSError as e:
+        out.update(ok=False, action="refused", reason="oserror",
+                   error=f"could not link {src} -> {dst}: {e.strerror}")
     return out
 
 
@@ -3559,7 +3721,7 @@ def cmd_soak(args):
 
 def cmd_check(args):
     """
-    Run `cargo +nightly check` against the kernel package and emit a JSON
+    Run `cargo check` against the kernel package and emit a JSON
     verdict.  No QEMU is launched.  Useful for sweeping feature-flag matrices
     after a code change.
     """
@@ -3578,7 +3740,7 @@ def cmd_check(args):
 
 def cmd_build(args):
     """
-    Run the REAL kernel build (`cargo +nightly build` for astryx-boot +
+    Run the REAL kernel build (`cargo build` for astryx-boot +
     astryx-kernel, then objcopy to the flat kernel.bin and stage the boot EFI) —
     i.e. codegen + link + ESP staging — and emit a JSON verdict with the host
     wall-clock build time.  No QEMU is launched.
@@ -3935,66 +4097,56 @@ def cmd_start(args):
             file=sys.stderr,
         )
 
-    # --data-img OVERRIDE: point the worktree's build/data.img at an explicit
-    # prebuilt image (e.g. /home/ubuntu/gui-complete.img) by replacing the
-    # worktree symlink target.  A prebuilt complete image is authoritative — we
-    # do NOT want the staleness check to regenerate it from build/disk/, so this
-    # implies --no-regen-data-img.  Additive: when --data-img is absent the
-    # behaviour is byte-identical to before.
+    # --data-img OVERRIDE: boot an explicit prebuilt image (e.g.
+    # /home/ubuntu/gui-complete.img) AS GIVEN.  The named path is validated and
+    # then threaded straight into _launch_qemu_harness(data_img_override=...) —
+    # exactly like the prebuilt per-variant image above.  The worktree's
+    # build/data.img is NOT consulted, NOT unlinked, NOT renamed and NOT
+    # re-pointed.
+    #
+    # BEHAVIOUR CHANGE (2026-08-13): this used to replace build/data.img with a
+    # symlink to the override.  When the override resolved to that same file
+    # (the common `--data-img <this worktree>/build/data.img` spelling) the
+    # unlink-then-symlink produced a SELF-REFERENTIAL link: unbootable, and
+    # reported by every later `start` as "--data-img not found" because a
+    # self-naming link fails resolution with ELOOP (symlink(7)).  A prebuilt
+    # complete image is authoritative, so this still implies --no-regen-data-img.
     _data_img_override = getattr(args, "data_img_override", None)
+    _data_img_explicit = None      # abs path booted as given, or None
     if _data_img_override:
-        _ovr = Path(_data_img_override)
-        if not _ovr.exists():
-            print(json.dumps({"ok": False, "error": f"--data-img not found: {_ovr}"}))
+        _ovr_info = _validate_explicit_data_img(_data_img_override)
+        if not _ovr_info["ok"]:
+            print(json.dumps({"ok": False, "error": _ovr_info["error"],
+                              "data_img": _ovr_info["path"],
+                              "reason": _ovr_info["reason"]}))
             sys.exit(2)
+        _data_img_explicit = _ovr_info["path"]
+        _prebuilt_data_img = _data_img_explicit
         # Force no-regen for an explicit prebuilt image.
         try:
             setattr(args, "no_regen_data_img", True)
         except Exception:
             pass
-        # Replace the worktree symlink/file so all downstream machinery
-        # (build_qemu_cmd, snap topology) uses the override transparently.
-        _data_img_path.parent.mkdir(parents=True, exist_ok=True)
-        # A symlink carries no data — drop it.  A REGULAR FILE is somebody's
-        # multi-GiB image and must never be deleted to make room for the
-        # override: move it aside and say where it went, so `--data-img` can
-        # never silently destroy the canonical disk.
-        _preserved_data_img = None
-        if _data_img_path.is_symlink():
-            try:
-                _data_img_path.unlink()
-            except Exception:
-                pass
-        elif _data_img_path.exists():
-            _preserved_data_img = _data_img_path.with_name(
-                _data_img_path.name + ".pre-data-img-override")
-            _n = 1
-            while _preserved_data_img.exists():
-                _preserved_data_img = _data_img_path.with_name(
-                    f"{_data_img_path.name}.pre-data-img-override.{_n}")
-                _n += 1
-            _data_img_path.rename(_preserved_data_img)
-        _data_img_path.symlink_to(_ovr.resolve())
-        if _preserved_data_img is not None:
-            print(f"[harness] --data-img: preserved the previous real "
-                  f"{_data_img_path} as {_preserved_data_img} "
-                  f"(restore it when you are done with the override)",
-                  file=sys.stderr)
         print(
             "╔══════════════════════════════════════════════════════════════╗\n"
-            "║  --data-img OVERRIDE (no-regen forced)                       ║\n"
-            f"║  {str(_data_img_path)[:60]:<60}  ║\n"
-            f"║  -> {str(_ovr.resolve())[:57]:<57}  ║\n"
+            "║  --data-img: booting this image AS GIVEN (no-regen forced,   ║\n"
+            "║  build/data.img untouched)                                   ║\n"
+            f"║  {_data_img_explicit[:60]:<60}  ║\n"
             "╚══════════════════════════════════════════════════════════════╝",
             file=sys.stderr,
         )
 
-    _data_img_missing = not _data_img_path.exists()
+    if _data_img_explicit:
+        # The image we boot was validated above; the worktree's build/data.img
+        # is irrelevant to this session, so no auto-symlink and no warning.
+        _data_img_missing = False
+    else:
+        _data_img_missing = not _data_img_path.exists()
     if _data_img_missing:
         _CANONICAL_DATA_IMG = Path("/home/ubuntu/AstryxOS/build/data.img")
-        if _CANONICAL_DATA_IMG.exists():
-            _data_img_path.parent.mkdir(parents=True, exist_ok=True)
-            _data_img_path.symlink_to(_CANONICAL_DATA_IMG)
+        _link_info = _link_canonical_data_img(_data_img_path,
+                                              _CANONICAL_DATA_IMG)
+        if _link_info["ok"] and _link_info["action"] != "noop":
             _data_img_missing = False
             print(
                 "╔══════════════════════════════════════════════════════════════╗\n"
@@ -4005,16 +4157,21 @@ def cmd_start(args):
                 "╚══════════════════════════════════════════════════════════════╝",
                 file=sys.stderr,
             )
+        elif _link_info["ok"]:
+            _data_img_missing = False
         else:
             print(
                 "╔══════════════════════════════════════════════════════════════╗\n"
-                "║  WARNING: data disk image not found                          ║\n"
+                "║  WARNING: data disk image not usable                         ║\n"
                 f"║  expected: {str(_data_img_path)[:51]:<51}  ║\n"
+                f"║  reason:   {str(_link_info['reason'])[:51]:<51}  ║\n"
                 "║  firefox-test paths will fail; /disk will not mount.         ║\n"
-                "║  Symlink from /home/ubuntu/AstryxOS/build/data.img to fix.   ║\n"
                 "╚══════════════════════════════════════════════════════════════╝",
                 file=sys.stderr,
             )
+            if _link_info["error"]:
+                print(f"[harness] data.img: {_link_info['error']}",
+                      file=sys.stderr)
 
     # ── data.img staleness check (W7 silent-wedge guard) ─────────────────────
     # Pattern: `install-firefox-stubs.sh` (and other build helpers) writes
@@ -4082,8 +4239,13 @@ def cmd_start(args):
         # Prebuilt per-variant image booted NON-destructively (build/data-glibc.img
         # for --firefox-variant glibc), or None when the shared build/data.img is
         # used.  Additive; downstream agents may read it to confirm the glibc
-        # discriminator booted the intended image.
+        # discriminator booted the intended image.  Since 2026-08-13 an explicit
+        # --data-img is carried here too (it boots by the same non-destructive
+        # route); data_img_explicit below disambiguates the two sources.
         "prebuilt_data_img": _prebuilt_data_img,
+        # Absolute path of an explicit --data-img, booted AS GIVEN, or None.
+        # Additive (2026-08-13).
+        "data_img_explicit": _data_img_explicit,
     }
     # D10 fix-it: in worktrees the local build/disk/ is typically absent;
     # if build/data.img is a symlink into the canonical tree, inspect that
@@ -4621,6 +4783,11 @@ def cmd_start(args):
         # attempt). Agents inspecting this field can immediately distinguish a
         # firefox-test wedge caused by missing /disk from a real regression.
         "data_img_missing": _data_img_missing,
+        # Absolute path of the image this session actually booted: an explicit
+        # --data-img / prebuilt variant image when one was selected, else the
+        # worktree's build/data.img.  Additive (2026-08-13) — read this instead
+        # of assuming build/data.img.
+        "data_img_booted": _prebuilt_data_img or str(_data_img_path),
         # True iff a file under build/disk/ was newer than data.img at session
         # start. When `data_img_regenerated` is also True, the image was
         # rebuilt before launch and the stale flag describes the pre-launch
@@ -4751,6 +4918,10 @@ def cmd_start(args):
           # True when data.img was absent (even after auto-symlink attempt).
           # Agents should treat this as a hard warning for firefox-test runs.
           "data_img_missing": _data_img_missing,
+          # Absolute path of the image this session actually booted (explicit
+          # --data-img / prebuilt variant image / worktree build/data.img).
+          # Additive (2026-08-13).
+          "data_img_booted": _prebuilt_data_img or str(_data_img_path),
           # True iff build/disk/ had files newer than data.img at session
           # start. False after a successful auto-regen (the post-regen value
           # is stored — pre-regen state is in `data_img_staleness_info`).
@@ -14284,12 +14455,15 @@ def main():
                                "depends on the existing data.img contents.")
     p_start.add_argument("--data-img", dest="data_img_override", default=None,
                           metavar="PATH",
-                          help="Boot against an explicit prebuilt data image "
-                               "(e.g. /home/ubuntu/gui-complete.img) by "
-                               "repointing the worktree build/data.img symlink. "
-                               "Implies --no-regen-data-img (a prebuilt complete "
-                               "image is authoritative and must not be "
-                               "regenerated). Additive; absent => unchanged.")
+                          help="Boot an explicit prebuilt data image (e.g. "
+                               "/home/ubuntu/gui-complete.img) AS GIVEN. The "
+                               "worktree's build/data.img is never unlinked, "
+                               "renamed or re-pointed (2026-08-13: it used to "
+                               "be, which self-destructed the link when the "
+                               "override named that same path). Implies "
+                               "--no-regen-data-img (a prebuilt complete image "
+                               "is authoritative and must not be regenerated). "
+                               "Additive; absent => unchanged.")
     p_start.add_argument("--firefox-variant", dest="firefox_variant",
                           choices=("musl", "glibc"), default="musl",
                           help="Pin which Firefox userspace layout the data "
@@ -15509,7 +15683,7 @@ def main():
     # confirm a regression is closed across N feature combos before
     # committing to a full boot.
     p_check = sub.add_parser("check",
-                              help="Run `cargo +nightly check` for given --features")
+                              help="Run `cargo check` for given --features")
     p_check.add_argument("--features", default="", metavar="FLAGS",
                           help="Feature flags passed VERBATIM to cargo. "
                                "Empty string → default desktop kernel.")

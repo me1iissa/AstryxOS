@@ -693,6 +693,115 @@ def _run_variant_data_img_cases(fn, di, gi):
         os.environ.pop("ASTRYX_GLIBC_DATA_IMG", None)
 
 
+def run_data_img_guard_check():
+    """
+    Tier 1.5 host-only check: the --data-img self-destruct guard.
+
+    Regression cover for the 2026-08-13 incident: `start --data-img P`, where
+    P resolved to the worktree's own build/data.img, unlinked P and re-created
+    it as a symlink to itself.  A self-naming link fails resolution with ELOOP
+    (symlink(7)), so the boot died and all 14 later boots in that soak series
+    reported a misleading "--data-img not found".
+
+    Asserts the two invariants that make that impossible:
+      (1) _validate_explicit_data_img classifies a symlink cycle as
+          "symlink-cycle" (never "missing") and accepts a real image.
+      (2) _link_canonical_data_img refuses to link a path to itself, and never
+          removes a path that holds data.
+
+    Path-level only — no kernel build, no QEMU.
+    """
+    print("=== Tier 1.5: --data-img self-destruct guard (host-only) ===")
+    print()
+    import importlib.util
+    import os
+    import tempfile
+    spec = importlib.util.spec_from_file_location("qh_smoke_dataimg", str(HARNESS))
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    validate = getattr(mod, "_validate_explicit_data_img", None)
+    link = getattr(mod, "_link_canonical_data_img", None)
+    check("data-img guard fns importable",
+          validate is not None and link is not None)
+    if validate is None or link is None:
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        real = tdp / "data.img"
+        real.write_text("image")
+
+        # (1a) A real image validates and is reported at its absolute path.
+        r = validate(str(real))
+        check("validate: real image → ok", r["ok"] and r["path"] == str(real),
+              str(r))
+
+        # (1b) The incident shape: a link that names itself is a CYCLE, and
+        # must never be reported as a plain "missing" path.
+        loop = tdp / "loop.img"
+        os.symlink(str(loop), str(loop))
+        r = validate(str(loop))
+        check("validate: self-referential link → symlink-cycle",
+              (not r["ok"]) and r["reason"] == "symlink-cycle", str(r))
+
+        # (1c) Other structural failures stay distinguishable.
+        dangling = tdp / "dangling.img"
+        os.symlink(str(tdp / "nope.img"), str(dangling))
+        r = validate(str(dangling))
+        check("validate: dangling link → dangling-symlink",
+              (not r["ok"]) and r["reason"] == "dangling-symlink", str(r))
+        r = validate(str(tdp / "absent.img"))
+        check("validate: absent path → missing",
+              (not r["ok"]) and r["reason"] == "missing", str(r))
+        r = validate(str(tdp))
+        check("validate: directory → not-a-file",
+              (not r["ok"]) and r["reason"] == "not-a-file", str(r))
+
+        # (2a) Linking a path to itself is refused, and the file survives.
+        r = link(real, real)
+        check("link: path to itself → refused",
+              (not r["ok"]) and r["reason"] == "self-referential", str(r))
+        check("link: self-link refusal left the image intact",
+              real.is_file() and real.read_text() == "image")
+
+        # (2b) A real file already at the destination is never replaced.
+        other = tdp / "canonical.img"
+        other.write_text("canonical")
+        r = link(real, other)
+        check("link: existing real file → noop",
+              r["ok"] and r["action"] == "noop", str(r))
+        check("link: noop left the image intact",
+              (not real.is_symlink()) and real.read_text() == "image")
+
+        # (2c) The normal worktree case still works.
+        wt = tdp / "wt" / "build" / "data.img"
+        r = link(wt, other)
+        check("link: absent worktree path → linked",
+              r["ok"] and r["action"] == "linked", str(r))
+        check("link: worktree link resolves to the canonical image",
+              wt.is_symlink() and os.path.realpath(str(wt)) == str(other))
+
+        # (2d) A self-referential link left by an older harness is repaired,
+        # not perpetuated.
+        broken = tdp / "broken.img"
+        os.symlink(str(broken), str(broken))
+        r = link(broken, other)
+        check("link: pre-existing self-loop → relinked-broken",
+              r["ok"] and r["action"] == "relinked-broken", str(r))
+        check("link: repaired link resolves to the canonical image",
+              os.path.realpath(str(broken)) == str(other))
+
+    print()
+
+
 def run_allowlist_check():
     """
     Tier 1.5 host-only check: exercise `allowlist` subcommands directly.
@@ -1854,6 +1963,7 @@ def main():
     # registry) against future refactors of qemu-harness.py.
     run_staleness_check()
     run_variant_data_img_check()
+    run_data_img_guard_check()
     run_allowlist_check()
     run_snapgate_argv_check()
     run_read_ff_png_check()
