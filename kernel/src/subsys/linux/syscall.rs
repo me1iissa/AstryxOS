@@ -6508,7 +6508,14 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
         if dest < 0 { return dest; }
         // Same pre-flight as the MAYMOVE arm above: a fresh anonymous
         // destination is entirely not-present, so resolve it before copying
-        // into it from ring 0.
+        // into it from ring 0.  Note the MAP_FIXED above has already unmapped
+        // whatever occupied `new_addr`; on this ENOMEM path the destination is
+        // destroyed and nothing is put back.  That is within contract —
+        // mremap(2) specifies MREMAP_FIXED "will unmap any previous mapping at
+        // the address range specified by new_address", so no caller may rely on
+        // it surviving.  The original mapping at `old_addr` is left untouched
+        // (the munmap of it runs only after a successful copy), matching
+        // mremap(2)'s "on failure the original mapping is not changed".
         if !preflight_mremap_dest(dest as u64, old_size.min(new_size) as usize) {
             let _ = crate::syscall::sys_munmap(dest as u64, new_size);
             return -12; // ENOMEM

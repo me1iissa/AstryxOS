@@ -1475,14 +1475,29 @@ fn revalidate_file_vma_generation(
 /// True iff `v` is an anonymous VMA whose extent exactly matches the captured
 /// `(base, end)` pair.  The anonymous counterpart of
 /// [`file_vma_identity_matches`]: an anonymous mapping has no file identity, so
-/// "same mapping" is decided by backing kind plus exact extent.  Extracted as a
-/// pure predicate so it is unit-testable without a live process / page table.
+/// "same mapping" is decided by backing kind, exact extent, AND protection.
+/// Extracted as a pure predicate so it is unit-testable without a live process
+/// / page table.
+///
+/// `prot` is part of the identity because the install flags (`vma.to_page_flags`)
+/// are derived from it and captured *before* the allocation.  A whole-VMA
+/// `mprotect(2)` landing during the release window leaves base/end/backing
+/// unchanged, so an extent-only check would pass and the arm would then install
+/// stale flags — writable pages for a range just made read-only (a genuine
+/// permission violation), or read-only pages for a range just made writable (a
+/// needless extra fault).  Treating a `prot` change as a replacement aborts the
+/// install; the fault re-evaluates against the current VMA on the next access,
+/// where the permission gate (`mm::vma::fault_access_permitted`) decides
+/// correctly.  The direction that matters — write-widening RW→RO — cannot be
+/// distinguished cheaply from the benign one, so both abort.
 pub(crate) fn anon_vma_identity_matches(
     v: &crate::mm::vma::VmArea,
+    vma_prot: crate::mm::vma::VmProt,
     vma_base: u64,
     vma_end: u64,
 ) -> bool {
     matches!(v.backing, crate::mm::vma::VmBacking::Anonymous)
+        && v.prot == vma_prot
         && v.base == vma_base
         && v.base + v.length == vma_end
 }
@@ -1591,6 +1606,8 @@ fn install_anon_frame(cr3: u64, page_addr: u64, page_flags: u64, phys: u64) -> b
 fn revalidate_anon_vma_generation(
     target_pid: u64,
     faulting_addr: u64,
+    cr3: u64,
+    vma_prot: crate::mm::vma::VmProt,
     vma_base: u64,
     vma_end: u64,
 ) -> Option<u64> {
@@ -1599,9 +1616,18 @@ fn revalidate_anon_vma_generation(
     let vs = procs.iter()
         .find(|p| p.pid == target_pid)
         .and_then(|p| p.vm_space.as_ref())?;
+    // Re-confirm the address space itself has not been swapped out from under
+    // the captured `cr3` (a concurrent `execve` on a sibling thread replaces the
+    // whole `VmSpace`).  Installing into the pre-release `cr3` after such a swap
+    // would publish a PTE into a page table no thread of this process still
+    // runs on.  `page_addr` and `cr3` were captured together before the release,
+    // so they must still describe the same live space here.
+    if vs.cr3 != cr3 {
+        return None;
+    }
     let gen = vs.generation.load(core::sync::atomic::Ordering::Acquire);
     let still_ours = vs.find_vma(faulting_addr)
-        .map(|v| anon_vma_identity_matches(v, vma_base, vma_end))
+        .map(|v| anon_vma_identity_matches(v, vma_prot, vma_base, vma_end))
         .unwrap_or(false);
     if still_ours { Some(gen) } else { None }
 }
@@ -3666,8 +3692,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 // re-validation below.  PROCESS_TABLE is released across the
                 // allocation, so every value carried over the gap must be a
                 // `Copy` scalar extracted here, while the borrow is still live.
+                // `prot` is captured because `page_flags` is derived from it and
+                // a concurrent mprotect must invalidate the install (see
+                // `anon_vma_identity_matches`).
                 let anon_vma_base = vma.base;
                 let anon_vma_end = vma.end();
+                let anon_vma_prot = vma.prot;
                 #[cfg(feature = "firefox-test-core")]
                 {
                     static ANON_PF_N: core::sync::atomic::AtomicU64
@@ -3725,7 +3755,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                         // the same base/end) must abort.
                         let still_anon = vm_space.find_vma(page_addr)
                             .map(|v| anon_vma_identity_matches(
-                                v, anon_vma_base, anon_vma_end))
+                                v, anon_vma_prot, anon_vma_base, anon_vma_end))
                             .unwrap_or(false);
                         if !still_anon {
                             #[cfg(feature = "firefox-test-core")]
@@ -3803,7 +3833,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 // unrelated sibling mmap bumped the generation (proceed either
                 // way), or this VMA was itself removed/replaced (abort).
                 if revalidate_anon_vma_generation(
-                    target_pid, page_addr, anon_vma_base, anon_vma_end).is_none()
+                    target_pid, page_addr, cr3, anon_vma_prot,
+                    anon_vma_base, anon_vma_end).is_none()
                 {
                     #[cfg(feature = "firefox-test-core")]
                     {
@@ -3820,6 +3851,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                     crate::mm::pmm::free_page(phys);
                     return false;
                 }
+                // Like the file-backed arm, this narrows the race rather than
+                // closing it: `revalidate_anon_vma_generation` drops its guard
+                // before returning, so a `munmap` landing between the re-check
+                // and this install still publishes into a range being torn down.
+                // `map_page_in_if_absent` inside `install_anon_frame` guards
+                // double-install, not VMA liveness; full closure needs the
+                // fault-fixup mechanism this tree still lacks.
                 return install_anon_frame(cr3, page_addr, page_flags, phys);
             }
             crate::mm::vma::VmBacking::Device { phys_base } => {

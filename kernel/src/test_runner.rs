@@ -36056,8 +36056,10 @@ fn test_pf_anon_vma_identity_match() -> bool {
         name: "[anon]",
     };
 
+    let prot = PROT_READ | PROT_WRITE;
+
     // (1) Exact identity → match (install may proceed).
-    if !anon_vma_identity_matches(&anon, base, end) {
+    if !anon_vma_identity_matches(&anon, prot, base, end) {
         test_fail!("pf_anon_id", "exact identity should match");
         return false;
     }
@@ -36065,13 +36067,22 @@ fn test_pf_anon_vma_identity_match() -> bool {
     //     on this range) → no match; this is the genuine teardown/replace case
     //     that MUST abort and free the frame rather than install into a range
     //     the process no longer owns.
-    if anon_vma_identity_matches(&anon, base + 0x1000, end)
-        || anon_vma_identity_matches(&anon, base, end + 0x1000)
-        || anon_vma_identity_matches(&anon, base, end - 0x1000) {
+    if anon_vma_identity_matches(&anon, prot, base + 0x1000, end)
+        || anon_vma_identity_matches(&anon, prot, base, end + 0x1000)
+        || anon_vma_identity_matches(&anon, prot, base, end - 0x1000) {
         test_fail!("pf_anon_id", "changed base/end must NOT match");
         return false;
     }
-    // (3) A file-backed VMA at the SAME extent → no match.  A sibling that
+    // (3) Changed protection at the SAME extent → no match.  A whole-VMA
+    //     mprotect during the release window leaves base/end/backing intact but
+    //     makes the captured page_flags stale; the install must abort so the
+    //     fault re-evaluates against the new protection.
+    if anon_vma_identity_matches(&anon, PROT_READ, base, end)
+        || anon_vma_identity_matches(&anon, prot | crate::mm::vma::PROT_EXEC, base, end) {
+        test_fail!("pf_anon_id", "changed prot must NOT match");
+        return false;
+    }
+    // (4) A file-backed VMA at the SAME extent → no match.  A sibling that
     //     unmapped the anon range and mmap'd a file over it lands here; the
     //     zeroed anon frame must never be installed for a file mapping.
     let file = VmArea {
@@ -36082,7 +36093,7 @@ fn test_pf_anon_vma_identity_match() -> bool {
         backing: VmBacking::File { mount_idx: 0, inode: 141, offset: 0, elf_load_delta: 0 },
         name: "test.so",
     };
-    if anon_vma_identity_matches(&file, base, end) {
+    if anon_vma_identity_matches(&file, prot, base, end) {
         test_fail!("pf_anon_id", "file VMA must NOT match an anon identity");
         return false;
     }
