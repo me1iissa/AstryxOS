@@ -1038,6 +1038,18 @@ impl Ext2Fs {
             }
         }
         // Miss: read the block and populate this level's slot.
+        //
+        // KNOWN, PRE-EXISTING, NOT ADDRESSED HERE: the lock is dropped across
+        // the block read, so a concurrent `write_indirect_slot` on the same
+        // block can write and invalidate in the window, and the store below
+        // then re-installs the bytes read BEFORE that write — stale data that
+        // survives the invalidation. The block number is right and the tuple is
+        // stored whole, so neither the `cached == block_num` guard nor the
+        // whole-tuple store detects it. Unchanged by the per-level split (the
+        // window is the same); the split only lengthens how long the stale
+        // entry then survives. The fix is a generation counter bumped on every
+        // invalidate and re-checked before the store — deliberately left as a
+        // follow-up rather than folded into a perf change.
         let mut buf = alloc::vec![0u8; self.block_size];
         if self.read_block(block_num, &mut buf).is_err() { return 0; }
         let result = {
@@ -1319,6 +1331,14 @@ impl Ext2Fs {
         // block is now a liability: a later allocation can hand this same block
         // to another file's indirect tree, and a stale slot would answer reads
         // of it with the previous owner's pointers.
+        //
+        // The gap between the bitmap write above and this sweep is DELIBERATE.
+        // Closing it would mean holding the state lock across a block-device
+        // write, and that is the lock-across-I/O deadlock class this tree has
+        // already been bitten by twice (the MOUNTS and RX_CUR fixes). A
+        // concurrent reader in the window can only re-cache a block that is
+        // already free, and the allocator cannot hand that block out until it
+        // reads the bitmap this write just updated.
         self.invalidate_indirect_cache(block_num);
         let mut state = self.state.lock();
         state.bgdt[group as usize].free_blocks_count += 1;
@@ -1448,13 +1468,6 @@ impl Ext2Fs {
         let _ = self.flush_superblock(&sb_snap);
     }
 
-    /// Write a single 32-bit little-endian pointer into an indirect block
-    /// at slot `index`.  Reads, modifies, writes the block.  Used by the
-    /// indirect-tree growth path.
-    ///
-    /// Also invalidates the single-entry indirect-block cache (PR-E) so a
-    /// subsequent `read_indirect` on the same block sees the updated value
-    /// rather than a stale cache entry.
     /// Drop any cached copy of `block_num` from the indirect-block cache.
     ///
     /// Must be called whenever a block's role or contents change underneath the
@@ -1478,6 +1491,12 @@ impl Ext2Fs {
         }
     }
 
+    /// Write a single 32-bit little-endian pointer into an indirect block
+    /// at slot `index`.  Reads, modifies, writes the block.  Used by the
+    /// indirect-tree growth path.
+    ///
+    /// Invalidates the block's cache slot afterwards so a subsequent
+    /// `read_indirect` sees the updated value rather than a stale entry.
     fn write_indirect_slot(&self, block_num: u32, index: usize, value: u32)
         -> Result<(), &'static str>
     {
