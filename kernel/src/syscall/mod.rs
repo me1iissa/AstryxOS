@@ -2778,26 +2778,54 @@ pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
                 // shipping build.
                 #[cfg(feature = "test-mode")]
                 cleartid_cow_test_hook::fire(cr3, page_addr, new_phys);
-                if crate::mm::vmm::map_page_in_cow_if_unchanged(
+                // Break-before-make, identical to the hardware write-fault CoW
+                // arm: clear the leaf, invalidate the old translation on every
+                // CPU, then publish — and release the old frame's reference only
+                // afterwards.  Publishing first would let one CPU cache the new
+                // frame while another still held the old one, and releasing the
+                // reference first would let a concurrent munmap or exit on the
+                // other side of the fork take old_phys's count to zero and
+                // recycle it while this address space could still reach it
+                // through a cached entry (Intel SDM Vol. 3A §4.10.4.3).
+                //
+                // The lock context here differs from the `#PF` caller and is
+                // worth stating.  This runs on the CLONE_CHILD_CLEARTID
+                // thread-exit path with **interrupts enabled**, not inside an
+                // interrupt gate, so this CPU can always service an incoming
+                // shootdown IPI through the ordinary ISR while it waits; the
+                // draining acquire inside `cow_break_if_unchanged` is therefore
+                // superset-safe here rather than load-bearing, exactly as the
+                // read-side draining acquire already is for this caller.  No
+                // lock is held across the call: the `PROCESS_TABLE` borrow taken
+                // for the VMA check above is scoped and already released, and
+                // `mm_sem` is not held on this path — `free_process_memory`, the
+                // one `mm_sem.write()` holder on thread exit, has returned well
+                // before the CLEARTID store is attempted.
+                match crate::mm::vmm::cow_break_if_unchanged(
                     cr3, page_addr, new_phys, flags, old_phys,
                 ) {
-                    // Won: release this address space's reference to old_phys —
-                    // and ONLY now, after a successful install, never before, so
-                    // the dec is exactly the single live-PTE transition this
-                    // break performed.
-                    let _ = crate::mm::refcount::page_ref_dec(old_phys);
-                    crate::mm::tlb::shootdown_page(cr3, page_addr);
-                    return true;
+                    crate::mm::vmm::CowBreak::Installed { .. } => {
+                        // Won: release this address space's reference to
+                        // old_phys — and ONLY now, after the break flush has
+                        // completed, never before, so the dec is exactly the
+                        // single live-PTE transition this break performed.
+                        let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                        return true;
+                    }
+                    crate::mm::vmm::CowBreak::Lost => {
+                        // Lost: a sibling CoW-broke this VA first and published
+                        // its own private frame.  Drop our redundant copy (undo
+                        // the ref we set, 1→0, so free_page's share-count==0
+                        // invariant holds) and leave old_phys's count UNTOUCHED —
+                        // the sibling's install already accounted for removing
+                        // the old mapping.  Nothing was written and no shootdown
+                        // was issued.  Retry: the PTE is now present+writable and
+                        // the next pass returns true.
+                        let _ = crate::mm::refcount::page_ref_dec(new_phys);
+                        crate::mm::pmm::free_page(new_phys);
+                        continue;
+                    }
                 }
-                // Lost: a sibling CoW-broke this VA first and published its own
-                // private frame.  Drop our redundant copy (undo the ref we set,
-                // 1→0, so free_page's share-count==0 invariant holds) and leave
-                // old_phys's count UNTOUCHED — the sibling's install already
-                // accounted for removing the old mapping.  Retry: the PTE is now
-                // present+writable and the next pass returns true.
-                let _ = crate::mm::refcount::page_ref_dec(new_phys);
-                crate::mm::pmm::free_page(new_phys);
-                continue;
             }
 
             // Sole owner (refcount sampled == 1) — flip writable in place.  The

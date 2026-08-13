@@ -1686,9 +1686,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                 let gen_now = vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                 if gen_now != gen_at_start {
                     // The whole-address-space generation moved.  The CoW install
-                    // below (`map_page_in_cow_if_unchanged`) is itself an atomic
-                    // CAS that installs only if the leaf PTE still maps the
-                    // `old_phys` we copied, so it already refuses to install over
+                    // below (`cow_break_if_unchanged`) re-validates under
+                    // `mm_sem` and breaks the mapping only if the leaf PTE still
+                    // maps the `old_phys` we copied, so it already refuses to
+                    // install over
                     // a sibling's teardown (munmap clears the PTE → CAS fails →
                     // loser path).  The generation is a COARSE whole-vmspace
                     // counter that also bumps on UNRELATED concurrent mappings;
@@ -1716,49 +1717,89 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, frame: &mut InterruptF
                     }
                     // else: unrelated bump — proceed; the CAS guards the install.
                 }
-                // Release PROCESS_TABLE before the CAS-install + cross-CPU
-                // shootdown below (same lock-vs-IPI deadlock as the MAP_SHARED
-                // arm above).  All uses of `vm_space` — including the gen-abort
-                // re-check — are complete; the install is a self-guarding CAS
-                // (`map_page_in_cow_if_unchanged`) and the refcount ops carry
+                // Release PROCESS_TABLE before the break-flush-make sequence
+                // below (same lock-vs-IPI deadlock as the MAP_SHARED arm
+                // above): that sequence sends a shootdown IPI, and a target CPU
+                // that is itself in `handle_page_fault` spins on PROCESS_TABLE
+                // with interrupts disabled, so it could never acknowledge while
+                // we hold it.  All uses of `vm_space` — including the gen-abort
+                // re-check — are complete; `cow_break_if_unchanged` takes this
+                // address space's `mm_sem` itself and the refcount ops carry
                 // their own locking, so none of this needs the process table.
+                // Lock order is preserved: PROCESS_TABLE is released strictly
+                // before `mm_sem` is taken, never nested the other way.
                 drop(procs);
                 // The private copy (new_phys) takes sole ownership; mark it
                 // before publishing so a concurrent faulter that observes the
                 // installed PTE never sees a 0-refcount frame.
                 crate::mm::refcount::page_ref_set(new_phys, 1);
-                // Install ONLY if the leaf PTE still maps the frame we sampled
-                // and copied (old_phys).  On a shared CR3 (CLONE_VM / vfork,
-                // threads across CPUs) two CPUs can CoW-fault the same page
-                // concurrently; an unconditional install would let the loser
-                // overwrite the winner's PTE with a *different* private frame
-                // -- one VA, two frames, a silent cross-CPU store-visibility
-                // failure (cf. the d4fb7fa anonymous-fault fix; the standard
-                // page-table-lock `pte_same` re-check in a CoW copy).
-                if crate::mm::vmm::map_page_in_cow_if_unchanged(
+                // Break-before-make.  `cow_break_if_unchanged` re-validates the
+                // leaf against the frame we sampled and copied (old_phys), then
+                // CLEARS it, shoots the old translation down on every CPU, and
+                // only then publishes new_phys.
+                //
+                // The re-validation is what keeps this safe on a shared CR3
+                // (CLONE_VM / vfork, threads across CPUs) where two CPUs can
+                // CoW-fault the same page concurrently: an unconditional install
+                // would let the loser overwrite the winner's PTE with a
+                // *different* private frame -- one VA, two frames, a silent
+                // cross-CPU store-visibility failure (cf. the d4fb7fa
+                // anonymous-fault fix; the standard page-table-lock `pte_same`
+                // re-check in a CoW copy).
+                //
+                // The ORDERING is what keeps it correct across CPUs.  Publishing
+                // new_phys before invalidating old_phys leaves a window in which
+                // a sibling CPU that re-walks caches the new frame while another
+                // still holds the old one — one address space observing two
+                // different contents for one address (Intel SDM Vol. 3A
+                // §4.10.4.3).  Clearing and flushing first removes that window
+                // at no extra IPI cost: a not-present entry is never cached
+                // (§4.10.2.3), so the subsequent publish needs no second
+                // shootdown.
+                match crate::mm::vmm::cow_break_if_unchanged(
                     cr3, page_addr, new_phys, page_flags, old_phys,
                 ) {
-                    // We won: the mapping that referenced old_phys is gone, so
-                    // release this process's reference to it (it may remain
-                    // shared with the parent, in which case the dec is harmless;
-                    // if this was the last reference the frame is freed).
-                    let _ = crate::mm::refcount::page_ref_dec(old_phys);
-                    // Cross-CPU shootdown: sibling threads sharing the parent's
-                    // CR3 may have the old read-only translation cached.  Without
-                    // this they keep faulting on every write until their TLB
-                    // happens to evict the entry.
-                    crate::mm::tlb::shootdown_page(cr3, page_addr);
-                } else {
-                    // A sibling CPU already CoW-copied this page and published
-                    // its own private frame.  Our copy is redundant: drop it and
-                    // leave old_phys's reference untouched (the sibling's install
-                    // accounted for removing the old mapping).  The PTE is now
-                    // present + writable, so the faulting store re-executes
-                    // cleanly on return.  Undo the refcount we set above (1 -> 0)
-                    // so free_page's pte_share_count==0 invariant is satisfied;
-                    // new_phys was never installed in any page table.
-                    let _ = crate::mm::refcount::page_ref_dec(new_phys);
-                    crate::mm::pmm::free_page(new_phys);
+                    crate::mm::vmm::CowBreak::Installed { .. } => {
+                        // We won: the mapping that referenced old_phys is gone,
+                        // so release this process's reference to it (it may
+                        // remain shared with the parent, in which case the dec
+                        // is harmless).
+                        //
+                        // This dec MUST follow the break flush — and now does,
+                        // because `cow_break_if_unchanged` issues that flush
+                        // before returning.  Our reference is the only thing
+                        // keeping old_phys out of the PMM free list while
+                        // another mapper still holds one: the moment we drop it,
+                        // a concurrent munmap or exit on the other side of the
+                        // fork can take the count to zero and free the frame.
+                        // Dropping it before the flush would let that happen
+                        // while sibling CPUs in *this* address space can still
+                        // reach old_phys through a cached entry, so they would
+                        // read — and, with any stale writable entry, write — a
+                        // frame the PMM had already handed to someone else.
+                        //
+                        // `flush_acked` is deliberately not consulted.  This arm
+                        // frees nothing, so it has no frame to route through
+                        // `quarantine_free`; on an ACK timeout `shootdown_range`
+                        // posts a deferred force-flush to each unacknowledged
+                        // CPU, which is the same guarantee every other
+                        // non-freeing PTE mutator here relies on.
+                        let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                    }
+                    crate::mm::vmm::CowBreak::Lost => {
+                        // A sibling CPU already CoW-copied this page and
+                        // published its own private frame.  Our copy is
+                        // redundant: drop it and leave old_phys's reference
+                        // untouched (the sibling's install accounted for
+                        // removing the old mapping).  Nothing was written and no
+                        // flush was issued, so the sibling's present + writable
+                        // PTE stands and the faulting store re-executes cleanly
+                        // on return.  Undo the refcount we set above (1 -> 0) so
+                        // free_page's pte_share_count==0 invariant is satisfied;
+                        // new_phys was never installed in any page table.
+                        let _ = crate::mm::refcount::page_ref_dec(new_phys);
+                        crate::mm::pmm::free_page(new_phys);
+                    }
                 }
                 return true;
             }
