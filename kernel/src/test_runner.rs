@@ -1374,6 +1374,18 @@ pub fn run() -> ! {
     total += 1;
     if test_pf_file_vma_identity_match() { passed += 1; }
 
+    // Test 98g4: demand-paging gen-revalidate anon-VMA identity predicate
+    // (the anon arm releases PROCESS_TABLE across alloc_page, so it re-confirms
+    // the mapping before installing).
+    total += 1;
+    if test_pf_anon_vma_identity_match() { passed += 1; }
+
+    // Test 98g5: user-write destination pre-flight — resolve / refuse / partial
+    // (keeps a kernel-mediated copy into a user buffer from taking an
+    // unrecoverable ring-0 fault under exhaustion).
+    total += 1;
+    if test_preflight_user_write_range() { passed += 1; }
+
     // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
@@ -36005,6 +36017,258 @@ fn test_pf_file_vma_identity_match() -> bool {
     true
 }
 
+/// Regression test for the ANONYMOUS demand-fault install-arm identity
+/// predicate (`anon_vma_identity_matches`).
+///
+/// The anonymous arm of `handle_page_fault` releases `PROCESS_TABLE` across its
+/// `alloc_page` — it has to, because an allocation that finds no free frame
+/// must be able to reach the OOM killer, and the killer cannot read the process
+/// table through a lock the faulting CPU already owns.  That release opens the
+/// same window the file-backed arm has always had across its I/O: a sibling CPU
+/// running `sys_munmap` / `MAP_FIXED` / `MADV_DONTNEED` can remove or replace
+/// the VMA while the frame is being allocated and zeroed, so the install is
+/// gated on re-confirming the mapping's identity afterwards.
+///
+/// An anonymous mapping has no file identity, so "same mapping" is decided by
+/// backing kind plus exact extent.  Testing identity directly is deliberately
+/// more precise than comparing the coarse `VmSpace::generation`: the generation
+/// bumps on ANY address-space mutation, so an unrelated sibling `mmap` (a
+/// thread pool spawning worker stacks) must not abort a perfectly good fault
+/// and deliver a spurious SIGSEGV — there is no re-fault path.
+///
+/// Refs: POSIX mmap(2) MAP_ANONYMOUS; Intel SDM Vol. 3A §4.10.5 (demand
+/// paging).
+fn test_pf_anon_vma_identity_match() -> bool {
+    test_header!("page-fault gen-revalidate: anon VMA identity predicate");
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ, PROT_WRITE,
+                         MAP_PRIVATE, MAP_ANONYMOUS};
+    use crate::arch::x86_64::idt::anon_vma_identity_matches;
+
+    let base: u64 = 0x7eff_6000_0000;
+    let len:  u64 = 0x21000;
+    let end:  u64 = base + len;
+    let anon = VmArea {
+        base,
+        length: len,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_PRIVATE | MAP_ANONYMOUS,
+        backing: VmBacking::Anonymous,
+        name: "[anon]",
+    };
+
+    let prot = PROT_READ | PROT_WRITE;
+
+    // (1) Exact identity → match (install may proceed).
+    if !anon_vma_identity_matches(&anon, prot, base, end) {
+        test_fail!("pf_anon_id", "exact identity should match");
+        return false;
+    }
+    // (2) Replaced extent (base or end moved, e.g. a sibling MAP_FIXED landed
+    //     on this range) → no match; this is the genuine teardown/replace case
+    //     that MUST abort and free the frame rather than install into a range
+    //     the process no longer owns.
+    if anon_vma_identity_matches(&anon, prot, base + 0x1000, end)
+        || anon_vma_identity_matches(&anon, prot, base, end + 0x1000)
+        || anon_vma_identity_matches(&anon, prot, base, end - 0x1000) {
+        test_fail!("pf_anon_id", "changed base/end must NOT match");
+        return false;
+    }
+    // (3) Changed protection at the SAME extent → no match.  A whole-VMA
+    //     mprotect during the release window leaves base/end/backing intact but
+    //     makes the captured page_flags stale; the install must abort so the
+    //     fault re-evaluates against the new protection.
+    if anon_vma_identity_matches(&anon, PROT_READ, base, end)
+        || anon_vma_identity_matches(&anon, prot | crate::mm::vma::PROT_EXEC, base, end) {
+        test_fail!("pf_anon_id", "changed prot must NOT match");
+        return false;
+    }
+    // (4) A file-backed VMA at the SAME extent → no match.  A sibling that
+    //     unmapped the anon range and mmap'd a file over it lands here; the
+    //     zeroed anon frame must never be installed for a file mapping.
+    let file = VmArea {
+        base,
+        length: len,
+        prot: PROT_READ | PROT_WRITE,
+        flags: MAP_PRIVATE,
+        backing: VmBacking::File { mount_idx: 0, inode: 141, offset: 0, elf_load_delta: 0 },
+        name: "test.so",
+    };
+    if anon_vma_identity_matches(&file, prot, base, end) {
+        test_fail!("pf_anon_id", "file VMA must NOT match an anon identity");
+        return false;
+    }
+
+    test_pass!("page-fault gen-revalidate anon VMA identity predicate");
+    true
+}
+
+/// Regression test for `syscall::preflight_user_write_range` — the destination
+/// pre-flight that keeps a kernel-mediated bulk copy into a user buffer from
+/// killing the machine.
+///
+/// A demand-paged user buffer is legitimately not-present on first touch, and
+/// the page-fault handler resolves a ring-0 fault on a user address exactly as
+/// it does a ring-3 one — right up until it *cannot* resolve it (the frame
+/// allocator has nothing left).  A ring-3 fault then costs one process; a
+/// ring-0 fault has nowhere to return to, because this tree has no
+/// exception-table / fault-fixup mechanism, so it takes the machine down.
+/// Resolving the destination first converts exactly that failure into an
+/// ordinary return value the caller can render as a short count or EFAULT
+/// (POSIX read(2) permits a short return and treats it as success).
+///
+/// The load-bearing property is the PARTIAL result: the helper reports how many
+/// leading bytes are backed, so a caller can deliver that prefix and stop.
+fn test_preflight_user_write_range() -> bool {
+    use crate::mm::vmm::{read_pte, PAGE_PRESENT, PAGE_WRITABLE};
+    test_header!("preflight_user_write_range: resolve, refuse, and partial");
+
+    let test_pid: u64 = 9973;
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("preflight", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+    // One writable anonymous VMA of exactly 4 pages.  The range beyond its end
+    // is deliberately left unmapped so the partial case is reachable.
+    let vma_base: u64 = 0x5200_0000;
+    let vma_len:  u64 = 0x4000;
+    {
+        let vma = crate::mm::vma::VmArea {
+            base: vma_base,
+            length: vma_len,
+            prot: crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
+            flags: crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+            backing: crate::mm::vma::VmBacking::Anonymous,
+            name: "[preflight-test]",
+        };
+        if vm.insert_vma(vma).is_err() {
+            test_fail!("preflight", "insert_vma failed");
+            crate::proc::free_vm_space(vm);
+            return false;
+        }
+    }
+    // Register the synthetic process: the resolver's VMA lookup is keyed on
+    // cr3 in PROCESS_TABLE.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.push(crate::proc::Process {
+            pid: test_pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8; 64]; n[..10].copy_from_slice(b"preflight\0"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: test_pid as u32, sid: test_pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        });
+    }
+
+    let mut ok = true;
+
+    // ── (a) Fully-backed range → full length, and the pages are really there.
+    //     Deliberately unaligned start + a length that straddles three pages,
+    //     because the caller's `buf + done` is never page-aligned in general.
+    {
+        let base = vma_base + 0x800;
+        let len  = 0x1800usize; // 0x5200_0800 .. 0x5200_2000 → pages 0,1
+        let got  = crate::syscall::preflight_user_write_range(cr3, base, len);
+        // The range spans pages 0 and 1; both must now be present + writable —
+        // resolving is what makes the subsequent copy safe, so a `len` return
+        // with an unbacked page would be a false negative.
+        let first_two = (0..2).all(|i| {
+            let pte = read_pte(cr3, vma_base + i * 0x1000);
+            pte & PAGE_PRESENT != 0 && pte & PAGE_WRITABLE != 0
+        });
+        if got != len || !first_two {
+            test_fail!("preflight",
+                "(a) in-VMA range: got={} want={} first_two_present={}",
+                got, len, first_two);
+            ok = false;
+        } else {
+            test_println!("  (a) fully-backed unaligned range resolved in full ✓");
+        }
+    }
+
+    // ── (b) Range entirely outside any VMA → 0 (the EFAULT case: nothing was
+    //     delivered, so the caller must report an error rather than success).
+    if ok {
+        let got = crate::syscall::preflight_user_write_range(cr3, 0x6000_0000, 0x2000);
+        if got != 0 {
+            test_fail!("preflight", "(b) unmapped range: got={} want 0", got);
+            ok = false;
+        } else {
+            test_println!("  (b) unmapped destination refused (0 bytes backed) ✓");
+        }
+    }
+
+    // ── (c) Range that starts inside the VMA and runs past its end → only the
+    //     in-VMA prefix.  This is the short-count case: the caller copies the
+    //     prefix, returns it, and never touches the page that would have
+    //     faulted unrecoverably.
+    if ok {
+        let base = vma_base + 0x3000;      // last page of the VMA
+        let len  = 0x3000usize;            // runs 2 pages past the end
+        let got  = crate::syscall::preflight_user_write_range(cr3, base, len);
+        if got != 0x1000 {
+            test_fail!("preflight",
+                "(c) straddling range: got={} want {} (in-VMA prefix only)",
+                got, 0x1000);
+            ok = false;
+        } else {
+            test_println!("  (c) range straddling the VMA end → in-VMA prefix only ✓");
+        }
+    }
+
+    // ── (d) Zero-length range → 0, and nothing is resolved.
+    if ok {
+        let got = crate::syscall::preflight_user_write_range(cr3, vma_base, 0);
+        if got != 0 {
+            test_fail!("preflight", "(d) zero-length: got={} want 0", got);
+            ok = false;
+        } else {
+            test_println!("  (d) zero-length range is a no-op ✓");
+        }
+    }
+
+    // ── Teardown ────────────────────────────────────────────────────────────
+    // free_vm_space is VMA-driven and the VMA covers every page the resolver
+    // faulted in; each frame's refcount equals its live-PTE count, so all reach
+    // rc 0 and free cleanly.
+    let vm = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let t = procs.iter_mut().find(|p| p.pid == test_pid).and_then(|p| p.vm_space.take());
+        procs.retain(|p| p.pid != test_pid);
+        t
+    };
+    if let Some(vm) = vm { crate::proc::free_vm_space(vm); }
+
+    if ok {
+        test_pass!("preflight_user_write_range resolve/refuse/partial");
+    }
+    ok
+}
+
 /// Regression test for the file-backed page-fault install-arm anti-aliasing
 /// back-out (the libxul GOT/PLT/.data/.bss private-writable segment race).
 ///
@@ -63059,12 +63323,31 @@ fn test_750_oom_killer_does_not_block_on_process_table() -> bool {
 
     // The lock must be usable again afterwards: the bounded path must not have
     // left it poisoned or taken.
-    match crate::proc::PROCESS_TABLE.try_lock() {
-        Some(_) => {}
-        None => {
-            test_fail!(NAME, "PROCESS_TABLE still held after invoke_oom_killer returned");
-            return false;
+    //
+    // This is deliberately a BOUNDED RETRY, not a single `try_lock`.  What the
+    // assertion is about is `invoke_oom_killer` leaking the lock — a permanent
+    // condition.  A single-shot check cannot distinguish that from a legitimate
+    // concurrent holder: the suite has live user processes on other CPUs, and
+    // any of them entering process teardown (`exit_group`) takes PROCESS_TABLE
+    // for the duration.  Observed doing exactly that between this test's two
+    // OOM calls, which made the single-shot form fail on a machine whose lock
+    // was perfectly healthy a moment later.  Retrying keeps the real property
+    // (the lock becomes acquirable again) and drops the unprovable one (it is
+    // acquirable at one specific instant, which no caller can guarantee on an
+    // SMP machine with other runnable threads).
+    let mut reacquired = false;
+    for _ in 0..1000 {
+        if crate::proc::PROCESS_TABLE.try_lock().is_some() {
+            reacquired = true;
+            break;
         }
+        crate::sched::yield_cpu();
+    }
+    if !reacquired {
+        test_fail!(NAME,
+            "PROCESS_TABLE never became acquirable after invoke_oom_killer returned \
+             (1000 yields) — the bounded path leaked or poisoned it");
+        return false;
     }
 
     test_pass!(NAME);

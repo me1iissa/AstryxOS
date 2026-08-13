@@ -204,19 +204,32 @@ const _SIGNAL_FRAME_SIZE_CHECK: () = {
 /// kernel's signal-frame delivery would then write to a read-only page
 /// in supervisor mode.
 ///
-/// TOCTOU note: this is a check-then-store helper.  Between the page-table
-/// walk here and the kernel's subsequent supervisor write in the caller, a
-/// concurrent thread sharing the same address space could in principle
-/// remap the range non-writable.  In practice the window is mitigated two
-/// ways: (1) the supervisor write is bracketed by the existing
-/// `extable`/fault-fixup machinery, so a racing remap downgrades from a
-/// fail-stop kernel oops to a SIGSEGV the user already expected; and (2)
-/// per-page atomic guard primitives (e.g. PTE-locked "begin-store" tokens)
-/// are deferred to a future hardening pass rather than added here, since
-/// they require touching every user-VA store path, not just signal
-/// delivery.  Threat model is "unprivileged userspace cannot induce a
-/// kernel oops on the synchronous SIGSEGV path", which the check-then-
-/// store shape already satisfies in conjunction with the fault fixup.
+/// TOCTOU note: this is a check-then-store helper, and the window it leaves
+/// open is NOT currently closed by anything.  Between the page-table walk here
+/// and the kernel's subsequent supervisor write in the caller, a concurrent
+/// thread sharing the same address space can unmap the range or remap it
+/// non-writable; the store then takes a supervisor #PF that this kernel has no
+/// way to recover from, because **there is no exception-table / fault-fixup
+/// mechanism in this tree** — no fixup section is emitted by the linker script
+/// and the fault handler has no faulting-RIP allowlist to consult, so a ring-0
+/// fault the demand-paging path cannot resolve is fatal to the machine rather
+/// than to the process.
+///
+/// (An earlier version of this comment asserted that "the supervisor write is
+/// bracketed by the existing `extable`/fault-fixup machinery".  That machinery
+/// does not exist and never did; the claim is removed rather than softened,
+/// because a reader auditing this path deserves the real guarantee.)
+///
+/// What this check therefore buys is narrower than "cannot oops", but it is
+/// still the property the threat model needs: it removes the *deterministic*,
+/// unprivileged path to a kernel fault (CWE-754 / CWE-20 / CWE-617) — user code
+/// deliberately pointing RSP at a PROT_READ mapping before raising a
+/// synchronous SIGSEGV — and leaves only a genuine concurrent-remap race that
+/// user code cannot aim.  Closing that residue requires the fault-fixup
+/// mechanism described above; per-page atomic guard primitives (PTE-locked
+/// "begin-store" tokens) are the alternative and are deferred for the same
+/// reason as before: they would have to touch every user-VA store path, not
+/// just signal delivery.
 pub(crate) fn is_user_writable_range(cr3: u64, base: u64, len: u64) -> bool {
     use crate::mm::vmm::{lookup_pte_in, virt_to_phys_in,
                           PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};

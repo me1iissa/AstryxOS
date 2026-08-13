@@ -2734,6 +2734,71 @@ pub(crate) mod cleartid_cow_test_hook {
     }
 }
 
+/// Pre-fault a **user** destination range so that a kernel-mediated bulk copy
+/// into it cannot take a ring-0 page fault the kernel is unable to recover
+/// from.
+///
+/// Returns the number of bytes at the FRONT of `[base, base + len)` that are
+/// now backed by a present, writable user translation: `len` when the whole
+/// range resolved, a smaller value (possibly `0`) when resolution failed at
+/// some page.  Resolution is page-granular and the returned count is clamped to
+/// the requested range, so a caller may copy exactly that many bytes and stop.
+///
+/// # Why this is needed
+///
+/// A demand-paged user buffer is legitimately not-present on first touch, and
+/// the normal resolution is the page-fault handler itself, which services a
+/// ring-0 fault on a user address exactly as it does a ring-3 one.  That works
+/// — right up until the handler *cannot* resolve the fault; the dominant cause
+/// is a frame allocator with nothing left to hand out.  At that point the two
+/// privilege levels diverge sharply: a ring-3 fault costs one process
+/// (SIGSEGV), whereas a ring-0 fault has nowhere to return to, because this
+/// tree has no exception-table / fault-fixup mechanism, and so it takes the
+/// machine down with a bugcheck.
+///
+/// Resolving the destination up-front converts exactly that failure from an
+/// unrecoverable ring-0 fault into an ordinary `false` return the caller can
+/// render as a short count or an error.  The frame allocation still has to
+/// happen — this is not an optimisation and buys no work back — it simply
+/// happens somewhere the failure is *representable*.
+///
+/// # What it does NOT do
+///
+/// This narrows the window; it does not close it.  Between resolving a page
+/// here and the copy touching it, a sibling thread sharing the address space
+/// can unmap it or drop its write permission — an ordinary `munmap`/`mprotect`
+/// in another thread is enough, no adversarial intent required — and the copy
+/// then takes the very fault this helper exists to avoid.  No check performed
+/// at one instant can observe a change that happens at the next; closing the
+/// residue requires re-validating at the moment of access, which is what an
+/// exception table provides and what this kernel still lacks.
+///
+/// Callers must therefore treat this as hardening, not as a guarantee, and
+/// must still be correct if the copy faults anyway.
+pub(crate) fn preflight_user_write_range(cr3: u64, base: u64, len: usize) -> usize {
+    let end = base.saturating_add(len as u64);
+    let mut va = crate::mm::vma::page_align_down(base);
+    let mut resolved = 0usize;
+    while va < end {
+        if !resolve_user_write_page(cr3, va) {
+            break;
+        }
+        let page_end = va.saturating_add(crate::mm::pmm::PAGE_SIZE as u64);
+        resolved = core::cmp::min(end, page_end).saturating_sub(base) as usize;
+        va = page_end;
+    }
+    resolved
+}
+
+/// True when this CPU must not attempt a user-write pre-flight: the resolver
+/// acquires `PROCESS_TABLE`, so calling it from a context that already owns the
+/// table would self-deadlock.  Callers fail open — skipping the pre-flight is
+/// exactly the behaviour that predates it, so the guard can only forgo the
+/// hardening, never introduce a new failure mode.
+pub(crate) fn preflight_would_deadlock() -> bool {
+    crate::proc::process_table_held_here()
+}
+
 pub(crate) fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
     use crate::mm::vmm::{
         read_pte, ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,

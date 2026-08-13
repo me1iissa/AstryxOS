@@ -264,16 +264,95 @@ pub fn invoke_oom_killer(needed_frames: usize) -> Option<Pid> {
         crate::mm::rss::underflow_count(),
     );
 
-    // Deliver SIGKILL.  signal::kill() acquires PROCESS_TABLE internally.
-    let result = crate::signal::kill(target_pid, crate::signal::SIGKILL);
-    if result != 0 {
-        crate::serial_println!(
-            "[OOM] WARN: kill(pid={}, SIGKILL) returned {} — process may have already exited",
-            target_pid, result
-        );
-    }
+    // Deliver SIGKILL.  NOT via `signal::kill`: that path is not IF=0-safe, and
+    // the sole production caller reaches here from `handle_page_fault`'s
+    // anonymous demand-fault arm, which runs on an interrupt gate with IF=0
+    // (Intel SDM Vol. 3A §6.8.1).  See `deliver_sigkill_oom`.
+    deliver_sigkill_oom(target_pid, needed_frames);
 
     Some(target_pid)
+}
+
+/// Mark SIGKILL pending on `victim` in an IF=0-safe way — the OOM kill step.
+///
+/// `signal::kill` cannot be used from the OOM path.  It takes a plain unbounded
+/// `PROCESS_TABLE.lock()` and then rings the poll bell, which takes a plain
+/// unbounded `THREAD_TABLE.lock()`.  Both are the same class of IF=0 hazard the
+/// scoring acquire above already avoids: a peer CPU holding a table lock across
+/// a TLB shootdown cannot get its ACK from a CPU that is IF-masked inside the
+/// page-fault handler, and a kernel `#PF` taken while a syscall on the same CPU
+/// holds `THREAD_TABLE` self-deadlocks.  Before this module was reachable from
+/// the fault path the point was moot — every fault-path caller fast-rejected on
+/// the held mark — but the anonymous arm now releases that mark to reach
+/// reclaim, so the kill step must be as IF=0-safe as the scoring step.
+///
+/// This does two things and no more:
+///
+/// 1. Acquires `PROCESS_TABLE` with the identical bounded, shootdown-draining
+///    `try_lock` discipline as the scoring block, failing closed on the bound.
+/// 2. Sets the pending SIGKILL bit on the victim (the lock-free marking half of
+///    `signal::kill`; `send_for_pid` only ORs a bitmask and stores a per-PID
+///    hint).  The victim reaps itself on its next scheduler pass through
+///    `check_signals`.
+///
+/// It deliberately does **not** ring the poll bell.  The bell's job is to wake
+/// pollers so they re-evaluate and return `EINTR`; it is a latency
+/// optimisation, not part of the kill's correctness, and it is the exact
+/// `THREAD_TABLE` acquire that is unsafe here.  Skipping it is sound because the
+/// effect is already deferred by construction: `pmm::alloc_page` does not depend
+/// on a synchronous reap — it spins briefly and retries once, and treats a
+/// still-failing retry as an ordinary allocation failure (POSIX has no
+/// guarantee that memory pressure is resolved within any bounded time).
+///
+/// Lock ordering is unchanged: `PROCESS_TABLE` is acquired alone, top of order,
+/// and released before returning; nothing else is taken while it is held.
+fn deliver_sigkill_oom(victim: Pid, needed_frames: usize) {
+    let mut guard = None;
+    let mut iters: u32 = 0;
+    while iters < PROCESS_TABLE_ACQUIRE_BOUND {
+        if let Some(g) = crate::proc::PROCESS_TABLE.try_lock() {
+            guard = Some(g);
+            break;
+        }
+        // Lock-free and EOI-free, so it is safe with interrupts disabled while
+        // this CPU holds none of the locks it is waiting on.  Identical to the
+        // scoring acquire above.  See `mm::tlb::drain_incoming_shootdown_if_smp`.
+        crate::mm::tlb::drain_incoming_shootdown_if_smp();
+        core::hint::spin_loop();
+        iters += 1;
+    }
+    let mut procs = match guard {
+        Some(g) => g,
+        None => {
+            let total = OOM_LOCK_GIVEUPS.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::serial_println!(
+                "[OOM] PROCESS_TABLE unacquirable for the SIGKILL of pid={} after {} iters \
+                 (needed={} frames) — victim not marked; giveups={}",
+                victim, PROCESS_TABLE_ACQUIRE_BOUND, needed_frames, total,
+            );
+            return;
+        }
+    };
+    match procs.iter_mut().find(|p| p.pid == victim) {
+        Some(p) => {
+            // Mirror `signal::kill`'s two dispositions for SIGKILL: mark it
+            // pending when the process has signal state, otherwise apply the
+            // default action (Terminate) directly.  A process selected by
+            // resident-page score always has an address space and thus signal
+            // state, so the fallback is defensive.
+            if let Some(ss) = p.signal_state.as_mut() {
+                ss.send_for_pid(crate::signal::SIGKILL, victim);
+            } else {
+                p.state = crate::proc::ProcessState::Zombie;
+                p.exit_code = -(crate::signal::SIGKILL as i32);
+            }
+        }
+        None => {
+            // Raced with the victim's own exit between scoring and here —
+            // already gone, which is the outcome we wanted.
+        }
+    }
+    // Intentionally no `ring_poll_bell` / thread wake — see the fn doc.
 }
 
 /// **The** OOM victim score: resident pages, in 4 KiB units.
