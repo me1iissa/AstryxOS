@@ -886,8 +886,48 @@ pub fn sync_inode(mount_idx: usize, inode: u64) {
 /// the rest of the VM expects.
 ///
 /// Returns the number of pages cached.
+/// Cycle accumulators for one `prepopulate_file` call, one field per layer the
+/// burst passes through. Always declared so the timed sites read the same in
+/// both builds; with `prepop-profile` off nothing ever writes it and the
+/// optimiser drops it entirely.
+#[derive(Default)]
+struct PrepopAcc {
+    read: u64,       // fs.read of a 2 MiB chunk (ext2 mapping + virtio)
+    prescan: u64,    // the all-cached pre-scan lookup, once per page per chunk
+    lookup: u64,     // the per-page lookup in the install loop
+    alloc: u64,      // pmm::alloc_page
+    zerocopy: u64,   // unconditional 4 KiB bzero + up-to-4 KiB copy
+    insert: u64,     // cache::insert (global PAGE_CACHE lock + BTreeMap)
+    diag: u64,       // w215 prov_record + preins_register (firefox-test-core only)
+    n_read: u64,
+    n_lookup: u64,
+    n_insert: u64,
+}
+
+/// Time `$body`, adding the elapsed TSC cycles to `$acc`. With the feature off
+/// this expands to `$body` alone — no rdtsc, no accumulator write.
+#[cfg(feature = "prepop-profile")]
+macro_rules! prof {
+    ($acc:expr, $body:expr) => {{
+        let __t0 = crate::arch::x86_64::irq::rdtsc();
+        let __r = $body;
+        $acc = $acc.wrapping_add(crate::arch::x86_64::irq::rdtsc().wrapping_sub(__t0));
+        __r
+    }};
+}
+#[cfg(not(feature = "prepop-profile"))]
+macro_rules! prof {
+    ($acc:expr, $body:expr) => {
+        $body
+    };
+}
+
 pub fn prepopulate_file(path: &str) -> usize {
     use crate::vfs;
+    #[allow(unused_mut)]
+    let mut acc = PrepopAcc::default();
+    #[cfg(feature = "prepop-profile")]
+    let prof_t0 = crate::arch::x86_64::irq::rdtsc();
 
     let (mount_idx, inode) = match vfs::resolve_path(path) {
         Ok(r) => r,
@@ -961,7 +1001,7 @@ pub fn prepopulate_file(path: &str) -> usize {
         let mut all_cached = true;
         for page_idx in 0..((this_chunk + 4095) / 4096) {
             let page_off = chunk_start + (page_idx as u64) * page_size;
-            if lookup(mount_idx, inode, page_off).is_none() {
+            if prof!(acc.prescan, lookup(mount_idx, inode, page_off)).is_none() {
                 all_cached = false;
                 break;
             }
@@ -991,7 +1031,8 @@ pub fn prepopulate_file(path: &str) -> usize {
         // as zero in-band (the FS returns Ok with the hole zero-filled), so a
         // legitimate short read is an `Ok(n)` we honour below.
         let read_buf = &mut chunk_buf[..this_chunk];
-        let bytes_read = match fs.read(inode, chunk_start, read_buf) {
+        acc.n_read += 1;
+        let bytes_read = match prof!(acc.read, fs.read(inode, chunk_start, read_buf)) {
             Ok(n) => n,
             Err(_) => {
                 crate::serial_println!(
@@ -1028,11 +1069,12 @@ pub fn prepopulate_file(path: &str) -> usize {
         let mut page_off_in_chunk = 0usize;
         while page_off_in_chunk < this_chunk {
             let page_off = chunk_start + page_off_in_chunk as u64;
-            if lookup(mount_idx, inode, page_off).is_some() {
+            acc.n_lookup += 1;
+            if prof!(acc.lookup, lookup(mount_idx, inode, page_off)).is_some() {
                 page_off_in_chunk += page_size as usize;
                 continue;
             }
-            if let Some(phys) = crate::mm::pmm::alloc_page() {
+            if let Some(phys) = prof!(acc.alloc, crate::mm::pmm::alloc_page()) {
                 let copy_len = core::cmp::min(
                     page_size as usize,
                     this_chunk - page_off_in_chunk,
@@ -1042,7 +1084,7 @@ pub fn prepopulate_file(path: &str) -> usize {
                 // write intent.  preins_register opens the race window;
                 // the matching cache::insert below will close it.
                 #[cfg(feature = "firefox-test-core")]
-                {
+                prof!(acc.diag, {
                     crate::mm::w215_diag::prov_record(
                         phys,
                         crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
@@ -1053,7 +1095,7 @@ pub fn prepopulate_file(path: &str) -> usize {
                         crate::mm::w215_diag::SITE_CACHE_PREPOPULATE,
                         mount_idx, inode, page_off,
                     );
-                }
+                });
                 // SAFETY: PMM hands out an exclusive 4 KiB physical frame.
                 // The higher-half identity map covers it, and the page cache
                 // is the sole owner once we insert.
@@ -1066,15 +1108,16 @@ pub fn prepopulate_file(path: &str) -> usize {
                 // zero when copy_len < page_size.  The unconditional bzero is
                 // inexpensive relative to the prior disk I/O and eliminates
                 // the class of stale-content faults entirely.
-                unsafe {
+                prof!(acc.zerocopy, unsafe {
                     core::ptr::write_bytes(dst, 0, page_size as usize);
                     core::ptr::copy_nonoverlapping(
                         chunk_buf.as_ptr().add(page_off_in_chunk),
                         dst,
                         copy_len,
                     );
-                }
-                insert(mount_idx, inode, page_off, phys);
+                });
+                acc.n_insert += 1;
+                prof!(acc.insert, insert(mount_idx, inode, page_off, phys));
                 cached += 1;
             } else {
                 // OOM — bail out of the inner loop; outer loop will hit the
@@ -1091,6 +1134,26 @@ pub fn prepopulate_file(path: &str) -> usize {
         }
 
         offset = chunk_start + this_chunk as u64;
+    }
+    // One line per file. `total` is the whole call, so anything it does not
+    // account for is the residual (loop control, chunk-buffer allocation, the
+    // per-4000-page progress print) — reported by subtraction rather than
+    // silently folded into a named segment. TSC_PER_TICK is emitted alongside
+    // so the host converts cycles to seconds with this boot's own calibration
+    // instead of an assumed clock rate.
+    #[cfg(feature = "prepop-profile")]
+    {
+        let total = crate::arch::x86_64::irq::rdtsc().wrapping_sub(prof_t0);
+        crate::serial_println!(
+            "[PREPOP/PROF] path={} pages={} total={} read={} prescan={} lookup={} \
+             alloc={} zerocopy={} insert={} diag={} n_read={} n_lookup={} \
+             n_insert={} tsc_per_tick={}",
+            path, cached, total, acc.read, acc.prescan, acc.lookup,
+            acc.alloc, acc.zerocopy, acc.insert, acc.diag,
+            acc.n_read, acc.n_lookup, acc.n_insert,
+            crate::arch::x86_64::irq::TSC_PER_TICK
+                .load(core::sync::atomic::Ordering::Relaxed),
+        );
     }
     cached
 }
