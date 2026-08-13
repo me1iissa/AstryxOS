@@ -29737,35 +29737,42 @@ fn test_heap_guard_pte() -> bool {
     true
 }
 
-/// Heap-region sizing math + the HEAP_EXHAUSTED bugcheck wiring.
+/// Heap-region sizing math, the occupancy high-water instrument, and the
+/// HEAP_EXHAUSTED bugcheck wiring.
 ///
-/// Guards the 384 MiB heap raise and the allocation-error handler that routes
-/// kernel OOM to a `HEAP_EXHAUSTED` bugcheck banner:
+/// `HEAP_SIZE` is a *static physical reservation* — every byte is withdrawn
+/// from the frame allocator at boot whether the allocator touches it or not —
+/// so its value is a memory-budget decision, not a tuning knob, and it is
+/// pinned here so a change cannot land silently:
 ///
-/// 1. `HEAP_SIZE` is exactly 384 MiB.
+/// 1. `HEAP_SIZE` is exactly 256 MiB.
 /// 2. The computed physical layout is self-consistent
 ///    (`phys_end == phys_start + HEAP_SIZE`) and lands in a valid free region:
 ///    base at or above the historical 8 MiB floor, `phys_end <= 1 GiB` (the
 ///    `heap::init` assertion bound — the heap stays inside the bootloader's
 ///    0..4 GiB higher-half huge-page map and never reaches MMIO territory).
 /// 3. The VA base equals `phys_start + PHYS_OFF` (higher-half identity offset).
-/// 4. `BUGCHECK_HEAP_EXHAUSTED` resolves to the `"HEAP_EXHAUSTED"` name, so the
+/// 4. The pressure threshold is 60 % of capacity and strictly inside it, and
+///    the high-water mark is a live running maximum: bounded by capacity and
+///    never below the occupancy a caller samples right now.
+/// 5. `BUGCHECK_HEAP_EXHAUSTED` resolves to the `"HEAP_EXHAUSTED"` name, so the
 ///    bugcheck banner labels a real OOM rather than `UNKNOWN_BUGCHECK`.
 ///
 /// This is a pure-arithmetic + table-lookup test — it never actually exhausts
 /// the heap (that would abort the whole run), it only certifies that an
 /// exhaustion *would* be diagnosable and that the region math is sound.
 fn test_heap_region_and_oom_bugcheck() -> bool {
-    test_header!("Heap region math (384 MiB) + HEAP_EXHAUSTED bugcheck wiring");
+    test_header!("Heap region math (256 MiB) + high-water instrument + HEAP_EXHAUSTED wiring");
 
-    use crate::mm::heap::{compute_heap_layout, HEAP_SIZE};
+    use crate::mm::heap::{compute_heap_layout, high_water_bytes,
+                          pressure_threshold_bytes, HEAP_SIZE};
     use crate::ke::bugcheck::{bugcheck_name, BUGCHECK_HEAP_EXHAUSTED};
 
-    // 1. HEAP_SIZE is the intended 384 MiB.
-    const EXPECT_SIZE: usize = 384 * 1024 * 1024;
+    // 1. HEAP_SIZE is the intended 256 MiB.
+    const EXPECT_SIZE: usize = 256 * 1024 * 1024;
     if HEAP_SIZE != EXPECT_SIZE {
         test_fail!("heap_region",
-            "HEAP_SIZE={:#x} ({} MiB) — expected {:#x} (384 MiB)",
+            "HEAP_SIZE={:#x} ({} MiB) — expected {:#x} (256 MiB)",
             HEAP_SIZE, HEAP_SIZE / (1024 * 1024), EXPECT_SIZE);
         return false;
     }
@@ -29804,7 +29811,49 @@ fn test_heap_region_and_oom_bugcheck() -> bool {
     test_println!("  layout phys=[{:#x}..{:#x}) va={:#x} — 8MiB<=base, phys_end<=1GiB ✓",
         phys_start, phys_end, va_start);
 
-    // 3. The OOM bugcheck code is wired into the name table (not UNKNOWN).
+    // 3. Pressure threshold + high-water instrument.
+    //
+    // The threshold must sit strictly inside capacity — a threshold at or
+    // above `HEAP_SIZE` can only fire once the allocator has already failed,
+    // which is precisely when the warning is useless.
+    let threshold = pressure_threshold_bytes();
+    if threshold != HEAP_SIZE / 5 * 3 {
+        test_fail!("heap_region",
+            "pressure_threshold_bytes()={} — expected 60% of HEAP_SIZE ({})",
+            threshold, HEAP_SIZE / 5 * 3);
+        return false;
+    }
+    if threshold == 0 || threshold >= HEAP_SIZE {
+        test_fail!("heap_region",
+            "pressure threshold {} is not strictly inside capacity {}",
+            threshold, HEAP_SIZE);
+        return false;
+    }
+
+    // The high-water mark is the *running maximum* of the same block-accurate
+    // occupancy `stats()` samples, so it is bounded above by capacity and
+    // bounded below by whatever occupancy is live right now.  Both bounds are
+    // load-bearing: an instrument that only ever reported zero would satisfy
+    // "<= capacity" alone and still be useless for sizing.
+    let (_total, live_used, _free) = crate::mm::heap::stats();
+    let hw = high_water_bytes();
+    if hw > HEAP_SIZE {
+        test_fail!("heap_region",
+            "high_water_bytes()={} exceeds HEAP_SIZE={} — impossible occupancy",
+            hw, HEAP_SIZE);
+        return false;
+    }
+    if hw < live_used {
+        test_fail!("heap_region",
+            "high_water_bytes()={} is below the live occupancy {} — the running \
+             maximum is not tracking allocations",
+            hw, live_used);
+        return false;
+    }
+    test_println!("  high_water={} KiB live_used={} KiB threshold={} MiB (60%) ✓",
+        hw / 1024, live_used / 1024, threshold / (1024 * 1024));
+
+    // 4. The OOM bugcheck code is wired into the name table (not UNKNOWN).
     let name = bugcheck_name(BUGCHECK_HEAP_EXHAUSTED);
     if name != "HEAP_EXHAUSTED" {
         test_fail!("heap_region",

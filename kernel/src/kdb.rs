@@ -2189,7 +2189,9 @@ fn op_tlb_stats(out: &mut String) {
 //   {
 //     "heap": { "current_bytes":N, "peak_bytes":N, "alloc_count":N,
 //               "free_count":N, "alloc_bytes":N, "free_bytes":N,
-//               "total_bytes":N, "allocator_used":N, "allocator_free":N },
+//               "total_bytes":N, "allocator_used":N, "allocator_free":N,
+//               "high_water_bytes":N, "pressure_threshold_bytes":N,
+//               "pressure_warned":bool },
 //     "collections": {
 //       "process_table": N | -1,
 //       "thread_table":  N | -1,
@@ -2245,7 +2247,18 @@ fn op_heap_stats(out: &mut String) {
     let _ = write!(out, r#""free_bytes":{},"#, h_free_b);
     let _ = write!(out, r#""total_bytes":{},"#, h_total);
     let _ = write!(out, r#""allocator_used":{},"#, h_alloc);
-    let _ = write!(out, r#""allocator_free":{}"#, h_free);
+    let _ = write!(out, r#""allocator_free":{},"#, h_free);
+    // Block-accurate occupancy high-water for this boot, plus the capacity
+    // fraction at which the one-shot `[HEAP] WARN` line fires.  `peak_bytes`
+    // above is the running peak of *requested* bytes and therefore excludes
+    // headers, alignment padding and un-split remainders; `high_water_bytes`
+    // is the figure to size `HEAP_SIZE` against.
+    let _ = write!(out, r#""high_water_bytes":{},"#,
+        crate::mm::heap::high_water_bytes());
+    let _ = write!(out, r#""pressure_threshold_bytes":{},"#,
+        crate::mm::heap::pressure_threshold_bytes());
+    let _ = write!(out, r#""pressure_warned":{}"#,
+        crate::mm::heap::pressure_warned());
     out.push('}');
 
     // ── Per-collection sizes ───────────────────────────────────────────────
