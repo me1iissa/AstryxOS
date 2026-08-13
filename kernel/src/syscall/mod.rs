@@ -3773,7 +3773,13 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     //     boot-time table, NOT a hot per-syscall emitter, so it belongs on the
     //     fast profile.  `firefox-test-trace` still emits it (it pulls the core).
     //   - `test-mode` (headless dynamic-linker tests verify placement)
-    #[cfg(any(feature = "firefox-test-core", feature = "test-mode-trace"))]
+    //   NOTE (measured 2026-08-13): the "~80 lines total" estimate above is
+    //   wrong by ~20x. Every content process re-maps the whole DSO closure, so
+    //   a Main_Page boot emits 1671 of these lines (186 KB) between the Firefox
+    //   exec and the screenshot write — 16 s of 115200-baud serial time on a
+    //   port the kernel busy-polls. `lean-serial` suppresses it for A/B runs.
+    #[cfg(all(any(feature = "firefox-test-core", feature = "test-mode-trace"),
+              not(feature = "lean-serial")))]
     if let Some(path) = so_trace_path_out {
         crate::serial_println!(
             "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",

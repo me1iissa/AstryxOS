@@ -1733,7 +1733,7 @@ pub fn parse_dynamic_test(data: &[u8]) -> (usize, usize, bool) {
 /// VMAs for each loaded segment are pushed into `vmas` so the process's VmSpace
 /// covers interpreter pages and can free them via the VMA walk on exit.
 /// W215 dispatch-4 probe: bounded emission counter for `[W215/INTERP]` lines.
-#[cfg(feature = "firefox-test-core")]
+#[cfg(all(feature = "firefox-test-core", not(feature = "lean-serial")))]
 static W215_INTERP_LOG: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -1891,7 +1891,7 @@ fn load_elf_dyn(
                 // in the loader path and must not take THREAD_TABLE per page --
                 // review F2, matching the alias detector's own choice in
                 // `mm::w215_diag::alias_install_check`.
-                #[cfg(feature = "firefox-test-core")]
+                #[cfg(all(feature = "firefox-test-core", not(feature = "lean-serial")))]
                 {
                     let n = W215_INTERP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                     // review F3: `n <= 4096` alone would silently drop the
