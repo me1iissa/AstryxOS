@@ -52,6 +52,11 @@ const DENTRY_CACHE_CAP: usize = 1024;
 const INODE_CACHE_CAP: usize = 2048;
 
 /// ext2 magic number.
+/// Depth of the ext2 indirect tree: a block pointer can be reached through at
+/// most three levels of indirection (single, double, triple).  One cache slot
+/// per level — see [`Ext2Fs::read_indirect`] for why a shared slot degenerates.
+const INDIRECT_LEVELS: usize = 3;
+
 const EXT2_MAGIC: u16 = 0xEF53;
 
 /// Read the wall clock as a Unix-epoch second count, clamped to `u32`
@@ -243,10 +248,13 @@ enum BlockReader {
 ///   `create_file`, `create_dir`, and `symlink`.  FIFO eviction via a
 ///   companion `VecDeque` of keys.  Cap: [`DENTRY_CACHE_CAP`] entries.
 ///
-/// * **Indirect-block cache** — a single-entry cache holding the most
-///   recently read indirect block.  Avoids re-reading the same indirect
-///   block on every pointer lookup when reading a large file
-///   sequentially (e.g. libxul.so mmap demand-fault storms).
+/// * **Indirect-block cache** — one slot per level of the indirect tree,
+///   each holding the most recently read block at that depth.  Avoids
+///   re-reading the same indirect block on every pointer lookup when
+///   reading a large file sequentially (e.g. libxul.so mmap demand-fault
+///   storms).  Per level rather than one slot overall: resolving a block
+///   in the double-indirect range touches two levels in succession, and a
+///   shared slot makes them evict each other on every single data block.
 struct Ext2State {
     /// Mutable superblock counters.  Other fields of the superblock
     /// (block_size, inode_size, …) are duplicated as immutable plain
@@ -264,10 +272,21 @@ struct Ext2State {
     /// order.  When `dentry_map.len() == DENTRY_CACHE_CAP` we pop the
     /// front and remove the corresponding entry from `dentry_map`.
     dentry_fifo: VecDeque<(u64, String)>,
-    /// Single-entry indirect-block cache.  `None` if empty.
-    /// Tuple is `(block_num, block_data)`.  Invalidated whenever
+    /// Indirect-block cache, one slot per level of the indirect tree.
+    /// Slot `L` holds the most recent block read at depth `L`; the tuple is
+    /// `(block_num, block_data)`, `None` if empty.  Invalidated whenever
     /// [`Ext2Fs::write_indirect_slot`] modifies an indirect block.
-    indirect_cache: Option<(u32, Vec<u8>)>,
+    ///
+    /// One slot PER LEVEL, not one slot overall.  Resolving a block in the
+    /// double-indirect range reads two blocks — the level-0 block, then the
+    /// level-1 block it points at — so a single shared slot has the two levels
+    /// evict each other and the hit rate is zero for the whole range.  With
+    /// `block_size` 4096 the direct and single-indirect ranges cover only the
+    /// first 4 MiB of a file, so every large object is entirely in that range.
+    /// Split by level, the level-0 block is constant across the whole
+    /// double-indirect range and the level-1 block serves 1024 consecutive
+    /// data blocks, so a sequential read hits in cache almost always.
+    indirect_cache: [Option<(u32, Vec<u8>)>; INDIRECT_LEVELS],
     /// Per-superblock inode cache: inode number → parsed on-disk inode.
     ///
     /// This is the FS's in-core copy of the on-disk inode metadata (size,
@@ -484,7 +503,7 @@ impl Ext2Fs {
                 bgdt,
                 dentry_map: BTreeMap::new(),
                 dentry_fifo: VecDeque::new(),
-                indirect_cache: None,
+                indirect_cache: [const { None }; INDIRECT_LEVELS],
                 inode_map: BTreeMap::new(),
                 inode_fifo: VecDeque::new(),
             }),
@@ -573,7 +592,7 @@ impl Ext2Fs {
                 bgdt,
                 dentry_map: BTreeMap::new(),
                 dentry_fifo: VecDeque::new(),
-                indirect_cache: None,
+                indirect_cache: [const { None }; INDIRECT_LEVELS],
                 inode_map: BTreeMap::new(),
                 inode_fifo: VecDeque::new(),
             }),
@@ -951,7 +970,7 @@ impl Ext2Fs {
         let block_idx = block_idx - 12;
         if block_idx < ptrs_per_block {
             // Single indirect
-            return self.read_indirect(inode.block[12], block_idx);
+            return self.read_indirect(inode.block[12], block_idx, 0);
         }
 
         let block_idx = block_idx - ptrs_per_block;
@@ -959,9 +978,9 @@ impl Ext2Fs {
             // Double indirect
             let i = block_idx / ptrs_per_block;
             let j = block_idx % ptrs_per_block;
-            let indirect = self.read_indirect(inode.block[13], i);
+            let indirect = self.read_indirect(inode.block[13], i, 0);
             if indirect == 0 { return 0; }
-            return self.read_indirect(indirect, j);
+            return self.read_indirect(indirect, j, 1);
         }
 
         let block_idx = block_idx - ptrs_per_block * ptrs_per_block;
@@ -970,26 +989,43 @@ impl Ext2Fs {
         let rem = block_idx % (ptrs_per_block * ptrs_per_block);
         let j = rem / ptrs_per_block;
         let k = rem % ptrs_per_block;
-        let ind1 = self.read_indirect(inode.block[14], i);
+        let ind1 = self.read_indirect(inode.block[14], i, 0);
         if ind1 == 0 { return 0; }
-        let ind2 = self.read_indirect(ind1, j);
+        let ind2 = self.read_indirect(ind1, j, 1);
         if ind2 == 0 { return 0; }
-        self.read_indirect(ind2, k)
+        self.read_indirect(ind2, k, 2)
     }
 
-    /// Read one pointer from an indirect block.
+    /// Read one pointer from an indirect block at depth `level`.
     ///
-    /// Uses the single-entry indirect-block cache in `Ext2State` (PR-E).
-    /// When the same indirect block is read repeatedly — the common case for
-    /// a sequential read of a file > 48 KiB — each pointer lookup hits the
-    /// cache rather than issuing a fresh disk read, eliminating the ~256×
-    /// redundant I/O noted in the audit §6 "Indirect block re-reading".
-    fn read_indirect(&self, block_num: u32, index: usize) -> u32 {
+    /// `level` is the block's depth in the indirect tree: 0 for a block named
+    /// directly by an `i_block[12..15]` slot, 1 for one named by a level-0
+    /// block, 2 for one named by a level-1 block.  It selects the cache slot,
+    /// so a walk that descends through several levels does not have each level
+    /// evict the one above it.
+    ///
+    /// Why per level.  Resolving one block in the double-indirect range calls
+    /// this twice — level 0, then level 1 — so with a single shared slot the
+    /// second call evicts the first, the next data block misses on both, and
+    /// the hit rate over the whole range is zero.  That is not a corner case:
+    /// at `block_size` 4096 the direct plus single-indirect ranges cover only
+    /// the first 4 MiB of a file, so every large shared object is read almost
+    /// entirely in the thrashing regime, and the caller that greedily extends
+    /// a contiguous run calls `resolve_block` once per block.  Mapping a 2 MiB
+    /// run therefore cost 512 x 2 = 1024 four-KiB metadata reads to enable one
+    /// data read — metadata I/O twice the data in bytes and 512x in requests.
+    ///
+    /// Split by level the same walk hits: the level-0 block is constant across
+    /// an entire double-indirect range, and a level-1 block serves 1024
+    /// consecutive data blocks.
+    fn read_indirect(&self, block_num: u32, index: usize, level: usize) -> u32 {
         if block_num == 0 { return 0; }
-        // Fast path: hit the per-FS indirect-block cache.
+        debug_assert!(level < INDIRECT_LEVELS);
+        let slot = level.min(INDIRECT_LEVELS - 1);
+        // Fast path: hit this level's slot of the indirect-block cache.
         {
             let state = self.state.lock();
-            if let Some((cached_block, ref cached_data)) = state.indirect_cache {
+            if let Some((cached_block, ref cached_data)) = state.indirect_cache[slot] {
                 if cached_block == block_num {
                     let off = index * 4;
                     if off + 4 <= cached_data.len() {
@@ -1001,7 +1037,19 @@ impl Ext2Fs {
                 }
             }
         }
-        // Miss: read the block and populate the cache.
+        // Miss: read the block and populate this level's slot.
+        //
+        // KNOWN, PRE-EXISTING, NOT ADDRESSED HERE: the lock is dropped across
+        // the block read, so a concurrent `write_indirect_slot` on the same
+        // block can write and invalidate in the window, and the store below
+        // then re-installs the bytes read BEFORE that write — stale data that
+        // survives the invalidation. The block number is right and the tuple is
+        // stored whole, so neither the `cached == block_num` guard nor the
+        // whole-tuple store detects it. Unchanged by the per-level split (the
+        // window is the same); the split only lengthens how long the stale
+        // entry then survives. The fix is a generation counter bumped on every
+        // invalidate and re-checked before the store — deliberately left as a
+        // follow-up rather than folded into a perf change.
         let mut buf = alloc::vec![0u8; self.block_size];
         if self.read_block(block_num, &mut buf).is_err() { return 0; }
         let result = {
@@ -1010,10 +1058,9 @@ impl Ext2Fs {
                 u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
             } else { 0 }
         };
-        // Store in cache.
         {
             let mut state = self.state.lock();
-            state.indirect_cache = Some((block_num, buf));
+            state.indirect_cache[slot] = Some((block_num, buf));
         }
         result
     }
@@ -1280,6 +1327,19 @@ impl Ext2Fs {
         }
         bitmap[byte_idx] &= !(1 << bit_off);
         if self.write_block(bitmap_block, &bitmap).is_err() { return; }
+        // The block is free as of here, so any cached copy of it as an indirect
+        // block is now a liability: a later allocation can hand this same block
+        // to another file's indirect tree, and a stale slot would answer reads
+        // of it with the previous owner's pointers.
+        //
+        // The gap between the bitmap write above and this sweep is DELIBERATE.
+        // Closing it would mean holding the state lock across a block-device
+        // write, and that is the lock-across-I/O deadlock class this tree has
+        // already been bitten by twice (the MOUNTS and RX_CUR fixes). A
+        // concurrent reader in the window can only re-cache a block that is
+        // already free, and the allocator cannot hand that block out until it
+        // reads the bitmap this write just updated.
+        self.invalidate_indirect_cache(block_num);
         let mut state = self.state.lock();
         state.bgdt[group as usize].free_blocks_count += 1;
         state.superblock.free_blocks_count += 1;
@@ -1408,13 +1468,35 @@ impl Ext2Fs {
         let _ = self.flush_superblock(&sb_snap);
     }
 
+    /// Drop any cached copy of `block_num` from the indirect-block cache.
+    ///
+    /// Must be called whenever a block's role or contents change underneath the
+    /// cache: when its bytes are rewritten outside [`Self::write_indirect_slot`],
+    /// and when it is freed (a freed block can be reallocated as a *different*
+    /// file's indirect block, and a stale slot would then hand out pointers
+    /// decoded from the previous owner's contents).
+    ///
+    /// Sweeps every level rather than guessing one: the caller does not know
+    /// the depth at which the block was cached, and a block number can legally
+    /// be cached at one depth and reallocated to another.
+    ///
+    /// Takes the state lock briefly and must not be called while it is held.
+    fn invalidate_indirect_cache(&self, block_num: u32) {
+        if block_num == 0 { return; }
+        let mut state = self.state.lock();
+        for slot in state.indirect_cache.iter_mut() {
+            if matches!(slot, Some((cached, _)) if *cached == block_num) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Write a single 32-bit little-endian pointer into an indirect block
     /// at slot `index`.  Reads, modifies, writes the block.  Used by the
     /// indirect-tree growth path.
     ///
-    /// Also invalidates the single-entry indirect-block cache (PR-E) so a
-    /// subsequent `read_indirect` on the same block sees the updated value
-    /// rather than a stale cache entry.
+    /// Invalidates the block's cache slot afterwards so a subsequent
+    /// `read_indirect` sees the updated value rather than a stale entry.
     fn write_indirect_slot(&self, block_num: u32, index: usize, value: u32)
         -> Result<(), &'static str>
     {
@@ -1426,16 +1508,7 @@ impl Ext2Fs {
         }
         buf[byte_off..byte_off + 4].copy_from_slice(&value.to_le_bytes());
         self.write_block(block_num, &buf)?;
-        // Invalidate: either evict or update the cache entry for this block.
-        {
-            let mut state = self.state.lock();
-            match &mut state.indirect_cache {
-                Some((cached_block, _)) if *cached_block == block_num => {
-                    state.indirect_cache = None;
-                }
-                _ => {}
-            }
-        }
+        self.invalidate_indirect_cache(block_num);
         Ok(())
     }
 
@@ -1472,7 +1545,7 @@ impl Ext2Fs {
                 inode.block[12] = new;
                 inode.blocks += (self.block_size / 512) as u32;
             }
-            let leaf = self.read_indirect(inode.block[12], block_idx);
+            let leaf = self.read_indirect(inode.block[12], block_idx, 0);
             if leaf == 0 {
                 let new = self.alloc_block()?;
                 self.write_indirect_slot(inode.block[12], block_idx, new).ok()?;
@@ -1493,13 +1566,13 @@ impl Ext2Fs {
                 inode.block[13] = new;
                 inode.blocks += (self.block_size / 512) as u32;
             }
-            let mut ind1 = self.read_indirect(inode.block[13], i);
+            let mut ind1 = self.read_indirect(inode.block[13], i, 0);
             if ind1 == 0 {
                 ind1 = self.alloc_block()?;
                 self.write_indirect_slot(inode.block[13], i, ind1).ok()?;
                 inode.blocks += (self.block_size / 512) as u32;
             }
-            let leaf = self.read_indirect(ind1, j);
+            let leaf = self.read_indirect(ind1, j, 1);
             if leaf == 0 {
                 let new = self.alloc_block()?;
                 self.write_indirect_slot(ind1, j, new).ok()?;
@@ -1521,19 +1594,19 @@ impl Ext2Fs {
             inode.block[14] = new;
             inode.blocks += (self.block_size / 512) as u32;
         }
-        let mut ind1 = self.read_indirect(inode.block[14], i);
+        let mut ind1 = self.read_indirect(inode.block[14], i, 0);
         if ind1 == 0 {
             ind1 = self.alloc_block()?;
             self.write_indirect_slot(inode.block[14], i, ind1).ok()?;
             inode.blocks += (self.block_size / 512) as u32;
         }
-        let mut ind2 = self.read_indirect(ind1, j);
+        let mut ind2 = self.read_indirect(ind1, j, 1);
         if ind2 == 0 {
             ind2 = self.alloc_block()?;
             self.write_indirect_slot(ind1, j, ind2).ok()?;
             inode.blocks += (self.block_size / 512) as u32;
         }
-        let leaf = self.read_indirect(ind2, k);
+        let leaf = self.read_indirect(ind2, k, 2);
         if leaf == 0 {
             let new = self.alloc_block()?;
             self.write_indirect_slot(ind2, k, new).ok()?;
@@ -1716,6 +1789,7 @@ impl Ext2Fs {
                 }
                 if top_changed {
                     let _ = self.write_block(inode.block[13], &buf);
+                    self.invalidate_indirect_cache(inode.block[13]);
                 }
             }
             if local_first == 0 {
@@ -1753,6 +1827,7 @@ impl Ext2Fs {
                 }
                 if top_changed {
                     let _ = self.write_block(inode.block[14], &buf);
+                    self.invalidate_indirect_cache(inode.block[14]);
                 }
             }
             if local_first == 0 {
@@ -1787,6 +1862,7 @@ impl Ext2Fs {
         }
         if changed {
             let _ = self.write_block(ind_block, &buf);
+            self.invalidate_indirect_cache(ind_block);
         }
     }
 
@@ -1816,6 +1892,7 @@ impl Ext2Fs {
         }
         if changed {
             let _ = self.write_block(dind_block, &buf);
+            self.invalidate_indirect_cache(dind_block);
         }
     }
 
