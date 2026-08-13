@@ -23,7 +23,7 @@ jobs:
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview, rustfmt
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -42,14 +42,14 @@ jobs:
       # crate that requires -Zbuild-std; checking it against the host target (linux-gnu)
       # causes a duplicate panic_impl error because std also defines a panic handler.
       - name: cargo check (astryx-shared)
-        run: cargo +nightly check -p astryx-shared
+        run: cargo check -p astryx-shared
 
       - name: cargo check (astryx-boot, UEFI target)
-        run: cargo +nightly check -p astryx-boot --target x86_64-unknown-uefi
+        run: cargo check -p astryx-boot --target x86_64-unknown-uefi
 
       - name: cargo check (astryx-kernel, bare-metal target)
         run: >
-          cargo +nightly check -p astryx-kernel
+          cargo check -p astryx-kernel
           --target kernel/x86_64-astryx.json
           -Zbuild-std=core,alloc
           -Zbuild-std-features=compiler-builtins-mem
@@ -79,7 +79,7 @@ jobs:
         continue-on-error: true
         run: |
           ulimit -v 8000000
-          cargo +nightly fmt --all -- --check
+          cargo fmt --all -- --check
 
       # PR #127 caveat: enforce the fault-immunity contract for
       # `ke::bugcheck` and `util::no_alloc_fmt` — these two files must
@@ -133,7 +133,7 @@ jobs:
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -160,7 +160,7 @@ jobs:
       # the host target trips a duplicate panic_impl), plus the combo under test.
       - name: cargo check (astryx-kernel, --features ${{ matrix.features }})
         run: >
-          cargo +nightly check -p astryx-kernel
+          cargo check -p astryx-kernel
           --target kernel/x86_64-astryx.json
           --features ${{ matrix.features }}
           -Zbuild-std=core,alloc
@@ -275,7 +275,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -317,7 +317,7 @@ jobs:
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -372,7 +372,7 @@ jobs:
       # uninformatively.  See kernel/Cargo.toml.
       - name: Build kernel (test-mode)
         run: |
-          cargo +nightly build \
+          cargo build \
             --package astryx-kernel \
             --target kernel/x86_64-astryx.json \
             --profile release \
@@ -382,7 +382,7 @@ jobs:
             -Zjson-target-spec
 
       - name: Build bootloader (UEFI)
-        run: cargo +nightly build --package astryx-boot --target x86_64-unknown-uefi --profile release
+        run: cargo build --package astryx-boot --target x86_64-unknown-uefi --profile release
 
       # watch-test.py with --no-build takes care of staging the ESP,
       # running objcopy to turn the ELF into a flat binary, and
@@ -391,7 +391,7 @@ jobs:
         run: |
           mkdir -p build/esp/EFI/BOOT build/esp/EFI/astryx
           cp target/x86_64-unknown-uefi/release/astryx-boot.efi build/esp/EFI/BOOT/BOOTX64.EFI
-          SYSROOT=$(rustc +nightly --print sysroot)
+          SYSROOT=$(rustc --print sysroot)
           OBJCOPY=$(find "$SYSROOT" -name llvm-objcopy | head -1)
           [ -n "$OBJCOPY" ] || OBJCOPY=llvm-objcopy
           "$OBJCOPY" -O binary target/x86_64-astryx/release/astryx-kernel build/esp/EFI/astryx/kernel.bin
@@ -564,7 +564,7 @@ jobs:
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -605,7 +605,7 @@ jobs:
 
       - name: Build kernel (test-mode)
         run: |
-          cargo +nightly build \
+          cargo build \
             --package astryx-kernel \
             --target kernel/x86_64-astryx.json \
             --profile release \
@@ -615,13 +615,13 @@ jobs:
             -Zjson-target-spec
 
       - name: Build bootloader (UEFI)
-        run: cargo +nightly build --package astryx-boot --target x86_64-unknown-uefi --profile release
+        run: cargo build --package astryx-boot --target x86_64-unknown-uefi --profile release
 
       - name: Stage ESP for watch-test
         run: |
           mkdir -p build/esp/EFI/BOOT build/esp/EFI/astryx
           cp target/x86_64-unknown-uefi/release/astryx-boot.efi build/esp/EFI/BOOT/BOOTX64.EFI
-          SYSROOT=$(rustc +nightly --print sysroot)
+          SYSROOT=$(rustc --print sysroot)
           OBJCOPY=$(find "$SYSROOT" -name llvm-objcopy | head -1)
           [ -n "$OBJCOPY" ] || OBJCOPY=llvm-objcopy
           "$OBJCOPY" -O binary target/x86_64-astryx/release/astryx-kernel build/esp/EFI/astryx/kernel.bin
@@ -686,7 +686,7 @@ jobs:
       - name: Install Rust nightly (matching rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-01
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
@@ -726,7 +726,7 @@ jobs:
 
       - name: Build kernel (test-mode)
         run: |
-          cargo +nightly build \
+          cargo build \
             --package astryx-kernel \
             --target kernel/x86_64-astryx.json \
             --profile release \
@@ -736,13 +736,13 @@ jobs:
             -Zjson-target-spec
 
       - name: Build bootloader (UEFI)
-        run: cargo +nightly build --package astryx-boot --target x86_64-unknown-uefi --profile release
+        run: cargo build --package astryx-boot --target x86_64-unknown-uefi --profile release
 
       - name: Stage ESP
         run: |
           mkdir -p build/esp/EFI/BOOT build/esp/EFI/astryx
           cp target/x86_64-unknown-uefi/release/astryx-boot.efi build/esp/EFI/BOOT/BOOTX64.EFI
-          SYSROOT=$(rustc +nightly --print sysroot)
+          SYSROOT=$(rustc --print sysroot)
           OBJCOPY=$(find "$SYSROOT" -name llvm-objcopy | head -1)
           [ -n "$OBJCOPY" ] || OBJCOPY=llvm-objcopy
           "$OBJCOPY" -O binary target/x86_64-astryx/release/astryx-kernel build/esp/EFI/astryx/kernel.bin
