@@ -813,7 +813,11 @@ pub fn map_page_in_if_absent(
     // here rather than forking a `_fault_path` sibling.  The draining acquire is
     // a superset-safe acquire (it services incoming shootdowns while spinning),
     // so the one non-fault-path caller — `syscall::resolve_user_write_page` on
-    // the CLONE_CHILD_CLEARTID exit path, IF=1 — is equally correct on it.
+    // the CLONE_CHILD_CLEARTID exit path — is equally correct on it, and in
+    // fact requires it whenever that thread entered through the INT 0x80 /
+    // INT 0x2E gates: both are 64-bit interrupt gates, which clear IF on entry
+    // where a trap gate does not (Intel SDM Vol. 3A §6.12.1.2), and neither
+    // stub re-enables it, so that caller can reach here with IF=0 too.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()
@@ -915,7 +919,11 @@ pub fn map_page_in_cow_if_unchanged(
     // acquire is used unconditionally rather than forking a sibling function; it
     // is a superset-safe acquire (services incoming shootdowns while spinning),
     // so the one non-fault-path caller — `syscall::resolve_user_write_page` on
-    // the CLONE_CHILD_CLEARTID exit path, IF=1 — is equally correct on it.
+    // the CLONE_CHILD_CLEARTID exit path — is equally correct on it, and in
+    // fact requires it whenever that thread entered through the INT 0x80 /
+    // INT 0x2E gates: both are 64-bit interrupt gates, which clear IF on entry
+    // where a trap gate does not (Intel SDM Vol. 3A §6.12.1.2), and neither
+    // stub re-enables it, so that caller can reach here with IF=0 too.
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard
         .as_ref()

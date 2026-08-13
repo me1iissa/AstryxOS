@@ -63097,6 +63097,17 @@ fn test_752_pmm_counters_match_bitmap() -> bool {
     test_header!(NAME);
 
     // ── At rest ────────────────────────────────────────────────────────────
+    // A refused double free is the one bitmap-mutating outcome that leaves
+    // drift at 0 by construction, so drift alone cannot report it; this
+    // counter is the only witness that one happened.  Sampled around the whole
+    // case so the alloc/free churn below is covered too.
+    //
+    // The case deliberately does NOT drive a double free of its own: between
+    // the two frees a sibling CPU could reallocate the frame, and the second
+    // free would then hand a live frame back to the pool — the case would be
+    // manufacturing the corruption it exists to detect.
+    let dbl_before = crate::mm::pmm::pmm_free_already_free_count();
+
     let base = crate::mm::pmm::accounting_snapshot();
     test_println!(
         "  total={} reserved={} used={} counter_free={} bitmap_free={} drift={}",
@@ -63190,6 +63201,76 @@ fn test_752_pmm_counters_match_bitmap() -> bool {
         return false;
     }
     test_println!("  {} frames freed, drift still 0", got);
+
+    // ── The bulk path ──────────────────────────────────────────────────────
+    // `alloc_pages` is a structurally distinct counter site: it marks a run of
+    // bits in a loop and then adds the run length in one `fetch_add`, where
+    // `alloc_page` marks and adds one at a time.  Everything above drives only
+    // the single-frame path, so a bulk-path arithmetic error (adding 1 for a
+    // run of `count`, or a mark loop that stops short) leaves this case green
+    // and reopens the drift class through the multi-frame allocator.
+    const BULK: usize = 4;
+    match crate::mm::pmm::alloc_pages(BULK) {
+        Some(base_phys) => {
+            let bulk = crate::mm::pmm::accounting_snapshot();
+            if bulk.drift() != 0 {
+                test_fail!(NAME,
+                    "after one alloc_pages({}): counter_free={} bitmap_free={} (drift {}) \
+                     — the bulk counter update does not match the run of bits it marked",
+                    BULK, bulk.counter_free, bulk.bitmap_free, bulk.drift());
+                for i in 0..BULK {
+                    crate::mm::pmm::free_page(
+                        base_phys + (i * crate::mm::pmm::PAGE_SIZE) as u64);
+                }
+                return false;
+            }
+            if bulk.reserved != base.reserved {
+                test_fail!(NAME,
+                    "RESERVED_PAGES moved under alloc_pages ({} -> {}) — a contiguous \
+                     allocation is not a reservation",
+                    base.reserved, bulk.reserved);
+                for i in 0..BULK {
+                    crate::mm::pmm::free_page(
+                        base_phys + (i * crate::mm::pmm::PAGE_SIZE) as u64);
+                }
+                return false;
+            }
+            // Freed one frame at a time, so the single-frame free path has to
+            // undo exactly what the bulk allocation did.
+            for i in 0..BULK {
+                crate::mm::pmm::free_page(
+                    base_phys + (i * crate::mm::pmm::PAGE_SIZE) as u64);
+            }
+            let bulk_after = crate::mm::pmm::accounting_snapshot();
+            if bulk_after.drift() != 0 {
+                test_fail!(NAME,
+                    "after freeing the alloc_pages({}) run frame by frame: counter_free={} \
+                     bitmap_free={} (drift {})",
+                    BULK, bulk_after.counter_free, bulk_after.bitmap_free,
+                    bulk_after.drift());
+                return false;
+            }
+            test_println!("  alloc_pages({}) + {} single frees, drift still 0", BULK, BULK);
+        }
+        None => {
+            test_fail!(NAME,
+                "alloc_pages({}) found no contiguous run — cannot exercise the bulk \
+                 counter site",
+                BULK);
+            return false;
+        }
+    }
+
+    // ── Double-free refusals, reported ─────────────────────────────────────
+    // Reported rather than asserted, and deliberately so: the counter is
+    // machine-wide, so a sibling CPU's double free during this case's window
+    // would fail it here and name the wrong code.  A non-zero delta is still a
+    // real defect — the `[PMM/DOUBLE-FREE]` serial line carries the caller RIP
+    // that identifies it, and `kdb heap-stats` exposes the running total as
+    // `.pmm.double_free_refused`.
+    let dbl_after = crate::mm::pmm::pmm_free_already_free_count();
+    test_println!("  double-free refusals: {} total, {} during this case",
+        dbl_after, dbl_after.saturating_sub(dbl_before));
 
     test_pass!(NAME);
     true
