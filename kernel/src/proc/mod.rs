@@ -993,6 +993,105 @@ fn kstack_candidate_ok(base: u64, size: u64, source: &str) -> bool {
     }
 }
 
+/// Emergency kernel-stack floor.  No kernel stack below this size is ever
+/// handed out (see [`alloc_kernel_stack`]).  These emergency stacks have no
+/// guard page, so an overflow does not fault (#PF) — it silently overwrites
+/// the neighbouring allocation and the bottom-of-stack canary, caught only
+/// later by the periodic canary audit in `sched::schedule`, at which point the
+/// machine bugchecks (`STACK_CANARY_CORRUPT`, 0xdead0001).  The measured
+/// worst-case kernel call chain under memory pressure — a userspace demand
+/// page-fault that misses the page cache and drives a file-backed fill through
+/// the block layer (page-fault → page-cache fill → ext2 read → virtio-blk,
+/// each carrying multi-KiB stack buffers) — reaches ~7 KiB, which overflows a
+/// 4 KiB stack outright, is marginal inside 8 KiB, and fits 16 KiB with
+/// comfortable headroom.  Refs: x86_64 SysV ABI §3.4.1 (stack-growth
+/// direction; stack initialised before first use); Intel SDM Vol. 3A §6.2
+/// (stack-fault behaviour).
+const MIN_EMERGENCY_KSTACK_SIZE: u64 = 16 * 1024;
+
+/// Emergency (sub-256-KiB) contiguous kernel-stack tiers, tried in order when
+/// the 256 KiB fast path and the dead-stack cache are both unavailable
+/// (PMM fragmented by the page cache).  The smallest tier is
+/// [`MIN_EMERGENCY_KSTACK_SIZE`]; if it cannot be satisfied, [`alloc_kernel_stack`]
+/// fails closed (returns `None`) rather than offer a smaller, overflow-prone
+/// stack.  Ordered largest-first so the roomiest available tier wins.
+const SMALL_KSTACK_TIERS: &[(usize, u64)] = &[
+    (4, 16 * 1024), // 4 pages × 4 KiB = 16 KiB (overflow-safe floor)
+];
+
+// Compile-time floor guarantee: no emergency tier may drop below the 16 KiB
+// overflow-safe floor.  A future edit that re-introduces an 8 KiB or 4 KiB
+// tier fails the build here rather than silently reopening the
+// STACK_CANARY_CORRUPT overflow window.
+const _: () = {
+    let mut i = 0;
+    while i < SMALL_KSTACK_TIERS.len() {
+        assert!(
+            SMALL_KSTACK_TIERS[i].1 >= MIN_EMERGENCY_KSTACK_SIZE,
+            "emergency kstack tier below the 16 KiB overflow-safe floor",
+        );
+        i += 1;
+    }
+};
+
+/// Walk [`SMALL_KSTACK_TIERS`] largest-first, attempting each tier via
+/// `try_alloc(pages) -> Option<phys>` and validating the resulting base via
+/// `accept(base, span) -> bool` (the #582 alloc-side alias guard).  Returns
+/// the first tier that both allocates and validates, as `(pages, phys, span)`,
+/// or `None` if none can — the fail-closed path.
+///
+/// Because every entry in [`SMALL_KSTACK_TIERS`] is
+/// `>= MIN_EMERGENCY_KSTACK_SIZE` (enforced at compile time above), any tier
+/// this returns is at or above the 16 KiB overflow-safe floor; it can never
+/// hand back a sub-floor stack.  Extracted so the floor + fail-closed contract
+/// are unit-testable with an injected fragmentation model (see
+/// `test_select_emergency_kstack_tier`).
+fn select_emergency_kstack_tier<A, K>(
+    mut try_alloc: A,
+    mut accept: K,
+) -> Option<(usize, u64, u64)>
+where
+    A: FnMut(usize) -> Option<u64>,
+    K: FnMut(u64, u64) -> bool,
+{
+    for &(pages, span_bytes) in SMALL_KSTACK_TIERS {
+        let Some(phys) = try_alloc(pages) else { continue };
+        let base = KERNEL_VIRT_OFFSET + phys;
+        if !accept(base, span_bytes) {
+            // Aliases a live stack (#582 case-B); `accept` quarantined it.
+            continue;
+        }
+        return Some((pages, phys, span_bytes));
+    }
+    None
+}
+
+/// Test-only: the emergency kstack tier table ([`SMALL_KSTACK_TIERS`]).
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_kstack_emergency_tiers() -> &'static [(usize, u64)] {
+    SMALL_KSTACK_TIERS
+}
+
+/// Test-only: the emergency kstack overflow-safe floor
+/// ([`MIN_EMERGENCY_KSTACK_SIZE`]).
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_min_emergency_kstack_size() -> u64 {
+    MIN_EMERGENCY_KSTACK_SIZE
+}
+
+/// Test-only: run the real tier selector ([`select_emergency_kstack_tier`])
+/// against an injected fragmentation model.  `max_pages` is the largest
+/// contiguous run the modelled PMM can satisfy; the alias-guard `accept` is
+/// forced true so the test exercises the floor + fail-closed contract in
+/// isolation.  Returns the selected `(pages, phys, span)` or `None`.
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
+pub fn test_select_emergency_kstack_tier(max_pages: usize) -> Option<(usize, u64, u64)> {
+    select_emergency_kstack_tier(
+        |pages| if pages <= max_pages { Some(0x1000u64 * pages as u64) } else { None },
+        |_base, _span| true,
+    )
+}
+
 fn alloc_kernel_stack() -> Option<(u64, u64)> {
     // Bound the alias-rejection retry loop.  Each rejected candidate is
     // quarantined (removed from circulation), so a bounded number of fresh
@@ -1044,85 +1143,52 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         break;
     }
     // Contiguous 256 KiB allocation failed (PMM fragmented by page cache).
-    // Walk down progressively smaller contiguous tiers before giving up:
-    // 16 KiB (4 pages) → 8 KiB (2 pages) → 4 KiB (1 page).  16 KiB matches
-    // x86_64 SysV ABI §3.4.1 minimum stack frame budgets observed in practice
-    // for short syscall paths and pthread_create(3) rationale (16 KiB is the
-    // smallest size POSIX requires implementations to honour when the caller
-    // does not specify PTHREAD_STACK_MIN explicitly), giving comfortable
-    // headroom over the 4 KiB single-page fallback that PR #392 made honest.
-    //
-    // Empirical motivation: the H1 STACK_CANARY_CORRUPT trial in PR #394 showed
-    // brk() peak push-depth on 4 KiB stacks reaching RSP = (base + small),
-    // where a subsequent `push %reg` writes (RSP - 8) = stack_base and zeroes
-    // the canary.  Widening to 16 KiB / 8 KiB makes that overflow materially
-    // less likely without requiring a full vmalloc-style remap (still tracked
-    // separately).  The bugcheck still fires if any tier overflows; the larger
-    // tier is the mitigation, not the cure.
-    //
-    // Behavioural contract: if every wider tier fails, fall through to the
-    // 4 KiB tier and keep it.  Refusing to spawn a thread is worse than the
-    // residual canary risk (the diagnostic still attributes the failure).
-    const SMALL_KSTACK_TIERS: &[(usize, u64)] = &[
-        (4, 16 * 1024), // tier 4: 4 pages × 4 KiB = 16 KiB
-        (2,  8 * 1024), // tier 2: 2 pages × 4 KiB =  8 KiB
-        (1,  4 * 1024), // tier 1: 1 page  × 4 KiB =  4 KiB (legacy emergency)
-    ];
-    for &(pages, span_bytes) in SMALL_KSTACK_TIERS {
-        let phys_opt = if pages == 1 {
+    // Fall back to the emergency tier at the 16 KiB overflow-safe floor (see
+    // `MIN_EMERGENCY_KSTACK_SIZE` for why 16 KiB and why the former 8 KiB /
+    // 4 KiB last-resort tiers were removed).  If even 16 KiB contiguous is
+    // unavailable, FAIL CLOSED: `select_emergency_kstack_tier` returns `None`,
+    // the `?` propagates it, and the clone/thread-create caller turns it into
+    // -EAGAIN/-ENOMEM for userspace — a per-thread failure the app handles,
+    // strictly better than a silent kernel-stack overflow that bugchecks the
+    // whole machine.  (Guard-paging these stacks so a future overflow faults at
+    // the boundary is tracked separately; it needs a vmalloc-style
+    // non-contiguous mapping.)  Refs: POSIX pthread_create(3), posix_spawn(3)
+    // (EAGAIN/ENOMEM on resource exhaustion).
+    let (pages, phys, span_bytes) = select_emergency_kstack_tier(
+        |pages| if pages == 1 {
             crate::mm::pmm::alloc_page()
         } else {
             crate::mm::pmm::alloc_pages(pages)
-        };
-        let Some(phys) = phys_opt else { continue };
-        let stack_base = KERNEL_VIRT_OFFSET + phys;
-        let stack_top = stack_base + span_bytes;
-        // #582 alloc-side alias guard — run BEFORE the zero-fill below.  If this
+        },
+        // #582 alloc-side alias guard — run BEFORE the zero-fill below.  If an
         // emergency-tier frame aliases a live thread's kernel stack, the
-        // zero-fill `write_bytes(0)` would tear that live owner's saved
-        // switch_context frame (the original case-A signature, `memset+0x39`).
-        // Reject (quarantine) and try the next tier instead of zeroing a live
-        // frame.
-        if !kstack_candidate_ok(stack_base, span_bytes, "pmm-emergency") {
-            continue;
-        }
-        // Defence-in-depth: `pmm::alloc_page`/`alloc_pages` do not zero the
-        // returned frame, so a frame previously occupied by the page cache
-        // (e.g. an evicted libxul `.text` page) can land here with residual
-        // bytes that decode as valid x86-64 instructions occupying the
-        // canary slot at `stack_base`.  PR #418's GDB autopsy reproduced this
-        // across two KVM trials with STABLE residue at +8/+24 (deterministic
-        // page-cache provenance, not stack overflow).  Zero the entire span
-        // before stamping the canary so `write_stack_canary` sees a clean
-        // bottom-of-stack and so any subsequent push reads back zero, not a
-        // stale instruction byte.  Per x86_64 SysV ABI §3.4.1 the kernel
-        // stack must be initialised before first use; this provides that
-        // initialisation at the consumer until `pmm` grows a zeroing variant.
-        // SAFETY: `stack_base` is a freshly allocated, exclusively-owned
-        // higher-half mapping of `span_bytes` contiguous physical bytes.
-        unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, span_bytes as usize); }
-        write_stack_canary(stack_base);
-        // Record in the emergency-stack ring so the canary-corruption
-        // diagnostic in `sched::schedule` retains attribution for every
-        // sub-256-KiB tier (not just 4 KiB).  `was_emergency_kstack` is the
-        // single channel readers use; one ring covers every short tier.
-        record_emergency_kstack(stack_base);
-        crate::serial_println!(
-            "[KSTACK/TIER] base={:#x} size={}K tier={} (PMM fragmented)",
-            stack_base, span_bytes / 1024, pages,
-        );
-        if pages == 1 {
-            // Preserve the legacy attribution line for the 4 KiB tier so
-            // existing log-grep tooling and the PR #391 diagnostic chain
-            // keep firing on the narrowest fallback specifically.
-            crate::serial_println!(
-                "[KSTACK/EMERGENCY] base={:#x} size=4K (PMM fragmented)",
-                stack_base,
-            );
-        }
-        return Some((stack_base, stack_top));
-    }
-    None
+        // zero-fill would tear that live owner's saved switch_context frame
+        // (the original case-A signature, `memset+0x39`).  On rejection the
+        // frame is quarantined and the tier is skipped.
+        |base, span| kstack_candidate_ok(base, span, "pmm-emergency"),
+    )?;
+    let stack_base = KERNEL_VIRT_OFFSET + phys;
+    let stack_top = stack_base + span_bytes;
+    // Defence-in-depth: `pmm::alloc_page`/`alloc_pages` do not zero the
+    // returned frame, so a frame previously occupied by the page cache (e.g. an
+    // evicted libxul `.text` page) can land here with residual bytes that
+    // decode as valid x86-64 instructions occupying the canary slot at
+    // `stack_base`.  Zero the entire span before stamping the canary so
+    // `write_stack_canary` sees a clean bottom-of-stack and any subsequent push
+    // reads back zero, not a stale instruction byte.  Per x86_64 SysV ABI
+    // §3.4.1 the kernel stack must be initialised before first use.
+    // SAFETY: `stack_base` is a freshly allocated, exclusively-owned higher-half
+    // mapping of `span_bytes` contiguous physical bytes.
+    unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, span_bytes as usize); }
+    write_stack_canary(stack_base);
+    // Record in the emergency-stack ring so the canary-corruption diagnostic in
+    // `sched::schedule` retains attribution for the emergency tier.
+    record_emergency_kstack(stack_base);
+    crate::serial_println!(
+        "[KSTACK/TIER] base={:#x} size={}K pages={} (PMM fragmented — emergency floor)",
+        stack_base, span_bytes / 1024, pages,
+    );
+    Some((stack_base, stack_top))
 }
 
 /// Emit a one-shot diagnostic line if `stack_base` was just handed out from
@@ -1228,21 +1294,21 @@ pub fn current_kernel_rsp_live() -> u64 {
 
 // ── Emergency-stack-fallback recorder ────────────────────────────────────
 //
-// When `alloc_kernel_stack` falls back from the normal 256 KiB path to any
-// of the smaller emergency tiers (16 KiB / 8 KiB / 4 KiB — see
-// `SMALL_KSTACK_TIERS`), callers stamp the honest span into
-// `Thread.kernel_stack_size` (PR #392, kstack-size honesty).  That span
-// alone, however, doesn't say *why* a thread is on a short stack — a
+// When `alloc_kernel_stack` falls back from the normal 256 KiB path to the
+// 16 KiB emergency tier (see `SMALL_KSTACK_TIERS`), callers stamp the honest
+// span into `Thread.kernel_stack_size` (PR #392, kstack-size honesty).  That
+// span alone, however, doesn't say *why* a thread is on a short stack — a
 // future allocator might return 16 KiB for reasons other than emergency
 // fallback.  This diagnostic-only ring complements the now-honest in-
 // Thread span by attributing the emergency origin even after a stack base
 // is later reused: if the same base reappears within the ring's 16-entry
 // window, the canary-corruption diagnostic in `sched::schedule` can still
 // answer "was this thread on an emergency-tier stack?" rather than
-// "merely on a short stack".  All sub-256-KiB tiers are recorded; the
-// `was_emergency_4k` label on the `[KSTACK/CANARY-FAIL]` line is retained
-// for backward-compat but now means "any emergency-tier base", with the
-// observed `size` field disambiguating which tier.
+// "merely on a short stack".  The `was_emergency_4k` label on the
+// `[KSTACK/CANARY-FAIL]` line is retained for backward-compat but now means
+// "an emergency-tier base" (the sole tier is 16 KiB; the sub-16-KiB tiers
+// that made the label literal were removed when the overflow floor was
+// raised).
 //
 // Lock-free SPSC-ish ring; the writer is the alloc path (one writer at a
 // time under PMM_LOCK), the readers are diagnostic emitters that tolerate
@@ -1252,8 +1318,8 @@ static EMERGENCY_KSTACK_RING: [AtomicU64; EMERGENCY_KSTACK_RING_LEN] =
     [const { AtomicU64::new(0) }; EMERGENCY_KSTACK_RING_LEN];
 static EMERGENCY_KSTACK_HEAD: AtomicU64 = AtomicU64::new(0);
 
-/// Record that `stack_base` was just handed out from the 4 KiB
-/// emergency-fallback path.  Called from `alloc_kernel_stack`.
+/// Record that `stack_base` was just handed out from the emergency-fallback
+/// path (the 16 KiB tier).  Called from `alloc_kernel_stack`.
 ///
 /// Visibility is `pub(crate)` — the single legitimate caller is the
 /// fallback arm of `alloc_kernel_stack` within this module; the
@@ -1267,7 +1333,8 @@ pub(crate) fn record_emergency_kstack(stack_base: u64) {
 }
 
 /// Return true iff `stack_base` matches a recently-recorded emergency
-/// 4 KiB fallback base.  Best-effort: the ring holds the last 16 entries.
+/// (16 KiB tier) fallback base.  Best-effort: the ring holds the last 16
+/// entries.
 pub fn was_emergency_kstack(stack_base: u64) -> bool {
     if stack_base == 0 { return false; }
     for i in 0..EMERGENCY_KSTACK_RING_LEN {
