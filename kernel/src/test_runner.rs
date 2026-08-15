@@ -1495,6 +1495,8 @@ pub fn run() -> ! {
         total += 1;
         if test_656_alloc_side_alias_guard() { passed += 1; }
         total += 1;
+        if test_755_kstack_emergency_floor_16k() { passed += 1; }
+        total += 1;
         if test_657_percpu_idle_work_steal() { passed += 1; }
         total += 1;
         if test_707_load_balance() { passed += 1; }
@@ -54941,8 +54943,9 @@ cross-CPU reschedule-poke wiring correct GREEN");
 /// `mirror_maintain`'s gated cross-check built a throwaway
 /// `[PerCpuRq; MAX_CPUS]` ON THE STACK.  A `PerCpuRq` carries a 32-level FIFO
 /// array, so the full image is ~16 KiB — larger than every emergency kstack
-/// tier (`proc::alloc_kernel_stack`'s 4 / 8 / 16 KiB PMM-fragmented
-/// fallbacks).  When `schedule()` ran on such a stack the audit array
+/// tier (`proc::alloc_kernel_stack`'s 16 KiB PMM-fragmented fallback; the
+/// former 8 KiB / 4 KiB tiers were removed when the overflow floor was raised).
+/// When `schedule()` ran on such a stack the audit array
 /// overflowed it and overwrote the running thread's saved `switch_context`
 /// frame, tearing the saved RFLAGS slot (observed TF=1 → single-step → `#DB`).
 ///
@@ -55318,6 +55321,99 @@ fn test_656_alloc_side_alias_guard() -> bool {
                 test_println!("  F: exact-span alias → flagged tid=1 (ok)");
             }
             other => { test_fail!(NAME, "F: exact-span alias not flagged correctly: {:?}", other); return false; }
+        }
+    }
+
+    test_pass!(NAME);
+    true
+}
+
+// ── Test 755: emergency kstack 16 KiB floor + fail-closed ────────────────────
+//
+// Regression guard for STACK_CANARY_CORRUPT (0xdead0001), a kernel-stack
+// OVERFLOW.  Under FF-GUI memory pressure the PMM cannot satisfy a 256 KiB
+// contiguous kstack, so `alloc_kernel_stack` falls to an emergency contiguous
+// tier.  The former last-resort tiers (8 KiB, 4 KiB) have no guard page and no
+// room for the ~7 KiB worst-case kernel call chain (demand page-fault →
+// page-cache fill → ext2 read → virtio-blk): a thread that landed on the 4 KiB
+// tier overflowed its base + canary silently, bugchecking the machine when the
+// periodic canary audit later noticed.  The fix raises the emergency floor to
+// 16 KiB and FAILS CLOSED (ENOMEM → -EAGAIN to pthread_create/posix_spawn) when
+// even 16 KiB contiguous is unavailable — a per-thread failure the app handles,
+// never a machine-wide bugcheck.  This test pins both halves of the contract
+// against the exact tier table + selector the kernel uses (`SMALL_KSTACK_TIERS`
+// / `select_emergency_kstack_tier`), with an injected fragmentation model so no
+// live PMM state is mutated.  Cite x86_64 SysV ABI §3.4.1 (stack-growth
+// direction), Intel SDM Vol. 3A §6.2 (stack-fault behaviour), and POSIX
+// pthread_create(3)/posix_spawn(3) (EAGAIN/ENOMEM on resource exhaustion).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_755_kstack_emergency_floor_16k() -> bool {
+    const NAME: &str = "[MM/KSTACK] emergency floor 16 KiB + fail-closed (Test 755)";
+    test_header!(NAME);
+
+    let floor = crate::proc::test_min_emergency_kstack_size();
+    let tiers = crate::proc::test_kstack_emergency_tiers();
+    test_println!("  floor={} B tiers={:?}", floor, tiers);
+
+    // (1) The overflow-safe floor is exactly 16 KiB.
+    if floor != 16 * 1024 {
+        test_fail!(NAME, "emergency floor {} != 16384", floor);
+        return false;
+    }
+    // (2) The tier table is non-empty and NO tier is below the floor — in
+    //     particular the 8 KiB and 4 KiB tiers must be gone.  (A compile-time
+    //     assertion in proc/mod.rs also guarantees this, but pin it at runtime
+    //     so a stale table is caught even if the assertion is ever weakened.)
+    if tiers.is_empty() {
+        test_fail!(NAME, "emergency tier table is empty");
+        return false;
+    }
+    for &(pages, span) in tiers {
+        if span < floor {
+            test_fail!(NAME, "tier {}pg span {} below the 16 KiB floor", pages, span);
+            return false;
+        }
+        if span == 4 * 1024 || span == 8 * 1024 {
+            test_fail!(NAME, "sub-floor tier {} B re-introduced (overflow hazard)", span);
+            return false;
+        }
+    }
+    test_println!("  (1,2) floor=16 KiB, no sub-floor tier ✓");
+
+    // (3) Fail-closed selection.  Model a fragmented PMM that can only satisfy
+    //     contiguous runs up to `max_pages`; assert the real selector never
+    //     hands back a stack when fewer than 4 (16 KiB) contiguous pages are
+    //     available.  The OLD allocator returned a 4 KiB stack for max_pages==1
+    //     — the exact overflow that bugchecked the machine.
+    for max_pages in 1..=3usize {
+        if crate::proc::test_select_emergency_kstack_tier(max_pages).is_some() {
+            test_fail!(NAME,
+                "selector handed out a stack with only {} contiguous page(s) available \
+                 — must fail closed below the 4-page (16 KiB) floor", max_pages);
+            return false;
+        }
+    }
+    test_println!("  (3) 1..=3 contiguous pages → fail closed (None) ✓");
+
+    // (4) When 4+ contiguous pages ARE available, the selector returns the
+    //     16 KiB floor tier (never smaller), for a fragmented and an ample PMM.
+    for max_pages in [4usize, 8, 64] {
+        match crate::proc::test_select_emergency_kstack_tier(max_pages) {
+            Some((pages, _phys, span)) => {
+                if span < floor {
+                    test_fail!(NAME, "max_pages={} selected span {} below floor",
+                        max_pages, span);
+                    return false;
+                }
+                test_println!("    max_pages={} → {} KiB tier ({}pg) ✓",
+                    max_pages, span / 1024, pages);
+            }
+            None => {
+                test_fail!(NAME,
+                    "selector failed to pick the 16 KiB tier with {} pages available",
+                    max_pages);
+                return false;
+            }
         }
     }
 
