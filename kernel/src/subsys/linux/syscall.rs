@@ -9823,11 +9823,20 @@ pub fn sys_futex_linux(
 ) -> i64 {
     const FUTEX_PRIVATE_FLAG:   u64 = 0x80;
     const FUTEX_CLOCK_REALTIME: u64 = 0x100;
-    let _ = FUTEX_PRIVATE_FLAG; // documented for clarity; no behavioural use
 
     let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
     let abs_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
     let pid = crate::proc::current_pid_lockless();
+
+    // Per futex(2): FUTEX_PRIVATE_FLAG selects the wait-queue *key* namespace.
+    // Private ops key by `(pid, uaddr)` (one mm per pid — the hot intra-process
+    // path).  A shared op (flag clear) on a genuine MAP_SHARED page keys by the
+    // physical identity of the word, so a waiter and a waker in two different
+    // address spaces — which is the ONLY way a shared futex is ever contended —
+    // land in the same bucket instead of two disjoint `(pid, uaddr)` keys whose
+    // wake would reach nobody.  `crate::syscall::futex_key` computes this once
+    // per op below; the flag is resolved here so every arm agrees.
+    let private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
 
     // Read the timespec at `timeout_ptr` (NULL means "no timeout") and convert
     // it to a *relative* nanosecond duration that the rest of the handler can
@@ -10021,8 +10030,17 @@ pub fn sys_futex_linux(
             // FUTEX_WAITERS until we have both registered as a waiter and
             // transitioned to Blocked, so it cannot return `woken=0` while
             // we're still mid-registration.
+            //
+            // Compute the wait-queue key ONCE, before the FUTEX_WAITERS
+            // critical section: for a shared op this walks the caller's page
+            // tables under a PROCESS_TABLE snapshot (released here, before
+            // FUTEX_WAITERS is taken — leaving the FUTEX_WAITERS → THREAD_TABLE
+            // order intact).  The same `wait_key` is reused by the post-wake
+            // cleanup below so a waiter always dequeues from the exact bucket it
+            // enqueued in.
+            let wait_key = crate::syscall::futex_key(private, pid, uaddr);
             match crate::syscall::futex_wait_check_and_enqueue(
-                pid, uaddr, val, tid, wake_tick,
+                wait_key, val, tid, wake_tick,
                 || unsafe { crate::syscall::user_read_u32_or_kdispatch(uaddr) },
             ) {
                 crate::syscall::FutexWaitOutcome::Enqueued     => {}
@@ -10092,7 +10110,10 @@ pub fn sys_futex_linux(
                 // requeue insert).  `take`-style: remove it so the map does
                 // not leak across this waiter's lifetime.
                 let dest = crate::syscall::FUTEX_REQUEUE_DEST.lock().remove(&(pid, tid));
-                let key = (pid, dest.unwrap_or(uaddr));
+                // `dest` is already a full FutexKey (the requeue destination
+                // bucket, private or shared); absent a requeue we dequeue from
+                // the exact key we enqueued under.
+                let key = dest.unwrap_or(wait_key);
                 if let Some(list) = waiters.get_mut(&key) {
                     let before = list.len();
                     list.retain(|&t| t != tid);
@@ -10133,6 +10154,27 @@ pub fn sys_futex_linux(
             let max_wake = if val == 0 { u64::MAX } else { val };
             let mut woken = 0u64;
 
+            // Resolve the wait-queue key once (private `(pid, uaddr)` or the
+            // shared `(FUTEX_SHARED_NS, phys)` — computed before FUTEX_WAITERS
+            // is taken, so no mm lock nests inside it).  A cross-process wake
+            // now hits the same bucket the cross-process waiter registered in.
+            let wake_key = crate::syscall::futex_key(private, pid, uaddr);
+            // Whether this wake landed in the PRIVATE namespace — true for a
+            // genuine private op AND for a shared-flagged op that fell back to
+            // the private key (non-MAP_SHARED / unfaulted word).  The same-pid
+            // cluster compensation and the `(pid, _)`-slice ghost diagnostics
+            // below apply to that namespace only; a genuine shared key
+            // `(FUTEX_SHARED_NS, phys)` skips them (its exact-key match is
+            // already correct and a pid-slice scan would be meaningless).  This
+            // is the correct gate rather than the raw private flag, so the
+            // synthetic-address ghost tests (op without the flag, falling back
+            // to a private key) keep exercising the diagnostics.
+            let key_is_private = wake_key.0 != crate::syscall::FUTEX_SHARED_NS;
+            // Read unconditionally: the only consumers are the feature-gated
+            // compensation/diagnostic blocks below, so a bare build would
+            // otherwise flag it unused.
+            let _ = key_is_private;
+
             // Diagnostic: log every WAKE *attempt* on entry, even ones that
             // match nothing.  Combined with [FUTEX_WAKE] (post-match) and
             // [FUTEX_WAIT_REG] (registration), this lets the harness diff
@@ -10152,57 +10194,20 @@ pub fn sys_futex_linux(
                 );
             }
 
-            let tids_to_wake: Vec<u64> = {
-                let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
-                    let mut result = Vec::new();
-                    while !list.is_empty() && woken < max_wake {
-                        result.push(list.remove(0));
-                        woken += 1;
-                    }
-                    if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
-                    }
-                    result
-                } else {
-                    Vec::new()
-                }
-            };
-
+            // Wake up to `max_wake` LIVE Blocked waiters on `wake_key`.  A stale
+            // Dead TID — e.g. a process OOM-killed while parked on this shared
+            // futex before its bucket was drained — is discarded WITHOUT spending
+            // a wake slot, so a `nr=1` shared wake still reaches the live waiter
+            // behind it (the F1 lost-wake guard).  The pop, liveness check, and
+            // `Blocked → Ready` transition run under one FUTEX_WAITERS →
+            // THREAD_TABLE critical section, and the woken thread gets the
+            // wake-preemption boost + a reschedule if it out-ranks the waker.
             {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                let cur_tid = crate::proc::current_tid();
-                let cur_prio = threads
-                    .iter()
-                    .find(|th| th.tid == cur_tid)
-                    .map(|th| th.priority)
-                    .unwrap_or(0);
-                let mut max_woken_prio = 0u8;
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                            // Wake-preemption: a futex waiter returning from a
-                            // sleep has not spent the CPU; boost it so it runs
-                            // ahead of continuously-runnable peers for its next
-                            // scheduling decision. See `proc::apply_wake_boost`.
-                            crate::proc::apply_wake_boost(th);
-                            max_woken_prio = max_woken_prio.max(th.priority);
-                        }
-                    }
-                }
-                drop(threads);
-                // resched_curr equivalent: if a woken thread now out-ranks the
-                // waker, request a reschedule so it preempts at syscall return
-                // rather than waiting out the waker's whole time slice. Without
-                // this the boost only changes *which* thread the picker prefers
-                // at the next natural switch — the waker can still run all the
-                // way to its own next block first. (POSIX sched(7): a wakeup may
-                // preempt the running task.)
-                if max_woken_prio > cur_prio {
-                    crate::sched::request_reschedule();
-                }
+                let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+                let woken_tids = crate::syscall::futex_wake_bucket_live(
+                    &mut waiters, wake_key, max_wake, crate::proc::current_tid(),
+                );
+                woken = woken_tids.len() as u64;
             }
 
             // Diagnostic: every FUTEX_WAKE is a candidate root cause for a
@@ -10232,8 +10237,12 @@ pub fn sys_futex_linux(
             // the userspace producer signalled the wrong field of a
             // composite cond-var (musl `pthread_cond_t._c_seq` vs
             // `_c_waiters`, public layout in the musl source).
+            // Private wakes only: the empty-wake key-landscape diagnostic scans
+            // this pid's `(pid, _)` slice, which is meaningless for a shared
+            // wake (its waiter sits in the pid-independent shared namespace and
+            // the exact-key match above already reached it).
             #[cfg(feature = "firefox-test-trace")]
-            if woken == 0 {
+            if woken == 0 && key_is_private {
                 crate::subsys::linux::futex_key_diag::emit_wake_empty(
                     pid, crate::proc::current_tid(), uaddr, futex_op,
                 );
@@ -10270,8 +10279,14 @@ pub fn sys_futex_linux(
             // `firefox-test`, OFF in stock builds) and behind the same
             // feature gates as the GHOST diagnostic above.  See
             // `subsys/linux/futex_cluster.rs` for the full algorithm.
+            // PRIVATE wakes only.  The cluster compensation is a same-pid glibc
+            // BZ-25847 workaround that scans this pid's `(pid, uaddr±window)`
+            // slice; running it for a SHARED wake would (a) scan the wrong
+            // namespace and (b) risk spuriously waking an unrelated private
+            // waiter within ±128 bytes.  A shared wake needs no compensation:
+            // the physical-identity key makes the exact-key match correct.
             #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
-            let extra_woken = if woken == 0 && (op == 1 || op == 10) {
+            let extra_woken = if woken == 0 && (op == 1 || op == 10) && key_is_private {
                 crate::subsys::linux::futex_cluster::compensate(
                     pid, crate::proc::current_tid(), uaddr, max_wake,
                 )
@@ -10316,7 +10331,7 @@ pub fn sys_futex_linux(
             // behaviour so Test 238 (which asserts FUTEX_WAKE_GHOST_COUNT
             // advances) is unchanged.
             #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
-            if woken == 0 && (op == 1 || op == 10) {
+            if woken == 0 && (op == 1 || op == 10) && key_is_private {
                 const FUTEX_GHOST_CLUSTER: u64 = 256;
                 let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
                 let cluster_hi = cluster_lo + FUTEX_GHOST_CLUSTER;
@@ -10356,7 +10371,7 @@ pub fn sys_futex_linux(
             // `firefox-test-core` boot pays no per-wake counter/correlation
             // cost; `test-mode` keeps it so Test 240 is unchanged.
             #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
-            if op == 1 || op == 10 {
+            if (op == 1 || op == 10) && key_is_private {
                 ghost_hist::GHOST_HIST_TOTAL_WAKES
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if woken == 0 {
@@ -10409,26 +10424,55 @@ pub fn sys_futex_linux(
             let mut woken = 0u64;
             let mut requeued = 0u64;
 
+            // Source and destination wait-queue keys, resolved once before the
+            // FUTEX_WAITERS critical section (a shared op walks page tables under
+            // PROCESS_TABLE here, never nested inside FUTEX_WAITERS).  A shared
+            // requeue moves waiters between two physical-identity buckets; the
+            // recorded destination is the full `dst_key`, so a requeued waiter's
+            // own timeout cleanup scans the bucket it actually sits in.
+            let src_key = crate::syscall::futex_key(private, pid, uaddr);
+            let dst_key = crate::syscall::futex_key(private, pid, uaddr2);
+
             let tids_to_wake: Vec<u64>;
             let tids_to_requeue: Vec<u64>;
 
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                let src = waiters.remove(&(pid, uaddr)).unwrap_or_default();
+                let src = waiters.remove(&src_key).unwrap_or_default();
                 let mut wake_list = Vec::new();
                 let mut requeue_list = Vec::new();
-                for tid in src {
-                    if woken < max_wake {
-                        wake_list.push(tid);
-                        woken += 1;
-                    } else if requeued < max_requeue {
-                        requeue_list.push(tid);
-                        requeued += 1;
+                {
+                    // F1 liveness gate on the WAKE budget only: a wake slot goes
+                    // only to a live Blocked waiter, so a stale Dead TID (e.g. an
+                    // OOM-killed process's waiter left in a shared bucket) is
+                    // dropped WITHOUT spending a wake slot — the wake reaches the
+                    // live cross-process waiter behind it.  The requeue-MOVE
+                    // relocates the still-parked waiter to uaddr2 regardless: a
+                    // stale entry there is harmless (drained on exit / discarded
+                    // by a later live-wake), and gating it would wrongly drop a
+                    // waiter the caller asked to move.  Lock order:
+                    // FUTEX_WAITERS → THREAD_TABLE.
+                    let threads = crate::proc::THREAD_TABLE.lock();
+                    for tid in src {
+                        if woken < max_wake {
+                            let live_blocked = threads.iter().any(|th| {
+                                th.tid == tid
+                                    && th.state == crate::proc::ThreadState::Blocked
+                            });
+                            if live_blocked {
+                                wake_list.push(tid);
+                                woken += 1;
+                            }
+                            // else: drop the Dead wake candidate, spend no budget.
+                        } else if requeued < max_requeue {
+                            requeue_list.push(tid);
+                            requeued += 1;
+                        }
                     }
                 }
                 // Requeue surviving waiters to uaddr2.
                 if !requeue_list.is_empty() {
-                    waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
+                    waiters.entry(dst_key).or_insert_with(Vec::new).extend(requeue_list.iter());
                     // Record each requeued TID's new destination key so its
                     // own FUTEX_WAIT post-`schedule()` cleanup scans the
                     // bucket it now sits in `(pid, uaddr2)` rather than its
@@ -10440,7 +10484,7 @@ pub fn sys_futex_linux(
                     // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order.
                     let mut dest = crate::syscall::FUTEX_REQUEUE_DEST.lock();
                     for &tid in &requeue_list {
-                        dest.insert((pid, tid), uaddr2);
+                        dest.insert((pid, tid), dst_key);
                     }
                 }
                 tids_to_wake = wake_list;
@@ -10519,6 +10563,13 @@ pub fn sys_futex_linux(
                 oparg = 1i32 << (oparg & 31);
             }
 
+            // Resolve both wake-target keys before the FUTEX_WAITERS critical
+            // section (a shared op walks page tables under PROCESS_TABLE here,
+            // never nested inside FUTEX_WAITERS), so a WAKE_OP that names a
+            // PROCESS_SHARED word reaches its cross-process waiters too.
+            let wake1_key = crate::syscall::futex_key(private, pid, uaddr);
+            let wake2_key = crate::syscall::futex_key(private, pid, uaddr2);
+
             // ── Atomic modify of *uaddr2, capturing the old value ─────────
             // Read-modify-write is serialised by the FUTEX_WAITERS lock held
             // across the whole op: every wake-class futex op takes it, so no
@@ -10546,17 +10597,15 @@ pub fn sys_futex_linux(
                 return -14; // EFAULT — *uaddr2 unwritable
             }
 
-            // ── Wake up to `val` waiters on uaddr ─────────────────────────
+            // ── Wake up to `val` LIVE waiters on uaddr ────────────────────
+            // Same F1 liveness guard as FUTEX_WAKE: a stale Dead TID in the
+            // bucket is discarded without spending a wake slot (each helper call
+            // holds FUTEX_WAITERS → THREAD_TABLE and does the Blocked→Ready flip).
+            let cur_tid = crate::proc::current_tid();
             let max_wake1 = if val == 0 { u64::MAX } else { val };
-            let mut tids_to_wake: Vec<u64> = Vec::new();
-            if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
-                let mut n = 0u64;
-                while !list.is_empty() && n < max_wake1 {
-                    tids_to_wake.push(list.remove(0));
-                    n += 1;
-                }
-                if list.is_empty() { waiters.remove(&(pid, uaddr)); }
-            }
+            let mut tids_to_wake: Vec<u64> = crate::syscall::futex_wake_bucket_live(
+                &mut waiters, wake1_key, max_wake1, cur_tid,
+            );
 
             // ── Evaluate CMP(oldval, cmparg); if true wake uaddr2 too ─────
             let cmp_true = match cmp_field {
@@ -10570,44 +10619,12 @@ pub fn sys_futex_linux(
             };
             if cmp_true {
                 let max_wake2 = if val2 == 0 { u64::MAX } else { val2 };
-                if let Some(list) = waiters.get_mut(&(pid, uaddr2)) {
-                    let mut n = 0u64;
-                    while !list.is_empty() && n < max_wake2 {
-                        tids_to_wake.push(list.remove(0));
-                        n += 1;
-                    }
-                    if list.is_empty() { waiters.remove(&(pid, uaddr2)); }
-                }
+                let woken2 = crate::syscall::futex_wake_bucket_live(
+                    &mut waiters, wake2_key, max_wake2, cur_tid,
+                );
+                tids_to_wake.extend(woken2);
             }
             drop(waiters);
-
-            // Flip every drained TID Blocked → Ready under one THREAD_TABLE
-            // acquisition (same post-drain pattern as FUTEX_WAKE).
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                let cur_tid = crate::proc::current_tid();
-                let cur_prio = threads
-                    .iter()
-                    .find(|th| th.tid == cur_tid)
-                    .map(|th| th.priority)
-                    .unwrap_or(0);
-                let mut max_woken_prio = 0u8;
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                            // Wake-preemption boost (see `proc::apply_wake_boost`).
-                            crate::proc::apply_wake_boost(th);
-                            max_woken_prio = max_woken_prio.max(th.priority);
-                        }
-                    }
-                }
-                drop(threads);
-                if max_woken_prio > cur_prio {
-                    crate::sched::request_reschedule();
-                }
-            }
 
             tids_to_wake.len() as i64
         }

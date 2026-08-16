@@ -4422,6 +4422,12 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
     struct WaiterRow { tid: u64, uaddr: u64, delta: i64 }
     let lo = addr.saturating_sub(half);
     let hi = addr.saturating_add(half);
+    // Resolve `addr`'s physical identity in the target pid's address space
+    // BEFORE taking FUTEX_WAITERS, so the shared-namespace scan below adds no
+    // lock nesting (get_process_cr3 takes PROCESS_TABLE; keeping it outside the
+    // FUTEX_WAITERS guard leaves the lock graph unchanged).
+    let center_phys: Option<u64> = crate::proc::get_process_cr3(pid)
+        .and_then(|cr3| crate::mm::vmm::virt_to_phys_in(cr3, addr));
     let mut waiters_busy = false;
     let mut waiter_rows: Vec<WaiterRow> = Vec::new();
     match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
@@ -4437,6 +4443,31 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
                     if waiter_rows.len() >= 64 { break; }
                 }
                 if waiter_rows.len() >= 64 { break; }
+            }
+            // PROCESS_SHARED waiters live in the pid-independent
+            // `(FUTEX_SHARED_NS, phys)` namespace, not the `(pid, uaddr)` slice
+            // scanned above.  Surface any waiter parked on `addr`'s physical
+            // frame so a cross-process shared-futex wedge reports its real
+            // waiter instead of appearing empty.  The `uaddr` column carries the
+            // physical address for these rows (delta is in phys space).
+            if let Some(cphys) = center_phys {
+                let plo = cphys.saturating_sub(half);
+                let phi = cphys.saturating_add(half);
+                for (&(ns, wphys), tids) in
+                    w.range((crate::syscall::FUTEX_SHARED_NS, plo)
+                            ..=(crate::syscall::FUTEX_SHARED_NS, phi))
+                {
+                    if ns != crate::syscall::FUTEX_SHARED_NS { continue; }
+                    if tids.is_empty() { continue; }
+                    if waiter_rows.len() >= 64 { break; }
+                    for &tid in tids.iter() {
+                        waiter_rows.push(WaiterRow {
+                            tid, uaddr: wphys,
+                            delta: wphys as i64 - cphys as i64,
+                        });
+                        if waiter_rows.len() >= 64 { break; }
+                    }
+                }
             }
         }
         None => waiters_busy = true,

@@ -858,6 +858,14 @@ pub fn run() -> ! {
     total += 1;
     if test_futex_requeue_dest_tracking() { passed += 1; }
 
+    // ── cross-mm PROCESS_SHARED futex wake (physical-identity key) ────────
+    total += 1;
+    if test_futex_shared_crossmm_wake() { passed += 1; }
+
+    // ── shared-futex Dead-skip wake budget + shared-bucket drain (F1) ─────
+    total += 1;
+    if test_futex_shared_dead_skip_and_drain() { passed += 1; }
+
     // ── Test 53: AF_UNIX socketpair + write/read ──────────────────────────
 
     total += 1;
@@ -16810,15 +16818,18 @@ fn test_futex_requeue_dest_tracking() -> bool {
     test_println!("  waiter moved uaddr1→uaddr2 ✓");
 
     // Step 3b: the destination must be recorded so the WAIT cleanup scans uaddr2.
+    // The recorded value is the full destination FutexKey.  These are kernel
+    // stack words (not MAP_SHARED user pages), so the non-private op falls back
+    // to the private key `(pid, a2)` — exactly what the WAIT cleanup expects.
     let recorded = FUTEX_REQUEUE_DEST.lock().get(&(pid, fake_tid)).copied();
-    if recorded != Some(a2) {
+    if recorded != Some((pid, a2)) {
         FUTEX_WAITERS.lock().remove(&(pid, a2));
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
-            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x})", recorded, a2);
+            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x?})", recorded, (pid, a2));
         return false;
     }
-    test_println!("  destination recorded: (pid,tid)→uaddr2 ✓ (gap #3)");
+    test_println!("  destination recorded: (pid,tid)→dst_key ✓ (gap #3)");
 
     // Step 4: replay the WAIT-branch timeout cleanup's bucket selection EXACTLY:
     //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(uaddr1)
@@ -16828,7 +16839,9 @@ fn test_futex_requeue_dest_tracking() -> bool {
     {
         let mut waiters = FUTEX_WAITERS.lock();
         let dest = FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
-        let key = (pid, dest.unwrap_or(a1));
+        // `dest` is already a full FutexKey; absent a requeue we would fall back
+        // to the original wait key `(pid, a1)`.
+        let key = dest.unwrap_or((pid, a1));
         if let Some(list) = waiters.get_mut(&key) {
             let before = list.len();
             list.retain(|&t| t != fake_tid);
@@ -16860,6 +16873,368 @@ fn test_futex_requeue_dest_tracking() -> bool {
     test_println!("  timeout cleanup removed the orphan from uaddr2, no leak ✓");
 
     test_pass!("futex REQUEUE destination tracking");
+    true
+}
+
+// ── Cross-mm PROCESS_SHARED futex wake (physical-identity key) ────────────────
+//
+// A PROCESS_SHARED futex (FUTEX_PRIVATE_FLAG clear) is contended only across a
+// process boundary, and the two processes sharing the word have distinct mms
+// that may map it at different virtual addresses.  Per futex(2), such a futex
+// MUST be keyed by the PHYSICAL identity of the word, not by (pid, uaddr):
+// otherwise the waiter (registered from process A at VA_a) and the waker
+// (issuing from process B at VA_b) compute different keys and the wake reaches
+// nobody — a permanent lost wake (the frozen cross-process wedge).
+//
+// A single-threaded test cannot park a real thread mid-WAIT across two live
+// mms, so this drives the invariant at the wait-queue level: a waiter is parked
+// under the shared key for physical frame P — the key the post-fix WAIT path
+// computes for (PID_A, VA_A) — and we show that
+//   (1) the OLD cross-process key (PID_B, VA_B) MISSES it (the dropped wake),
+//   (2) the shared key for the SAME P — what the post-fix WAKE path computes
+//       for (PID_B, VA_B) — HITS it, drains it, and flips it Blocked→Ready.
+// Pre-fix there was no shared namespace and the wake keyed (PID_B, VA_B), so
+// step (1) is precisely the bug and step (2) is the fix.  A regression that
+// reintroduced pid/uaddr into the shared key would make A's and B's keys
+// diverge and this test would fail at step (2).
+//
+// Ref: futex(2) "Private futexes"; POSIX.1-2017 pthread_mutexattr_getpshared.
+fn test_futex_shared_crossmm_wake() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, futex_shared_key_from_phys};
+    test_header!("cross-mm PROCESS_SHARED futex wake (physical-identity key)");
+
+    // Two DIFFERENT processes mapping ONE shared frame P at DIFFERENT VAs.
+    const PID_A:      u64 = 0x5EED_0A01;
+    const PID_B:      u64 = 0x5EED_0B02;      // != PID_A
+    const VA_A:       u64 = 0x7F00_1111_0000;
+    const VA_B:       u64 = 0x7F00_2222_0000; // != VA_A
+    const PHYS_P:     u64 = 0x0000_0003_ABCD_E000 | 0x40; // frame | in-page off
+    const WAITER_TID: u64 = 0x5EED_7777;
+
+    // The private cross-process keys genuinely differ — this is exactly why the
+    // historical (pid, uaddr) key dropped the cross-mm wake.
+    if (PID_A, VA_A) == (PID_B, VA_B) {
+        test_fail!("futex_shared_crossmm",
+            "test constants broken: cross-process private keys are equal");
+        return false;
+    }
+
+    // The shared key depends ONLY on the physical word, so A's and B's keys
+    // agree — the property the whole fix rests on.
+    let key_from_a = futex_shared_key_from_phys(PHYS_P);
+    let key_from_b = futex_shared_key_from_phys(PHYS_P);
+    if key_from_a != key_from_b {
+        test_fail!("futex_shared_crossmm",
+            "shared key not physical-identity-stable: A={:#x?} B={:#x?}",
+            key_from_a, key_from_b);
+        return false;
+    }
+    test_println!("  shared key stable on phys P: {:#x?} (pid/VA-independent) ✓", key_from_a);
+
+    // Defence-in-depth: bail if the synthetic ids collide with live rows.
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.tid == WAITER_TID || t.pid == PID_A) {
+            test_fail!("futex_shared_crossmm",
+                "synthetic PID/TID collides with a live THREAD_TABLE row");
+            return false;
+        }
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_from_a);
+        w.remove(&(PID_B, VA_B));
+    }
+
+    // Serialize against the picker while a synthetic Blocked row is live
+    // (identical discipline to the CLEARTID lethal-signal wake test).
+    crate::hal::disable_interrupts();
+    let sched_was_active = crate::sched::is_active();
+    if sched_was_active { crate::sched::disable(); }
+
+    // Synthetic Blocked waiter row (fields per proc::Thread; Blocked + an
+    // impossible affinity so the picker never dispatches it).
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.push(crate::proc::Thread {
+            tid: WAITER_TID,
+            pid: PID_A,
+            state: crate::proc::ThreadState::Blocked,
+            context: alloc::boxed::Box::new(crate::proc::CpuContext::default()),
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+            wake_tick: u64::MAX - 2,
+            name: [0u8; 32],
+            exit_code: 0,
+            fpu_state: None,
+            user_entry_rip: 0,
+            user_entry_rsp: 0,
+            user_entry_rdx: 0,
+            user_entry_r8: 0,
+            priority: 0,
+            base_priority: 0,
+            tls_base: 0,
+            gs_base: 0,
+            cpu_affinity: Some(0xFE),
+            last_cpu: 0,
+            first_run: false,
+            ready_since_tick: 0,
+            mirror_slot: None,
+            ctx_rsp_valid: alloc::boxed::Box::new(
+                core::sync::atomic::AtomicBool::new(true)),
+            clear_child_tid: 0,
+            fork_user_regs: crate::proc::ForkUserRegs::default(),
+            vfork_parent_tid: None,
+            robust_list_head: 0,
+            robust_list_len: 0,
+            vfork_isolated_stack: None,
+            vfork_isolated_tls: None,
+        });
+    }
+
+    // WAIT (process A, VA_A → phys P): register the waiter under the shared key.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.entry(key_from_a).or_insert_with(alloc::vec::Vec::new).push(WAITER_TID);
+    }
+
+    // (1) The historical cross-process key (PID_B, VA_B) MISSES it — the bug.
+    let old_key_hits = FUTEX_WAITERS.lock().contains_key(&(PID_B, VA_B));
+
+    // (2) The shared WAKE from process B (VA_B → phys P) computes the SAME
+    // shared key and drains the waiter — mirroring the production FUTEX_WAKE
+    // arm: get_mut(&wake_key), pop, then flip Blocked→Ready under THREAD_TABLE.
+    let woken: alloc::vec::Vec<u64> = {
+        let mut w = FUTEX_WAITERS.lock();
+        let wake_key = futex_shared_key_from_phys(PHYS_P); // what (PID_B,VA_B) yields
+        let mut out = alloc::vec::Vec::new();
+        if let Some(list) = w.get_mut(&wake_key) {
+            while !list.is_empty() { out.push(list.remove(0)); }
+            if list.is_empty() { w.remove(&wake_key); }
+        }
+        out
+    };
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for &t in &woken {
+            if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
+                if th.state == crate::proc::ThreadState::Blocked {
+                    th.state = crate::proc::ThreadState::Ready;
+                    th.wake_tick = 0;
+                }
+            }
+        }
+    }
+
+    // Snapshot results, then tear the synthetic row down BEFORE re-enabling
+    // interrupts so the picker never sees a Ready synthetic thread.
+    let waiter_state = crate::proc::THREAD_TABLE.lock()
+        .iter().find(|t| t.tid == WAITER_TID).map(|t| t.state);
+    let bucket_drained = !FUTEX_WAITERS.lock().contains_key(&key_from_a);
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for t in threads.iter_mut().filter(|t| t.pid == PID_A) {
+            t.state = crate::proc::ThreadState::Dead;
+        }
+        threads.retain(|t| t.pid != PID_A);
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_from_a);
+        w.remove(&(PID_B, VA_B));
+    }
+    if sched_was_active { crate::sched::enable(); }
+    crate::hal::enable_interrupts();
+
+    // ── Assertions ────────────────────────────────────────────────────────
+    if old_key_hits {
+        test_fail!("futex_shared_crossmm",
+            "historical cross-process key (PID_B, VA_B) unexpectedly present");
+        return false;
+    }
+    test_println!("  old cross-process key (PID_B,VA_B) misses the waiter ✓ (the dropped wake)");
+
+    if woken.len() != 1 || woken[0] != WAITER_TID {
+        test_fail!("futex_shared_crossmm",
+            "shared wake drained {:?}, expected [{:#x}]", woken, WAITER_TID);
+        return false;
+    }
+    if waiter_state != Some(crate::proc::ThreadState::Ready) {
+        test_fail!("futex_shared_crossmm",
+            "waiter state after shared wake = {:?}, expected Ready", waiter_state);
+        return false;
+    }
+    if !bucket_drained {
+        test_fail!("futex_shared_crossmm", "shared bucket not drained after wake");
+        return false;
+    }
+    test_println!("  shared wake from (PID_B,VA_B) woke the (PID_A,VA_A) waiter Blocked→Ready ✓");
+
+    test_pass!("cross-mm PROCESS_SHARED futex wake (physical-identity key)");
+    true
+}
+
+// ── F1 guard: a Dead TID in a shared bucket must not consume the wake budget,
+//    and futex_drain_pid must sweep shared buckets ───────────────────────────
+//
+// The physical-identity key makes cross-process shared wakes land, but a
+// PROCESS_SHARED waiter whose process is OOM-killed leaves a Dead TID in the
+// `(FUTEX_SHARED_NS, phys)` bucket (that bucket is pid-independent, so the
+// per-pid private drain never reached it).  If a subsequent `nr=1` shared wake
+// (a CrossProcessMutex unlock / pthread_cond_signal) counted that Dead pop
+// toward its single wake slot, the live cross-process waiter behind it would
+// never be woken — re-opening the exact permanent lost-wake this PR closes.
+// This test drives BOTH halves of the fix at the data-structure level:
+//   (b) `futex_wake_bucket_live` skips the Dead head WITHOUT spending budget,
+//       so a max_wake=1 wake still reaches the live Blocked waiter behind it;
+//   (a) `futex_drain_pid` evicts a dying process's TIDs from shared buckets.
+// Ref: futex(2) (FUTEX_WAKE); pthread_cond_signal(3p).
+fn test_futex_shared_dead_skip_and_drain() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, futex_shared_key_from_phys,
+                         futex_wake_bucket_live, futex_drain_pid};
+    test_header!("shared-futex Dead-skip wake budget + shared-bucket drain (F1)");
+
+    const PA:        u64 = 0x5EED_0F11;
+    const DEAD_TID:  u64 = 0x5EED_D3AD;
+    const LIVE_TID:  u64 = 0x5EED_11FE;
+    const PHYS_P2:   u64 = 0x0000_0007_1234_5000 | 0x80; // wake-budget bucket
+    const PHYS_P3:   u64 = 0x0000_0007_1234_6000 | 0x40; // drain bucket
+    let key_p2 = futex_shared_key_from_phys(PHYS_P2);
+    let key_p3 = futex_shared_key_from_phys(PHYS_P3);
+
+    // Defence-in-depth: bail if the synthetic ids collide with live rows.
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.tid == DEAD_TID || t.tid == LIVE_TID || t.pid == PA) {
+            test_fail!("futex_shared_dead_skip",
+                "synthetic PID/TID collides with a live THREAD_TABLE row");
+            return false;
+        }
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_p2);
+        w.remove(&key_p3);
+    }
+
+    let mk = |tid: u64, state: crate::proc::ThreadState| crate::proc::Thread {
+        tid,
+        pid: PA,
+        state,
+        context: alloc::boxed::Box::new(crate::proc::CpuContext::default()),
+        kernel_stack_base: 0,
+        kernel_stack_size: 0,
+        wake_tick: u64::MAX - 2,
+        name: [0u8; 32],
+        exit_code: 0,
+        fpu_state: None,
+        user_entry_rip: 0,
+        user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8: 0,
+        priority: 0,
+        base_priority: 0,
+        tls_base: 0,
+        gs_base: 0,
+        cpu_affinity: Some(0xFE),
+        last_cpu: 0,
+        first_run: false,
+        ready_since_tick: 0,
+        mirror_slot: None,
+        ctx_rsp_valid: alloc::boxed::Box::new(
+            core::sync::atomic::AtomicBool::new(true)),
+        clear_child_tid: 0,
+        fork_user_regs: crate::proc::ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        robust_list_head: 0,
+        robust_list_len: 0,
+        vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
+    };
+
+    crate::hal::disable_interrupts();
+    let sched_was_active = crate::sched::is_active();
+    if sched_was_active { crate::sched::disable(); }
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.push(mk(DEAD_TID, crate::proc::ThreadState::Dead));
+        threads.push(mk(LIVE_TID, crate::proc::ThreadState::Blocked));
+    }
+
+    // (b) Shared bucket with the DEAD TID at the HEAD, LIVE Blocked behind it.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        let v = w.entry(key_p2).or_insert_with(alloc::vec::Vec::new);
+        v.push(DEAD_TID);
+        v.push(LIVE_TID);
+    }
+    // A nr=1 wake must skip the Dead head (no budget) and wake the live waiter.
+    let woken_b: alloc::vec::Vec<u64> = {
+        let mut w = FUTEX_WAITERS.lock();
+        futex_wake_bucket_live(&mut w, key_p2, 1, /*cur_tid*/ LIVE_TID)
+    };
+    let live_state_b = crate::proc::THREAD_TABLE.lock()
+        .iter().find(|t| t.tid == LIVE_TID).map(|t| t.state);
+    let p2_drained = !FUTEX_WAITERS.lock().contains_key(&key_p2);
+
+    // (a) Register the (now reset) LIVE tid in a fresh shared bucket, then drain
+    //     the dying process: futex_drain_pid must evict it from the shared NS.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == LIVE_TID) {
+            t.state = crate::proc::ThreadState::Blocked;
+        }
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.entry(key_p3).or_insert_with(alloc::vec::Vec::new).push(LIVE_TID);
+    }
+    futex_drain_pid(PA);
+    let p3_drained = !FUTEX_WAITERS.lock().contains_key(&key_p3);
+
+    // Teardown synthetic rows + buckets BEFORE re-enabling interrupts.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for t in threads.iter_mut().filter(|t| t.pid == PA) {
+            t.state = crate::proc::ThreadState::Dead;
+        }
+        threads.retain(|t| t.pid != PA);
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_p2);
+        w.remove(&key_p3);
+    }
+    if sched_was_active { crate::sched::enable(); }
+    crate::hal::enable_interrupts();
+
+    // ── Assertions ────────────────────────────────────────────────────────
+    if woken_b.len() != 1 || woken_b[0] != LIVE_TID {
+        test_fail!("futex_shared_dead_skip",
+            "nr=1 wake drained {:?}, expected only the LIVE tid [{:#x}] \
+             (Dead head must not consume the wake budget)", woken_b, LIVE_TID);
+        return false;
+    }
+    if live_state_b != Some(crate::proc::ThreadState::Ready) {
+        test_fail!("futex_shared_dead_skip",
+            "live waiter behind the Dead head not woken (state={:?})", live_state_b);
+        return false;
+    }
+    if !p2_drained {
+        test_fail!("futex_shared_dead_skip",
+            "shared bucket not emptied (Dead discarded + live woken)");
+        return false;
+    }
+    test_println!("  Dead head skipped, nr=1 budget reached the live waiter ✓");
+    if !p3_drained {
+        test_fail!("futex_shared_dead_skip",
+            "futex_drain_pid did NOT sweep the shared (FUTEX_SHARED_NS, phys) bucket");
+        return false;
+    }
+    test_println!("  futex_drain_pid swept the dying process's shared-bucket TID ✓");
+
+    test_pass!("shared-futex Dead-skip wake budget + shared-bucket drain (F1)");
     true
 }
 
@@ -41455,7 +41830,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
         // helper returns ValueMismatch we count as "done" (a benign
         // EAGAIN — wake-side beat us via the FUTEX_WORD update).
         let outcome = futex_wait_check_and_enqueue(
-            SYNTH_PID, SYNTH_UADDR, EXPECTED_VAL as u64, tid,
+            (SYNTH_PID, SYNTH_UADDR), EXPECTED_VAL as u64, tid,
             u64::MAX, // indefinite
             || Some(FUTEX_WORD.load(Ordering::SeqCst)),
         );
@@ -41636,7 +42011,7 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // Case 1: low-32 bits agree, high bits all-ones (sign-extended int).
     // MUST Enqueue (pre-fix this returned ValueMismatch → the storm).
     let outcome = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, VAL_SIGN_EXTENDED, tid,
+        (SYNTH_PID, SYNTH_UADDR), VAL_SIGN_EXTENDED, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
@@ -41672,7 +42047,7 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // the comparison legitimately exists to produce; the fix must not mask it).
     let bad_val: u64 = 0xFFFF_FFFF_8000_0011; // low32 = 0x8000_0011 != WORD
     let outcome2 = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, bad_val, tid,
+        (SYNTH_PID, SYNTH_UADDR), bad_val, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
