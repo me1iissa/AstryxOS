@@ -605,6 +605,83 @@ pub(crate) fn futex_key(private: bool, pid: u64, uaddr: u64) -> FutexKey {
     }
 }
 
+/// Wake up to `max_wake` **live Blocked** waiters parked on `key`, returning the
+/// TIDs actually transitioned `Blocked → Ready`.
+///
+/// A wake slot is spent only on a live Blocked waiter.  A stale non-live entry
+/// — most importantly a **Dead** TID left in a `(FUTEX_SHARED_NS, phys)` bucket
+/// by a process that was OOM-killed while parked on a cross-process shared futex
+/// before [`futex_drain_pid`] swept it — is discarded from the bucket WITHOUT
+/// consuming a wake slot, so the wake still reaches the live cross-process waiter
+/// behind it.  Counting a Dead pop toward the budget is exactly what would drop a
+/// `nr=1` shared wake (a `CrossProcessMutex` unlock / `pthread_cond_signal`) and
+/// re-open the permanent lost-wake this futex-key work is meant to close.
+///
+/// The pop, the liveness check, and the `Blocked → Ready` transition run under a
+/// single `FUTEX_WAITERS → THREAD_TABLE` critical section (the established kernel
+/// lock order).  The caller must already hold `FUTEX_WAITERS` and pass the guard
+/// as `waiters`; this routine acquires `THREAD_TABLE` itself.  A woken waiter
+/// gets the wake-preemption boost, and a reschedule is requested if any woken
+/// thread out-ranks the waker (`cur_tid`) — mirroring the historical per-arm
+/// wake epilogue.
+///
+/// Refs: `futex(2)` (FUTEX_WAKE); `pthread_cond_signal(3p)`.
+pub(crate) fn futex_wake_bucket_live(
+    waiters: &mut BTreeMap<FutexKey, Vec<u64>>,
+    key: FutexKey,
+    max_wake: u64,
+    cur_tid: u64,
+) -> Vec<u64> {
+    let mut woken: Vec<u64> = Vec::new();
+    let mut max_woken_prio = 0u8;
+    let cur_prio;
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        cur_prio = threads
+            .iter()
+            .find(|th| th.tid == cur_tid)
+            .map(|th| th.priority)
+            .unwrap_or(0);
+        if let Some(list) = waiters.get_mut(&key) {
+            let mut i = 0;
+            while i < list.len() && (woken.len() as u64) < max_wake {
+                let tid = list[i];
+                let is_live_blocked = threads
+                    .iter_mut()
+                    .find(|th| th.tid == tid)
+                    .map(|th| {
+                        if th.state == crate::proc::ThreadState::Blocked {
+                            th.state = crate::proc::ThreadState::Ready;
+                            th.wake_tick = 0;
+                            crate::proc::apply_wake_boost(th);
+                            max_woken_prio = max_woken_prio.max(th.priority);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if is_live_blocked {
+                    // Woke a live waiter: remove it and count the slot.
+                    list.remove(i);
+                    woken.push(tid);
+                } else {
+                    // Dead / already-woken / unknown TID: drop it from the
+                    // bucket without spending a wake slot, and keep scanning.
+                    list.remove(i);
+                }
+            }
+            if list.is_empty() {
+                waiters.remove(&key);
+            }
+        }
+    }
+    if max_woken_prio > cur_prio {
+        crate::sched::request_reschedule();
+    }
+    woken
+}
+
 /// Outcome of `futex_wait_check_and_enqueue`.
 #[derive(Debug)]
 pub(crate) enum FutexWaitOutcome {
@@ -2582,23 +2659,48 @@ pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
 /// equivalent here: the threads themselves are already Dead, so we just
 /// clean up the queue keyed by `(pid, _)`.
 pub fn futex_drain_pid(pid: u64) {
-    // This drains the dying process's PRIVATE `(pid, _)` buckets.  A
-    // PROCESS_SHARED waiter sits in a `(FUTEX_SHARED_NS, phys)` bucket that is
-    // deliberately not pid-scoped (the whole point of the shared key is that it
-    // is independent of which mm reaches the word), so it is not swept here.
-    // That is safe: every thread of `pid` is already `Dead` by the time this
-    // runs, and the WAKE path only ever flips `Blocked → Ready`, so a leftover
-    // dead TID in a shared bucket is inert — a later shared wake pops it and the
-    // THREAD_TABLE state check skips it.  Shared buckets self-drain as their
-    // waiters are woken; a genuinely abandoned one holds only inert dead TIDs.
     let mut waiters = FUTEX_WAITERS.lock();
+    // Drain the dying process's PRIVATE `(pid, _)` buckets.
     let dead_keys: alloc::vec::Vec<(u64, u64)> = waiters
         .keys()
-        .filter(|&&(p, _)| p == pid)
+        .filter(|&&(p, _)| p == pid && p != FUTEX_SHARED_NS)
         .copied()
         .collect();
     for key in dead_keys {
         waiters.remove(&key);
+    }
+    // Also evict this process's TIDs from the pid-independent PROCESS_SHARED
+    // buckets `(FUTEX_SHARED_NS, phys)`.  A thread parked on a cross-process
+    // shared futex is keyed by the physical word, not by pid, so the `(pid, _)`
+    // sweep above cannot reach it.  Leaving a stale Dead TID there is NOT inert:
+    // a later `nr=1` shared wake (a `CrossProcessMutex` unlock /
+    // `pthread_cond_signal`) would pop the Dead TID, spend its one wake slot on
+    // it (it stays Dead), and never reach the LIVE cross-process waiter behind
+    // it — the exact permanent lost-wake this futex-key work closes.  Reachable
+    // in practice because the OOM killer can terminate a process mid-shared-wait.
+    // Collect the process's TIDs (its threads are all marked Dead by exit_group
+    // before this runs and are still present in THREAD_TABLE) and remove them
+    // from every shared bucket.  Lock order: FUTEX_WAITERS → THREAD_TABLE (the
+    // established kernel order; the exit_group caller holds no lock here).
+    {
+        let dying_tids: alloc::vec::Vec<u64> = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().filter(|t| t.pid == pid).map(|t| t.tid).collect()
+        };
+        if !dying_tids.is_empty() {
+            let shared_keys: alloc::vec::Vec<FutexKey> = waiters
+                .range((FUTEX_SHARED_NS, u64::MIN)..=(FUTEX_SHARED_NS, u64::MAX))
+                .map(|(&k, _)| k)
+                .collect();
+            for key in shared_keys {
+                if let Some(list) = waiters.get_mut(&key) {
+                    list.retain(|t| !dying_tids.contains(t));
+                    if list.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+            }
+        }
     }
     // Drain any lingering requeue-destination records for this pid so a
     // PID-reuse cannot inherit a stale `(pid, tid) → uaddr2` mapping.  Same

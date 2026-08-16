@@ -862,6 +862,10 @@ pub fn run() -> ! {
     total += 1;
     if test_futex_shared_crossmm_wake() { passed += 1; }
 
+    // ── shared-futex Dead-skip wake budget + shared-bucket drain (F1) ─────
+    total += 1;
+    if test_futex_shared_dead_skip_and_drain() { passed += 1; }
+
     // ── Test 53: AF_UNIX socketpair + write/read ──────────────────────────
 
     total += 1;
@@ -17067,6 +17071,170 @@ fn test_futex_shared_crossmm_wake() -> bool {
     test_println!("  shared wake from (PID_B,VA_B) woke the (PID_A,VA_A) waiter Blocked→Ready ✓");
 
     test_pass!("cross-mm PROCESS_SHARED futex wake (physical-identity key)");
+    true
+}
+
+// ── F1 guard: a Dead TID in a shared bucket must not consume the wake budget,
+//    and futex_drain_pid must sweep shared buckets ───────────────────────────
+//
+// The physical-identity key makes cross-process shared wakes land, but a
+// PROCESS_SHARED waiter whose process is OOM-killed leaves a Dead TID in the
+// `(FUTEX_SHARED_NS, phys)` bucket (that bucket is pid-independent, so the
+// per-pid private drain never reached it).  If a subsequent `nr=1` shared wake
+// (a CrossProcessMutex unlock / pthread_cond_signal) counted that Dead pop
+// toward its single wake slot, the live cross-process waiter behind it would
+// never be woken — re-opening the exact permanent lost-wake this PR closes.
+// This test drives BOTH halves of the fix at the data-structure level:
+//   (b) `futex_wake_bucket_live` skips the Dead head WITHOUT spending budget,
+//       so a max_wake=1 wake still reaches the live Blocked waiter behind it;
+//   (a) `futex_drain_pid` evicts a dying process's TIDs from shared buckets.
+// Ref: futex(2) (FUTEX_WAKE); pthread_cond_signal(3p).
+fn test_futex_shared_dead_skip_and_drain() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, futex_shared_key_from_phys,
+                         futex_wake_bucket_live, futex_drain_pid};
+    test_header!("shared-futex Dead-skip wake budget + shared-bucket drain (F1)");
+
+    const PA:        u64 = 0x5EED_0F11;
+    const DEAD_TID:  u64 = 0x5EED_D3AD;
+    const LIVE_TID:  u64 = 0x5EED_11FE;
+    const PHYS_P2:   u64 = 0x0000_0007_1234_5000 | 0x80; // wake-budget bucket
+    const PHYS_P3:   u64 = 0x0000_0007_1234_6000 | 0x40; // drain bucket
+    let key_p2 = futex_shared_key_from_phys(PHYS_P2);
+    let key_p3 = futex_shared_key_from_phys(PHYS_P3);
+
+    // Defence-in-depth: bail if the synthetic ids collide with live rows.
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        if threads.iter().any(|t| t.tid == DEAD_TID || t.tid == LIVE_TID || t.pid == PA) {
+            test_fail!("futex_shared_dead_skip",
+                "synthetic PID/TID collides with a live THREAD_TABLE row");
+            return false;
+        }
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_p2);
+        w.remove(&key_p3);
+    }
+
+    let mk = |tid: u64, state: crate::proc::ThreadState| crate::proc::Thread {
+        tid,
+        pid: PA,
+        state,
+        context: alloc::boxed::Box::new(crate::proc::CpuContext::default()),
+        kernel_stack_base: 0,
+        kernel_stack_size: 0,
+        wake_tick: u64::MAX - 2,
+        name: [0u8; 32],
+        exit_code: 0,
+        fpu_state: None,
+        user_entry_rip: 0,
+        user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8: 0,
+        priority: 0,
+        base_priority: 0,
+        tls_base: 0,
+        gs_base: 0,
+        cpu_affinity: Some(0xFE),
+        last_cpu: 0,
+        first_run: false,
+        ready_since_tick: 0,
+        mirror_slot: None,
+        ctx_rsp_valid: alloc::boxed::Box::new(
+            core::sync::atomic::AtomicBool::new(true)),
+        clear_child_tid: 0,
+        fork_user_regs: crate::proc::ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        robust_list_head: 0,
+        robust_list_len: 0,
+        vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
+    };
+
+    crate::hal::disable_interrupts();
+    let sched_was_active = crate::sched::is_active();
+    if sched_was_active { crate::sched::disable(); }
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.push(mk(DEAD_TID, crate::proc::ThreadState::Dead));
+        threads.push(mk(LIVE_TID, crate::proc::ThreadState::Blocked));
+    }
+
+    // (b) Shared bucket with the DEAD TID at the HEAD, LIVE Blocked behind it.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        let v = w.entry(key_p2).or_insert_with(alloc::vec::Vec::new);
+        v.push(DEAD_TID);
+        v.push(LIVE_TID);
+    }
+    // A nr=1 wake must skip the Dead head (no budget) and wake the live waiter.
+    let woken_b: alloc::vec::Vec<u64> = {
+        let mut w = FUTEX_WAITERS.lock();
+        futex_wake_bucket_live(&mut w, key_p2, 1, /*cur_tid*/ LIVE_TID)
+    };
+    let live_state_b = crate::proc::THREAD_TABLE.lock()
+        .iter().find(|t| t.tid == LIVE_TID).map(|t| t.state);
+    let p2_drained = !FUTEX_WAITERS.lock().contains_key(&key_p2);
+
+    // (a) Register the (now reset) LIVE tid in a fresh shared bucket, then drain
+    //     the dying process: futex_drain_pid must evict it from the shared NS.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == LIVE_TID) {
+            t.state = crate::proc::ThreadState::Blocked;
+        }
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.entry(key_p3).or_insert_with(alloc::vec::Vec::new).push(LIVE_TID);
+    }
+    futex_drain_pid(PA);
+    let p3_drained = !FUTEX_WAITERS.lock().contains_key(&key_p3);
+
+    // Teardown synthetic rows + buckets BEFORE re-enabling interrupts.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for t in threads.iter_mut().filter(|t| t.pid == PA) {
+            t.state = crate::proc::ThreadState::Dead;
+        }
+        threads.retain(|t| t.pid != PA);
+    }
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&key_p2);
+        w.remove(&key_p3);
+    }
+    if sched_was_active { crate::sched::enable(); }
+    crate::hal::enable_interrupts();
+
+    // ── Assertions ────────────────────────────────────────────────────────
+    if woken_b.len() != 1 || woken_b[0] != LIVE_TID {
+        test_fail!("futex_shared_dead_skip",
+            "nr=1 wake drained {:?}, expected only the LIVE tid [{:#x}] \
+             (Dead head must not consume the wake budget)", woken_b, LIVE_TID);
+        return false;
+    }
+    if live_state_b != Some(crate::proc::ThreadState::Ready) {
+        test_fail!("futex_shared_dead_skip",
+            "live waiter behind the Dead head not woken (state={:?})", live_state_b);
+        return false;
+    }
+    if !p2_drained {
+        test_fail!("futex_shared_dead_skip",
+            "shared bucket not emptied (Dead discarded + live woken)");
+        return false;
+    }
+    test_println!("  Dead head skipped, nr=1 budget reached the live waiter ✓");
+    if !p3_drained {
+        test_fail!("futex_shared_dead_skip",
+            "futex_drain_pid did NOT sweep the shared (FUTEX_SHARED_NS, phys) bucket");
+        return false;
+    }
+    test_println!("  futex_drain_pid swept the dying process's shared-bucket TID ✓");
+
+    test_pass!("shared-futex Dead-skip wake budget + shared-bucket drain (F1)");
     true
 }
 

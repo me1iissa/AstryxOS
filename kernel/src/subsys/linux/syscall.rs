@@ -10194,57 +10194,20 @@ pub fn sys_futex_linux(
                 );
             }
 
-            let tids_to_wake: Vec<u64> = {
-                let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                if let Some(list) = waiters.get_mut(&wake_key) {
-                    let mut result = Vec::new();
-                    while !list.is_empty() && woken < max_wake {
-                        result.push(list.remove(0));
-                        woken += 1;
-                    }
-                    if list.is_empty() {
-                        waiters.remove(&wake_key);
-                    }
-                    result
-                } else {
-                    Vec::new()
-                }
-            };
-
+            // Wake up to `max_wake` LIVE Blocked waiters on `wake_key`.  A stale
+            // Dead TID — e.g. a process OOM-killed while parked on this shared
+            // futex before its bucket was drained — is discarded WITHOUT spending
+            // a wake slot, so a `nr=1` shared wake still reaches the live waiter
+            // behind it (the F1 lost-wake guard).  The pop, liveness check, and
+            // `Blocked → Ready` transition run under one FUTEX_WAITERS →
+            // THREAD_TABLE critical section, and the woken thread gets the
+            // wake-preemption boost + a reschedule if it out-ranks the waker.
             {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                let cur_tid = crate::proc::current_tid();
-                let cur_prio = threads
-                    .iter()
-                    .find(|th| th.tid == cur_tid)
-                    .map(|th| th.priority)
-                    .unwrap_or(0);
-                let mut max_woken_prio = 0u8;
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                            // Wake-preemption: a futex waiter returning from a
-                            // sleep has not spent the CPU; boost it so it runs
-                            // ahead of continuously-runnable peers for its next
-                            // scheduling decision. See `proc::apply_wake_boost`.
-                            crate::proc::apply_wake_boost(th);
-                            max_woken_prio = max_woken_prio.max(th.priority);
-                        }
-                    }
-                }
-                drop(threads);
-                // resched_curr equivalent: if a woken thread now out-ranks the
-                // waker, request a reschedule so it preempts at syscall return
-                // rather than waiting out the waker's whole time slice. Without
-                // this the boost only changes *which* thread the picker prefers
-                // at the next natural switch — the waker can still run all the
-                // way to its own next block first. (POSIX sched(7): a wakeup may
-                // preempt the running task.)
-                if max_woken_prio > cur_prio {
-                    crate::sched::request_reschedule();
-                }
+                let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+                let woken_tids = crate::syscall::futex_wake_bucket_live(
+                    &mut waiters, wake_key, max_wake, crate::proc::current_tid(),
+                );
+                woken = woken_tids.len() as u64;
             }
 
             // Diagnostic: every FUTEX_WAKE is a candidate root cause for a
@@ -10478,13 +10441,33 @@ pub fn sys_futex_linux(
                 let src = waiters.remove(&src_key).unwrap_or_default();
                 let mut wake_list = Vec::new();
                 let mut requeue_list = Vec::new();
-                for tid in src {
-                    if woken < max_wake {
-                        wake_list.push(tid);
-                        woken += 1;
-                    } else if requeued < max_requeue {
-                        requeue_list.push(tid);
-                        requeued += 1;
+                {
+                    // F1 liveness gate on the WAKE budget only: a wake slot goes
+                    // only to a live Blocked waiter, so a stale Dead TID (e.g. an
+                    // OOM-killed process's waiter left in a shared bucket) is
+                    // dropped WITHOUT spending a wake slot — the wake reaches the
+                    // live cross-process waiter behind it.  The requeue-MOVE
+                    // relocates the still-parked waiter to uaddr2 regardless: a
+                    // stale entry there is harmless (drained on exit / discarded
+                    // by a later live-wake), and gating it would wrongly drop a
+                    // waiter the caller asked to move.  Lock order:
+                    // FUTEX_WAITERS → THREAD_TABLE.
+                    let threads = crate::proc::THREAD_TABLE.lock();
+                    for tid in src {
+                        if woken < max_wake {
+                            let live_blocked = threads.iter().any(|th| {
+                                th.tid == tid
+                                    && th.state == crate::proc::ThreadState::Blocked
+                            });
+                            if live_blocked {
+                                wake_list.push(tid);
+                                woken += 1;
+                            }
+                            // else: drop the Dead wake candidate, spend no budget.
+                        } else if requeued < max_requeue {
+                            requeue_list.push(tid);
+                            requeued += 1;
+                        }
                     }
                 }
                 // Requeue surviving waiters to uaddr2.
@@ -10614,17 +10597,15 @@ pub fn sys_futex_linux(
                 return -14; // EFAULT — *uaddr2 unwritable
             }
 
-            // ── Wake up to `val` waiters on uaddr ─────────────────────────
+            // ── Wake up to `val` LIVE waiters on uaddr ────────────────────
+            // Same F1 liveness guard as FUTEX_WAKE: a stale Dead TID in the
+            // bucket is discarded without spending a wake slot (each helper call
+            // holds FUTEX_WAITERS → THREAD_TABLE and does the Blocked→Ready flip).
+            let cur_tid = crate::proc::current_tid();
             let max_wake1 = if val == 0 { u64::MAX } else { val };
-            let mut tids_to_wake: Vec<u64> = Vec::new();
-            if let Some(list) = waiters.get_mut(&wake1_key) {
-                let mut n = 0u64;
-                while !list.is_empty() && n < max_wake1 {
-                    tids_to_wake.push(list.remove(0));
-                    n += 1;
-                }
-                if list.is_empty() { waiters.remove(&wake1_key); }
-            }
+            let mut tids_to_wake: Vec<u64> = crate::syscall::futex_wake_bucket_live(
+                &mut waiters, wake1_key, max_wake1, cur_tid,
+            );
 
             // ── Evaluate CMP(oldval, cmparg); if true wake uaddr2 too ─────
             let cmp_true = match cmp_field {
@@ -10638,44 +10619,12 @@ pub fn sys_futex_linux(
             };
             if cmp_true {
                 let max_wake2 = if val2 == 0 { u64::MAX } else { val2 };
-                if let Some(list) = waiters.get_mut(&wake2_key) {
-                    let mut n = 0u64;
-                    while !list.is_empty() && n < max_wake2 {
-                        tids_to_wake.push(list.remove(0));
-                        n += 1;
-                    }
-                    if list.is_empty() { waiters.remove(&wake2_key); }
-                }
+                let woken2 = crate::syscall::futex_wake_bucket_live(
+                    &mut waiters, wake2_key, max_wake2, cur_tid,
+                );
+                tids_to_wake.extend(woken2);
             }
             drop(waiters);
-
-            // Flip every drained TID Blocked → Ready under one THREAD_TABLE
-            // acquisition (same post-drain pattern as FUTEX_WAKE).
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                let cur_tid = crate::proc::current_tid();
-                let cur_prio = threads
-                    .iter()
-                    .find(|th| th.tid == cur_tid)
-                    .map(|th| th.priority)
-                    .unwrap_or(0);
-                let mut max_woken_prio = 0u8;
-                for &t in &tids_to_wake {
-                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
-                        if th.state == crate::proc::ThreadState::Blocked {
-                            th.state = crate::proc::ThreadState::Ready;
-                            th.wake_tick = 0;
-                            // Wake-preemption boost (see `proc::apply_wake_boost`).
-                            crate::proc::apply_wake_boost(th);
-                            max_woken_prio = max_woken_prio.max(th.priority);
-                        }
-                    }
-                }
-                drop(threads);
-                if max_woken_prio > cur_prio {
-                    crate::sched::request_reschedule();
-                }
-            }
 
             tids_to_wake.len() as i64
         }
